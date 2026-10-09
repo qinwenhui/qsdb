@@ -11,6 +11,7 @@
 
 pub mod api;
 pub mod catalog;
+pub mod compact;
 pub mod error;
 pub mod exec;
 pub mod expr;
@@ -23,6 +24,7 @@ pub mod sql;
 pub mod stats;
 pub mod types;
 pub mod write;
+pub mod write_buffer;
 
 pub use api::{Qsdb, QsdbOptions, ScanRequest};
 pub use catalog::{ColumnDef, TableDef};

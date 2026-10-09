@@ -40,10 +40,10 @@ pub fn data_schema(def: &TableDef) -> SchemaRef {
 }
 
 /// parquet 写参数（format-spec §5；表属性 `compression` 可改 snappy）。
-fn writer_props(def: &TableDef) -> Result<WriterProperties> {
+pub fn writer_props(def: &TableDef) -> Result<WriterProperties> {
     let compression = match def.properties.get("compression").map(|s| s.as_str()) {
         None | Some("zstd") => Compression::ZSTD(
-            parquet::basic::ZstdLevel::try_new(3)
+            parquet::basic::ZstdLevel::try_new(1)
                 .map_err(|e| QsdbError::invalid(format!("zstd level: {e}")))?,
         ),
         Some("snappy") => Compression::SNAPPY,
@@ -186,6 +186,23 @@ fn write_segment(
     })
 }
 
+/// 列统计累积器（compaction 复用）。
+#[derive(Default)]
+pub struct ColAcc {
+    pub min: Option<crate::types::Literal>,
+    pub max: Option<crate::types::Literal>,
+    pub nulls: u64,
+}
+
+/// Literal min/max 合并（compaction 复用）。
+pub fn combine_lit(
+    a: Option<crate::types::Literal>,
+    b: Option<crate::types::Literal>,
+    keep_min: bool,
+) -> Option<crate::types::Literal> {
+    stats_merge::combine(a, b, keep_min)
+}
+
 mod stats_merge {
     use crate::types::Literal;
 
@@ -204,7 +221,11 @@ mod stats_merge {
         combine(a, b, false)
     }
 
-    fn combine(a: Option<Literal>, b: Option<Literal>, keep_min: bool) -> Option<Literal> {
+    pub(super) fn combine(
+        a: Option<Literal>,
+        b: Option<Literal>,
+        keep_min: bool,
+    ) -> Option<Literal> {
         match (a, b) {
             (None, x) | (x, None) => x,
             (Some(x), Some(y)) => match x.partial_cmp_literal(&y) {

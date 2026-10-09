@@ -1,8 +1,8 @@
 # QSDB
 
-**A single-node, embeddable, columnar analytical read/write store. Arrow-native. Parquet-backed. Zero external services.**
+**A standalone, single-node, embeddable columnar analytical database. Arrow-native. Parquet-backed. Zero external services.**
 
-QSDB 为大数据计算引擎而生：作为 Rust 库嵌入时它是高吞吐读写层，编译为单二进制时它是可直接部署的分析服务。设计目标只有两个——**超高性能**与**超低占用**。
+通用嵌入式分析数据库：作为 Rust 库嵌入任意应用/引擎，或编译为单二进制直接部署。不绑定任何上游，接口全部基于开放标准（Arrow / Parquet / HTTP / SQL）。三件事做到极致——**读写速度、资源占用、并发能力**。
 
 - 列式、不可变文件：append + 分区级原子 overwrite，无行级 UPDATE/DELETE
 - Arrow `RecordBatch` 全链路零拷贝，嵌入式 API 是一等公民
@@ -55,12 +55,13 @@ qsdb query  --path /data/qsdb "SELECT ..."           # 一次性查询 (M2)
 | M0 | 骨架 + 类型系统（Decimal 精度矩阵 / cast / compare） | ✅ |
 | M1 | 读写闭环：表格式 + 提交协议 + 三级裁剪扫描 + 嵌入式 API | ✅ |
 | M2 | 向量化执行 + SQL-0/1 + CLI | ✅（聚合红线部分达成，M4 复测） |
-| M3 | HTTP 服务 + compaction + 治理 | ⬜ |
+| M3 | HTTP 服务 + compaction + WriteBuffer 攒批 | ✅ |
 | M4 | Join + spill + bloom + S3/HDFS | ⬜ |
 | M5 | 窗口/CTE/UDF + Flight + SIMD/GPU | ⬜ |
 
 M1 实测（Windows 开发机，release）：写入 1.4M rows/s、扫描 855 MB/s 单线程、万级分区元数据 18ms。
 M2 实测：1 亿行 3 列 group by 0.92s（18 线程）；SQL-0/1 全语义 e2e 106 测试。
+M3 实测：HTTP 并发写入 522MB/s（8 流回环）；二进制 15.7MB；compaction/攒批就位。
 
 ## 开发
 

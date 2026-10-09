@@ -16,3 +16,7 @@ qsdb = { workspace = true }
 clap = { workspace = true }
 rustyline = { workspace = true }
 arrow = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }

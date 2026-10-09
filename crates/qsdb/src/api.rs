@@ -293,6 +293,29 @@ impl Qsdb {
         Ok((tables.len(), bytes))
     }
 
+    /// 表级 compaction（小文件合并；详见 `compact` 模块）。
+    pub fn compact_table(&self, table: &str) -> Result<crate::compact::CompactResult> {
+        let def = self.def(None, table)?;
+        let tdir = table_dir(&self.root, DEFAULT_DB, table);
+        crate::compact::compact_table(
+            &self.root,
+            &tdir,
+            &def,
+            &crate::compact::CompactOptions::default(),
+        )
+    }
+
+    /// 带选项 compaction。
+    pub fn compact_table_with(
+        &self,
+        table: &str,
+        opts: crate::compact::CompactOptions,
+    ) -> Result<crate::compact::CompactResult> {
+        let def = self.def(None, table)?;
+        let tdir = table_dir(&self.root, DEFAULT_DB, table);
+        crate::compact::compact_table(&self.root, &tdir, &def, &opts)
+    }
+
     /// 强制重建表级分区索引（`partitions.idx`）。
     ///
     /// 场景：索引损坏、跨进程写入造成 stale、或旧版本目录首次启用索引。

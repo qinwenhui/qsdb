@@ -10,6 +10,8 @@ use arrow::array::Array;
 use arrow::record_batch::RecordBatch;
 use clap::Parser;
 use qsdb::sql::SqlResult;
+mod server;
+
 use qsdb::{Qsdb, QsdbOptions};
 
 #[derive(Debug, Parser)]
@@ -44,12 +46,18 @@ enum Cmd {
         #[command(subcommand)]
         cmd: AdminCmd,
     },
-    /// 启动 HTTP API 服务（M3 开放）
+    /// 启动 HTTP API 服务
     Server {
         #[arg(long)]
         path: PathBuf,
         #[arg(long, default_value = "0.0.0.0:9430")]
         addr: String,
+        /// bearer token 鉴权（不设则开放）
+        #[arg(long)]
+        token: Option<String>,
+        /// 自动 compaction 周期（秒）
+        #[arg(long)]
+        auto_compact_secs: Option<u64>,
     },
 }
 
@@ -63,6 +71,8 @@ enum AdminCmd {
     RefreshIndex { table: String },
     /// trash/孤儿清理
     Gc,
+    /// 小文件合并
+    Compact { table: String },
 }
 
 fn main() {
@@ -95,6 +105,19 @@ fn main() {
                         std::process::exit(1);
                     }
                 },
+                AdminCmd::Compact { table } => match db.compact_table(&table) {
+                    Ok(r) => {
+                        println!(
+                            "compacted: {} partitions, {} segments, {} rows, {} bytes",
+                            r.partitions_compacted, r.segments_merged, r.rows, r.bytes_written
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                },
                 AdminCmd::Gc => match db.gc() {
                     Ok((purged, freed)) => {
                         println!("gc: {purged} entries, {} bytes freed", freed);
@@ -114,11 +137,27 @@ fn main() {
                 }
             }
         }
-        Cmd::Server { path, addr } => {
-            eprintln!(
-                "qsdb server: planned for M3 (path={}, addr={addr}) — not yet implemented",
-                path.display()
-            );
+        Cmd::Server {
+            path,
+            addr,
+            token,
+            auto_compact_secs,
+        } => {
+            let db = match Qsdb::open(&path, QsdbOptions::default()) {
+                Ok(db) => Arc::new(db),
+                Err(e) => {
+                    eprintln!("open {} failed: {e}", path.display());
+                    std::process::exit(1);
+                }
+            };
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("init tokio runtime");
+            if let Err(e) = rt.block_on(crate::server::serve(db, &addr, token, auto_compact_secs)) {
+                eprintln!("server error: {e}");
+                std::process::exit(1);
+            }
         }
     }
 }

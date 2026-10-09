@@ -14,4 +14,14 @@ path = "src/main.rs"
 [dependencies]
 qsdb = { workspace = true }
 arrow = { workspace = true }
+parquet = { workspace = true }
 rayon = { workspace = true }
+
+[features]
+# DuckDB 进程内对比（bundled 编译 C++，首次编译数分钟）
+duckdb = ["dep:duckdb"]
+
+[dependencies.duckdb]
+version = "1.1"
+optional = true
+features = ["bundled"]

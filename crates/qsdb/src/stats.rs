@@ -190,13 +190,29 @@ fn string_stats<O: arrow::array::OffsetSizeTrait>(array: &dyn Array, stats: &mut
         .as_any()
         .downcast_ref::<GenericStringArray<O>>()
         .unwrap();
+    let mut min: Option<&str> = None;
+    let mut max: Option<&str> = None;
     for i in 0..arr.len() {
         if arr.is_null(i) {
             continue;
         }
-        let v = Literal::Utf8(arr.value(i).to_string());
-        lit_update(&mut stats.min, v.clone(), true);
-        lit_update(&mut stats.max, v, false);
+        let v = arr.value(i);
+        min = Some(match min {
+            None => v,
+            Some(m) if v < m => v,
+            Some(m) => m,
+        });
+        max = Some(match max {
+            None => v,
+            Some(m) if v > m => v,
+            Some(m) => m,
+        });
+    }
+    if let Some(m) = min {
+        stats.min = Some(Literal::Utf8(m.to_string()));
+    }
+    if let Some(m) = max {
+        stats.max = Some(Literal::Utf8(m.to_string()));
     }
 }
 

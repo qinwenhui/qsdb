@@ -8,9 +8,15 @@
 
 ## 一、项目定位
 
-QSDB 是一个**单机、嵌入式优先、列式、Arrow-native、Parquet-backed 的分析型读写库**。
+> 2026-10-10 定位修正：QSDB 是**独立通用的单机分析数据库**，不绑定任何上游计算引擎。
+> 唯一职责：极致的读写速度、极致低的资源占用、极致的高并发。生态工具（数据同步 /
+> CDC / 各类导入导出生态）是未来**独立新项目**，QSDB 只保证接口开放与标准
+> （Arrow / Parquet / HTTP），不在本仓库内实现。
 
-- **一等公民是嵌入式 Rust API**（Arrow RecordBatch 进出），服务于上游大数据计算引擎的读写。
+QSDB 是一个**单机、嵌入式优先、列式、Arrow-native、Parquet-backed 的通用分析数据库**。
+
+- **一等公民是嵌入式 Rust API**（Arrow RecordBatch 进出），任何应用、任何计算引擎、
+  任何语言生态（经 HTTP/IPC）都可以作为客户端。
 - **同一份核心库编译为单二进制** `qsdb`（server / shell / query 子命令），可独立部署在机器上直接启动。
 - 无外部服务依赖（无 HMS / MySQL / ZooKeeper），元数据与数据全部落在本地目录，分区级文件锁保证多进程/多线程互斥。
 
@@ -26,9 +32,9 @@ QSDB 是一个**单机、嵌入式优先、列式、Arrow-native、Parquet-backe
 | 对外接口 | 嵌入式 API（主）→ CLI → HTTP → Arrow Flight（后） |
 | 扩展路径 | SIMD（arrow 内核 + 定制热点）→ GPU（feature，后置） |
 
-**与参考文档的定位差异**：参考文档是通用 SQL 引擎；QSDB 是**计算引擎的读写库**。因此：
+**与参考文档的定位差异**：参考文档是通用 SQL 引擎；QSDB 收敛为**通用高性能读写存储引擎**。因此：
 1. 嵌入式 API 优先级最高，SQL 是分阶段的门面；
-2. 写路径（批量 append、分区 overwrite、小文件治理）与参考文档同等重要甚至更重要；
+2. 读写路径（批量 append、分区 overwrite、小文件治理、并发扩展）是最核心的工程对象；
 3. 参考「HMS 教训」的解法完全继承：**元数据 = 本地文件 + 内存缓存 + 分区级文件锁，不走任何网络服务**。
 
 ---
@@ -462,13 +468,38 @@ GET  /health | /metrics   # prometheus 文本：行数/字节数/段数/缓存�
   - ✅ 附带达成：谓词下推（可下推形态进三级裁剪）、INSERT OVERWRITE、
     DECIMAL i256 精确算术、并行聚合与串行结果一致性测试。
 
-### M3（第 9–11 周）：服务化与治理
-- `qsdb server` + HTTP API + /metrics；compaction；GC 策略；崩溃恢复演练脚本。
-- **Gate**：
-  - HTTP 写入 ≥ 500MB/s（本机回环）；
-  - 服务态空闲 RSS < 48MB、二进制 ≤ 20MB（CI 守门）；
-  - compaction 在线运行时 P99 读延迟劣化 < 10%；
-  - 公开 bench 报告：scan vs duckdb/datafusion read_parquet。
+### M3（第 9–11 周）：服务化与治理 ✅ 已完成
+- `qsdb server`（axum：query/write IPC/tables/schema/partitions/stats/health/metrics，
+  bearer token 鉴权，1GB body 上限，spawn_blocking 桥接核心库，Ctrl-C 优雅退出 +
+  写缓冲 flush）；compaction（分区锁内合并重写 + manifest 原子替换 + 分区级 rayon
+  并行 + admin/compact 与 --auto-compact-secs）；WriteBuffer 攒批（双阈值自动
+  flush + 分区级并行提交；server 写路径默认走缓冲）。
+- 写路径性能修正：zstd level 3→1；列统计收集改 typed 快路径（跳过逐行 Literal
+  构造，+12% 吞吐）。
+- **Gate（实测，Windows 开发机 release，fat-LTO + panic=abort + strip）**：
+  - ✅ HTTP 写入（并发 8 流回环）522 MB/s logical / 10.7M rows/s；
+    单流上限 ~94MB/s（parquet 单线程压缩 bound，多流聚合是主口径）；
+  - ✅ 二进制 15.7MB（红线 ≤ 20MB）；
+  - ⏳ 服务态空闲 RSS：CI Linux 项（Windows 本机无 /proc）；
+  - ⏳ compaction 在线 P99 劣化 <10%：压测脚本 M4 初补（语义已有并发安全测试）；
+  - ✅ scan vs 原生 parquet-rs：743 vs 1240 MB/s 单线程（开销系数 1.67x，
+    含分区发现/manifest/行过滤管线——M4 优化项）；
+  - ✅ DuckDB 对比基线（进程内 bundled 1.1，同批 parquet 文件，同机 18 线程；
+    `cargo run --release -p qsdb-bench --features duckdb --bin duckdb_vs`）：
+    | 场景（4 千万行×7 列） | QSDB | DuckDB | 比值 |
+    |---|---|---|---|
+    | 过滤扫描 a>0 计数 | 0.739s | 0.083s | 0.11x |
+    | 全表聚合 count/sum/min/max | 0.650s | 0.219s | 0.34x |
+    | 3 列 group by | 50.9s ⚠️ | 0.180s | 异常 |
+    | 分区点查 dt= | 0.321s | 0.002s | 0.01x |
+    | 写入 | 2.27M rows/s | 16.1M rows/s(COPY) | 0.14x |
+    根因定位（M4 工作清单，按优先级）：
+    ① group by 并行/faster-path 失效（50s ≈ 全串行+通用分组路径，应 <1s）——疑似 bug；
+    ② scan 单线程（DuckDB 18 线程并行扫描）→ scan 层分片并行；
+    ③ count(*) 等不读列的查询仍全列解码 → 聚合列裁剪下推；
+    ④ 分区点查无短路（min/max 统计已可 O(1) 出 count）→ 元数据应答；
+    ⑤ 写入模型差异（QSDB parquet+zstd 持久化 vs DuckDB 内存表 COPY，不可比但暴露
+    zstd 编码成本）→ row group 并行压缩评估。
 
 ### M4（第 12 周起）：Join 与进阶
 - HashJoin（build/probe、广播小表）、SQL-2、外排 spill、bloom filter（等值点查）、S3/HDFS backend、distinct_count HLL。

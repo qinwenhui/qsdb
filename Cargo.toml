@@ -32,15 +32,18 @@ windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem", "Win32
 sqlparser = "0.63"
 clap = { version = "4", features = ["derive"] }
 rustyline = "18"
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal"] }
 
 # 内部 crate
 qsdb = { path = "crates/qsdb" }
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
 codegen-units = 1
-strip = "debuginfo"
+panic = "abort"
+strip = "symbols"
 
 # 基准构建：快编译 + 可观测
 [profile.bench-release]
