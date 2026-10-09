@@ -59,10 +59,8 @@ fn main() {
     let _ = check;
 
     // 预热（threads 默认即全部核）
-    duck.execute_batch(&format!(
-        "SELECT count(*) FROM read_parquet('{glob_str}')"
-    ))
-    .unwrap();
+    duck.execute_batch(&format!("SELECT count(*) FROM read_parquet('{glob_str}')"))
+        .unwrap();
     let threads = duck
         .query_row("SELECT current_setting('threads')", [], |r| {
             r.get::<_, i64>(0)

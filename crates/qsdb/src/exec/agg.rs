@@ -309,6 +309,8 @@ pub struct GroupTable {
     by_hash: HashMap<u64, Vec<u32>>,
     groups: Vec<GroupRow>,
     pending_arity: Option<usize>,
+    /// Int64 fast path 的持久化开放寻址索引（(hash, gid)；跨批存活）
+    fast_slots: Vec<(u64, u32)>,
 }
 
 impl GroupTable {
@@ -366,27 +368,26 @@ impl GroupTable {
 
     /// Int64 分组列特化：key = 列值序列直接内联，开放寻址探测。
     ///
-    /// 槽 (hash, gid)；gid == u32::MAX 为空。命中需 hash 与 key bytes 双重校验。
+    /// 探测表（fast_slots）是 GroupTable 的持久化字段——跨批存活，
+    /// 否则每批重建会丢失已建组索引导致组键分裂（M4-1 bug）。
     fn assign_groups_fast(&mut self, cols: &[Vec<i64>], out: &mut Vec<u32>) {
         const EMPTY: u32 = u32::MAX;
         let arity = self.agg_arity_hint();
         let n = cols.first().map(|c| c.len()).unwrap_or(0);
-        let mut cap: usize = 16;
-        while cap < (n + 1) * 2 {
-            cap <<= 1;
-        }
-        let mut slots: Vec<(u64, u32)> = vec![(0, EMPTY); cap];
-        let mut used = 0usize;
-        let mut key_bytes: Vec<u8> = Vec::with_capacity(cols.len() * 8);
-
-        let insert_slot = |slots: &mut Vec<(u64, u32)>, h: u64, gid: u32| {
-            let mask = slots.len() - 1;
-            let mut idx = (h as usize) & mask;
-            while slots[idx].1 != EMPTY {
-                idx = (idx + 1) & mask;
+        if self.fast_slots.is_empty() {
+            // 初始容量：2×当前组数与合理下限取大（留扩容余量）
+            let mut cap: usize = 16;
+            while cap < (self.groups.len() + n + 1) * 2 {
+                cap <<= 1;
             }
-            slots[idx] = (h, gid);
-        };
+            self.fast_slots = vec![(0, EMPTY); cap];
+            // 已有组（如 merge 后继续 ingest）回填索引
+            for (gid, row) in self.groups.iter().enumerate() {
+                let h = fxhash_bytes(&row.key) | 1;
+                Self::insert_slot(&mut self.fast_slots, h, gid as u32);
+            }
+        }
+        let mut key_bytes: Vec<u8> = Vec::with_capacity(cols.len() * 8);
 
         for row in 0..n {
             key_bytes.clear();
@@ -394,11 +395,10 @@ impl GroupTable {
                 key_bytes.extend_from_slice(&c[row].to_le_bytes());
             }
             let h = fxhash_bytes(&key_bytes) | 1;
-            let mask = slots.len() - 1;
-            let mut idx = (h as usize) & mask;
+            let mut idx = (h as usize) & (self.fast_slots.len() - 1);
             let gid;
             loop {
-                let slot = slots[idx];
+                let slot = self.fast_slots[idx];
                 if slot.1 == EMPTY {
                     gid = self.groups.len() as u32;
                     let literals: Vec<Literal> =
@@ -408,14 +408,18 @@ impl GroupTable {
                         literals,
                         states: vec![AggState::default(); arity],
                     });
-                    slots[idx] = (h, gid);
-                    used += 1;
-                    if used * 2 >= slots.len() {
-                        let old = std::mem::take(&mut slots);
-                        slots = vec![(0, EMPTY); old.len() * 2];
+                    self.fast_slots[idx] = (h, gid);
+                    // 负载因子 >= 50% 扩容重排
+                    if (self.groups.len()) * 2 >= self.fast_slots.len() {
+                        let mut cap = self.fast_slots.len() * 2;
+                        while cap < (self.groups.len() + 1) * 2 {
+                            cap <<= 1;
+                        }
+                        let old = std::mem::take(&mut self.fast_slots);
+                        self.fast_slots = vec![(0, EMPTY); cap];
                         for (oh, og) in old {
                             if og != EMPTY {
-                                insert_slot(&mut slots, oh, og);
+                                Self::insert_slot(&mut self.fast_slots, oh, og);
                             }
                         }
                     }
@@ -425,10 +429,20 @@ impl GroupTable {
                     gid = slot.1;
                     break;
                 }
-                idx = (idx + 1) & mask;
+                idx = (idx + 1) & (self.fast_slots.len() - 1);
             }
             out.push(gid);
         }
+    }
+
+    #[inline]
+    fn insert_slot(slots: &mut Vec<(u64, u32)>, h: u64, gid: u32) {
+        let mask = slots.len() - 1;
+        let mut idx = (h as usize) & mask;
+        while slots[idx].1 != u32::MAX {
+            idx = (idx + 1) & mask;
+        }
+        slots[idx] = (h, gid);
     }
 
     fn group_id(&mut self, key: &[u8], arrays: &[ArrayRef], row: usize) -> u32 {
@@ -462,7 +476,9 @@ impl GroupTable {
     }
 
     /// merge 另一张 partial 表（两表结构一致：同 group/aggs 语义）。
+    /// merge 后 fast 索引置空（下次 fast ingest 时按 groups 惰性回填）。
     pub fn merge(&mut self, other: GroupTable, agg_count: usize) {
+        self.fast_slots.clear();
         for row in other.groups {
             let h = fxhash_bytes(&row.key);
             let gid = match self.by_hash.get(&h).and_then(|cands| {
@@ -695,11 +711,14 @@ fn int64_group_columns(arrays: &[ArrayRef]) -> Option<Vec<Vec<i64>>> {
         if arr.null_count() > 0 {
             return None;
         }
-        out.push(arr.values().to_vec());
+        // 注意：不能用 values().to_vec()——slice 批的 values() 不含 offset，
+        // 会读到错位数据导致组键分裂（M4-1 bug）。value(i) 带 offset 语义。
+        out.push((0..arr.len()).map(|i| arr.value(i)).collect());
     }
     Some(out)
 }
 
+/// 整数列 → i64 值（offset 感知；NULL 以 0 占位，由调用方用 is_null 跳过）。
 fn downcast_ints(a: &dyn Array) -> Vec<i64> {
     use arrow::datatypes::*;
     match a.data_type() {
