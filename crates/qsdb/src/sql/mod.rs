@@ -220,6 +220,27 @@ pub fn execute_sql(db: &Qsdb, sql: &str) -> Result<SqlResult> {
                 resolve: Box::new(|name: &str| db.table_def(name)),
             };
             let plan = translate::translate_select_full(*q, &resolver)?;
+            // M4-4 元数据短路：count(*) + 纯分区列谓词 → manifest O(1) 应答
+            if let Some(n) = metadata_shortcut_count(db, &plan)? {
+                let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                    arrow::datatypes::Field::new(
+                        "count(*)",
+                        arrow::datatypes::DataType::Int64,
+                        true,
+                    ),
+                ]));
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(arrow::array::Int64Array::from(vec![Some(
+                        n as i64,
+                    )]))],
+                )
+                .map_err(|e| QsdbError::invalid(format!("shortcut batch: {e}")))?;
+                return Ok(SqlResult::Query {
+                    schema,
+                    batches: vec![batch],
+                });
+            }
             let mut exec = exec_builder::build(db, &plan)?;
             let schema = exec.schema();
             let mut batches = Vec::new();
@@ -229,6 +250,52 @@ pub fn execute_sql(db: &Qsdb, sql: &str) -> Result<SqlResult> {
             Ok(SqlResult::Query { schema, batches })
         }
     }
+}
+
+/// 检测可元数据应答的形态：Project? → Aggregate(count(*), 无 group) → Scan(predicate 仅分区列)。
+/// 返回 Some(count) 表示短路命中（None 走正常执行）。
+fn metadata_shortcut_count(
+    db: &Qsdb,
+    plan: &crate::sql::translate::LogicalPlan,
+) -> Result<Option<u64>> {
+    use crate::sql::translate::LogicalPlan;
+    // 剥 Project
+    let mut cur = plan;
+    if let LogicalPlan::Project { input, .. } = cur {
+        cur = input;
+    }
+    // Aggregate：无 group、唯一聚合 count(*)
+    let LogicalPlan::Aggregate { input, group, aggs } = cur else {
+        return Ok(None);
+    };
+    let input: &LogicalPlan = input;
+    if !group.is_empty() || aggs.len() != 1 {
+        return Ok(None);
+    }
+    let agg = &aggs[0];
+    if agg.func != crate::expr::AggFunc::Count || agg.arg.is_some() {
+        return Ok(None);
+    }
+    // Scan：谓词仅引用分区列
+    let LogicalPlan::Scan { def, predicate } = input else {
+        return Ok(None);
+    };
+    if def.partition_keys.is_empty() {
+        return Ok(None);
+    }
+    if let Some(pred) = predicate {
+        let mut cols = std::collections::HashSet::new();
+        pred.referenced_columns(&mut cols);
+        let only_partition = cols.iter().all(|c| {
+            def.partition_keys
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(c.as_str()))
+        });
+        if !only_partition {
+            return Ok(None);
+        }
+    }
+    db.scan_metadata_count(&def.name, predicate.as_ref())
 }
 
 /// INSERT 行 → RecordBatch（按表列序 cast）。

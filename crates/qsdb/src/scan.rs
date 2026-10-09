@@ -124,7 +124,7 @@ impl Predicate {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tri {
+pub(crate) enum Tri {
     True,
     False,
     Unknown,
@@ -194,6 +194,11 @@ fn lit_ge(a: &Literal, b: &Literal) -> bool {
 }
 
 /// 对分区常量求值：`vals` 提供已解析的分区列值；仅确定性结果返回 True/False。
+/// （元数据短路复用；None=Unknown 表示无法裁剪）
+pub(crate) fn eval_partition_predicate(pred: &Predicate, vals: &HashMap<&str, &Literal>) -> Tri {
+    eval_on_partition(pred, vals)
+}
+
 fn eval_on_partition(pred: &Predicate, vals: &HashMap<&str, &Literal>) -> Tri {
     let cmp_part =
         |column: &str, value: &Literal, ok: &dyn Fn(std::cmp::Ordering) -> bool| -> Tri {

@@ -148,6 +148,7 @@ fn encode_value(a: &dyn Array, i: usize, buf: &mut Vec<u8>) {
     }
 }
 
+/// 快路径比较：现有 Literal（同型）与新原生值比较。
 /// 数组取值 → Literal（全部类型；NULL → Literal::Null）。
 pub fn array_value_to_literal(a: &dyn Array, i: usize) -> Literal {
     use arrow::datatypes::*;
@@ -436,7 +437,7 @@ impl GroupTable {
     }
 
     #[inline]
-    fn insert_slot(slots: &mut Vec<(u64, u32)>, h: u64, gid: u32) {
+    fn insert_slot(slots: &mut [(u64, u32)], h: u64, gid: u32) {
         let mask = slots.len() - 1;
         let mut idx = (h as usize) & mask;
         while slots[idx].1 != u32::MAX {
@@ -626,41 +627,52 @@ impl GroupTable {
         a: &dyn Array,
         group_ids: &[u32],
     ) -> Result<()> {
-        // int64/date/ts 快路径
-        let dt = a.data_type().clone();
-        let fast_i64: Option<Vec<i64>> = match dt {
-            DataType::Int64 => Some(
-                a.as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap()
-                    .iter()
-                    .map(|v| v.unwrap_or(0))
-                    .collect(),
-            ),
-            _ => None,
-        };
-        if let Some(vals) = fast_i64 {
-            for (row, &g) in group_ids.iter().enumerate() {
-                if a.is_null(row) {
-                    continue;
+        use arrow::datatypes::TimeUnit;
+        // typed 快路径：直接以原生值比较，跳过逐行 Literal 构造
+        macro_rules! fast {
+            ($ty:ty, $make:expr) => {{
+                let arr = a.as_any().downcast_ref::<$ty>().unwrap();
+                for (row, &g) in group_ids.iter().enumerate() {
+                    if arr.is_null(row) {
+                        continue;
+                    }
+                    let v = arr.value(row);
+                    let st = &mut self.groups[g as usize].states[ai];
+                    let slot = if is_min { &mut st.min } else { &mut st.max };
+                    match slot {
+                        None => *slot = Some($make(v)),
+                        Some(cur) => match cur {
+                            crate::types::Literal::Null => *slot = Some($make(v)),
+                            _ => match cur.partial_cmp_literal(&$make(v)) {
+                                Ok(Some(o)) => {
+                                    let better = if is_min {
+                                        o == std::cmp::Ordering::Greater
+                                    } else {
+                                        o == std::cmp::Ordering::Less
+                                    };
+                                    if better {
+                                        *slot = Some($make(v));
+                                    }
+                                }
+                                _ => {}
+                            },
+                        },
+                    }
                 }
-                let v = Literal::Int64(vals[row]);
-                let st = &mut self.groups[g as usize].states[ai];
-                let cur = if is_min { st.min.take() } else { st.max.take() };
-                let merged = if is_min {
-                    combine_min(cur, Some(v))
-                } else {
-                    combine_max(cur, Some(v))
-                };
-                if is_min {
-                    st.min = merged;
-                } else {
-                    st.max = merged;
-                }
-            }
-            return Ok(());
+                return Ok(());
+            }};
         }
-        // 通用路径
+        match a.data_type() {
+            DataType::Int64 => fast!(Int64Array, Literal::Int64),
+            DataType::Float64 => fast!(Float64Array, Literal::Float64),
+            DataType::Date32 => fast!(Date32Array, Literal::Date),
+            DataType::Utf8 => fast!(StringArray, |v: &str| Literal::Utf8(v.to_string())),
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                fast!(TimestampNanosecondArray, Literal::Timestamp)
+            }
+            _ => {}
+        }
+        // 通用路径（其余类型）
         for (row, &g) in group_ids.iter().enumerate() {
             if a.is_null(row) {
                 continue;

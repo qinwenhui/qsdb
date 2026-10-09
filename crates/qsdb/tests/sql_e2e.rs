@@ -17,7 +17,15 @@ fn db(tag: &str) -> (Qsdb, std::path::PathBuf) {
 }
 
 /// 执行 SQL，返回行集（`v1|v2|…`；排序后比较用 sort 参数）。
+/// 排序后比较（ParScan 无序输出的稳定断言）。
 fn q(db: &Qsdb, sql: &str) -> Vec<String> {
+    let mut r = raw(db, sql);
+    r.sort();
+    r
+}
+
+/// 原始输出顺序（ORDER BY / LIMIT-TOPN 语义断言用）。
+fn raw(db: &Qsdb, sql: &str) -> Vec<String> {
     let batches = db.sql_collect(sql).unwrap();
     rows(&batches)
 }
@@ -265,7 +273,7 @@ fn select_projection_filter() {
     assert_eq!(r, vec!["2"]);
     // 字符串比较
     assert!(q(&db, "SELECT cnt FROM events WHERE tenant = 'a'") == vec!["1", "NULL"]);
-    assert!(q(&db, "SELECT cnt FROM events WHERE tenant < 'c'") == vec!["1", "2", "NULL", "3"]);
+    assert!(q(&db, "SELECT cnt FROM events WHERE tenant < 'c'") == vec!["1", "2", "3", "NULL"]);
     // LIMIT
     assert_eq!(q(&db, "SELECT cnt FROM events LIMIT 2").len(), 2);
     assert_eq!(q(&db, "SELECT cnt FROM events LIMIT 0").len(), 0);
@@ -311,7 +319,7 @@ fn select_null_semantics() {
     );
     // NOT (x = v)：NULL 行不返回（Kleene NOT unknown = unknown）
     assert!(
-        q(&db, "SELECT cnt FROM events WHERE NOT (score = 1.5)") == vec!["2", "NULL", "4", "5"]
+        q(&db, "SELECT cnt FROM events WHERE NOT (score = 1.5)") == vec!["2", "4", "5", "NULL"]
     );
     // score IS NULL 行
     assert!(q(&db, "SELECT cnt FROM events WHERE score IS NULL") == vec!["3"]);
@@ -389,26 +397,29 @@ fn aggregate_basics() {
 fn order_by_distinct() {
     let (db, root) = setup_events("ord");
     // ORDER BY 升/降
-    assert!(q(&db, "SELECT cnt FROM events ORDER BY cnt") == vec!["1", "2", "3", "4", "5", "NULL"]);
     assert!(
-        q(&db, "SELECT cnt FROM events ORDER BY cnt DESC") == vec!["NULL", "5", "4", "3", "2", "1"]
+        raw(&db, "SELECT cnt FROM events ORDER BY cnt") == vec!["1", "2", "3", "4", "5", "NULL"]
+    );
+    assert!(
+        raw(&db, "SELECT cnt FROM events ORDER BY cnt DESC")
+            == vec!["NULL", "5", "4", "3", "2", "1"]
     );
     // 别名排序
     assert!(
-        q(
+        raw(
             &db,
             "SELECT cnt AS c FROM events WHERE cnt IS NOT NULL ORDER BY c DESC"
         ) == vec!["5", "4", "3", "2", "1"]
     );
     // LIMIT + ORDER = TopN
     assert!(
-        q(
+        raw(
             &db,
             "SELECT cnt FROM events WHERE cnt IS NOT NULL ORDER BY cnt DESC LIMIT 2"
         ) == vec!["5", "4"]
     );
     // 多键
-    let r = q(
+    let r = raw(
         &db,
         "SELECT dt, cnt FROM events WHERE cnt IS NOT NULL ORDER BY dt DESC, cnt ASC LIMIT 3",
     );

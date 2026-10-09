@@ -3,6 +3,7 @@
 //! 句柄无状态（磁盘为真值 + mtime 缓存），`Send + Sync`，
 //! 同目录可多实例/多进程共存（分区 flock 协调）。
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -314,6 +315,66 @@ impl Qsdb {
         let def = self.def(None, table)?;
         let tdir = table_dir(&self.root, DEFAULT_DB, table);
         crate::compact::compact_table(&self.root, &tdir, &def, &opts)
+    }
+
+    /// 元数据应答：按谓词裁剪分区后，从 manifest 统计直接合成结果（不打开 parquet）。
+    ///
+    /// 当前支持的聚合：count(*)（= 各分区 row_count 之和）。
+    /// 谓词仅支持分区列等值/范围形态（非分区列谓词返回 None，走正常扫描）。
+    pub fn scan_metadata_count(
+        &self,
+        table: &str,
+        predicate: Option<&Predicate>,
+    ) -> Result<Option<u64>> {
+        let def = self.def(None, table)?;
+        if def.partition_keys.is_empty() {
+            return Ok(None);
+        }
+        let tdir = table_dir(&self.root, DEFAULT_DB, table);
+        let depth = def.partition_keys.len();
+        let parts = crate::scan::list_partitions(&tdir, depth);
+        let mut total = 0u64;
+        let mut any = false;
+        for (pdir, dir_vals) in parts {
+            let mut pvals: HashMap<String, Literal> = HashMap::new();
+            let mut ok = true;
+            for (k, raw) in &dir_vals {
+                match def.column(k) {
+                    Some(c) => {
+                        match crate::partition::parse_partition_value(raw, &c.logical_type) {
+                            Ok(v) => {
+                                pvals.insert(k.clone(), v);
+                            }
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            // 分区裁剪
+            if let Some(pred) = predicate {
+                let lookup: HashMap<&str, &Literal> =
+                    pvals.iter().map(|(k, v)| (k.as_str(), v)).collect();
+                if crate::scan::eval_partition_predicate(pred, &lookup) == crate::scan::Tri::False {
+                    continue;
+                }
+            }
+            let Some(m) = crate::manifest::PartitionManifest::read(&pdir)? else {
+                continue;
+            };
+            any = true;
+            total += m.total_rows();
+        }
+        if any { Ok(Some(total)) } else { Ok(Some(0)) }
     }
 
     /// 强制重建表级分区索引（`partitions.idx`）。

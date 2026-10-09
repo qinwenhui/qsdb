@@ -72,19 +72,13 @@ fn main() {
     bench_pair(
         "filter scan  (a > 0, count)",
         || {
-            let mut n = 0i64;
-            for b in db
-                .scan_collect(ScanRequest {
-                    table: "t".into(),
-                    predicate: Some(qsdb::Predicate::gt("a", qsdb::types::Literal::Int64(0))),
-                    projection: Some(vec!["a".into()]),
-                    ..Default::default()
-                })
+            let out = db
+                .sql_collect("SELECT count(*) FROM t WHERE a > 0")
+                .unwrap();
+            arrow::util::display::array_value_to_string(out[0].column(0).as_ref(), 0)
                 .unwrap()
-            {
-                n += b.num_rows() as i64;
-            }
-            n
+                .parse::<i64>()
+                .unwrap()
         },
         || {
             duck.query_row(

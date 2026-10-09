@@ -29,17 +29,233 @@ impl ExecNode for OneShotExec {
 }
 
 pub fn build(db: &Qsdb, plan: &LogicalPlan) -> Result<Box<dyn ExecNode>> {
+    // M4-3 列裁剪下推：收集全计划引用列，Scan 只读所需列（含谓词列）。
+    let mut used: Vec<String> = Vec::new();
+    collect_plan_columns(plan, &mut used);
+    if let Some(def) = plan_scan_def(plan) {
+        let all: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
+        let mut proj: Vec<String> = all
+            .iter()
+            .filter(|n| used.iter().any(|u| u.eq_ignore_ascii_case(n.as_str())))
+            .cloned()
+            .collect();
+        if proj.is_empty() {
+            proj = all.first().cloned().into_iter().collect();
+        }
+        if proj.len() < all.len() {
+            let mapping = build_mapping(&all, &proj);
+            let rewritten = rewrite_plan(plan, &mapping, &all);
+            return build_inner(db, &rewritten, Some(proj));
+        }
+    }
+    build_inner(db, plan, None)
+}
+
+/// 全计划引用列名（Column 节点）。
+fn collect_plan_columns(plan: &LogicalPlan, out: &mut Vec<String>) {
+    match plan {
+        LogicalPlan::Scan { .. } => {}
+        LogicalPlan::Filter { input, predicate } => {
+            collect_expr_columns(predicate, out);
+            collect_plan_columns(input, out);
+        }
+        LogicalPlan::Project { input, exprs, .. } => {
+            for e in exprs {
+                collect_expr_columns(e, out);
+            }
+            collect_plan_columns(input, out);
+        }
+        LogicalPlan::Aggregate { input, group, aggs } => {
+            for g in group {
+                collect_expr_columns(g, out);
+            }
+            for a in aggs {
+                if let Some(arg) = &a.arg {
+                    collect_expr_columns(arg, out);
+                }
+            }
+            collect_plan_columns(input, out);
+        }
+        LogicalPlan::Sort { input, keys } => {
+            for k in keys {
+                collect_expr_columns(&k.expr, out);
+            }
+            collect_plan_columns(input, out);
+        }
+        LogicalPlan::Limit { input, .. } | LogicalPlan::Distinct { input } => {
+            collect_plan_columns(input, out);
+        }
+    }
+}
+
+fn collect_expr_columns(e: &PhysExpr, out: &mut Vec<String>) {
+    match e {
+        PhysExpr::Column { name, .. } => {
+            if !out.iter().any(|n| n.eq_ignore_ascii_case(name.as_str())) {
+                out.push(name.clone());
+            }
+        }
+        PhysExpr::Lit(_) => {}
+        PhysExpr::Arith { l, r, .. } | PhysExpr::Cmp { l, r, .. } => {
+            collect_expr_columns(l, out);
+            collect_expr_columns(r, out);
+        }
+        PhysExpr::And(a, b) | PhysExpr::Or(a, b) => {
+            collect_expr_columns(a, out);
+            collect_expr_columns(b, out);
+        }
+        PhysExpr::Not(a) | PhysExpr::IsNull(a, _) => collect_expr_columns(a, out),
+        PhysExpr::Cast { e, .. } => collect_expr_columns(e, out),
+        PhysExpr::Fn { args, .. } => args.iter().for_each(|a| collect_expr_columns(a, out)),
+    }
+}
+
+/// 计划根到叶的 Scan 表定义。
+fn plan_scan_def(plan: &LogicalPlan) -> Option<Arc<crate::catalog::TableDef>> {
+    match plan {
+        LogicalPlan::Scan { def, .. } => Some(Arc::clone(def)),
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Distinct { input } => plan_scan_def(input),
+    }
+}
+
+/// 全列名 → 投影列名 的 idx 映射（大小写不敏感）。
+fn build_mapping(all: &[String], proj: &[String]) -> Vec<Option<usize>> {
+    all.iter()
+        .map(|a| proj.iter().position(|p| p.eq_ignore_ascii_case(a.as_str())))
+        .collect()
+}
+
+/// 重写计划中所有 Column.idx（全表列序 → 投影序）。
+/// `all`：表全列名——非表列（聚合输出列如 sum(x)）保持原 idx。
+fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Scan { def, predicate } => LogicalPlan::Scan {
+            def: Arc::clone(def),
+            predicate: predicate.clone(),
+        },
+        LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
+            input: Box::new(rewrite_plan(input, mapping, all)),
+            predicate: rewrite_expr(predicate, mapping, all),
+        },
+        LogicalPlan::Project {
+            input,
+            exprs,
+            names,
+        } => LogicalPlan::Project {
+            input: Box::new(rewrite_plan(input, mapping, all)),
+            exprs: exprs
+                .iter()
+                .map(|e| rewrite_expr(e, mapping, all))
+                .collect(),
+            names: names.clone(),
+        },
+        LogicalPlan::Aggregate { input, group, aggs } => LogicalPlan::Aggregate {
+            input: Box::new(rewrite_plan(input, mapping, all)),
+            group: group
+                .iter()
+                .map(|g| rewrite_expr(g, mapping, all))
+                .collect(),
+            aggs: aggs
+                .iter()
+                .map(|a| crate::expr::AggExpr {
+                    func: a.func,
+                    arg: a.arg.as_ref().map(|e| rewrite_expr(e, mapping, all)),
+                    out_name: a.out_name.clone(),
+                    out_ty: a.out_ty.clone(),
+                })
+                .collect(),
+        },
+        LogicalPlan::Sort { input, keys } => LogicalPlan::Sort {
+            input: Box::new(rewrite_plan(input, mapping, all)),
+            keys: keys
+                .iter()
+                .map(|k| crate::exec::SortKey {
+                    expr: rewrite_expr(&k.expr, mapping, all),
+                    descending: k.descending,
+                })
+                .collect(),
+        },
+        LogicalPlan::Limit { input, n } => LogicalPlan::Limit {
+            input: Box::new(rewrite_plan(input, mapping, all)),
+            n: *n,
+        },
+        LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
+            input: Box::new(rewrite_plan(input, mapping, all)),
+        },
+    }
+}
+
+fn rewrite_expr(e: &PhysExpr, mapping: &[Option<usize>], all: &[String]) -> PhysExpr {
+    match e {
+        PhysExpr::Column { idx, name, ty } => {
+            // 非表列（聚合输出列等）：idx 语义属上层算子，保持不变
+            let is_table_col = all.iter().any(|a| a.eq_ignore_ascii_case(name.as_str()));
+            PhysExpr::Column {
+                idx: if is_table_col {
+                    mapping[*idx].unwrap_or(*idx)
+                } else {
+                    *idx
+                },
+                name: name.clone(),
+                ty: ty.clone(),
+            }
+        }
+        PhysExpr::Lit(l) => PhysExpr::Lit(l.clone()),
+        PhysExpr::Arith { op, l, r, ty } => PhysExpr::Arith {
+            op: *op,
+            l: Box::new(rewrite_expr(l, mapping, all)),
+            r: Box::new(rewrite_expr(r, mapping, all)),
+            ty: ty.clone(),
+        },
+        PhysExpr::Cmp { op, l, r } => PhysExpr::Cmp {
+            op: *op,
+            l: Box::new(rewrite_expr(l, mapping, all)),
+            r: Box::new(rewrite_expr(r, mapping, all)),
+        },
+        PhysExpr::And(a, b) => PhysExpr::And(
+            Box::new(rewrite_expr(a, mapping, all)),
+            Box::new(rewrite_expr(b, mapping, all)),
+        ),
+        PhysExpr::Or(a, b) => PhysExpr::Or(
+            Box::new(rewrite_expr(a, mapping, all)),
+            Box::new(rewrite_expr(b, mapping, all)),
+        ),
+        PhysExpr::Not(a) => PhysExpr::Not(Box::new(rewrite_expr(a, mapping, all))),
+        PhysExpr::IsNull(a, neg) => PhysExpr::IsNull(Box::new(rewrite_expr(a, mapping, all)), *neg),
+        PhysExpr::Cast { e, ty } => PhysExpr::Cast {
+            e: Box::new(rewrite_expr(e, mapping, all)),
+            ty: ty.clone(),
+        },
+        PhysExpr::Fn { name, args, ty } => PhysExpr::Fn {
+            name: name.clone(),
+            args: args.iter().map(|a| rewrite_expr(a, mapping, all)).collect(),
+            ty: ty.clone(),
+        },
+    }
+}
+
+fn build_inner(
+    db: &Qsdb,
+    plan: &LogicalPlan,
+    scan_proj: Option<Vec<String>>,
+) -> Result<Box<dyn ExecNode>> {
     match plan {
         LogicalPlan::Scan { def, predicate } => {
             let scan = db.scan(ScanRequest {
                 table: def.name.clone(),
                 predicate: predicate.clone(),
+                projection: scan_proj,
                 ..Default::default()
             })?;
-            Ok(Box::new(ScanExec::new(scan)))
+            Ok(crate::exec::par_scan::make_scan(scan))
         }
         LogicalPlan::Filter { input, predicate } => Ok(Box::new(FilterExec::new(
-            build(db, input)?,
+            build_inner(db, input, scan_proj.clone())?,
             predicate.clone(),
         ))),
         LogicalPlan::Project {
@@ -47,23 +263,25 @@ pub fn build(db: &Qsdb, plan: &LogicalPlan) -> Result<Box<dyn ExecNode>> {
             exprs,
             names,
         } => Ok(Box::new(ProjectExec::new(
-            build(db, input)?,
+            build_inner(db, input, scan_proj.clone())?,
             exprs.clone(),
             names.clone(),
         ))),
-        LogicalPlan::Aggregate { input, group, aggs } => build_aggregate(db, input, group, aggs),
+        LogicalPlan::Aggregate { input, group, aggs } => {
+            build_aggregate(db, input, group, aggs, &scan_proj)
+        }
         LogicalPlan::Sort { input, keys } => Ok(Box::new(SortExec::new(
-            build(db, input)?,
+            build_inner(db, input, scan_proj.clone())?,
             keys.clone(),
             None,
         ))),
         LogicalPlan::Limit { input, n } => Ok(Box::new(LimitExec {
-            input: build(db, input)?,
+            input: build_inner(db, input, scan_proj.clone())?,
             remaining: *n,
         })),
-        LogicalPlan::Distinct { input } => {
-            Ok(Box::new(crate::exec::DistinctExec::new(build(db, input)?)))
-        }
+        LogicalPlan::Distinct { input } => Ok(Box::new(crate::exec::DistinctExec::new(
+            build_inner(db, input, scan_proj.clone())?,
+        ))),
     }
 }
 
@@ -73,10 +291,11 @@ fn build_aggregate(
     input: &LogicalPlan,
     group: &[PhysExpr],
     aggs: &[AggExpr],
+    scan_proj: &Option<Vec<String>>,
 ) -> Result<Box<dyn ExecNode>> {
-    let Some((shards, filters)) = try_shard_source(db, input) else {
+    let Some((shards, filters)) = try_shard_source(db, input, scan_proj) else {
         return Ok(Box::new(HashAggExec::new(
-            build(db, input)?,
+            build_inner(db, input, scan_proj.clone())?,
             group.to_vec(),
             aggs.to_vec(),
         )?));
@@ -147,6 +366,7 @@ fn run_partial(
 fn try_shard_source(
     db: &Qsdb,
     plan: &LogicalPlan,
+    scan_proj: &Option<Vec<String>>,
 ) -> Option<(Vec<crate::scan::Scan>, Vec<PhysExpr>)> {
     let mut filters: Vec<PhysExpr> = Vec::new();
     let mut cur = plan;
@@ -161,6 +381,7 @@ fn try_shard_source(
                     .scan(ScanRequest {
                         table: def.name.clone(),
                         predicate: predicate.clone(),
+                        projection: scan_proj.clone(),
                         ..Default::default()
                     })
                     .ok()?;
