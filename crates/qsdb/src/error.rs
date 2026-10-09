@@ -33,6 +33,14 @@ pub enum QsdbError {
     /// 元数据/表格式层错误
     #[error("metadata error: {0}")]
     Meta(String),
+
+    /// 对象（库/表/分区/列）不存在
+    #[error("not found: {0}")]
+    NotFound(String),
+
+    /// 对象已存在
+    #[error("already exists: {0}")]
+    AlreadyExists(String),
 }
 
 impl QsdbError {
@@ -54,6 +62,19 @@ impl QsdbError {
 
     pub fn meta(msg: impl Into<String>) -> Self {
         Self::Meta(msg.into())
+    }
+
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Self::NotFound(msg.into())
+    }
+
+    pub fn already_exists(msg: impl Into<String>) -> Self {
+        Self::AlreadyExists(msg.into())
+    }
+
+    /// 不存在类 IO 错误（NotFound/AlreadyExists）转 Option
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::NotFound(_) | Self::AlreadyExists(_))
     }
 }
 

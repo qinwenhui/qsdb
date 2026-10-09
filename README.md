@@ -52,12 +52,14 @@ qsdb query  --path /data/qsdb "SELECT ..."           # 一次性查询 (M2)
 
 | 里程碑 | 内容 | 状态 |
 |--------|------|------|
-| M0 | 骨架 + 类型系统（Decimal 精度矩阵 / cast / compare） | 🚧 进行中 |
-| M1 | 读写闭环：表格式 + 提交协议 + 裁剪扫描 + 嵌入式 API | ⬜ |
+| M0 | 骨架 + 类型系统（Decimal 精度矩阵 / cast / compare） | ✅ |
+| M1 | 读写闭环：表格式 + 提交协议 + 三级裁剪扫描 + 嵌入式 API | ✅ |
 | M2 | 向量化执行 + SQL-0/1 + CLI | ⬜ |
 | M3 | HTTP 服务 + compaction + 治理 | ⬜ |
 | M4 | Join + spill + bloom + S3/HDFS | ⬜ |
 | M5 | 窗口/CTE/UDF + Flight + SIMD/GPU | ⬜ |
+
+M1 实测（Windows 开发机，release）：写入 1.4M rows/s、扫描 855 MB/s 单线程、万级分区元数据 18ms。
 
 ## 开发
 
