@@ -1,6 +1,6 @@
 [package]
 name = "qsdb-cli"
-description = "QSDB standalone binary: server / shell / query / admin"
+description = "QSDB standalone binary: shell / query / admin"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,3 +14,5 @@ path = "src/main.rs"
 [dependencies]
 qsdb = { workspace = true }
 clap = { workspace = true }
+rustyline = { workspace = true }
+arrow = { workspace = true }

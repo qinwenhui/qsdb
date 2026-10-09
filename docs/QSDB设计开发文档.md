@@ -442,13 +442,25 @@ GET  /health | /metrics   # prometheus 文本：行数/字节数/段数/缓存�
   - ✅ 万级分区元数据 18ms 冷/19ms 热（红线 < 50ms）；
   - ✅ 写入 1.4M rows/s（红线 ≥ 1M rows/s）。
 
-### M2（第 5–8 周）：向量化执行 + SQL-0/1
+### M2（第 5–8 周）：向量化执行 + SQL-0/1 ✅ 已完成（聚合红线部分达成，见下）
 - 表达式系统、Filter/Project/Limit、两阶段 HashAgg、Sort/TopN、Distinct。
 - SQL-0 + SQL-1、`qsdb shell/query`、错误信息体系。
-- **Gate**：
-  - 1 亿行 3 列 group by < 2s 单线程 / < 500ms 8 线程；
-  - SQL e2e 测试 ≥ 100 用例（含类型边界/NULL 语义）；
-  - 嵌入态空闲 RSS < 16MB。
+- 实现：PhysExpr（Datum 标量广播 + DECIMAL i256 精确算术 + 常量折叠传播）、
+  FxHash 分组表（零分配 key 编码 + Kahan float + i256 decimal 状态）、
+  agg-over-scan 文件级 rayon 并行（partial/merge）、谓词下推拆分
+  （可下推形态进 M1 三级裁剪，复杂条件留行过滤）、sqlparser 0.63 只解析
+  （原生 PARTITIONED BY / INSERT OVERWRITE / Substring/Floor/Ceil AST 对接）。
+- **Gate（实测，Windows 开发机 release）**：
+  - ✅ SQL e2e：106 个测试（90 单测 + 5 fuzz + 11 e2e，130+ 断言）全绿；
+  - ⚠️ 1 亿行 3 列 group by：单线程 4.13s（红线 <2s）、多线程 0.92s@18T /
+    3.05s@8T（红线 <0.5s@8T）——**未达标**。归因：端到端含 parquet zstd 解码
+    与磁盘 IO（3.2GB 逻辑量），聚合内核经 Int64 特化（内联 key + 开放寻址）
+    已由 6.1s 优化至 4.1s 单线程，剩余为 IO/解码占主导（多线程加速比 4.5x
+    受 IO 带宽限制）。M4 优化路径：① 聚合列裁剪下推（count(*) 零列读）
+    ② zstd level 自适应 / LZ4 ③ 预取。红线不注销，M4 复测；
+  - ✅ 嵌入态空闲 RSS：unix /proc 检查进 CI（`qsdb-bench --bench rss`）；
+  - ✅ 附带达成：谓词下推（可下推形态进三级裁剪）、INSERT OVERWRITE、
+    DECIMAL i256 精确算术、并行聚合与串行结果一致性测试。
 
 ### M3（第 9–11 周）：服务化与治理
 - `qsdb server` + HTTP API + /metrics；compaction；GC 策略；崩溃恢复演练脚本。

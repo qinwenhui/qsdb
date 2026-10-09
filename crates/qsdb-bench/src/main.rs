@@ -41,6 +41,8 @@ fn main() {
         "write" => write_bench(rows, repeat),
         "scan" => scan_bench(rows, repeat),
         "meta" => meta_bench(parts),
+        "agg" => agg_bench(rows),
+        "rss" => rss_bench(),
         other => {
             eprintln!("unknown bench '{other}' (expect smoke|write|scan|meta)");
             std::process::exit(2);
@@ -236,6 +238,103 @@ fn scan_bench(rows: usize, repeat: usize) {
         .sum();
     let el = t.elapsed().as_secs_f64();
     println!("scan(dt=eq): {n}/{written} rows in {el:.3}s（分区裁剪后 1/{repeat} 数据）");
+}
+
+/// M2 gate：1 亿行 3 列 group by（单线程/多线程由 RAYON_NUM_THREADS 控制）。
+fn agg_bench(rows: usize) {
+    let root = work_root();
+    let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
+    db.sql(
+        "CREATE TABLE agg_bench (g1 BIGINT, g2 BIGINT, g3 BIGINT, v BIGINT) PARTITIONED BY (g1)",
+    )
+    .unwrap();
+    let threads = rayon_threads();
+    println!("agg: {rows} rows, 3-col group by, rayon threads = {threads}");
+    // 写入：分批
+    let t = Instant::now();
+    const BATCH: usize = 2_000_000;
+    let mut written = 0usize;
+    let mut part = 0i32;
+    while written < rows {
+        let n = BATCH.min(rows - written);
+        let batch = synth_agg_batch(n, part);
+        db.append("agg_bench", &[batch]).unwrap();
+        written += n;
+        part = part.wrapping_add(1) & 63; // 64 个分区
+    }
+    println!("write {written} rows in {:.1}s", t.elapsed().as_secs_f64());
+
+    // 热身（页缓存）
+    let _ = db.sql_collect("SELECT count(*) FROM agg_bench").unwrap();
+
+    let t = Instant::now();
+    let out = db
+        .sql_collect("SELECT g1, g2, g3, count(*), sum(v) FROM agg_bench GROUP BY g1, g2, g3")
+        .unwrap();
+    let el = t.elapsed().as_secs_f64();
+    let groups: usize = out.iter().map(|b| b.num_rows()).sum();
+    println!(
+        "group by: {groups} groups in {el:.2}s → {:.0} rows/s（红线：1 亿行 < 2s 单线程 / < 0.5s 8 线程）",
+        rows as f64 / el
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+fn synth_agg_batch(rows: usize, part: i32) -> RecordBatch {
+    let mut g2 = Vec::with_capacity(rows);
+    let mut g3 = Vec::with_capacity(rows);
+    let mut v = Vec::with_capacity(rows);
+    let mut x = (part as u64) | 1;
+    for _ in 0..rows {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        g2.push((x % 100) as i64);
+        g3.push((x % 50) as i64);
+        v.push((x % 1000) as i64);
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("g1", DataType::Int64, true),
+        Field::new("g2", DataType::Int64, true),
+        Field::new("g3", DataType::Int64, true),
+        Field::new("v", DataType::Int64, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![i64::from(part); rows])),
+            Arc::new(Int64Array::from(g2)),
+            Arc::new(Int64Array::from(g3)),
+            Arc::new(Int64Array::from(v)),
+        ],
+    )
+    .unwrap()
+}
+
+fn rayon_threads() -> usize {
+    std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(rayon::current_num_threads)
+}
+
+/// M2 gate：嵌入态空闲 RSS（unix /proc；Windows 打印跳过）。
+fn rss_bench() {
+    let root = work_root();
+    let _db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
+    #[cfg(unix)]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        for line in status.lines() {
+            if line.starts_with("VmRSS") {
+                println!("{line}（红线 < 16MB 嵌入态）");
+                return;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    println!("rss: /proc 检查仅 unix；Windows 由 CI 任务管理器口径另行验证");
+    std::fs::remove_dir_all(&root).ok();
 }
 
 fn meta_bench(parts: usize) {

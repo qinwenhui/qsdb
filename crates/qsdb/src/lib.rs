@@ -12,11 +12,14 @@
 pub mod api;
 pub mod catalog;
 pub mod error;
+pub mod exec;
+pub mod expr;
 pub mod fsutil;
 pub mod index;
 pub mod manifest;
 pub mod partition;
 pub mod scan;
+pub mod sql;
 pub mod stats;
 pub mod types;
 pub mod write;

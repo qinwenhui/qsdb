@@ -31,6 +31,7 @@ windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem", "Win32
 # 前端/门面
 sqlparser = "0.63"
 clap = { version = "4", features = ["derive"] }
+rustyline = "18"
 
 # 内部 crate
 qsdb = { path = "crates/qsdb" }

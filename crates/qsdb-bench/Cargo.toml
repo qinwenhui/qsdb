@@ -14,3 +14,4 @@ path = "src/main.rs"
 [dependencies]
 qsdb = { workspace = true }
 arrow = { workspace = true }
+rayon = { workspace = true }

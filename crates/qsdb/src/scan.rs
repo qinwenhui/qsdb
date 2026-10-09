@@ -534,6 +534,9 @@ fn resolve_value(column: &str, value: Literal, def: &TableDef) -> Result<Literal
 
 /// 列出表的分区目录（Hive 风格逐层下钻；隐藏/下划线目录跳过）。
 pub fn list_partitions(table_dir: &Path, depth: usize) -> Vec<(PathBuf, Vec<(String, String)>)> {
+    if depth == 0 {
+        return Vec::new(); // 非分区表
+    }
     let mut level_dirs = vec![table_dir.to_path_buf()];
     for _ in 0..depth {
         let mut next = Vec::new();
@@ -1009,6 +1012,31 @@ impl Scan {
     /// 输出 schema（投影顺序）。
     pub fn schema(&self) -> &SchemaRef {
         &self.plan.output_schema
+    }
+
+    /// 按（近似）均分把文件切给 n 个分片扫描；不可分（文件数 < 2 或带 limit）
+    /// → None。分片共享计划（投影/谓词），各自独立迭代。
+    pub fn shard(&self, n: usize) -> Option<Vec<Scan>> {
+        if self.remaining.is_some() || self.files.len() < 2 {
+            return None;
+        }
+        let n = n.min(self.files.len());
+        let mut shards: Vec<Scan> = (0..n)
+            .map(|_| Scan {
+                plan: Arc::clone(&self.plan),
+                files: std::collections::VecDeque::new(),
+                current: None,
+                remaining: None,
+            })
+            .collect();
+        for (i, f) in self.files.iter().enumerate() {
+            shards[i * n / self.files.len()].files.push_back(FilePlan {
+                path: f.path.clone(),
+                partition_values: f.partition_values.clone(),
+                row_groups: f.row_groups.clone(),
+            });
+        }
+        Some(shards)
     }
 
     fn open_next(&mut self) -> Result<bool> {

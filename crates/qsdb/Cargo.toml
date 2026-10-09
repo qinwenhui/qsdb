@@ -16,6 +16,8 @@ postcard = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 fs2 = { workspace = true }
+rayon = { workspace = true }
+sqlparser = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }

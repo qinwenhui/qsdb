@@ -197,6 +197,23 @@ impl Qsdb {
         )
     }
 
+    // -- SQL（M2：SQL-0/1）----------------------------------------------------
+
+    /// 执行单条 SQL（DDL/DML/SELECT）。
+    pub fn sql(&self, sql: &str) -> Result<crate::sql::SqlResult> {
+        crate::sql::execute_sql(self, sql)
+    }
+
+    /// 便捷：SELECT 物化执行（错误路径直接返回）。
+    pub fn sql_collect(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+        match crate::sql::execute_sql(self, sql)? {
+            crate::sql::SqlResult::Query { batches, .. } => Ok(batches),
+            crate::sql::SqlResult::Ok { message } => {
+                Err(QsdbError::invalid(format!("not a query: {message}")))
+            }
+        }
+    }
+
     /// 便捷：扫描并物化（调试/小结果集用）。
     pub fn scan_collect(&self, req: ScanRequest) -> Result<Vec<RecordBatch>> {
         let mut out = Vec::new();
