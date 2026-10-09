@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = ["crates/qsdb", "crates/qsdb-cli", "crates/qsdb-bench"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/qinwenhui/qsdb"
+
+[workspace.dependencies]
+# 内存模型与文件格式（唯二重依赖，版本严格同步）
+arrow = "60"
+parquet = { version = "60", default-features = false, features = ["arrow"] }
+
+# 元数据
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+
+# 基础
+thiserror = "2"
+tracing = "0.1"
+rayon = "1"
+hashbrown = "0.17"
+fs2 = "0.4"
+uuid = { version = "1", features = ["v7"] }
+
+# 前端/门面
+sqlparser = "0.63"
+clap = { version = "4", features = ["derive"] }
+
+# 内部 crate
+qsdb = { path = "crates/qsdb" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+# 基准构建：快编译 + 可观测
+[profile.bench-release]
+inherits = "release"
+debug = "line-tables-only"
+lto = "off"
+codegen-units = 16

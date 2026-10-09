@@ -1,0 +1,16 @@
+[package]
+name = "qsdb-bench"
+description = "QSDB macro benchmarks (scan / metadata / write)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "qsdb-bench"
+path = "src/main.rs"
+
+[dependencies]
+qsdb = { workspace = true }
+arrow = { workspace = true }

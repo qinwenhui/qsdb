@@ -1,0 +1,19 @@
+# Rust
+/target
+**/*.rs.bk
+*.profraw
+coverage/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+Thumbs.db
+.DS_Store
+
+# 运行时产物
+*.tmp
+*.lock.tmp
+/data/
