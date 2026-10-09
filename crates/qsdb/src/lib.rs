@@ -10,6 +10,7 @@
 //! 同一数据目录允许多实例/多进程共存（分区级文件锁协调）。
 
 pub mod api;
+pub mod cache;
 pub mod catalog;
 pub mod compact;
 pub mod error;

@@ -914,6 +914,20 @@ fn cmp_mask(
     Ok(mask)
 }
 
+/// RecordBatch 浅克隆（列 Arc 共享，零拷贝）。
+fn clone_batch(b: &RecordBatch) -> RecordBatch {
+    b.clone()
+}
+
+/// 文件 mtime → epoch 毫秒。
+fn file_mtime_ms(md: &std::fs::Metadata) -> u64 {
+    md.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// `&dyn Array` → Datum 适配器（Datum 仅为 Sized 数组实现）。
 struct ArrDatum<'a>(&'a dyn Array);
 
@@ -991,18 +1005,39 @@ fn constant_array(lit: &Literal, dt: &DataType, n: usize) -> Result<ArrayRef> {
 pub struct Scan {
     plan: Arc<ScanPlan>,
     files: std::collections::VecDeque<FilePlan>,
-    current: Option<(ParquetRecordBatchReader, FilePlan)>,
+    current: Option<(BatchSource, FilePlan)>,
+    /// miss 路径的回填收集器（文件读尽时 finish）
+    pending_collector: Option<crate::cache::CacheCollector>,
     remaining: Option<u64>,
+    cache: Option<Arc<crate::cache::SegmentCache>>,
+}
+
+/// 批来源：parquet 流式 reader 或缓存命中批列表。
+enum BatchSource {
+    Parquet(ParquetRecordBatchReader),
+    Cached(std::vec::IntoIter<RecordBatch>),
+}
+
+impl BatchSource {
+    fn next_batch(&mut self) -> Option<Result<RecordBatch>> {
+        match self {
+            Self::Parquet(r) => r
+                .next()
+                .map(|b| b.map_err(|e| QsdbError::meta(format!("read batch failed: {e}")))),
+            Self::Cached(v) => v.next().map(Ok),
+        }
+    }
 }
 
 impl Scan {
-    pub(crate) fn new(
+    pub(crate) fn with_cache(
         root: &Path,
         table_dir: &Path,
         def: Arc<TableDef>,
         projection: Option<Vec<String>>,
         predicate: Option<Predicate>,
         limit: Option<u64>,
+        cache: Option<Arc<crate::cache::SegmentCache>>,
     ) -> Result<Self> {
         let plan = ScanPlan::build(def, projection, predicate, limit)?;
         let files = plan_scan(root, table_dir, &plan)?;
@@ -1010,7 +1045,9 @@ impl Scan {
             plan: Arc::new(plan),
             files: files.into(),
             current: None,
+            pending_collector: None,
             remaining: limit,
+            cache,
         })
     }
 
@@ -1031,7 +1068,9 @@ impl Scan {
                 plan: Arc::clone(&self.plan),
                 files: std::collections::VecDeque::new(),
                 current: None,
+                pending_collector: None,
                 remaining: None,
+                cache: self.cache.clone(),
             })
             .collect();
         for (i, f) in self.files.iter().enumerate() {
@@ -1064,6 +1103,33 @@ impl Scan {
             })?;
             leaves.push(idx);
         }
+        // 热缓存：命中零解码
+        if let Some(cache) = &self.cache {
+            if cache.is_enabled() {
+                if let Ok(md) = std::fs::metadata(&file.path) {
+                    let mtime_ms = file_mtime_ms(&md);
+                    if let Some(hit) = cache.get(
+                        &file.path,
+                        mtime_ms,
+                        md.len(),
+                        &self.plan.read_columns,
+                        &file.row_groups,
+                    ) {
+                        self.current = Some((BatchSource::Cached(hit.iter().cloned().collect::<Vec<_>>().into_iter()), file));
+                        return Ok(true);
+                    }
+                    // miss：装 collector 供回填
+                    let collector = cache.collector(
+                        file.path.clone(),
+                        mtime_ms,
+                        md.len(),
+                        self.plan.read_columns.clone(),
+                        file.row_groups.clone(),
+                    );
+                    self.pending_collector = Some(collector);
+                }
+            }
+        }
         let mask = ProjectionMask::leaves(builder.parquet_schema(), leaves.iter().copied());
         builder = builder.with_projection(mask);
         if let Some(rgs) = &file.row_groups {
@@ -1073,7 +1139,7 @@ impl Scan {
             .with_batch_size(BATCH_SIZE)
             .build()
             .map_err(|e| QsdbError::meta(format!("build reader failed: {e}")))?;
-        self.current = Some((reader, file));
+        self.current = Some((BatchSource::Parquet(reader), file));
         Ok(true)
     }
 
@@ -1117,9 +1183,9 @@ impl Iterator for Scan {
         loop {
             // 先取出批次与分区值，结束对 self 的借用
             let taken = match self.current.as_mut() {
-                Some((reader, file)) => match reader.next() {
+                Some((source, file)) => match source.next_batch() {
                     None => None,
-                    Some(Err(e)) => Some(Err(QsdbError::meta(format!("read batch failed: {e}")))),
+                    Some(Err(e)) => Some(Err(e)),
                     Some(Ok(b)) => Some(Ok((b, file.partition_values.clone()))),
                 },
                 None => None,
@@ -1130,6 +1196,10 @@ impl Iterator for Scan {
                     return Some(Err(e));
                 }
                 Some(Ok((batch, pvals))) => {
+                    // miss 路径：收集原始解码批（行过滤/组装前的，Arc clone 零拷贝）
+                    if let Some(c) = &mut self.pending_collector {
+                        c.push(clone_batch(&batch));
+                    }
                     return match self.finish_batch(batch, &pvals) {
                         Ok(Some(b)) => Some(Ok(b)),
                         Ok(None) => None,
@@ -1138,7 +1208,10 @@ impl Iterator for Scan {
                 }
                 None => {
                     if self.current.is_some() {
-                        self.current = None; // 当前文件读完
+                        self.current = None; // 当前文件读完：回填缓存
+                        if let Some(c) = self.pending_collector.take() {
+                            c.finish();
+                        }
                     }
                 }
             }

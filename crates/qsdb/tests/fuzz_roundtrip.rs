@@ -263,7 +263,10 @@ fn crash_tmp_manifest_leftover_is_harmless() {
     // 读取不受影响
     assert_eq!(count_rows(&db, "events"), 5);
     // gc 清理
-    let opts = QsdbOptions { trash_grace_ms: 0 };
+    let opts = QsdbOptions {
+        trash_grace_ms: 0,
+        scan_cache_bytes: 0,
+    };
     let db2 = Qsdb::open(&root, opts).unwrap();
     db2.gc().unwrap();
     assert_eq!(count_rows(&db, "events"), 5);

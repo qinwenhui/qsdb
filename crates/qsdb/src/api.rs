@@ -26,12 +26,16 @@ use crate::write::{self, WriteResult};
 pub struct QsdbOptions {
     /// trash 静默期（毫秒）；`gc()` 只清理更早的条目
     pub trash_grace_ms: u64,
+    /// 热数据缓存预算（字节）：segment 级解码后 LRU 缓存。
+    /// `0` = 关闭；默认 256MB。
+    pub scan_cache_bytes: usize,
 }
 
 impl Default for QsdbOptions {
     fn default() -> Self {
         Self {
             trash_grace_ms: 10 * 60 * 1000,
+            scan_cache_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -55,6 +59,7 @@ pub struct Qsdb {
     root: PathBuf,
     opts: QsdbOptions,
     defs: TableDefCache,
+    cache: Arc<crate::cache::SegmentCache>,
 }
 
 impl Qsdb {
@@ -65,10 +70,12 @@ impl Qsdb {
             .map_err(|e| QsdbError::meta(format!("init db root failed: {e}")))?;
         fs::create_dir_all(db_dir(&root, DEFAULT_DB))
             .map_err(|e| QsdbError::meta(format!("init default db failed: {e}")))?;
+        let cache = Arc::new(crate::cache::SegmentCache::new(opts.scan_cache_bytes));
         Ok(Self {
             root,
             opts,
             defs: TableDefCache::default(),
+            cache,
         })
     }
 
@@ -188,13 +195,14 @@ impl Qsdb {
     pub fn scan(&self, req: ScanRequest) -> Result<Scan> {
         let def = self.def(req.db.as_deref(), &req.table)?;
         let tdir = table_dir(&self.root, self.db_name(req.db.as_deref()), &req.table);
-        Scan::new(
+        Scan::with_cache(
             &self.root,
             &tdir,
             def,
             req.projection,
             req.predicate,
             req.limit,
+            Some(Arc::clone(&self.cache)),
         )
     }
 
@@ -377,6 +385,21 @@ impl Qsdb {
         if any { Ok(Some(total)) } else { Ok(Some(0)) }
     }
 
+    /// 热缓存状态：(entries, bytes, hits, misses)。
+    pub fn cache_stats(&self) -> (usize, usize, u64, u64) {
+        self.cache.stats()
+    }
+
+    /// 清空热缓存。
+    pub fn cache_clear(&self) {
+        self.cache.clear();
+    }
+
+    /// 热缓存预算（字节；0 = 关闭）。
+    pub fn cache_budget(&self) -> usize {
+        self.cache.budget()
+    }
+
     /// 强制重建表级分区索引（`partitions.idx`）。
     ///
     /// 场景：索引损坏、跨进程写入造成 stale、或旧版本目录首次启用索引。
@@ -542,7 +565,10 @@ mod tests {
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
 
         // 孤儿清理（trash 静默期 0 + orphan grace 0 → 全清）
-        let opts = QsdbOptions { trash_grace_ms: 0 };
+        let opts = QsdbOptions {
+            trash_grace_ms: 0,
+            scan_cache_bytes: 0,
+        };
         let db2 = Qsdb::open(&root, opts).unwrap();
         db2.gc().unwrap();
         // 数据仍完整

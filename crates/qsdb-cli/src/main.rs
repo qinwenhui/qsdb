@@ -58,6 +58,9 @@ enum Cmd {
         /// 自动 compaction 周期（秒）
         #[arg(long)]
         auto_compact_secs: Option<u64>,
+        /// 热数据缓存预算（MB；0 = 关闭，默认 256）
+        #[arg(long, default_value_t = 256)]
+        cache_mb: usize,
     },
 }
 
@@ -142,8 +145,13 @@ fn main() {
             addr,
             token,
             auto_compact_secs,
+            cache_mb,
         } => {
-            let db = match Qsdb::open(&path, QsdbOptions::default()) {
+            let opts = QsdbOptions {
+                scan_cache_bytes: cache_mb * 1024 * 1024,
+                ..Default::default()
+            };
+            let db = match Qsdb::open(&path, opts) {
                 Ok(db) => Arc::new(db),
                 Err(e) => {
                     eprintln!("open {} failed: {e}", path.display());

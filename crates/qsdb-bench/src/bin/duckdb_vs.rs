@@ -33,7 +33,19 @@ fn main() {
     std::fs::create_dir_all(&root).unwrap();
 
     // 1) 数据准备（QSDB 写出 parquet，双方共用）
-    let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
+    let cache_mb: usize = std::env::var("QSDB_CACHE_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4096);
+    let db = Qsdb::open(
+        &root,
+        QsdbOptions {
+            scan_cache_bytes: cache_mb * 1024 * 1024,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    println!("qsdb hot cache: {cache_mb} MB");
     db.sql("CREATE TABLE t (dt DATE, g1 BIGINT, g2 BIGINT, g3 BIGINT, a BIGINT, b BIGINT, score DOUBLE) PARTITIONED BY (dt)")
         .unwrap();
     let t_write = Instant::now();
