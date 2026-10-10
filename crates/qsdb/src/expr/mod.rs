@@ -9,6 +9,7 @@
 
 pub mod eval;
 pub mod scalar;
+pub mod udf;
 
 use crate::types::{Literal, LogicalType};
 

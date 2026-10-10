@@ -1,7 +1,8 @@
-//! 标量函数注册表（SQL-1 集）。
+//! 标量函数注册表（SQL-1 内置集 + UDF 回退）。
 //!
-//! length / upper / lower / trim / substr / abs / round / floor / ceil。
+//! 内置：length / upper / lower / trim / substr / abs / round / floor / ceil。
 //! 全部行级函数：NULL 输入 → NULL 输出。
+//! 未命中内置表时查全局 UDF 注册表（见 [`crate::expr::udf`]）。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,14 +13,14 @@ use arrow::datatypes::{Float64Type, Int64Type};
 use crate::error::{QsdbError, Result};
 use crate::types::LogicalType;
 
-type RetTyFn = Box<dyn Fn(&[LogicalType]) -> Result<LogicalType> + Send + Sync>;
-type EvalFn = Box<dyn Fn(&[ArrayRef]) -> Result<ArrayRef> + Send + Sync>;
+pub type RetTyFn = Arc<dyn Fn(&[LogicalType]) -> Result<LogicalType> + Send + Sync>;
+pub type EvalFn = Arc<dyn Fn(&[ArrayRef]) -> Result<ArrayRef> + Send + Sync>;
 
-/// 标量函数定义。
+/// 标量函数定义（内置与 UDF 共用）。
 pub struct ScalarFnDef {
     /// 入参类型 → 返回类型（binder 类型检查）
     pub ret_ty: RetTyFn,
-    /// 行级求值
+    /// 向量化求值（整批进整批出；NULL 处理由实现负责）
     pub eval: EvalFn,
 }
 
@@ -36,24 +37,24 @@ where
     Ok(Arc::new(out))
 }
 
-fn registry() -> &'static HashMap<&'static str, ScalarFnDef> {
+fn registry() -> &'static HashMap<&'static str, Arc<ScalarFnDef>> {
     use std::sync::OnceLock;
-    static REG: OnceLock<HashMap<&'static str, ScalarFnDef>> = OnceLock::new();
+    static REG: OnceLock<HashMap<&'static str, Arc<ScalarFnDef>>> = OnceLock::new();
     REG.get_or_init(build)
 }
 
-fn build() -> HashMap<&'static str, ScalarFnDef> {
-    let mut m: HashMap<&'static str, ScalarFnDef> = HashMap::new();
+fn build() -> HashMap<&'static str, Arc<ScalarFnDef>> {
+    let mut m: HashMap<&'static str, Arc<ScalarFnDef>> = HashMap::new();
 
     // length(string) -> bigint
     m.insert(
         "length",
-        ScalarFnDef {
-            ret_ty: Box::new(|args| match args {
+        Arc::new(ScalarFnDef {
+            ret_ty: Arc::new(|args| match args {
                 [t] if t.is_string() => Ok(LogicalType::Int64),
                 _ => Err(QsdbError::type_err("length(string) expected")),
             }),
-            eval: Box::new(|args| {
+            eval: Arc::new(|args| {
                 let s = string_arg(args, 0, "length")?;
                 let out: Int64Array = s
                     .iter()
@@ -61,7 +62,7 @@ fn build() -> HashMap<&'static str, ScalarFnDef> {
                     .collect();
                 Ok(Arc::new(out))
             }),
-        },
+        }),
     );
 
     // upper / lower / trim(string) -> string
@@ -69,12 +70,12 @@ fn build() -> HashMap<&'static str, ScalarFnDef> {
         let mode: &'static str = name;
         m.insert(
             name,
-            ScalarFnDef {
-                ret_ty: Box::new(move |args| match args {
+            Arc::new(ScalarFnDef {
+                ret_ty: Arc::new(move |args| match args {
                     [t] if t.is_string() => Ok(t.clone()),
                     _ => Err(QsdbError::type_err(format!("{mode}(string) expected"))),
                 }),
-                eval: Box::new(move |args| {
+                eval: Arc::new(move |args| {
                     let s = string_arg(args, 0, mode)?;
                     let out: GenericStringArray<i32> = s
                         .iter()
@@ -88,15 +89,15 @@ fn build() -> HashMap<&'static str, ScalarFnDef> {
                         .collect();
                     Ok(Arc::new(out))
                 }),
-            },
+            }),
         );
     }
 
     // substr(string, start[, len]) -> string（1-based）
     m.insert(
         "substr",
-        ScalarFnDef {
-            ret_ty: Box::new(|args| match args {
+        Arc::new(ScalarFnDef {
+            ret_ty: Arc::new(|args| match args {
                 [t, LogicalType::Int64] | [t, LogicalType::Int64, LogicalType::Int64]
                     if t.is_string() =>
                 {
@@ -104,7 +105,7 @@ fn build() -> HashMap<&'static str, ScalarFnDef> {
                 }
                 _ => Err(QsdbError::type_err("substr(string, start[, len]) expected")),
             }),
-            eval: Box::new(|args| {
+            eval: Arc::new(|args| {
                 let s = string_arg(args, 0, "substr")?;
                 let start = int_arg(args, 1, "substr")?;
                 let len_arr: Option<&Int64Array> = if args.len() > 2 {
@@ -146,18 +147,18 @@ fn build() -> HashMap<&'static str, ScalarFnDef> {
                 }
                 Ok(Arc::new(out.finish()))
             }),
-        },
+        }),
     );
 
     // abs(numeric) -> numeric（当前支持 BIGINT/DOUBLE）
     m.insert(
         "abs",
-        ScalarFnDef {
-            ret_ty: Box::new(|args| match args {
+        Arc::new(ScalarFnDef {
+            ret_ty: Arc::new(|args| match args {
                 [t] if t.is_numeric() => Ok(t.clone()),
                 _ => Err(QsdbError::type_err("abs(numeric) expected")),
             }),
-            eval: Box::new(|args| match args[0].data_type() {
+            eval: Arc::new(|args| match args[0].data_type() {
                 arrow::datatypes::DataType::Int64 => {
                     primitive_map::<Int64Type, _>(args, |v: i64| v.wrapping_abs())
                 }
@@ -168,7 +169,7 @@ fn build() -> HashMap<&'static str, ScalarFnDef> {
                     "abs on {other:?} (支持 BIGINT/DOUBLE)"
                 ))),
             }),
-        },
+        }),
     );
 
     // round / floor / ceil(double[, digits]) -> double
@@ -176,8 +177,8 @@ fn build() -> HashMap<&'static str, ScalarFnDef> {
         let nm: &'static str = name;
         m.insert(
             name,
-            ScalarFnDef {
-                ret_ty: Box::new(move |args| match args {
+            Arc::new(ScalarFnDef {
+                ret_ty: Arc::new(move |args| match args {
                     [LogicalType::Float64] | [LogicalType::Float64, LogicalType::Int64] => {
                         Ok(LogicalType::Float64)
                     }
@@ -185,7 +186,7 @@ fn build() -> HashMap<&'static str, ScalarFnDef> {
                         "{nm}(double[, digits]) expected"
                     ))),
                 }),
-                eval: Box::new(move |args| {
+                eval: Arc::new(move |args| {
                     let v = args[0]
                         .as_any()
                         .downcast_ref::<Float64Array>()
@@ -206,18 +207,29 @@ fn build() -> HashMap<&'static str, ScalarFnDef> {
                     let out: Float64Array = v.iter().map(|x| x.map(f)).collect();
                     Ok(Arc::new(out))
                 }),
-            },
+            }),
         );
     }
 
     m
 }
 
-/// 按名查找。
-pub fn lookup(name: &str) -> Result<&'static ScalarFnDef> {
-    registry()
-        .get(name)
-        .ok_or_else(|| QsdbError::not_found(format!("unknown function '{name}'")))
+/// 按名查找：内置表优先，未命中查 UDF 注册表。
+pub fn lookup(name: &str) -> Result<Arc<ScalarFnDef>> {
+    if let Some(def) = registry().get(name) {
+        return Ok(Arc::clone(def));
+    }
+    super::udf::lookup(name).ok_or_else(|| {
+        QsdbError::not_found(format!(
+            "unknown function '{name}' (支持: {:?})",
+            known_functions()
+        ))
+    })
+}
+
+/// 是否为内置函数名（UDF 注册防冲突用）。
+pub fn is_builtin(name: &str) -> bool {
+    registry().contains_key(name)
 }
 
 /// 已注册函数名（错误提示用）。
