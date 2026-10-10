@@ -1,4 +1,4 @@
-//! CTE + 窗口函数测试（M5）。
+//! CTE + 窗口函数 + UDF 测试（M5）。
 
 use qsdb::{Qsdb, QsdbOptions};
 
@@ -97,5 +97,134 @@ fn cte_dead_and_shadow() {
     assert_eq!(r, vec!["3"]);
     // 与表同名 → 拒绝（防止歧义）
     assert!(db.sql("WITH t AS (SELECT 1) SELECT * FROM t").is_err());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn window_row_number() {
+    let (db, root) = setup("win1");
+    db.sql("CREATE TABLE t (dt DATE, uid BIGINT, amt BIGINT) PARTITIONED BY (dt)")
+        .unwrap();
+    // amt=100 出现两次（uid 1 和 uid 3）→ 测 RANK 并列
+    db.sql(
+        "INSERT INTO t VALUES
+        (DATE '2026-01-01', 1, 100), (DATE '2026-01-01', 2, 300),
+        (DATE '2026-01-01', 3, 200),
+        (DATE '2026-01-02', 1, 50), (DATE '2026-01-02', 2, 80),
+        (DATE '2026-01-02', 3, 100)",
+    )
+    .unwrap();
+
+    // ROW_NUMBER：uid 分区内按 amt 降序
+    let r = q(
+        &db,
+        "SELECT uid, row_number() OVER (PARTITION BY uid ORDER BY amt DESC) AS rn FROM t",
+    );
+    assert_eq!(r, vec!["1|1", "1|2", "2|1", "2|2", "3|1", "3|2"]);
+
+    // RANK：全局 amt 降序，两个 100 并列 rank=3，之后跳到 5
+    // 300→1, 200→2, 100→3, 100→3, 80→5, 50→6
+    let r = q(
+        &db,
+        "SELECT uid, rank() OVER (ORDER BY amt DESC) AS rk FROM t",
+    );
+    assert_eq!(r, vec!["1|3", "1|6", "2|1", "2|5", "3|2", "3|3"]);
+
+    // DENSE_RANK：并列不跳号 300→1, 200→2, 100→3, 100→3, 80→4, 50→5
+    let r = q(
+        &db,
+        "SELECT uid, dense_rank() OVER (ORDER BY amt DESC) AS dr FROM t",
+    );
+    assert_eq!(r, vec!["1|3", "1|5", "2|1", "2|4", "3|2", "3|3"]);
+
+    // SUM OVER 有 ORDER BY：运行总和（RANGE 帧含并列）
+    let r = q(
+        &db,
+        "SELECT uid, sum(amt) OVER (PARTITION BY uid ORDER BY amt DESC) AS run_total FROM t",
+    );
+    assert_eq!(
+        r,
+        vec!["1|100", "1|150", "2|300", "2|380", "3|200", "3|300"]
+    );
+
+    // SUM OVER 无 ORDER BY：整分区总值（每行相同）
+    let r = q(
+        &db,
+        "SELECT uid, sum(amt) OVER (PARTITION BY uid) AS total FROM t",
+    );
+    assert_eq!(
+        r,
+        vec!["1|150", "1|150", "2|380", "2|380", "3|300", "3|300"]
+    );
+
+    // RANGE 帧并列语义：两个 100 行共享"≤100 全部行"的总和 50+80+100+100=330
+    // 各行帧值：50→50, 80→130, 100→330, 100→330, 200→530, 300→830
+    let r = q(&db, "SELECT amt, sum(amt) OVER (ORDER BY amt) AS s FROM t");
+    assert_eq!(
+        r,
+        vec![
+            "100|330", "100|330", "200|530", "300|830", "50|50", "80|130"
+        ]
+    );
+
+    // COUNT OVER：分区非 null 计数
+    let r = q(
+        &db,
+        "SELECT uid, count(amt) OVER (PARTITION BY uid) AS cnt FROM t",
+    );
+    assert_eq!(r, vec!["1|2", "1|2", "2|2", "2|2", "3|2", "3|2"]);
+
+    // MIN/MAX OVER 整型列（输出类型 Int64）
+    let r = q(
+        &db,
+        "SELECT uid, min(amt) OVER (PARTITION BY uid) AS mn, max(amt) OVER (PARTITION BY uid) AS mx FROM t",
+    );
+    assert_eq!(
+        r,
+        vec![
+            "1|50|100",
+            "1|50|100",
+            "2|80|300",
+            "2|80|300",
+            "3|100|200",
+            "3|100|200"
+        ]
+    );
+
+    // AVG OVER：分区均值
+    let r = q(
+        &db,
+        "SELECT uid, avg(amt) OVER (PARTITION BY uid) AS av FROM t",
+    );
+    assert_eq!(
+        r,
+        vec![
+            "1|75.0", "1|75.0", "2|190.0", "2|190.0", "3|150.0", "3|150.0"
+        ]
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn window_with_filter() {
+    let (db, root) = setup("win2");
+    db.sql("CREATE TABLE s (grp STRING, v BIGINT) PARTITIONED BY (grp)")
+        .unwrap();
+    db.sql("INSERT INTO s VALUES ('a', 10), ('a', 20), ('b', 5), ('b', 15), ('b', 25)")
+        .unwrap();
+
+    // WHERE 先过滤再开窗：v>5 留下 a(10,20) b(15,25)
+    let r = q(
+        &db,
+        "SELECT grp, v, row_number() OVER (PARTITION BY grp ORDER BY v) AS rn FROM s WHERE v > 5",
+    );
+    assert_eq!(r, vec!["a|10|1", "a|20|2", "b|15|1", "b|25|2"]);
+
+    // 无 ORDER BY 聚合窗口 + 外层 ORDER BY：每行 = 分区总值
+    let r = q(
+        &db,
+        "SELECT grp, sum(v) OVER (PARTITION BY grp) AS total FROM s ORDER BY grp, total",
+    );
+    assert_eq!(r, vec!["a|30", "a|30", "b|45", "b|45", "b|45"]);
     std::fs::remove_dir_all(&root).ok();
 }

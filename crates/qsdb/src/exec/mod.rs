@@ -7,6 +7,7 @@ pub mod agg;
 pub mod join;
 pub mod par_scan;
 pub mod spill;
+pub mod window;
 
 use std::sync::Arc;
 

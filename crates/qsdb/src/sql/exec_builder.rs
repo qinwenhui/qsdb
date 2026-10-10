@@ -48,6 +48,10 @@ pub fn build(
     ctx: &Arc<crate::query::QueryContext>,
 ) -> Result<Box<dyn ExecNode>> {
     // M4-3 列裁剪下推：收集全计划引用列，Scan 只读所需列（含谓词列）。
+    // Window 计划的窗口列 idx 假设全列序——下推重排会破坏索引映射，跳过。
+    if has_window_node(plan) {
+        return build_inner(db, plan, None, ctx);
+    }
     let mut used: Vec<String> = Vec::new();
     collect_plan_columns(plan, &mut used);
     if let Some(def) = plan_scan_def(plan) {
@@ -106,7 +110,7 @@ fn collect_plan_columns(plan: &LogicalPlan, out: &mut Vec<String>) {
         LogicalPlan::Join { .. } | LogicalPlan::CrossJoinFilter { .. } => {
             // 多表计划不走列裁剪下推（build 的 count_scans guard 兜底）
         }
-        LogicalPlan::Values { .. } => {} // 内存源无需裁剪
+        LogicalPlan::Values { .. } | LogicalPlan::Window { .. } => {} // 内存/窗口源无需裁剪
     }
 }
 
@@ -132,6 +136,20 @@ fn collect_expr_columns(e: &PhysExpr, out: &mut Vec<String>) {
     }
 }
 
+/// 计划内是否含 Window 节点（列裁剪跳过：窗口列 idx 假设全列序）。
+fn has_window_node(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Window { .. } => true,
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Distinct { input } => has_window_node(input),
+        _ => false,
+    }
+}
+
 /// 计划根到叶的 Scan 表定义。
 fn plan_scan_def(plan: &LogicalPlan) -> Option<Arc<crate::catalog::TableDef>> {
     match plan {
@@ -145,6 +163,7 @@ fn plan_scan_def(plan: &LogicalPlan) -> Option<Arc<crate::catalog::TableDef>> {
         LogicalPlan::Join { .. }
         | LogicalPlan::CrossJoinFilter { .. }
         | LogicalPlan::Values { .. } => None,
+        LogicalPlan::Window { input, .. } => plan_scan_def(input),
     }
 }
 
@@ -215,6 +234,23 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
         LogicalPlan::Join { .. }
         | LogicalPlan::CrossJoinFilter { .. }
         | LogicalPlan::Values { .. } => plan.clone(),
+        LogicalPlan::Window {
+            input,
+            partition_by,
+            order_by,
+            window_fns,
+        } => LogicalPlan::Window {
+            input: Box::new(rewrite_plan(input, mapping, all)),
+            partition_by: partition_by
+                .iter()
+                .map(|p| rewrite_expr(p, mapping, all))
+                .collect(),
+            order_by: order_by
+                .iter()
+                .map(|(e, d)| (rewrite_expr(e, mapping, all), *d))
+                .collect(),
+            window_fns: window_fns.clone(),
+        },
     }
 }
 
@@ -313,6 +349,21 @@ fn build_inner(
         LogicalPlan::Distinct { input } => Ok(Box::new(crate::exec::DistinctExec::new(
             build_inner(db, input, scan_proj.clone(), ctx)?,
         ))),
+        LogicalPlan::Window {
+            input,
+            partition_by,
+            order_by,
+            window_fns,
+        } => {
+            let input_exec = build_inner(db, input, None, ctx)?;
+            Ok(Box::new(crate::exec::window::WindowExec::new(
+                input_exec,
+                partition_by.clone(),
+                order_by.clone(),
+                window_fns.clone(),
+                Arc::clone(ctx),
+            )))
+        }
         LogicalPlan::Values { columns, cte_id } => {
             let schema = Arc::new(arrow::datatypes::Schema::new(
                 columns

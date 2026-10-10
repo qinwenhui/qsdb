@@ -50,6 +50,13 @@ pub enum LogicalPlan {
     Distinct {
         input: Box<LogicalPlan>,
     },
+    /// 窗口函数：PARTITION BY + ORDER BY + 窗口函数列表
+    Window {
+        input: Box<LogicalPlan>,
+        partition_by: Vec<PhysExpr>,
+        order_by: Vec<(PhysExpr, bool)>,
+        window_fns: Vec<crate::exec::window::WindowFn>,
+    },
     /// 内存批源（CTE 物化；执行层持有批数据，binder 只带 schema 描述）
     Values {
         columns: Vec<(String, LogicalType)>,
@@ -642,6 +649,15 @@ pub fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<(String, LogicalTyp
                 "CTE output from JOIN not inferable in binder",
             ));
         }
+        LogicalPlan::Window {
+            input, window_fns, ..
+        } => {
+            let mut cols = plan_output_columns(input)?;
+            for f in window_fns {
+                cols.push((f.output_name(), f.output_type()));
+            }
+            cols
+        }
     })
 }
 
@@ -897,6 +913,11 @@ pub fn translate_select_full_with_ctes(
     for it in &items {
         collect_aggs(&it.sql, &ctx, &mut aggs)?;
     }
+    // 窗口函数检测（OVER 子句）
+    let mut window_fns: Vec<crate::exec::window::WindowFn> = Vec::new();
+    for it in &items {
+        collect_windows(&it.sql, &ctx, &mut window_fns)?;
+    }
     // HAVING（SQL-2）：对聚合输出过滤
     let mut having_pred: Option<PhysExpr> = None;
     if let Some(h) = &select.having {
@@ -929,6 +950,35 @@ pub fn translate_select_full_with_ctes(
         }
     }
     let is_agg = !aggs.is_empty() || !group_exprs.is_empty();
+    // 窗口函数：若有聚合，窗口在聚合之上；否则直接在输入上
+    let has_window = !window_fns.is_empty();
+    let mut window_partition: Vec<PhysExpr> = Vec::new();
+    let mut window_order: Vec<(PhysExpr, bool)> = Vec::new();
+    if has_window {
+        // 提取第一个 OVER 子句的 PARTITION BY / ORDER BY（所有窗口共用）
+        extract_window_spec(
+            &select.projection,
+            &ctx,
+            &mut window_partition,
+            &mut window_order,
+        )?;
+    }
+
+    // 窗口（无聚合场景：直接在输入上开窗口）
+    if has_window && !is_agg {
+        plan = LogicalPlan::Window {
+            input: Box::new(plan),
+            partition_by: window_partition,
+            order_by: window_order,
+            window_fns: window_fns.clone(),
+        };
+    }
+    let window_fns_unused_in_agg = is_agg && has_window;
+    if window_fns_unused_in_agg {
+        return Err(QsdbError::unsupported(
+            "window functions over GROUP BY output (aggregate + window in same query) lands later",
+        ));
+    }
 
     if is_agg {
         // 聚合后 schema 上下文（重绑定投影）
@@ -968,7 +1018,18 @@ pub fn translate_select_full_with_ctes(
         let mut proj_exprs = Vec::with_capacity(items.len());
         let mut proj_names = Vec::with_capacity(items.len());
         for it in &items {
-            proj_exprs.push(bind_expr(&it.sql, &ctx)?);
+            // 窗口函数投影：直接生成 Column 引用（idx = 输入列数 + 窗口列序）
+            if let Some(wf_idx) = find_window_fn_index(&it.sql, &window_fns, &ctx) {
+                let input_col_count = ctx.cols.len();
+                let wf = &window_fns[wf_idx];
+                proj_exprs.push(PhysExpr::Column {
+                    idx: input_col_count + wf_idx,
+                    name: wf.output_name(),
+                    ty: wf.output_type(),
+                });
+            } else {
+                proj_exprs.push(bind_expr(&it.sql, &ctx)?);
+            }
             proj_names.push(it.name.clone());
         }
         plan = LogicalPlan::Project {
@@ -1191,6 +1252,106 @@ fn substitute_aliases(
         E::IsNotNull(inner) => E::IsNotNull(Box::new(substitute_aliases(inner, items))),
         other => other.clone(),
     }
+}
+
+/// 收集 SELECT item 中的窗口函数（OVER 子句）。
+/// 判断 SELECT item 是否是纯窗口函数引用，返回其在 window_fns 中的 idx。
+fn find_window_fn_index(
+    e: &sqlparser::ast::Expr,
+    window_fns: &[crate::exec::window::WindowFn],
+    ctx: &SchemaCtx,
+) -> Option<usize> {
+    use sqlparser::ast::Expr as E;
+    if let E::Function(f) = e {
+        f.over.as_ref()?;
+        let name = f.name.to_string().to_ascii_lowercase();
+        for (i, w) in window_fns.iter().enumerate() {
+            let w_name = w.output_name();
+            // row_number() → row_number()
+            if w_name == name || w_name.starts_with(&format!("{name}(")) {
+                return Some(i);
+            }
+        }
+    }
+    let _ = ctx;
+    None
+}
+
+fn collect_windows(
+    e: &sqlparser::ast::Expr,
+    ctx: &SchemaCtx,
+    out: &mut Vec<crate::exec::window::WindowFn>,
+) -> Result<()> {
+    use sqlparser::ast::Expr as E;
+    match e {
+        E::Function(f) if f.over.is_some() => {
+            let name = f.name.to_string().to_ascii_lowercase();
+            let fn_def = match name.as_str() {
+                "row_number" | "rownum" => crate::exec::window::WindowFn::RowNumber,
+                "rank" => crate::exec::window::WindowFn::Rank,
+                "dense_rank" => crate::exec::window::WindowFn::DenseRank,
+                "sum" | "count" | "min" | "max" | "avg" => {
+                    let arg = match fn_args(f).first() {
+                        Some(sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(inner),
+                        )) => bind_expr(&inner.clone(), ctx)?,
+                        _ => return Err(QsdbError::invalid("window agg needs an argument")),
+                    };
+                    match name.as_str() {
+                        "sum" => crate::exec::window::WindowFn::Sum(arg),
+                        "count" => crate::exec::window::WindowFn::Count(arg),
+                        "min" => crate::exec::window::WindowFn::Min(arg),
+                        "max" => crate::exec::window::WindowFn::Max(arg),
+                        _ => crate::exec::window::WindowFn::Avg(arg),
+                    }
+                }
+                other => {
+                    return Err(QsdbError::unsupported(format!(
+                        "window function '{other}' (support: row_number/rank/dense_rank/sum/count/min/max/avg)"
+                    )));
+                }
+            };
+            out.push(fn_def);
+            Ok(())
+        }
+        E::BinaryOp { left, right, .. } => {
+            collect_windows(left, ctx, out)?;
+            collect_windows(right, ctx, out)
+        }
+        E::Nested(inner) => collect_windows(inner, ctx, out),
+        E::Cast { expr, .. } => collect_windows(expr, ctx, out),
+        _ => Ok(()),
+    }
+}
+
+/// 从 SELECT 投影中提取第一个 OVER 的 PARTITION BY / ORDER BY。
+fn extract_window_spec(
+    projection: &[sqlparser::ast::SelectItem],
+    ctx: &SchemaCtx,
+    partition_by: &mut Vec<PhysExpr>,
+    order_by: &mut Vec<(PhysExpr, bool)>,
+) -> Result<()> {
+    use sqlparser::ast::*;
+    for item in projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) => e,
+            SelectItem::ExprWithAlias { expr, .. } => expr,
+            _ => continue,
+        };
+        if let Expr::Function(f) = expr {
+            if let Some(WindowType::WindowSpec(spec)) = &f.over {
+                for p in &spec.partition_by {
+                    partition_by.push(bind_expr(p, ctx)?);
+                }
+                for ob in &spec.order_by {
+                    let desc = matches!(&ob.options.sort, Some(sqlparser::ast::OrderBySort::Desc));
+                    order_by.push((bind_expr(&ob.expr, ctx)?, desc));
+                }
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn expr_display(e: &sqlparser::ast::Expr) -> String {
@@ -1636,7 +1797,7 @@ fn try_bind_agg(f: &sqlparser::ast::Function, ctx: &SchemaCtx) -> Result<Option<
         return Ok(None);
     }
     if f.over.is_some() {
-        return Err(QsdbError::unsupported("window functions land in M5"));
+        return Ok(None); // 窗口函数不作为聚合处理（由 collect_windows / 投影拦截）
     }
     let func = match name.as_str() {
         "count" => AggFunc::Count,
