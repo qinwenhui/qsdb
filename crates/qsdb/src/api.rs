@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::record_batch::RecordBatch;
 
@@ -60,12 +61,57 @@ pub struct ScanRequest {
     pub limit: Option<u64>,
 }
 
+/// 运行期可热更配置：原子量存储，新查询/新请求即时生效，**无需重启**。
+///
+/// 初始值取自 [`QsdbOptions`]；之后经 setter 调整（server 的
+/// `PUT /api/v1/config` 或嵌入方直接调用）。
+#[derive(Debug)]
+pub struct QsdbRuntime {
+    /// 默认查询超时（毫秒；0 = 不超时）
+    query_timeout_ms: AtomicU64,
+    /// 默认单查询内存上限（字节；0 = 不限）
+    query_memory_limit_bytes: AtomicU64,
+}
+
+impl QsdbRuntime {
+    fn from_opts(opts: &QsdbOptions) -> Self {
+        Self {
+            query_timeout_ms: AtomicU64::new(opts.query_timeout_ms.unwrap_or(0)),
+            query_memory_limit_bytes: AtomicU64::new(opts.query_memory_limit_bytes.unwrap_or(0)),
+        }
+    }
+
+    pub fn query_timeout_ms(&self) -> Option<u64> {
+        match self.query_timeout_ms.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(v),
+        }
+    }
+
+    pub fn set_query_timeout_ms(&self, ms: u64) {
+        self.query_timeout_ms.store(ms, Ordering::Relaxed);
+    }
+
+    pub fn query_memory_limit_bytes(&self) -> Option<u64> {
+        match self.query_memory_limit_bytes.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(v),
+        }
+    }
+
+    pub fn set_query_memory_limit_bytes(&self, bytes: u64) {
+        self.query_memory_limit_bytes
+            .store(bytes, Ordering::Relaxed);
+    }
+}
+
 /// QSDB 句柄。
 pub struct Qsdb {
     root: PathBuf,
     opts: QsdbOptions,
     defs: TableDefCache,
     cache: Arc<crate::cache::SegmentCache>,
+    runtime: Arc<QsdbRuntime>,
 }
 
 impl Qsdb {
@@ -77,11 +123,13 @@ impl Qsdb {
         fs::create_dir_all(db_dir(&root, DEFAULT_DB))
             .map_err(|e| QsdbError::meta(format!("init default db failed: {e}")))?;
         let cache = Arc::new(crate::cache::SegmentCache::new(opts.scan_cache_bytes));
+        let runtime = Arc::new(QsdbRuntime::from_opts(&opts));
         Ok(Self {
             root,
             opts,
             defs: TableDefCache::default(),
             cache,
+            runtime,
         })
     }
 
@@ -229,12 +277,23 @@ impl Qsdb {
     // -- SQL（M2：SQL-0/1）----------------------------------------------------
 
     /// 新建查询上下文（server 会话层用；嵌入用户也可自建以获得取消/超时能力）。
+    /// 超时/内存上限取**运行期配置**（可热更）；显式 timeout_ms 优先。
     pub fn new_query_context(&self, timeout_ms: Option<u64>) -> Arc<crate::query::QueryContext> {
         crate::query::QueryContext::new(
             format!("q{}", uuid::Uuid::now_v7().simple()),
-            timeout_ms.or(self.opts.query_timeout_ms),
-            self.opts.query_memory_limit_bytes,
+            timeout_ms.or_else(|| self.runtime.query_timeout_ms()),
+            self.runtime.query_memory_limit_bytes(),
         )
+    }
+
+    /// 运行期配置（热更）：`Arc` 引用可直接调 setter。
+    pub fn runtime(&self) -> Arc<QsdbRuntime> {
+        Arc::clone(&self.runtime)
+    }
+
+    /// 启动期选项快照（只读；改动需重开句柄）。
+    pub fn options(&self) -> &QsdbOptions {
+        &self.opts
     }
 
     /// 执行单条 SQL（DDL/DML/SELECT）——panic 隔离 + 默认超时/内存上限。

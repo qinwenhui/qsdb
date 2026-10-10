@@ -64,6 +64,9 @@ enum Cmd {
         /// 并发查询上限（0 = 不限）
         #[arg(long, default_value_t = 0)]
         max_concurrent_queries: usize,
+        /// 配置文件（JSON：query_timeout_ms / query_memory_limit_bytes）
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 }
 
@@ -150,6 +153,7 @@ fn main() {
             auto_compact_secs,
             cache_mb,
             max_concurrent_queries,
+            config,
         } => {
             let opts = QsdbOptions {
                 scan_cache_bytes: cache_mb * 1024 * 1024,
@@ -172,6 +176,7 @@ fn main() {
                 token,
                 auto_compact_secs,
                 Some(max_concurrent_queries),
+                config.as_deref(),
             )) {
                 eprintln!("server error: {e}");
                 std::process::exit(1);

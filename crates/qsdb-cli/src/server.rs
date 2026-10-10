@@ -131,13 +131,37 @@ impl Metrics {
 
 /// 启动服务（阻塞至 Ctrl-C）。
 #[allow(clippy::too_many_arguments)]
+/// 服务器配置文件（可选 JSON）。
+#[derive(serde::Deserialize, Default)]
+pub struct ServerConfigFile {
+    #[serde(default)]
+    pub query_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub query_memory_limit_bytes: Option<u64>,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     db: Arc<Qsdb>,
     addr: &str,
     token: Option<String>,
     auto_compact_secs: Option<u64>,
     max_concurrent_queries: Option<usize>,
+    config_file: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(path) = config_file {
+        let text = std::fs::read_to_string(path)?;
+        let cfg: ServerConfigFile = serde_json::from_str(&text)
+            .map_err(|e| format!("parse config {}: {e}", path.display()))?;
+        let rt = db.runtime();
+        if let Some(ms) = cfg.query_timeout_ms {
+            rt.set_query_timeout_ms(ms);
+        }
+        if let Some(bytes) = cfg.query_memory_limit_bytes {
+            rt.set_query_memory_limit_bytes(bytes);
+        }
+        eprintln!("config file applied: {}", path.display());
+    }
     let writer = db.writer(WriteBufferOptions::default());
     let state = Arc::new(AppState {
         db,
@@ -161,6 +185,7 @@ pub async fn serve(
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/queries", get(list_queries))
         .route("/api/v1/queries/{id}/cancel", post(cancel_query))
+        .route("/api/v1/config", get(get_config).put(put_config))
         .layer(write_layer)
         .with_state(Arc::clone(&state));
 
@@ -528,6 +553,63 @@ async fn stats(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
         Ok(Err(e)) => status_of(&e, e.to_string()),
         Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
+}
+
+async fn get_config(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
+        return err_response(StatusCode::UNAUTHORIZED, "unauthorized".into());
+    }
+    let rt = s.db.runtime();
+    let opts = s.db.options();
+    Json(serde_json::json!({
+        // 运行期（热更生效）
+        "runtime": {
+            "queryTimeoutMs": rt.query_timeout_ms().unwrap_or(0),
+            "queryMemoryLimitBytes": rt.query_memory_limit_bytes().unwrap_or(0),
+        },
+        // 启动期快照（只读，改动需重启）
+        "startup": {
+            "scanCacheBytes": opts.scan_cache_bytes,
+            "trashGraceMs": opts.trash_grace_ms,
+        },
+        // 服务器级
+        "server": {
+            "maxConcurrentQueries": s.max_concurrent_queries,
+        },
+        "_hint": "PUT /api/v1/config 可热更 runtime 节；startup/server 节需重启",
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize, Default)]
+struct ConfigUpdate {
+    #[serde(default)]
+    query_timeout_ms: Option<u64>,
+    #[serde(default)]
+    query_memory_limit_bytes: Option<u64>,
+}
+
+async fn put_config(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<ConfigUpdate>,
+) -> Response {
+    if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
+        return err_response(StatusCode::UNAUTHORIZED, "unauthorized".into());
+    }
+    let rt = s.db.runtime();
+    if let Some(ms) = body.query_timeout_ms {
+        rt.set_query_timeout_ms(ms);
+    }
+    if let Some(bytes) = body.query_memory_limit_bytes {
+        rt.set_query_memory_limit_bytes(bytes);
+    }
+    Json(serde_json::json!({
+        "queryTimeoutMs": rt.query_timeout_ms().unwrap_or(0),
+        "queryMemoryLimitBytes": rt.query_memory_limit_bytes().unwrap_or(0),
+        "applied": true,
+    }))
+    .into_response()
 }
 
 async fn list_queries(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
