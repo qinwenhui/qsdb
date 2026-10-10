@@ -13,6 +13,20 @@ use crate::expr::{AggExpr, PhysExpr};
 
 use super::translate::LogicalPlan;
 
+// CTE 批缓存（execute_sql 物化后注入；build 期间读取）。
+// thread_local：查询独立，无跨查询泄漏。
+thread_local! {
+    static CTE_BATCHES: std::cell::RefCell<std::collections::HashMap<u32, Vec<RecordBatch>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// 注入 CTE 批缓存（execute_sql 调用；build 前设置）。
+pub fn set_cte_batches(map: std::collections::HashMap<u32, Vec<RecordBatch>>) {
+    CTE_BATCHES.with(|c| {
+        *c.borrow_mut() = map;
+    });
+}
+
 /// 一次性批执行节点（并行聚合结果）。
 struct OneShotExec {
     batch: Option<RecordBatch>,
@@ -92,6 +106,7 @@ fn collect_plan_columns(plan: &LogicalPlan, out: &mut Vec<String>) {
         LogicalPlan::Join { .. } | LogicalPlan::CrossJoinFilter { .. } => {
             // 多表计划不走列裁剪下推（build 的 count_scans guard 兜底）
         }
+        LogicalPlan::Values { .. } => {} // 内存源无需裁剪
     }
 }
 
@@ -127,7 +142,9 @@ fn plan_scan_def(plan: &LogicalPlan) -> Option<Arc<crate::catalog::TableDef>> {
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Distinct { input } => plan_scan_def(input),
-        LogicalPlan::Join { .. } | LogicalPlan::CrossJoinFilter { .. } => None,
+        LogicalPlan::Join { .. }
+        | LogicalPlan::CrossJoinFilter { .. }
+        | LogicalPlan::Values { .. } => None,
     }
 }
 
@@ -195,7 +212,9 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
         LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
             input: Box::new(rewrite_plan(input, mapping, all)),
         },
-        LogicalPlan::Join { .. } | LogicalPlan::CrossJoinFilter { .. } => plan.clone(),
+        LogicalPlan::Join { .. }
+        | LogicalPlan::CrossJoinFilter { .. }
+        | LogicalPlan::Values { .. } => plan.clone(),
     }
 }
 
@@ -294,6 +313,18 @@ fn build_inner(
         LogicalPlan::Distinct { input } => Ok(Box::new(crate::exec::DistinctExec::new(
             build_inner(db, input, scan_proj.clone(), ctx)?,
         ))),
+        LogicalPlan::Values { columns, cte_id } => {
+            let schema = Arc::new(arrow::datatypes::Schema::new(
+                columns
+                    .iter()
+                    .map(|(n, t)| arrow::datatypes::Field::new(n, t.arrow_type(), true))
+                    .collect::<Vec<_>>(),
+            ));
+            let batches = CTE_BATCHES
+                .with(|c| c.borrow().get(cte_id).cloned())
+                .unwrap_or_default();
+            Ok(Box::new(crate::exec::ValuesExec::new(schema, batches)))
+        }
         LogicalPlan::CrossJoinFilter {
             left,
             right,

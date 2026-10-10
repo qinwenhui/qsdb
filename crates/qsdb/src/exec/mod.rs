@@ -146,6 +146,34 @@ impl ExecNode for ProjectExec {
     }
 }
 
+/// 内存批源（CTE 物化体；批由外部注入）。
+pub struct ValuesExec {
+    batches: std::vec::IntoIter<RecordBatch>,
+    schema: SchemaRef,
+}
+
+impl ValuesExec {
+    pub fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
+        Self {
+            batches: batches.into_iter(),
+            schema,
+        }
+    }
+
+    pub fn empty(schema: SchemaRef) -> Self {
+        Self::new(schema, Vec::new())
+    }
+}
+
+impl ExecNode for ValuesExec {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+    fn next(&mut self) -> Option<Result<RecordBatch>> {
+        self.batches.next().map(Ok)
+    }
+}
+
 /// LIMIT。
 pub struct LimitExec {
     pub input: Box<dyn ExecNode>,

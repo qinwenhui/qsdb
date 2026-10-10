@@ -50,6 +50,11 @@ pub enum LogicalPlan {
     Distinct {
         input: Box<LogicalPlan>,
     },
+    /// 内存批源（CTE 物化；执行层持有批数据，binder 只带 schema 描述）
+    Values {
+        columns: Vec<(String, LogicalType)>,
+        cte_id: u32,
+    },
     /// 非等值 INNER：cross join（左 × 右）后在合并 schema 上过滤
     CrossJoinFilter {
         left: Box<LogicalPlan>,
@@ -601,14 +606,68 @@ pub fn predicate_from_where(
     })
 }
 
+static CTE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+fn next_cte_id() -> u32 {
+    CTE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 计划输出列（名字 + 类型）——CTE 内联绑定的列序来源。
+pub fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<(String, LogicalType)>> {
+    Ok(match plan {
+        LogicalPlan::Scan { def, .. } => def
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.logical_type.clone()))
+            .collect(),
+        LogicalPlan::Project { names, exprs, .. } => names
+            .iter()
+            .zip(exprs.iter())
+            .map(|(n, e)| (n.clone(), e.data_type()))
+            .collect(),
+        LogicalPlan::Values { columns, .. } => columns.clone(),
+        LogicalPlan::Aggregate { group, aggs, .. } => {
+            let mut cols: Vec<(String, LogicalType)> =
+                group.iter().map(|g| (g.display(), g.data_type())).collect();
+            for a in aggs {
+                cols.push((a.out_name.clone(), a.out_ty.clone()));
+            }
+            cols
+        }
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Distinct { input } => plan_output_columns(input)?,
+        LogicalPlan::Join { .. } | LogicalPlan::CrossJoinFilter { .. } => {
+            return Err(QsdbError::unsupported(
+                "CTE output from JOIN not inferable in binder",
+            ));
+        }
+    })
+}
+
 pub struct TableResolver<'a> {
     pub resolve: TableResolverFn<'a>,
+}
+
+/// CTE 物化定义（执行层按 id 填充批数据）。
+#[derive(Debug, Clone)]
+pub struct CteDef {
+    pub cte_id: u32,
+    pub columns: Vec<(String, LogicalType)>,
+    pub plan: LogicalPlan,
 }
 
 pub fn translate_select_full(
     q: sqlparser::ast::Query,
     resolver: &TableResolver,
 ) -> Result<LogicalPlan> {
+    translate_select_full_with_ctes(q, resolver).map(|(p, _)| p)
+}
+
+pub fn translate_select_full_with_ctes(
+    q: sqlparser::ast::Query,
+    resolver: &TableResolver,
+) -> Result<(LogicalPlan, Vec<CteDef>)> {
     use sqlparser::ast::*;
 
     let select = match *q.body {
@@ -632,13 +691,62 @@ pub fn translate_select_full(
             )));
         }
     };
-    let def = (resolver.resolve)(&table)?;
-    let mut ctx = SchemaCtx::from_table(&def);
+    // CTE（非递归）：WITH name AS (...) 内联展开为子计划
+    let mut cte_plans: std::collections::HashMap<
+        String,
+        (LogicalPlan, Vec<(String, LogicalType)>),
+    > = std::collections::HashMap::new();
+    let mut cte_defs: Vec<CteDef> = Vec::new();
+    if let Some(with) = &q.with {
+        if with.recursive {
+            return Err(QsdbError::unsupported("recursive CTE"));
+        }
+        let mut defs: Vec<CteDef> = Vec::new();
+        for cte in &with.cte_tables {
+            let name = cte.alias.name.value.clone();
+            if cte_plans.contains_key(&name) || (resolver.resolve)(&name).is_ok() {
+                return Err(QsdbError::unsupported("recursive or duplicate CTE"));
+            }
+            let sub = translate_select_full(*cte.query.clone(), resolver)?;
+            let cols = plan_output_columns(&sub)?;
+            cte_plans.insert(name, (sub.clone(), cols.clone()));
+            defs.push(CteDef {
+                cte_id: u32::MAX, // 哨兵：主查询 FROM 未引用时保持 MAX
+                columns: cols,
+                plan: sub,
+            });
+        }
+        cte_defs = defs;
+    }
 
-    let mut plan = LogicalPlan::Scan {
-        def: Arc::clone(&def),
-        predicate: None,
-    };
+    // FROM 主表：CTE 名优先
+    let (mut plan, mut ctx): (LogicalPlan, SchemaCtx) =
+        if let Some((_sub, cols)) = cte_plans.get(&table) {
+            let id = next_cte_id();
+            // 同步 CteDef 的 id（执行层按 id 匹配；用列名匹配定位）
+            if let Some(d) = cte_defs
+                .iter_mut()
+                .find(|d| d.columns.as_slice() == cols.as_slice())
+            {
+                d.cte_id = id;
+            }
+            (
+                LogicalPlan::Values {
+                    columns: cols.clone(),
+                    cte_id: id,
+                },
+                SchemaCtx { cols: cols.clone() },
+            )
+        } else {
+            let def = (resolver.resolve)(&table)?;
+            (
+                LogicalPlan::Scan {
+                    def: Arc::clone(&def),
+                    predicate: None,
+                },
+                SchemaCtx::from_table(&def),
+            )
+        };
 
     // JOIN 链（SQL-2：等值 INNER/LEFT）
     for join in &select.from[0].joins {
@@ -715,7 +823,13 @@ pub fn translate_select_full(
         if !bound.is_boolean() {
             return Err(QsdbError::type_err("WHERE must be boolean"));
         }
-        let (pushdown, residual) = split_pushdown(&bound);
+        // Values（CTE）不可下推（无 Scan 节点）→ 全部留作行过滤
+        let is_values = matches!(plan, LogicalPlan::Values { .. });
+        let (pushdown, residual) = if is_values {
+            (None, Some(bound))
+        } else {
+            split_pushdown(&bound)
+        };
         if let Some(p) = pushdown {
             if let LogicalPlan::Scan { predicate, .. } = &mut plan {
                 *predicate = Some(p);
@@ -982,7 +1096,7 @@ pub fn translate_select_full(
         }
     }
 
-    Ok(plan)
+    Ok((plan, cte_defs))
 }
 
 fn proj_exprs_len_before(plan: &LogicalPlan) -> usize {
