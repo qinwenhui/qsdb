@@ -6,6 +6,7 @@
 pub mod agg;
 pub mod join;
 pub mod par_scan;
+pub mod spill;
 
 use std::sync::Arc;
 
@@ -208,39 +209,96 @@ impl SortExec {
     }
 
     fn collect_all(&mut self) -> Result<RecordBatch> {
-        let mut batches = Vec::new();
+        // 内存超限 → 落盘（chunk 排序后写临时 parquet run）而非终止查询
+        let mut spill_dir: Option<spill::SpillDir> = None;
+        let mut run_paths: Vec<std::path::PathBuf> = Vec::new();
+        let mut chunk: Vec<RecordBatch> = Vec::new();
+        let mut chunk_bytes = 0u64;
         let mut charged = 0u64;
+
+        let flush_chunk = |chunk: &mut Vec<RecordBatch>,
+                           chunk_bytes: &mut u64,
+                           spill_dir: &mut Option<spill::SpillDir>,
+                           run_paths: &mut Vec<std::path::PathBuf>|
+         -> Result<()> {
+            if chunk.is_empty() {
+                return Ok(());
+            }
+            let dir = spill_dir.get_or_insert_with(spill::SpillDir::new);
+            let path = spill::write_sorted_run(dir, chunk, &self.keys, &self.schema)?;
+            run_paths.push(path);
+            chunk.clear();
+            *chunk_bytes = 0;
+            Ok(())
+        };
+
         while let Some(b) = self.input.next() {
             self.ctx.check()?;
             let x = b?;
-            // 排序物化是内存大头：逐批记账（超限 → 查询终止而非 OOM 全库）
             let bytes = x.get_array_memory_size() as u64;
-            self.ctx.charge_memory(bytes)?;
+            // 记账超限 → 当前 chunk 落盘，继续（总量受磁盘而非内存约束）
+            if self.ctx.charge_memory(bytes).is_err() {
+                self.ctx.release_memory(chunk_bytes);
+                flush_chunk(&mut chunk, &mut chunk_bytes, &mut spill_dir, &mut run_paths)?;
+                // 单批超过全额限制：该批独立成 run（不再记账）
+                let mut single = Vec::new();
+                single.push(x);
+                flush_chunk(&mut single, &mut 0, &mut spill_dir, &mut run_paths)?;
+                continue;
+            }
             charged += bytes;
-            batches.push(x);
+            chunk_bytes += bytes;
+            chunk.push(x);
         }
         self.ctx.release_memory(charged);
-        if batches.is_empty() {
-            return Ok(RecordBatch::new_empty(self.schema()));
+
+        if run_paths.is_empty() {
+            // 纯内存路径（原逻辑）
+            return sort_in_memory(chunk, &self.schema());
         }
-        if batches.len() == 1 {
-            return Ok(batches.pop().unwrap());
+        // 有 run：尾块排序成内存 run，k 路归并（一次性产出合并批；
+        // 流式化留待后续——排序输出本来就要被 limit/take 整体消费）
+        let mut runs: Vec<Vec<RecordBatch>> = Vec::new();
+        for p in &run_paths {
+            runs.push(spill::read_run(p)?);
         }
-        // 同 schema concat
-        let n_cols = self.schema().fields().len();
-        let mut cols = Vec::with_capacity(n_cols);
-        for c in 0..n_cols {
-            let parts: Vec<&dyn Array> = batches.iter().map(|b| b.column(c).as_ref()).collect();
-            cols.push(concat(&parts).map_err(|e| QsdbError::invalid(format!("concat: {e}")))?);
+        if !chunk.is_empty() {
+            let sorted = sort_in_memory(chunk, &self.schema)?;
+            if sorted.num_rows() > 0 {
+                runs.push(vec![sorted]);
+            }
         }
-        let n: usize = batches.iter().map(|b| b.num_rows()).sum();
-        RecordBatch::try_new_with_options(
-            self.schema(),
-            cols,
-            &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(n)),
-        )
-        .map_err(|e| QsdbError::invalid(format!("concat batch: {e}")))
+        let mut merger = spill::RunMerger::new(runs, &self.keys)?;
+        let mut outs = Vec::new();
+        while let Some(b) = merger.next_batch(&self.keys)? {
+            outs.push(b);
+        }
+        drop(spill_dir); // 清理临时文件
+        spill::concat_batches(&outs, &self.schema)
     }
+}
+
+/// 纯内存排序：concat → lexsort → take。
+fn sort_in_memory(batches: Vec<RecordBatch>, schema: &SchemaRef) -> Result<RecordBatch> {
+    if batches.is_empty() {
+        return Ok(RecordBatch::new_empty(Arc::clone(schema)));
+    }
+    if batches.len() == 1 {
+        return Ok(batches.into_iter().next().unwrap());
+    }
+    let n_cols = schema.fields().len();
+    let mut cols = Vec::with_capacity(n_cols);
+    for c in 0..n_cols {
+        let parts: Vec<&dyn Array> = batches.iter().map(|b| b.column(c).as_ref()).collect();
+        cols.push(concat(&parts).map_err(|e| QsdbError::invalid(format!("concat: {e}")))?);
+    }
+    let n: usize = batches.iter().map(|b| b.num_rows()).sum();
+    RecordBatch::try_new_with_options(
+        Arc::clone(schema),
+        cols,
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(n)),
+    )
+    .map_err(|e| QsdbError::invalid(format!("concat batch: {e}")))
 }
 
 impl ExecNode for SortExec {

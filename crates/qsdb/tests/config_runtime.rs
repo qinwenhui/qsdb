@@ -55,12 +55,18 @@ fn runtime_memory_limit_hot() {
     db.sql("CREATE TABLE t (dt DATE, v BIGINT) PARTITIONED BY (dt)")
         .unwrap();
     db.sql("INSERT INTO t VALUES (DATE '2026-01-01', 1), (DATE '2026-01-02', 2), (DATE '2026-01-03', 3)").unwrap();
-    db.runtime().set_query_memory_limit_bytes(1); // 1 字节：任何物化即超
-    let err = match db.sql("SELECT v FROM t ORDER BY v") {
-        Err(e) => e,
-        Ok(_) => panic!("expected memory limit"),
-    };
-    assert!(matches!(err, QsdbError::QueryMemoryLimit(_)), "{err}");
+    // ORDER BY 在 1 字节上限下经 spill 外排完成（不再因超限终止）
+    db.runtime().set_query_memory_limit_bytes(1);
+    let out = db.sql_collect("SELECT v FROM t ORDER BY v").unwrap();
+    let rows: Vec<String> = out
+        .iter()
+        .flat_map(|b| {
+            (0..b.num_rows()).map(|i| {
+                arrow::util::display::array_value_to_string(b.column(0).as_ref(), i).unwrap()
+            })
+        })
+        .collect();
+    assert_eq!(rows, vec!["1", "2", "3"]);
     db.runtime().set_query_memory_limit_bytes(0); // 关
     assert!(db.sql("SELECT v FROM t ORDER BY v").is_ok());
     std::fs::remove_dir_all(&root).ok();

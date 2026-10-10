@@ -93,15 +93,30 @@ fn cancel_mid_query() {
 }
 
 #[test]
-fn memory_limit_terminates_sort() {
+fn memory_limit_spills_sort() {
     let (db, root) = seeded_db("memlimit", 64);
-    // 限制 1KB：排序物化首批（>8KB）即触发
+    // 限制 1KB：排序经 spill 外排完成（M4-6 语义从「终止」升级为「落盘完成」）
     let ctx = QueryContext::new("m1", None, Some(1024));
-    let err = match db.sql_with_context("SELECT v FROM t ORDER BY v", &ctx) {
-        Err(e) => e,
-        Ok(_) => panic!("expected timeout error"),
+    let out = db
+        .sql_with_context("SELECT v FROM t ORDER BY v", &ctx)
+        .unwrap();
+    let batches = match &out {
+        qsdb::sql::SqlResult::Query { batches, .. } => batches,
+        qsdb::sql::SqlResult::Ok { .. } => panic!("expected query result"),
     };
-    assert!(matches!(err, QsdbError::QueryMemoryLimit(_)), "{err}");
+    let rows: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            (0..b.num_rows()).map(|i| {
+                arrow::util::display::array_value_to_string(b.column(0).as_ref(), i).unwrap()
+            })
+        })
+        .collect();
+    let nums: Vec<i64> = rows.iter().map(|v| v.parse().unwrap()).collect();
+    let mut sorted = nums.clone();
+    sorted.sort();
+    assert_eq!(nums, sorted, "spill 排序结果必须（数值）有序");
+    assert_eq!(nums.len(), 64);
     // 不限内存的同查询成功
     let ok = db.sql_collect("SELECT v FROM t ORDER BY v");
     assert!(ok.is_ok());
