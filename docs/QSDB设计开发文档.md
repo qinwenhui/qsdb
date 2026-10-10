@@ -528,8 +528,29 @@ GET  /health | /metrics   # prometheus 文本：行数/字节数/段数/缓存�
 - HashJoin（build/probe、广播小表）、SQL-2、外排 spill、bloom filter（等值点查）、S3/HDFS backend、distinct_count HLL。
 - **Gate**：TPC-H 子集（当时语法范围内）对比报告；spill 下 10× 内存超限查询可完成。
 
-### M5（按需）：生态与极限
-- SQL-3（窗口/CTE/UDF）、Arrow Flight、SIMD 定制热点内核、约束系统、GPU feature（Vulkan 优先）。
+### M5（按需）：生态与极限 ✅ 已完成（2026-10-10，范围用户定案）
+- 落地：SQL-3 补全（窗口基础集+后置项：多 spec/同名区分/LAG-LEAD/嵌表达式/聚合上窗口；
+  CTE 链式引用+嵌套 WITH+JOIN 右侧；嵌套子查询：FROM 派生表/JOIN 右派生表/标量子查询/
+  IN 值列表；UDF+UDAF 注册）、约束系统（NOT NULL 强制/CHECK/UNIQUE·PK 显式后置）、
+  ALTER TABLE ADD COLUMN（只加不删+旧 segment 缺列补 NULL 读+宽松写，format-spec §7.1）、
+  Arrow Flight（feature-gated，h2c 独立口，do_get/get_flight_info/get_schema/do_put）。
+- 定案后置：S3/HDFS backend（写提交协议依赖本地锁+rename 原子性，远端需重设计——
+  lease 锁+conditional put，M6 候选）；SIMD 热点内核（等 gate 数据定热点）；
+  GPU feature（用户定案后置）；EXISTS/IN 子查询（需 semi-join）、关联子查询。
+- **Gate（实测，同机 40M 行×7 列×8 分区，18 线程口径；机器中等负载）**：
+  - ✅ M4 核心路径零回归：点查 **10.08x 反超**（M4 8.8x）、aggregate **1.18x 反超**
+    （M4 1.25-1.78x 区间内）、过滤扫描 0.86x（M4 0.74x 同级，≥0.5x 目标持续达成）、
+    group by 0.37x（M4 0.38x——已知差距项，M5 未触碰扫描/聚合热路径）；
+  - ✅ M5 特性开销（8M 行实测）：约束写开销 **0.99x（零）**（NOT NULL 位图 O(1)+
+    CHECK 每批一次求值）；CTE vs 派生表 **1.00x**；窗口 row_number 2.25x 于等价
+    ORDER BY 基线（物化窗口 v1 预期内）；UDAF 串行物化路径 18x 于内置状态机
+    （设计如此——核心聚合热路径零改动，文档化）；
+  - ✅ LIMIT 0 schema 契约（同步工具 schema 协商依赖）测试锁定；
+  - ⚠️ **二进制红线**：默认 feature release 24.1MB，超红线 24MB 0.1MB
+    （M4 gate 23.6MB + M5 SQL-3 核心代码 ~0.5MB；strip=symbols 已开）。
+    处置待用户定案：调整红线至 25MB（范围驱动）或 M6 瘦身。flight feature 构建
+    25.3MB（默认关闭，不计红线）；
+  - ✅ 165 测试全绿、clippy 干净（默认+flight 双模式）。
 
 ---
 
