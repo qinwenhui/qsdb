@@ -27,6 +27,13 @@ pub fn set_cte_batches(map: std::collections::HashMap<u32, Vec<RecordBatch>>) {
     });
 }
 
+/// 增量写入单个 CTE 批（链式 CTE：后物化者读取先物化者的缓存）。
+pub fn add_cte_batches(cte_id: u32, batches: Vec<RecordBatch>) {
+    CTE_BATCHES.with(|c| {
+        c.borrow_mut().insert(cte_id, batches);
+    });
+}
+
 /// 一次性批执行节点（并行聚合结果）。
 struct OneShotExec {
     batch: Option<RecordBatch>,

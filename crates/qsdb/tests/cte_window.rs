@@ -101,6 +101,67 @@ fn cte_dead_and_shadow() {
 }
 
 #[test]
+fn cte_chained_and_join_right() {
+    let (db, root) = setup("cte3");
+    db.sql("CREATE TABLE sales (dt DATE, tenant STRING, amt BIGINT) PARTITIONED BY (dt)")
+        .unwrap();
+    db.sql(
+        "INSERT INTO sales VALUES
+        (DATE '2026-01-01', 'a', 10), (DATE '2026-01-01', 'b', 20),
+        (DATE '2026-01-02', 'a', 30), (DATE '2026-01-02', 'c', 40)",
+    )
+    .unwrap();
+
+    // 链式引用：s2 引用 s1（后定义引用先定义）；s1: b/a/c → 20+30+40 = 90
+    let r = q(
+        &db,
+        "WITH s1 AS (SELECT tenant, amt FROM sales WHERE amt > 15),
+              s2 AS (SELECT sum(amt) AS t FROM s1)
+         SELECT t FROM s2",
+    );
+    assert_eq!(r, vec!["90"]);
+
+    // 三级链：s3 引用 s2 引用 s1；s1: a 行 10+30=40 → ×2 = 80
+    let r = q(
+        &db,
+        "WITH s1 AS (SELECT amt FROM sales WHERE tenant = 'a'),
+              s2 AS (SELECT sum(amt) AS t FROM s1),
+              s3 AS (SELECT t * 2 AS t2 FROM s2)
+         SELECT t2 FROM s3",
+    );
+    assert_eq!(r, vec!["80"]);
+
+    // CTE 内自带 WITH（嵌套）：inner1: 30+40 = 70
+    let r = q(
+        &db,
+        "WITH outer1 AS (
+             WITH inner1 AS (SELECT amt FROM sales WHERE amt > 25)
+             SELECT sum(amt) AS t FROM inner1)
+         SELECT t FROM outer1",
+    );
+    assert_eq!(r, vec!["70"]);
+
+    // CTE 做 JOIN 右侧（等值）：totals a=40, b=20, c=40
+    let r = q(
+        &db,
+        "WITH totals AS (SELECT tenant, sum(amt) AS total FROM sales GROUP BY tenant)
+         SELECT sales.tenant, totals.total FROM sales JOIN totals ON sales.tenant = totals.tenant
+         ORDER BY sales.tenant, totals.total",
+    );
+    assert_eq!(r, vec!["a|40", "a|40", "b|20", "c|40"]);
+
+    // 同一 CTE 主 FROM + JOIN 右侧共享一次物化
+    let r = q(
+        &db,
+        "WITH s1 AS (SELECT tenant, amt FROM sales)
+         SELECT count(*) FROM s1 JOIN s1 AS other ON s1.amt = other.amt",
+    );
+    // amt 各不相同 → 等值自连接每行恰匹配 1 行 → 4
+    assert_eq!(r, vec!["4"]);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn window_row_number() {
     let (db, root) = setup("win1");
     db.sql("CREATE TABLE t (dt DATE, uid BIGINT, amt BIGINT) PARTITIONED BY (dt)")

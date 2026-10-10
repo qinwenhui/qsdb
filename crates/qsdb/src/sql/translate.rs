@@ -673,6 +673,10 @@ pub struct CteDef {
     pub plan: LogicalPlan,
 }
 
+/// 可见 CTE 表：本级已构建项 + 祖先级传递（链式引用）。
+/// (cte_id, 输出列)——完整计划在 CteDef 中。
+type VisibleCtes = std::collections::HashMap<String, (u32, Vec<(String, LogicalType)>)>;
+
 pub fn translate_select_full(
     q: sqlparser::ast::Query,
     resolver: &TableResolver,
@@ -683,6 +687,76 @@ pub fn translate_select_full(
 pub fn translate_select_full_with_ctes(
     q: sqlparser::ast::Query,
     resolver: &TableResolver,
+) -> Result<(LogicalPlan, Vec<CteDef>)> {
+    let ancestors: VisibleCtes = std::collections::HashMap::new();
+    translate_select_inner(q, resolver, &ancestors)
+}
+
+/// 表源解析：CTE 优先（本级 → 祖先），退回实表 Scan。
+fn resolve_table_source(
+    name: &str,
+    visible: &VisibleCtes,
+    resolver: &TableResolver,
+) -> Result<(LogicalPlan, SchemaCtx)> {
+    if let Some((id, cols)) = visible.get(name) {
+        return Ok((
+            LogicalPlan::Values {
+                columns: cols.clone(),
+                cte_id: *id,
+            },
+            SchemaCtx { cols: cols.clone() },
+        ));
+    }
+    let def = (resolver.resolve)(name)?;
+    Ok((
+        LogicalPlan::Scan {
+            def: Arc::clone(&def),
+            predicate: None,
+        },
+        SchemaCtx::from_table(&def),
+    ))
+}
+
+/// 过滤未被引用的 CTE（dead CTE 不物化）：
+/// 从主计划收集 Values 引用，沿 CteDef.plan 传递闭包。
+fn filter_reachable_ctes(defs: Vec<CteDef>, main: &LogicalPlan) -> Vec<CteDef> {
+    fn collect_refs(p: &LogicalPlan, out: &mut Vec<u32>) {
+        match p {
+            LogicalPlan::Values { cte_id, .. } => out.push(*cte_id),
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Distinct { input }
+            | LogicalPlan::Window { input, .. } => collect_refs(input, out),
+            LogicalPlan::Join { left, right, .. }
+            | LogicalPlan::CrossJoinFilter { left, right, .. } => {
+                collect_refs(left, out);
+                collect_refs(right, out);
+            }
+            LogicalPlan::Scan { .. } => {}
+        }
+    }
+    let mut keep = std::collections::HashSet::new();
+    let mut queue = Vec::new();
+    collect_refs(main, &mut queue);
+    while let Some(id) = queue.pop() {
+        if keep.insert(id) {
+            if let Some(d) = defs.iter().find(|d| d.cte_id == id) {
+                collect_refs(&d.plan, &mut queue);
+            }
+        }
+    }
+    defs.into_iter()
+        .filter(|d| keep.contains(&d.cte_id))
+        .collect()
+}
+
+fn translate_select_inner(
+    q: sqlparser::ast::Query,
+    resolver: &TableResolver,
+    ancestors: &VisibleCtes,
 ) -> Result<(LogicalPlan, Vec<CteDef>)> {
     use sqlparser::ast::*;
 
@@ -707,62 +781,37 @@ pub fn translate_select_full_with_ctes(
             )));
         }
     };
-    // CTE（非递归）：WITH name AS (...) 内联展开为子计划
-    let mut cte_plans: std::collections::HashMap<
-        String,
-        (LogicalPlan, Vec<(String, LogicalType)>),
-    > = std::collections::HashMap::new();
+    // CTE（非递归）：WITH name AS (...) 内联展开为子计划。
+    // 定义期即分配 cte_id；祖先 CTE 可见（后定义可引用先定义，链式）。
+    let mut visible: VisibleCtes = ancestors.clone();
     let mut cte_defs: Vec<CteDef> = Vec::new();
     if let Some(with) = &q.with {
         if with.recursive {
             return Err(QsdbError::unsupported("recursive CTE"));
         }
-        let mut defs: Vec<CteDef> = Vec::new();
         for cte in &with.cte_tables {
             let name = cte.alias.name.value.clone();
-            if cte_plans.contains_key(&name) || (resolver.resolve)(&name).is_ok() {
+            if visible.contains_key(&name) || (resolver.resolve)(&name).is_ok() {
                 return Err(QsdbError::unsupported("recursive or duplicate CTE"));
             }
-            let sub = translate_select_full(*cte.query.clone(), resolver)?;
+            let (sub, mut child_defs) =
+                translate_select_inner(*cte.query.clone(), resolver, &visible)?;
             let cols = plan_output_columns(&sub)?;
-            cte_plans.insert(name, (sub.clone(), cols.clone()));
-            defs.push(CteDef {
-                cte_id: u32::MAX, // 哨兵：主查询 FROM 未引用时保持 MAX
-                columns: cols,
+            let id = next_cte_id();
+            // 子级 WITH 的 CTE 先入列（执行层按序物化，被引用者在前）
+            cte_defs.append(&mut child_defs);
+            cte_defs.push(CteDef {
+                cte_id: id,
+                columns: cols.clone(),
                 plan: sub,
             });
+            visible.insert(name, (id, cols));
         }
-        cte_defs = defs;
     }
 
-    // FROM 主表：CTE 名优先
+    // FROM 主表：CTE 优先（本级 → 祖先），退回实表
     let (mut plan, mut ctx): (LogicalPlan, SchemaCtx) =
-        if let Some((_sub, cols)) = cte_plans.get(&table) {
-            let id = next_cte_id();
-            // 同步 CteDef 的 id（执行层按 id 匹配；用列名匹配定位）
-            if let Some(d) = cte_defs
-                .iter_mut()
-                .find(|d| d.columns.as_slice() == cols.as_slice())
-            {
-                d.cte_id = id;
-            }
-            (
-                LogicalPlan::Values {
-                    columns: cols.clone(),
-                    cte_id: id,
-                },
-                SchemaCtx { cols: cols.clone() },
-            )
-        } else {
-            let def = (resolver.resolve)(&table)?;
-            (
-                LogicalPlan::Scan {
-                    def: Arc::clone(&def),
-                    predicate: None,
-                },
-                SchemaCtx::from_table(&def),
-            )
-        };
+        resolve_table_source(&table, &visible, resolver)?;
 
     // JOIN 链（SQL-2：等值 INNER/LEFT）
     for join in &select.from[0].joins {
@@ -779,32 +828,59 @@ pub fn translate_select_full_with_ctes(
                 )));
             }
         };
-        let right_name = match &join.relation {
+        let (right_name, right_orig) = match &join.relation {
             TableFactor::Table { name, alias, .. } => match alias {
-                Some(a) => a.name.value.clone(),
-                None => object_name_single(name.clone())?,
+                Some(a) => (a.name.value.clone(), object_name_single(name.clone())?),
+                None => {
+                    let n = object_name_single(name.clone())?;
+                    (n.clone(), n)
+                }
             },
             other => return Err(QsdbError::unsupported(format!("JOIN target {other:?}"))),
         };
-        let right_def = (resolver.resolve)(&right_name)?;
+        // 右侧源：CTE 优先（别名 → 原名 → 祖先），退回实表
+        let right_lookup = if visible.contains_key(&right_name) {
+            right_name.clone()
+        } else {
+            right_orig
+        };
+        let (right_plan, right_cols): (LogicalPlan, Vec<(String, LogicalType)>) =
+            if let Some((id, cols)) = visible.get(&right_lookup) {
+                (
+                    LogicalPlan::Values {
+                        columns: cols.clone(),
+                        cte_id: *id,
+                    },
+                    cols.clone(),
+                )
+            } else {
+                let right_def = (resolver.resolve)(&right_name)?;
+                (
+                    LogicalPlan::Scan {
+                        def: Arc::clone(&right_def),
+                        predicate: None,
+                    },
+                    right_def
+                        .columns
+                        .iter()
+                        .map(|c| (c.name.clone(), c.logical_type.clone()))
+                        .collect(),
+                )
+            };
         let sqlparser::ast::JoinConstraint::On(on_expr) = constraint else {
             return Err(QsdbError::unsupported("JOIN ... ON <equi-cond> required"));
         };
         // ctx 扩展：右表列仅以限定名注册（table.col），顺序 = join 输出右段。
         // 非限定右列引用不支持（SQL-2 约束，歧义保护）。
         let n_left_plain = ctx.cols.iter().filter(|(n, _)| !n.contains('.')).count();
-        for c in &right_def.columns {
-            ctx.cols
-                .push((format!("{right_name}.{}", c.name), c.logical_type.clone()));
+        for (cn, ct) in &right_cols {
+            ctx.cols.push((format!("{right_name}.{cn}"), ct.clone()));
         }
         match split_equi_condition(on_expr, n_left_plain, &ctx) {
             Ok((lkey, rkey)) => {
                 plan = LogicalPlan::Join {
                     left: Box::new(plan),
-                    right: Box::new(LogicalPlan::Scan {
-                        def: Arc::clone(&right_def),
-                        predicate: None,
-                    }),
+                    right: Box::new(right_plan),
                     left_keys: vec![lkey],
                     right_keys: vec![rkey],
                     join_type: jt,
@@ -818,10 +894,7 @@ pub fn translate_select_full_with_ctes(
                 }
                 plan = LogicalPlan::CrossJoinFilter {
                     left: Box::new(plan),
-                    right: Box::new(LogicalPlan::Scan {
-                        def: Arc::clone(&right_def),
-                        predicate: None,
-                    }),
+                    right: Box::new(right_plan),
                     predicate: combined,
                 };
             }
@@ -1154,7 +1227,8 @@ pub fn translate_select_full_with_ctes(
         }
     }
 
-    Ok((plan, cte_defs))
+    let defs = filter_reachable_ctes(cte_defs, &plan);
+    Ok((plan, defs))
 }
 
 fn proj_exprs_len_before(plan: &LogicalPlan) -> usize {

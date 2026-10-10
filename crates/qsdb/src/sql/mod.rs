@@ -247,12 +247,12 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
                 resolve: Box::new(|name: &str| db.table_def(name)),
             };
             let (plan, cte_defs) = translate::translate_select_full_with_ctes(*q, &resolver)?;
-            // CTE 物化：执行每个 CTE 子计划 → 批缓存（cte_id → Vec<RecordBatch>）
-            let mut cte_batches: std::collections::HashMap<u32, Vec<RecordBatch>> =
-                std::collections::HashMap::new();
+            // CTE 物化：按定义序执行每个 CTE 子计划 → 批缓存（cte_id → Vec<RecordBatch>）。
+            // 增量装入：链式 CTE（引用先定义者）物化时缓存已可读。
+            exec_builder::set_cte_batches(std::collections::HashMap::new());
             for cte in &cte_defs {
                 if cte.cte_id == u32::MAX {
-                    continue; // 主查询未引用该 CTE（dead CTE）
+                    continue; // 防御：translate 已过滤 dead CTE
                 }
                 let ctx = crate::query::QueryContext::benign();
                 let mut exec = exec_builder::build(db, &cte.plan, &ctx)?;
@@ -260,9 +260,8 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
                 while let Some(b) = exec.next() {
                     batches.push(b?);
                 }
-                cte_batches.insert(cte.cte_id, batches);
+                exec_builder::add_cte_batches(cte.cte_id, batches);
             }
-            exec_builder::set_cte_batches(cte_batches);
             ctx.check()?;
             // M4-4 元数据短路：count(*) + 纯分区列谓词 → manifest O(1) 应答
             if let Some(n) = metadata_shortcut_count(db, &plan)? {
