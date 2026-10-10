@@ -5,7 +5,7 @@
 //! - 聚合类（默认帧 = SQL 标准 RANGE 语义）：SUM / COUNT / MIN / MAX / AVG
 //!   - 无 ORDER BY → 帧为整个分区，每行取分区总值
 //!   - 有 ORDER BY → 无界前驱到当前行（含并列 peer），并列行共享段尾值
-//! - 偏移类（后置）：LAG / LEAD
+//! - 偏移类：LAG / LEAD(arg, offset[, default])——offset 为正整数常量，越出分区取 NULL/default
 //!
 //! 输出列序：输入列 ++ 窗口列（按 SELECT 中出现顺序）。
 //! 输出行序：(PARTITION BY, ORDER BY) 排序后（窗口函数语义允许）。
@@ -15,9 +15,12 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, UInt32Array,
+    UInt32Builder,
+};
 use arrow::compute::kernels::sort::{SortColumn, lexsort_to_indices};
-use arrow::compute::{concat, take};
+use arrow::compute::{concat, interleave, take};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
@@ -27,6 +30,27 @@ use crate::expr::eval;
 use crate::query::QueryContext;
 
 use super::ExecNode;
+
+/// 窗口规格：一个 OVER 子句的 PARTITION BY / ORDER BY（绑定后的物理表达式）。
+/// 多个窗口函数 spec 相同（signature 相等）时可共享同一 Window 节点。
+#[derive(Debug, Clone, Default)]
+pub struct WindowSpec {
+    pub partition_by: Vec<PhysExpr>,
+    pub order_by: Vec<(PhysExpr, bool)>,
+}
+
+impl WindowSpec {
+    /// 绑定签名（表达式 display 串）：分组共享节点的判据。
+    pub fn signature(&self) -> String {
+        let p: Vec<String> = self.partition_by.iter().map(|e| e.display()).collect();
+        let o: Vec<String> = self
+            .order_by
+            .iter()
+            .map(|(e, d)| format!("{}:{d}", e.display()))
+            .collect();
+        format!("{}|{}", p.join(","), o.join(","))
+    }
+}
 
 /// 窗口函数定义（binder 产出）。
 #[derive(Debug, Clone)]
@@ -39,6 +63,10 @@ pub enum WindowFn {
     Min(PhysExpr),
     Max(PhysExpr),
     Avg(PhysExpr),
+    /// lag(arg, offset[, default])：分区内在排序序上取前 offset 行的值
+    Lag(PhysExpr, i64, Option<Box<PhysExpr>>),
+    /// lead(arg, offset[, default])：取后 offset 行的值
+    Lead(PhysExpr, i64, Option<Box<PhysExpr>>),
 }
 
 impl WindowFn {
@@ -52,6 +80,12 @@ impl WindowFn {
             Self::Min(e) => format!("min({})", e.display()),
             Self::Max(e) => format!("max({})", e.display()),
             Self::Avg(e) => format!("avg({})", e.display()),
+            Self::Lag(e, off, None) => format!("lag({}, {off})", e.display()),
+            Self::Lag(e, off, Some(d)) => format!("lag({}, {off}, {})", e.display(), d.display()),
+            Self::Lead(e, off, None) => format!("lead({}, {off})", e.display()),
+            Self::Lead(e, off, Some(d)) => {
+                format!("lead({}, {off}, {})", e.display(), d.display())
+            }
         }
     }
 
@@ -69,6 +103,7 @@ impl WindowFn {
             },
             Self::Avg(_) => LogicalType::Float64,
             Self::Min(e) | Self::Max(e) => e.data_type(),
+            Self::Lag(e, ..) | Self::Lead(e, ..) => e.data_type(),
         }
     }
 }
@@ -179,8 +214,13 @@ impl WindowExec {
                 }),
             });
         }
-        let indices = lexsort_to_indices(&sort_cols, None)
-            .map_err(|e| QsdbError::invalid(format!("window sort: {e}")))?;
+        // 空 spec（OVER ()：无分区无序）→ 恒等序（保持输入行序）
+        let indices = if sort_cols.is_empty() {
+            (0..n as u32).collect::<UInt32Array>()
+        } else {
+            lexsort_to_indices(&sort_cols, None)
+                .map_err(|e| QsdbError::invalid(format!("window sort: {e}")))?
+        };
 
         // 取排序后的输入列
         let sorted_cols: Vec<ArrayRef> = (0..input_batch.num_columns())
@@ -428,6 +468,58 @@ fn compute_window_fn(
             backfill_segments(&mut out, &seg_start);
             Ok(Arc::new(Int64Array::from(out)))
         }
+        WindowFn::Lag(arg, offset, default) | WindowFn::Lead(arg, offset, default) => {
+            let lag = matches!(f, WindowFn::Lag(..));
+            let arg_arr = broadcast_const(eval::eval(arg, sorted_batch)?, n)?;
+            // 分区行区间（行已按分区+序排序）：每行所属分区的首/末行号
+            let mut part_first = vec![0usize; n];
+            let mut part_last = vec![0usize; n];
+            let mut seg = 0usize;
+            for (i, is_start) in partition_start
+                .iter()
+                .enumerate()
+                .chain(std::iter::once((n, &true)))
+            {
+                if *is_start {
+                    for r in seg..i {
+                        part_first[r] = seg;
+                        part_last[r] = i - 1;
+                    }
+                    seg = i;
+                }
+            }
+            // 目标行号：越出分区 → 无（NULL / default）
+            let off = *offset as usize;
+            let mut idx_b = UInt32Builder::with_capacity(n);
+            for i in 0..n {
+                let j = if lag {
+                    i.checked_sub(off)
+                } else {
+                    i.checked_add(off)
+                };
+                match j {
+                    Some(j) if j >= part_first[i] && j <= part_last[i] => {
+                        idx_b.append_value(j as u32);
+                    }
+                    _ => idx_b.append_null(),
+                }
+            }
+            let idx = idx_b.finish();
+            let taken = take(&arg_arr, &idx, None)
+                .map_err(|e| QsdbError::invalid(format!("window lag/lead take: {e}")))?;
+            match default {
+                None => Ok(taken),
+                Some(d) => {
+                    // 越界行取 default（索引为 null 的位置）：0=taken，1=default
+                    let d_arr = broadcast_const(eval::eval(d, sorted_batch)?, n)?;
+                    let pick: Vec<(usize, usize)> = (0..n)
+                        .map(|i| if idx.is_null(i) { (1, i) } else { (0, i) })
+                        .collect();
+                    interleave(&[taken.as_ref(), d_arr.as_ref()], &pick)
+                        .map_err(|e| QsdbError::invalid(format!("window lag/lead default: {e}")))
+                }
+            }
+        }
     }
 }
 
@@ -445,6 +537,16 @@ fn backfill_segments<T: Copy>(out: &mut [T], seg_start: &[bool]) {
         out[i..j].fill(last);
         i = j;
     }
+}
+
+/// 常量（长度 1）数组广播到 n 行（lag/lead 的字面量参数/default）。
+fn broadcast_const(arr: ArrayRef, n: usize) -> Result<ArrayRef> {
+    if arr.len() == n || n == 0 {
+        return Ok(arr);
+    }
+    let pick: Vec<(usize, usize)> = vec![(0, 0); n];
+    interleave(&[arr.as_ref()], &pick)
+        .map_err(|e| QsdbError::invalid(format!("window const broadcast: {e}")))
 }
 
 /// 两行在同一数组上是否相等（null == null 为 true 用于分区边界）。

@@ -913,11 +913,12 @@ pub fn translate_select_full_with_ctes(
     for it in &items {
         collect_aggs(&it.sql, &ctx, &mut aggs)?;
     }
-    // 窗口函数检测（OVER 子句）
-    let mut window_fns: Vec<crate::exec::window::WindowFn> = Vec::new();
+    // 窗口函数收集（AST 级去重；绑定在确定输入上下文后进行）
+    let mut win_calls: Vec<WindowCall> = Vec::new();
     for it in &items {
-        collect_windows(&it.sql, &ctx, &mut window_fns)?;
+        collect_window_calls(&it.sql, &mut win_calls);
     }
+    let has_window = !win_calls.is_empty();
     // HAVING（SQL-2）：对聚合输出过滤
     let mut having_pred: Option<PhysExpr> = None;
     if let Some(h) = &select.having {
@@ -950,34 +951,14 @@ pub fn translate_select_full_with_ctes(
         }
     }
     let is_agg = !aggs.is_empty() || !group_exprs.is_empty();
-    // 窗口函数：若有聚合，窗口在聚合之上；否则直接在输入上
-    let has_window = !window_fns.is_empty();
-    let mut window_partition: Vec<PhysExpr> = Vec::new();
-    let mut window_order: Vec<(PhysExpr, bool)> = Vec::new();
-    if has_window {
-        // 提取第一个 OVER 子句的 PARTITION BY / ORDER BY（所有窗口共用）
-        extract_window_spec(
-            &select.projection,
-            &ctx,
-            &mut window_partition,
-            &mut window_order,
-        )?;
-    }
-
-    // 窗口（无聚合场景：直接在输入上开窗口）
+    // 窗口（无聚合场景：直接在输入上开窗口，按 spec 分组链式叠加）
+    let mut windows: Vec<BoundWindow> = Vec::new();
+    let mut win_cols: Vec<(String, crate::types::LogicalType)> = Vec::new();
     if has_window && !is_agg {
-        plan = LogicalPlan::Window {
-            input: Box::new(plan),
-            partition_by: window_partition,
-            order_by: window_order,
-            window_fns: window_fns.clone(),
-        };
-    }
-    let window_fns_unused_in_agg = is_agg && has_window;
-    if window_fns_unused_in_agg {
-        return Err(QsdbError::unsupported(
-            "window functions over GROUP BY output (aggregate + window in same query) lands later",
-        ));
+        windows = bind_window_calls(&win_calls, &mut |e| bind_expr(e, &ctx))?;
+        let (p, wc) = chain_window_nodes(plan, &windows);
+        plan = p;
+        win_cols = wc;
     }
 
     if is_agg {
@@ -990,24 +971,41 @@ pub fn translate_select_full_with_ctes(
             agg_ctx_cols.push((a.out_name.clone(), a.out_ty.clone()));
         }
         let agg_ctx = SchemaCtx { cols: agg_ctx_cols };
-        // 校验 + 重绑定投影
-        let mut proj_exprs = Vec::with_capacity(items.len());
-        let mut proj_names = Vec::with_capacity(items.len());
-        for it in &items {
-            let rebound = rebind_over_agg(&it.sql, &ctx, &group_exprs, &aggs, &agg_ctx)?;
-            proj_exprs.push(rebound);
-            proj_names.push(it.name.clone());
-        }
         plan = LogicalPlan::Aggregate {
             input: Box::new(plan),
-            group: group_exprs,
-            aggs,
+            group: group_exprs.clone(),
+            aggs: aggs.clone(),
         };
         if let Some(hp) = having_pred {
             plan = LogicalPlan::Filter {
                 input: Box::new(plan),
                 predicate: hp,
             };
+        }
+        // 窗口在聚合输出之上（HAVING 之后）：spec/参数重绑定到聚合输出
+        let mut proj_exprs = Vec::with_capacity(items.len());
+        let mut proj_names = Vec::with_capacity(items.len());
+        let mut win_agg_ctx = SchemaCtx {
+            cols: agg_ctx.cols.clone(),
+        };
+        if has_window {
+            windows = bind_window_calls(&win_calls, &mut |e| {
+                rebind_over_agg(e, &ctx, &group_exprs, &aggs, &agg_ctx)
+            })?;
+            let (p, wc) = chain_window_nodes(plan, &windows);
+            plan = p;
+            win_agg_ctx.cols.extend(wc);
+        }
+        // 投影：窗口调用置换为合成 Identifier 后重绑定（win_agg_ctx 含窗口列）
+        for it in &items {
+            let sub = if has_window {
+                substitute_windows(&it.sql, &windows)
+            } else {
+                it.sql.clone()
+            };
+            let rebound = rebind_over_agg(&sub, &ctx, &group_exprs, &aggs, &win_agg_ctx)?;
+            proj_exprs.push(rebound);
+            proj_names.push(it.name.clone());
         }
         plan = LogicalPlan::Project {
             input: Box::new(plan),
@@ -1017,19 +1015,18 @@ pub fn translate_select_full_with_ctes(
     } else {
         let mut proj_exprs = Vec::with_capacity(items.len());
         let mut proj_names = Vec::with_capacity(items.len());
+        // 投影上下文 = 输入列 ++ 窗口列（链序）；AST 置换后统一按名字绑定
+        let mut proj_ctx = SchemaCtx {
+            cols: ctx.cols.clone(),
+        };
+        proj_ctx.cols.extend(win_cols.iter().cloned());
         for it in &items {
-            // 窗口函数投影：直接生成 Column 引用（idx = 输入列数 + 窗口列序）
-            if let Some(wf_idx) = find_window_fn_index(&it.sql, &window_fns, &ctx) {
-                let input_col_count = ctx.cols.len();
-                let wf = &window_fns[wf_idx];
-                proj_exprs.push(PhysExpr::Column {
-                    idx: input_col_count + wf_idx,
-                    name: wf.output_name(),
-                    ty: wf.output_type(),
-                });
+            let sub = if has_window {
+                substitute_windows(&it.sql, &windows)
             } else {
-                proj_exprs.push(bind_expr(&it.sql, &ctx)?);
-            }
+                it.sql.clone()
+            };
+            proj_exprs.push(bind_expr(&sub, &proj_ctx)?);
             proj_names.push(it.name.clone());
         }
         plan = LogicalPlan::Project {
@@ -1254,104 +1251,327 @@ fn substitute_aliases(
     }
 }
 
-/// 收集 SELECT item 中的窗口函数（OVER 子句）。
-/// 判断 SELECT item 是否是纯窗口函数引用，返回其在 window_fns 中的 idx。
-fn find_window_fn_index(
-    e: &sqlparser::ast::Expr,
-    window_fns: &[crate::exec::window::WindowFn],
-    ctx: &SchemaCtx,
-) -> Option<usize> {
-    use sqlparser::ast::Expr as E;
-    if let E::Function(f) = e {
-        f.over.as_ref()?;
-        let name = f.name.to_string().to_ascii_lowercase();
-        for (i, w) in window_fns.iter().enumerate() {
-            let w_name = w.output_name();
-            // row_number() → row_number()
-            if w_name == name || w_name.starts_with(&format!("{name}(")) {
-                return Some(i);
-            }
-        }
-    }
-    let _ = ctx;
-    None
+// ---------------------------------------------------------------------------
+// 窗口函数：AST 收集 → 绑定（普通 ctx / 聚合重绑定）→ 按 spec 分组链式叠加 → 投影置换
+// ---------------------------------------------------------------------------
+
+/// AST 级窗口调用（未绑定；绑定上下文由调用方决定）。
+#[derive(Clone)]
+struct WindowCall {
+    /// 归一化调用签名 "name(arg,...)"（同名不同参区分）
+    key: String,
+    /// OVER spec 的 AST 签名（同名同参不同 spec 区分）
+    spec_sig: String,
+    f: sqlparser::ast::Function,
 }
 
-fn collect_windows(
-    e: &sqlparser::ast::Expr,
-    ctx: &SchemaCtx,
-    out: &mut Vec<crate::exec::window::WindowFn>,
-) -> Result<()> {
+/// 绑定后的窗口：spec + 函数 + 唯一输出列名（AST 置换的目标标识符）。
+struct BoundWindow {
+    spec: crate::exec::window::WindowSpec,
+    wf: crate::exec::window::WindowFn,
+    key: String,
+    spec_sig: String,
+    /// 输出列名：默认 output_name，重名追加 " #n"
+    name: String,
+}
+
+/// 收集表达式内的窗口调用（含嵌套标量函数参数内）；同调用签名+spec 签名去重。
+fn collect_window_calls(e: &sqlparser::ast::Expr, out: &mut Vec<WindowCall>) {
     use sqlparser::ast::Expr as E;
     match e {
-        E::Function(f) if f.over.is_some() => {
-            let name = f.name.to_string().to_ascii_lowercase();
-            let fn_def = match name.as_str() {
-                "row_number" | "rownum" => crate::exec::window::WindowFn::RowNumber,
-                "rank" => crate::exec::window::WindowFn::Rank,
-                "dense_rank" => crate::exec::window::WindowFn::DenseRank,
-                "sum" | "count" | "min" | "max" | "avg" => {
-                    let arg = match fn_args(f).first() {
-                        Some(sqlparser::ast::FunctionArg::Unnamed(
-                            sqlparser::ast::FunctionArgExpr::Expr(inner),
-                        )) => bind_expr(&inner.clone(), ctx)?,
-                        _ => return Err(QsdbError::invalid("window agg needs an argument")),
-                    };
-                    match name.as_str() {
-                        "sum" => crate::exec::window::WindowFn::Sum(arg),
-                        "count" => crate::exec::window::WindowFn::Count(arg),
-                        "min" => crate::exec::window::WindowFn::Min(arg),
-                        "max" => crate::exec::window::WindowFn::Max(arg),
-                        _ => crate::exec::window::WindowFn::Avg(arg),
-                    }
+        E::Function(f) => {
+            if f.over.is_some() {
+                let c = WindowCall {
+                    key: window_call_key(f),
+                    spec_sig: window_spec_sig(f),
+                    f: f.clone(),
+                };
+                if !out
+                    .iter()
+                    .any(|x| x.key == c.key && x.spec_sig == c.spec_sig)
+                {
+                    out.push(c);
                 }
-                other => {
-                    return Err(QsdbError::unsupported(format!(
-                        "window function '{other}' (support: row_number/rank/dense_rank/sum/count/min/max/avg)"
-                    )));
+                return;
+            }
+            for a in fn_args(f) {
+                if let sqlparser::ast::FunctionArg::Unnamed(
+                    sqlparser::ast::FunctionArgExpr::Expr(inner),
+                ) = a
+                {
+                    collect_window_calls(inner, out);
                 }
-            };
-            out.push(fn_def);
-            Ok(())
+            }
         }
         E::BinaryOp { left, right, .. } => {
-            collect_windows(left, ctx, out)?;
-            collect_windows(right, ctx, out)
+            collect_window_calls(left, out);
+            collect_window_calls(right, out);
         }
-        E::Nested(inner) => collect_windows(inner, ctx, out),
-        E::Cast { expr, .. } => collect_windows(expr, ctx, out),
-        _ => Ok(()),
+        E::Nested(inner) => collect_window_calls(inner, out),
+        E::Cast { expr, .. } => collect_window_calls(expr, out),
+        E::UnaryOp { expr, .. } => collect_window_calls(expr, out),
+        E::IsNull(inner) | E::IsNotNull(inner) => collect_window_calls(inner, out),
+        _ => {}
     }
 }
 
-/// 从 SELECT 投影中提取第一个 OVER 的 PARTITION BY / ORDER BY。
-fn extract_window_spec(
-    projection: &[sqlparser::ast::SelectItem],
-    ctx: &SchemaCtx,
-    partition_by: &mut Vec<PhysExpr>,
-    order_by: &mut Vec<(PhysExpr, bool)>,
-) -> Result<()> {
-    use sqlparser::ast::*;
-    for item in projection {
-        let expr = match item {
-            SelectItem::UnnamedExpr(e) => e,
-            SelectItem::ExprWithAlias { expr, .. } => expr,
-            _ => continue,
-        };
-        if let Expr::Function(f) = expr {
-            if let Some(WindowType::WindowSpec(spec)) = &f.over {
-                for p in &spec.partition_by {
-                    partition_by.push(bind_expr(p, ctx)?);
-                }
-                for ob in &spec.order_by {
-                    let desc = matches!(&ob.options.sort, Some(sqlparser::ast::OrderBySort::Desc));
-                    order_by.push((bind_expr(&ob.expr, ctx)?, desc));
-                }
-                return Ok(());
+/// 归一化调用签名：name(arg1,arg2)，全小写。
+fn window_call_key(f: &sqlparser::ast::Function) -> String {
+    let args: Vec<String> = fn_args(f)
+        .iter()
+        .filter_map(|a| match a {
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => {
+                Some(e.to_string().to_ascii_lowercase())
             }
+            _ => None,
+        })
+        .collect();
+    format!(
+        "{}({})",
+        f.name.to_string().to_ascii_lowercase(),
+        args.join(",")
+    )
+}
+
+/// OVER spec 的 AST 签名（小写；named window 后置）。
+fn window_spec_sig(f: &sqlparser::ast::Function) -> String {
+    if let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = &f.over {
+        let p: Vec<String> = spec
+            .partition_by
+            .iter()
+            .map(|e| e.to_string().to_ascii_lowercase())
+            .collect();
+        let o: Vec<String> = spec
+            .order_by
+            .iter()
+            .map(|ob| {
+                let desc = matches!(&ob.options.sort, Some(sqlparser::ast::OrderBySort::Desc));
+                format!("{}:{desc}", ob.expr.to_string().to_ascii_lowercase())
+            })
+            .collect();
+        format!("p[{}]o[{}]", p.join(","), o.join(","))
+    } else {
+        "named-window".into()
+    }
+}
+
+/// AST 置换：窗口调用 → 合成 Identifier（引用窗口输出列，名字绑定层唯一化）。
+/// 覆盖 collect_window_calls 的全部形态；纯窗口项同样置换（统一走名字绑定）。
+fn substitute_windows(e: &sqlparser::ast::Expr, windows: &[BoundWindow]) -> sqlparser::ast::Expr {
+    use sqlparser::ast::Expr as E;
+    match e {
+        E::Function(f) => {
+            if f.over.is_some() {
+                let key = window_call_key(f);
+                let sig = window_spec_sig(f);
+                if let Some(w) = windows.iter().find(|w| w.key == key && w.spec_sig == sig) {
+                    return E::Identifier(sqlparser::ast::Ident::new(w.name.clone()));
+                }
+                return e.clone();
+            }
+            // 嵌套在标量函数参数里的窗口（abs(sum(x) OVER (...))）
+            let mut nf = f.clone();
+            let new_args: Vec<sqlparser::ast::FunctionArg> = fn_args(f)
+                .iter()
+                .map(|a| match a {
+                    sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(inner),
+                    ) => sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(substitute_windows(inner, windows)),
+                    ),
+                    other => other.clone(),
+                })
+                .collect();
+            if let sqlparser::ast::FunctionArguments::List(l) = &mut nf.args {
+                l.args = new_args;
+            }
+            E::Function(nf)
+        }
+        E::BinaryOp { left, op, right } => E::BinaryOp {
+            left: Box::new(substitute_windows(left, windows)),
+            op: op.clone(),
+            right: Box::new(substitute_windows(right, windows)),
+        },
+        E::Nested(inner) => E::Nested(Box::new(substitute_windows(inner, windows))),
+        E::UnaryOp { expr, .. } => {
+            let inner = substitute_windows(expr, windows);
+            let mut u = e.clone();
+            if let E::UnaryOp { expr: slot, .. } = &mut u {
+                **slot = inner;
+            }
+            u
+        }
+        E::Cast { expr, .. } => {
+            let inner = substitute_windows(expr, windows);
+            let mut c = e.clone();
+            if let E::Cast { expr: slot, .. } = &mut c {
+                **slot = inner;
+            }
+            c
+        }
+        E::IsNull(inner) => E::IsNull(Box::new(substitute_windows(inner, windows))),
+        E::IsNotNull(inner) => E::IsNotNull(Box::new(substitute_windows(inner, windows))),
+        other => other.clone(),
+    }
+}
+
+/// 绑定全部窗口调用（bind 决定上下文：普通 ctx 或聚合重绑定）+ 输出列名唯一化。
+fn bind_window_calls(
+    calls: &[WindowCall],
+    bind: &mut dyn FnMut(&sqlparser::ast::Expr) -> Result<PhysExpr>,
+) -> Result<Vec<BoundWindow>> {
+    let mut out = Vec::with_capacity(calls.len());
+    for c in calls {
+        let spec = parse_window_spec(&c.f, bind)?;
+        let wf = parse_window_fn(&c.f, bind)?;
+        out.push(BoundWindow {
+            spec,
+            wf,
+            key: c.key.clone(),
+            spec_sig: c.spec_sig.clone(),
+            name: String::new(),
+        });
+    }
+    for i in 0..out.len() {
+        let base = out[i].wf.output_name();
+        let dup = out[..i].iter().filter(|w| w.name == base).count();
+        out[i].name = if dup == 0 {
+            base
+        } else {
+            format!("{base} #{}", dup + 1)
+        };
+    }
+    Ok(out)
+}
+
+/// 解析 OVER spec（PARTITION BY / ORDER BY 经 bind 绑定）。
+fn parse_window_spec(
+    f: &sqlparser::ast::Function,
+    bind: &mut dyn FnMut(&sqlparser::ast::Expr) -> Result<PhysExpr>,
+) -> Result<crate::exec::window::WindowSpec> {
+    if let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = &f.over {
+        let mut partition_by = Vec::new();
+        for p in &spec.partition_by {
+            partition_by.push(bind(p)?);
+        }
+        let mut order_by = Vec::new();
+        for ob in &spec.order_by {
+            let desc = matches!(&ob.options.sort, Some(sqlparser::ast::OrderBySort::Desc));
+            order_by.push((bind(&ob.expr)?, desc));
+        }
+        Ok(crate::exec::window::WindowSpec {
+            partition_by,
+            order_by,
+        })
+    } else {
+        Err(QsdbError::unsupported("named window (WINDOW 子句)"))
+    }
+}
+
+/// 解析窗口函数本体（参数经 bind 绑定）。
+fn parse_window_fn(
+    f: &sqlparser::ast::Function,
+    bind: &mut dyn FnMut(&sqlparser::ast::Expr) -> Result<PhysExpr>,
+) -> Result<crate::exec::window::WindowFn> {
+    use crate::exec::window::WindowFn as W;
+    let name = fn_name(f);
+    let arg_exprs: Vec<sqlparser::ast::Expr> = fn_args(f)
+        .iter()
+        .filter_map(|a| match a {
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => {
+                Some(e.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    match name.as_str() {
+        "row_number" | "rownum" => Ok(W::RowNumber),
+        "rank" => Ok(W::Rank),
+        "dense_rank" => Ok(W::DenseRank),
+        "sum" | "count" | "min" | "max" | "avg" => {
+            let first = arg_exprs
+                .first()
+                .ok_or_else(|| QsdbError::invalid("window agg needs an argument"))?;
+            let arg = bind(first)?;
+            Ok(match name.as_str() {
+                "sum" => W::Sum(arg),
+                "count" => W::Count(arg),
+                "min" => W::Min(arg),
+                "max" => W::Max(arg),
+                _ => W::Avg(arg),
+            })
+        }
+        "lag" | "lead" => {
+            let first = arg_exprs
+                .first()
+                .ok_or_else(|| QsdbError::invalid("lag/lead needs an argument"))?;
+            let arg = bind(first)?;
+            // offset：正整数常量（默认 1）
+            let offset = match arg_exprs.get(1) {
+                None => 1i64,
+                Some(sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan {
+                    value: sqlparser::ast::Value::Number(s, _),
+                    ..
+                })) => {
+                    let v: i64 = s.parse().map_err(|_| {
+                        QsdbError::invalid(format!("lag/lead offset '{s}' not an integer"))
+                    })?;
+                    if v <= 0 {
+                        return Err(QsdbError::invalid("lag/lead offset must be positive"));
+                    }
+                    v
+                }
+                Some(_) => {
+                    return Err(QsdbError::invalid(
+                        "lag/lead offset must be an integer literal",
+                    ));
+                }
+            };
+            // default：绑定后 cast 到参数类型
+            let default = match arg_exprs.get(2) {
+                None => None,
+                Some(d) => Some(Box::new(bind(d)?.cast_to(arg.data_type()))),
+            };
+            Ok(if name == "lag" {
+                W::Lag(arg, offset, default)
+            } else {
+                W::Lead(arg, offset, default)
+            })
+        }
+        other => Err(QsdbError::unsupported(format!(
+            "window function '{other}' (support: row_number/rank/dense_rank/sum/count/min/max/avg/lag/lead)"
+        ))),
+    }
+}
+
+/// 按 spec 绑定签名分组，链式叠加 Window 节点（spec 共享一节点）；
+/// 返回窗口输出列（列名, 类型）按链序（组间首见序、组内收集序）。
+fn chain_window_nodes(
+    plan: LogicalPlan,
+    windows: &[BoundWindow],
+) -> (LogicalPlan, Vec<(String, crate::types::LogicalType)>) {
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (i, w) in windows.iter().enumerate() {
+        let sig = w.spec.signature();
+        match groups.iter_mut().find(|(s, _)| *s == sig) {
+            Some((_, idxs)) => idxs.push(i),
+            None => groups.push((sig, vec![i])),
         }
     }
-    Ok(())
+    let mut plan = plan;
+    let mut cols = Vec::new();
+    for (_, idxs) in &groups {
+        plan = LogicalPlan::Window {
+            input: Box::new(plan),
+            partition_by: windows[idxs[0]].spec.partition_by.clone(),
+            order_by: windows[idxs[0]].spec.order_by.clone(),
+            window_fns: idxs.iter().map(|&i| windows[i].wf.clone()).collect(),
+        };
+        for &i in idxs {
+            cols.push((windows[i].name.clone(), windows[i].wf.output_type()));
+        }
+    }
+    (plan, cols)
 }
 
 fn expr_display(e: &sqlparser::ast::Expr) -> String {
@@ -1797,7 +2017,7 @@ fn try_bind_agg(f: &sqlparser::ast::Function, ctx: &SchemaCtx) -> Result<Option<
         return Ok(None);
     }
     if f.over.is_some() {
-        return Ok(None); // 窗口函数不作为聚合处理（由 collect_windows / 投影拦截）
+        return Ok(None); // 窗口函数不作为聚合处理（由 collect_window_calls / 投影置换接管）
     }
     let func = match name.as_str() {
         "count" => AggFunc::Count,
@@ -1857,6 +2077,15 @@ fn collect_aggs(e: &sqlparser::ast::Expr, ctx: &SchemaCtx, aggs: &mut Vec<AggExp
                 ) = a
                 {
                     collect_aggs(inner, ctx, aggs)?;
+                }
+            }
+            // OVER spec 内的聚合引用（rank() OVER (ORDER BY count(*))）
+            if let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = &f.over {
+                for p in &spec.partition_by {
+                    collect_aggs(p, ctx, aggs)?;
+                }
+                for ob in &spec.order_by {
+                    collect_aggs(&ob.expr, ctx, aggs)?;
                 }
             }
             Ok(())
