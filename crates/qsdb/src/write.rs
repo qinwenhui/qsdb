@@ -8,6 +8,7 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use arrow::array::Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_writer::ArrowWriter;
@@ -252,6 +253,59 @@ fn lock_path(partition_dir: &Path) -> PathBuf {
     partition_dir.join(".lock")
 }
 
+/// 写入端约束检查（M5-B）：
+/// - NOT NULL：位图 null_count() O(1)，无约束列零开销
+/// - CHECK：每批一次表达式求值，TRUE/NULL 通过（SQL 标准 unknown 视为满足）
+pub(crate) fn check_constraints(def: &TableDef, batches: &[RecordBatch]) -> Result<()> {
+    for (i, col) in def.data_columns().iter().enumerate() {
+        if !col.nullable {
+            for b in batches.iter().filter(|b| b.num_rows() > 0) {
+                if let Some(arr) = b.columns().get(i) {
+                    let nulls = arr.null_count();
+                    if nulls > 0 {
+                        return Err(QsdbError::invalid(format!(
+                            "NOT NULL constraint violated: column '{}' has {nulls} null(s)",
+                            col.name
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    let checks: Vec<&str> = def
+        .data_columns()
+        .iter()
+        .filter_map(|c| c.check.as_deref())
+        .collect();
+    if checks.is_empty() {
+        return Ok(());
+    }
+    let ctx = crate::sql::translate::SchemaCtx {
+        cols: def
+            .data_columns()
+            .iter()
+            .map(|c| (c.name.clone(), c.logical_type.clone()))
+            .collect(),
+    };
+    for sql in checks {
+        let pred =
+            crate::sql::translate::bind_expr(&crate::sql::translate::parse_expr_sql(sql)?, &ctx)?;
+        for b in batches.iter().filter(|b| b.num_rows() > 0) {
+            let arr = crate::expr::eval::eval(&pred, b)?;
+            let ba = arr
+                .as_any()
+                .downcast_ref::<arrow::array::BooleanArray>()
+                .ok_or_else(|| QsdbError::type_err("CHECK predicate must be boolean"))?;
+            if let Some(row) = (0..ba.len()).find(|&i| !ba.is_null(i) && !ba.value(i)) {
+                return Err(QsdbError::invalid(format!(
+                    "CHECK constraint violated ({sql}): first failing row {row}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// append（单分区；输入批必须已按分区分组，含全表数据列）。
 pub(crate) fn append_partition(
     table_dir: &Path,
@@ -263,6 +317,7 @@ pub(crate) fn append_partition(
     let Some(file_schema) = validate_batches(batches, &schema)? else {
         return Ok(WriteResult::default()); // 全空输入 → no-op
     };
+    check_constraints(def, batches)?;
     let dir = pdir(table_dir, def, values)?;
     fs::create_dir_all(&dir)
         .map_err(|e| QsdbError::meta(format!("mkdir partition failed: {e}")))?;
@@ -321,6 +376,7 @@ pub(crate) fn overwrite_partition(
 ) -> Result<WriteResult> {
     let schema = data_schema(def);
     let file_schema = validate_batches(batches, &schema)?;
+    check_constraints(def, batches)?;
     let dir = pdir(table_dir, def, values)?;
     fs::create_dir_all(&dir)
         .map_err(|e| QsdbError::meta(format!("mkdir partition failed: {e}")))?;
@@ -405,6 +461,7 @@ mod tests {
                     name: "dt".into(),
                     logical_type: LogicalType::Date,
                     nullable: true,
+                    check: None,
                     default: None,
                     comment: None,
                 },
@@ -412,6 +469,7 @@ mod tests {
                     name: "v".into(),
                     logical_type: LogicalType::Int64,
                     nullable: true,
+                    check: None,
                     default: None,
                     comment: None,
                 },

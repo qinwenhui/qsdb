@@ -23,6 +23,9 @@ pub struct ColumnDef {
     pub name: String,
     pub logical_type: LogicalType,
     pub nullable: bool,
+    /// 列级 CHECK 约束（原始表达式文本；写入端重解析绑定。仅可引用数据列）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<Literal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -332,6 +335,7 @@ mod tests {
             name: name.into(),
             logical_type: ty,
             nullable: true,
+            check: None,
             default: None,
             comment: None,
         }

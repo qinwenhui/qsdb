@@ -452,12 +452,19 @@ pub(crate) fn scan_all(table: &str) -> ScanRequest {
 }
 
 /// 建列定义便捷函数（translate 用）。
-pub(crate) fn make_column(name: &str, ty: LogicalType, nullable: bool) -> ColumnDef {
+pub(crate) fn make_column(
+    name: &str,
+    ty: LogicalType,
+    nullable: bool,
+    check: Option<String>,
+    comment: Option<String>,
+) -> ColumnDef {
     ColumnDef {
         name: name.into(),
         logical_type: ty,
         nullable,
+        check,
         default: None,
-        comment: None,
+        comment,
     }
 }

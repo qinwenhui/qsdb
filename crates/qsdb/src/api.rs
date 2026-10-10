@@ -653,6 +653,7 @@ mod tests {
             name: name.into(),
             logical_type: ty,
             nullable: true,
+            check: None,
             default: None,
             comment: None,
         }

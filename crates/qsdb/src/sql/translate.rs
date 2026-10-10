@@ -154,6 +154,49 @@ pub fn parse_statements(sql: &str) -> Result<Vec<ParsedStatement>> {
         .collect()
 }
 
+/// 解析独立表达式文本（CHECK 约束以字符串存储，写入端重解析绑定）。
+pub(crate) fn parse_expr_sql(s: &str) -> Result<sqlparser::ast::Expr> {
+    let stmts = Parser::parse_sql(&GenericDialect {}, &format!("SELECT {s}"))
+        .map_err(|e| QsdbError::parse_err(format!("check expr '{s}' parse: {e}")))?;
+    match stmts.into_iter().next() {
+        Some(SqlStatement::Query(q)) => match *q.body {
+            SetExpr::Select(s) => match s.projection.into_iter().next() {
+                Some(sqlparser::ast::SelectItem::UnnamedExpr(e)) => Ok(e),
+                _ => Err(QsdbError::invalid("check expr empty")),
+            },
+            other => Err(QsdbError::invalid(format!(
+                "check expr body {other:?} not supported"
+            ))),
+        },
+        _ => Err(QsdbError::invalid("check expr not a query")),
+    }
+}
+
+/// CHECK 约束 DDL 期校验：仅可引用数据列（分区列不在写入批内）、结果必须布尔。
+fn validate_check_exprs(def: &TableDef) -> Result<()> {
+    let has_check = def.columns.iter().any(|c| c.check.is_some());
+    if !has_check {
+        return Ok(());
+    }
+    let ctx = SchemaCtx {
+        cols: def
+            .data_columns()
+            .iter()
+            .map(|c| (c.name.clone(), c.logical_type.clone()))
+            .collect(),
+    };
+    for c in def.columns.iter().filter(|c| c.check.is_some()) {
+        let pred = bind_expr(&parse_expr_sql(c.check.as_ref().unwrap())?, &ctx)?;
+        if !pred.is_boolean() {
+            return Err(QsdbError::type_err(format!(
+                "CHECK constraint on '{}' must be boolean",
+                c.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn translate_statement(stmt: SqlStatement, raw: &str) -> Result<ParsedStatement> {
     match stmt {
         SqlStatement::CreateTable(ct) => {
@@ -162,12 +205,40 @@ fn translate_statement(stmt: SqlStatement, raw: &str) -> Result<ParsedStatement>
             for c in &ct.columns {
                 let ty = ast_type_to_logical(&c.data_type)?;
                 let mut nullable = true;
+                let mut check: Option<String> = None;
+                let mut comment: Option<String> = None;
                 for opt in &c.options {
-                    if matches!(opt.option, sqlparser::ast::ColumnOption::NotNull) {
-                        nullable = false;
+                    match &opt.option {
+                        sqlparser::ast::ColumnOption::Null => nullable = true,
+                        sqlparser::ast::ColumnOption::NotNull => nullable = false,
+                        sqlparser::ast::ColumnOption::Check(cc) => {
+                            check = Some(cc.expr.to_string());
+                        }
+                        sqlparser::ast::ColumnOption::Comment(s) => comment = Some(s.clone()),
+                        sqlparser::ast::ColumnOption::Unique(_) => {
+                            return Err(QsdbError::unsupported(
+                                "UNIQUE constraint (needs partition-level dedup against old segments) lands later",
+                            ));
+                        }
+                        sqlparser::ast::ColumnOption::PrimaryKey(_) => {
+                            return Err(QsdbError::unsupported(
+                                "PRIMARY KEY constraint (implies UNIQUE, needs partition-level dedup) lands later",
+                            ));
+                        }
+                        other => {
+                            return Err(QsdbError::unsupported(format!(
+                                "column option {other:?} not supported (allow: NULL / NOT NULL / CHECK / COMMENT)"
+                            )));
+                        }
                     }
                 }
-                defs.push(super::make_column(&c.name.value, ty, nullable));
+                defs.push(super::make_column(
+                    &c.name.value,
+                    ty,
+                    nullable,
+                    check,
+                    comment,
+                ));
             }
             // PARTITIONED BY (…) 原生解析；旧语法后备手工解析
             let part_keys = match &ct.hive_distribution {
@@ -192,6 +263,8 @@ fn translate_statement(stmt: SqlStatement, raw: &str) -> Result<ParsedStatement>
             }
             let mut def = TableDef::new(table, defs, part_keys)?;
             def.properties = properties;
+            // CHECK 约束 DDL 期校验：可绑定（仅数据列）、布尔型——写路径免重复报错歧义
+            validate_check_exprs(&def)?;
             let _ = ct.if_not_exists; // 建表冲突按 AlreadyExists 报错
             Ok(ParsedStatement::CreateTable { def })
         }

@@ -35,6 +35,7 @@ fn col(name: &str, ty: LogicalType) -> ColumnDef {
         name: name.into(),
         logical_type: ty,
         nullable: true,
+        check: None,
         default: None,
         comment: None,
     }
