@@ -41,6 +41,22 @@ pub enum QsdbError {
     /// 对象已存在
     #[error("already exists: {0}")]
     AlreadyExists(String),
+
+    /// 查询被取消（kill / 客户端断连）
+    #[error("query cancelled: {0}")]
+    QueryCancelled(String),
+
+    /// 查询超时
+    #[error("query timeout: {0}")]
+    QueryTimeout(String),
+
+    /// 查询内存超限（查询终止而非 OOM 全库）
+    #[error("query memory limit exceeded: {0}")]
+    QueryMemoryLimit(String),
+
+    /// 查询内部 panic（已被隔离边界捕获，进程无恙）
+    #[error("query panicked (isolated, process unaffected): {0}")]
+    QueryPanic(String),
 }
 
 impl QsdbError {

@@ -29,12 +29,50 @@ use qsdb::sql::SqlResult;
 use qsdb::write_buffer::{WriteBuffer, WriteBufferOptions};
 use qsdb::{Qsdb, QsdbError};
 
+/// 运行中查询注册条目。
+pub struct QueryEntry {
+    pub ctx: Arc<qsdb::query::QueryContext>,
+    pub sql: String,
+}
+
 /// 服务共享状态。
 pub struct AppState {
     pub db: Arc<Qsdb>,
     pub writer: WriteBuffer,
     pub token: Option<String>,
     pub metrics: Metrics,
+    /// 运行中查询（query_id → entry）
+    pub queries: std::sync::Mutex<HashMap<String, QueryEntry>>,
+    /// 并发查询上限（0 = 不限）
+    pub max_concurrent_queries: usize,
+}
+
+impl AppState {
+    fn register_query(
+        &self,
+        ctx: Arc<qsdb::query::QueryContext>,
+        sql: String,
+    ) -> std::result::Result<(), String> {
+        let mut q = self
+            .queries
+            .lock()
+            .map_err(|_| "registry poisoned".to_string())?;
+        if self.max_concurrent_queries > 0 && q.len() >= self.max_concurrent_queries {
+            return Err(format!(
+                "too many concurrent queries ({} running, limit {})",
+                q.len(),
+                self.max_concurrent_queries
+            ));
+        }
+        q.insert(ctx.query_id.clone(), QueryEntry { ctx, sql });
+        Ok(())
+    }
+
+    fn unregister_query(&self, id: &str) {
+        if let Ok(mut q) = self.queries.lock() {
+            q.remove(id);
+        }
+    }
 }
 
 /// 简易指标（prometheus 文本输出）。
@@ -92,11 +130,13 @@ impl Metrics {
 }
 
 /// 启动服务（阻塞至 Ctrl-C）。
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     db: Arc<Qsdb>,
     addr: &str,
     token: Option<String>,
     auto_compact_secs: Option<u64>,
+    max_concurrent_queries: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let writer = db.writer(WriteBufferOptions::default());
     let state = Arc::new(AppState {
@@ -104,6 +144,8 @@ pub async fn serve(
         writer,
         token,
         metrics: Metrics::default(),
+        queries: std::sync::Mutex::new(HashMap::new()),
+        max_concurrent_queries: max_concurrent_queries.unwrap_or(0),
     });
 
     // 写入走大 body（Arrow IPC 批）；默认 2MB 限制放大到 1GB
@@ -117,6 +159,8 @@ pub async fn serve(
         .route("/api/v1/tables/{table}/schema", get(schema))
         .route("/api/v1/tables/{table}/partitions", get(partitions))
         .route("/api/v1/stats", get(stats))
+        .route("/api/v1/queries", get(list_queries))
+        .route("/api/v1/queries/{id}/cancel", post(cancel_query))
         .layer(write_layer)
         .with_state(Arc::clone(&state));
 
@@ -225,11 +269,25 @@ async fn query(
         return err_response(StatusCode::UNAUTHORIZED, "unauthorized".into());
     }
     s.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+    // 会话：每请求一个 QueryContext（超时可经 X-QSDB-Timeout 头覆盖）
+    let timeout_ms: Option<u64> = headers
+        .get("x-qsdb-timeout-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok());
+    let ctx = s.db.new_query_context(timeout_ms);
+    if let Err(msg) = s.register_query(Arc::clone(&ctx), body.sql.clone()) {
+        s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+        return err_response(StatusCode::SERVICE_UNAVAILABLE, msg);
+    }
+    let query_id = ctx.query_id.clone();
+    let reg = Arc::clone(&s);
     let t = Instant::now();
     let st = Arc::clone(&s);
     let sql = body.sql;
     let fmt = body.format.unwrap_or_else(|| "json".into());
-    let result = tokio::task::spawn_blocking(move || st.db.sql(&sql)).await;
+    let ctx_exec = Arc::clone(&ctx);
+    let result = tokio::task::spawn_blocking(move || st.db.sql_with_context(&sql, &ctx_exec)).await;
+    reg.unregister_query(&query_id);
     let elapsed = t.elapsed().as_nanos() as u64;
     s.metrics.observe_query(elapsed);
     match result {
@@ -469,6 +527,56 @@ async fn stats(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
         Ok(Ok(v)) => Json(v).into_response(),
         Ok(Err(e)) => status_of(&e, e.to_string()),
         Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn list_queries(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
+        return err_response(StatusCode::UNAUTHORIZED, "unauthorized".into());
+    }
+    let entries: Vec<serde_json::Value> = match s.queries.lock() {
+        Ok(q) => q
+            .iter()
+            .map(|(id, e)| {
+                serde_json::json!({
+                    "id": id,
+                    "sql": e.sql,
+                    "elapsedMs": e.ctx.elapsed().as_millis() as u64,
+                    "memoryBytes": e.ctx.memory_used(),
+                    "cancelled": e.ctx.is_cancelled(),
+                })
+            })
+            .collect(),
+        Err(_) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "registry poisoned".into(),
+            );
+        }
+    };
+    Json(serde_json::json!({ "queries": entries, "count": entries.len() })).into_response()
+}
+
+async fn cancel_query(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
+        return err_response(StatusCode::UNAUTHORIZED, "unauthorized".into());
+    }
+    match s.queries.lock() {
+        Ok(q) => match q.get(&id) {
+            Some(e) => {
+                e.ctx.cancel();
+                Json(serde_json::json!({ "cancelled": id })).into_response()
+            }
+            None => err_response(StatusCode::NOT_FOUND, format!("query {id} not running")),
+        },
+        Err(_) => err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "registry poisoned".into(),
+        ),
     }
 }
 

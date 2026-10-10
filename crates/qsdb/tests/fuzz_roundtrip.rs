@@ -266,6 +266,7 @@ fn crash_tmp_manifest_leftover_is_harmless() {
     let opts = QsdbOptions {
         trash_grace_ms: 0,
         scan_cache_bytes: 0,
+        ..Default::default()
     };
     let db2 = Qsdb::open(&root, opts).unwrap();
     db2.gc().unwrap();

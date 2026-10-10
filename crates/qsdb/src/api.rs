@@ -29,6 +29,10 @@ pub struct QsdbOptions {
     /// 热数据缓存预算（字节）：segment 级解码后 LRU 缓存。
     /// `0` = 关闭；默认 256MB。
     pub scan_cache_bytes: usize,
+    /// 默认查询超时（毫秒）；None/0 = 不超时
+    pub query_timeout_ms: Option<u64>,
+    /// 默认单查询内存上限（字节）；None = 不限。超限查询被终止而非 OOM 全库。
+    pub query_memory_limit_bytes: Option<u64>,
 }
 
 impl Default for QsdbOptions {
@@ -36,6 +40,8 @@ impl Default for QsdbOptions {
         Self {
             trash_grace_ms: 10 * 60 * 1000,
             scan_cache_bytes: 256 * 1024 * 1024,
+            query_timeout_ms: None,
+            query_memory_limit_bytes: None,
         }
     }
 }
@@ -193,6 +199,19 @@ impl Qsdb {
 
     /// 流式扫描。
     pub fn scan(&self, req: ScanRequest) -> Result<Scan> {
+        self.scan_inner(req, crate::query::QueryContext::benign())
+    }
+
+    /// 带查询上下文的扫描（取消/超时在批边界生效）。
+    pub fn scan_with_context(
+        &self,
+        req: ScanRequest,
+        ctx: Arc<crate::query::QueryContext>,
+    ) -> Result<Scan> {
+        self.scan_inner(req, ctx)
+    }
+
+    fn scan_inner(&self, req: ScanRequest, ctx: Arc<crate::query::QueryContext>) -> Result<Scan> {
         let def = self.def(req.db.as_deref(), &req.table)?;
         let tdir = table_dir(&self.root, self.db_name(req.db.as_deref()), &req.table);
         Scan::with_cache(
@@ -203,14 +222,34 @@ impl Qsdb {
             req.predicate,
             req.limit,
             Some(Arc::clone(&self.cache)),
+            ctx,
         )
     }
 
     // -- SQL（M2：SQL-0/1）----------------------------------------------------
 
-    /// 执行单条 SQL（DDL/DML/SELECT）。
+    /// 新建查询上下文（server 会话层用；嵌入用户也可自建以获得取消/超时能力）。
+    pub fn new_query_context(&self, timeout_ms: Option<u64>) -> Arc<crate::query::QueryContext> {
+        crate::query::QueryContext::new(
+            format!("q{}", uuid::Uuid::now_v7().simple()),
+            timeout_ms.or(self.opts.query_timeout_ms),
+            self.opts.query_memory_limit_bytes,
+        )
+    }
+
+    /// 执行单条 SQL（DDL/DML/SELECT）——panic 隔离 + 默认超时/内存上限。
     pub fn sql(&self, sql: &str) -> Result<crate::sql::SqlResult> {
-        crate::sql::execute_sql(self, sql)
+        let ctx = self.new_query_context(None);
+        self.sql_with_context(sql, &ctx)
+    }
+
+    /// 带外部上下文执行（可取消/超时/记账）。
+    pub fn sql_with_context(
+        &self,
+        sql: &str,
+        ctx: &Arc<crate::query::QueryContext>,
+    ) -> Result<crate::sql::SqlResult> {
+        crate::sql::execute_sql_ctx(self, sql, ctx)
     }
 
     /// 便捷：SELECT 物化执行（错误路径直接返回）。
@@ -568,6 +607,7 @@ mod tests {
         let opts = QsdbOptions {
             trash_grace_ms: 0,
             scan_cache_bytes: 0,
+            ..Default::default()
         };
         let db2 = Qsdb::open(&root, opts).unwrap();
         db2.gc().unwrap();

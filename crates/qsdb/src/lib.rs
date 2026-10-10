@@ -20,6 +20,7 @@ pub mod fsutil;
 pub mod index;
 pub mod manifest;
 pub mod partition;
+pub mod query;
 pub mod scan;
 pub mod sql;
 pub mod stats;

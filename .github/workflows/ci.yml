@@ -43,11 +43,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build release
         run: cargo build -p qsdb-cli --release
-      - name: Check binary size (<= 20MB)
+      # 24MB 红线：panic=unwind 表占 +7.8MB（会话隔离硬要求，见设计文档 §M4-6）
+      - name: Check binary size (<= 24MB)
         run: |
           SIZE=$(stat -c%s target/release/qsdb)
           echo "qsdb binary size: $SIZE bytes ($((SIZE / 1024 / 1024)) MB)"
-          if [ "$SIZE" -gt 20971520 ]; then
-            echo "::error::binary exceeds 20MB budget"
+          if [ "$SIZE" -gt 25165824 ]; then
+            echo "::error::binary exceeds 24MB budget"
             exit 1
           fi

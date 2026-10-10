@@ -30,8 +30,22 @@ pub enum SqlResult {
     Ok { message: String },
 }
 
-/// 执行一条 SQL（含多条语句时只执行第一条并提示）。
+/// 执行一条 SQL（panic 隔离边界 + 良性上下文）。
 pub fn execute_sql(db: &Qsdb, sql: &str) -> Result<SqlResult> {
+    execute_sql_ctx(db, sql, &crate::query::QueryContext::benign())
+}
+
+/// 带查询上下文执行（隔离边界：panic → 错误；ctx 贯穿全部算子）。
+pub fn execute_sql_ctx(
+    db: &Qsdb,
+    sql: &str,
+    ctx: &Arc<crate::query::QueryContext>,
+) -> Result<SqlResult> {
+    crate::query::run_isolated(|| execute_inner(db, sql, ctx))
+}
+
+fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) -> Result<SqlResult> {
+    ctx.check()?;
     let mut stmts = translate::parse_statements(sql)?;
     if stmts.is_empty() {
         return Err(QsdbError::invalid("empty statement"));
@@ -42,6 +56,7 @@ pub fn execute_sql(db: &Qsdb, sql: &str) -> Result<SqlResult> {
         ));
     }
     let stmt = stmts.pop().unwrap();
+    ctx.check()?;
     match stmt {
         translate::ParsedStatement::CreateTable { def } => {
             db.create_table(def)?;
@@ -220,6 +235,7 @@ pub fn execute_sql(db: &Qsdb, sql: &str) -> Result<SqlResult> {
                 resolve: Box::new(|name: &str| db.table_def(name)),
             };
             let plan = translate::translate_select_full(*q, &resolver)?;
+            ctx.check()?;
             // M4-4 元数据短路：count(*) + 纯分区列谓词 → manifest O(1) 应答
             if let Some(n) = metadata_shortcut_count(db, &plan)? {
                 let schema = Arc::new(arrow::datatypes::Schema::new(vec![
@@ -241,7 +257,7 @@ pub fn execute_sql(db: &Qsdb, sql: &str) -> Result<SqlResult> {
                     batches: vec![batch],
                 });
             }
-            let mut exec = exec_builder::build(db, &plan)?;
+            let mut exec = exec_builder::build(db, &plan, ctx)?;
             let schema = exec.schema();
             let mut batches = Vec::new();
             while let Some(b) = exec.next() {

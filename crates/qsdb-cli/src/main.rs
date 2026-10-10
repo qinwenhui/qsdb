@@ -61,6 +61,9 @@ enum Cmd {
         /// 热数据缓存预算（MB；0 = 关闭，默认 256）
         #[arg(long, default_value_t = 256)]
         cache_mb: usize,
+        /// 并发查询上限（0 = 不限）
+        #[arg(long, default_value_t = 0)]
+        max_concurrent_queries: usize,
     },
 }
 
@@ -146,6 +149,7 @@ fn main() {
             token,
             auto_compact_secs,
             cache_mb,
+            max_concurrent_queries,
         } => {
             let opts = QsdbOptions {
                 scan_cache_bytes: cache_mb * 1024 * 1024,
@@ -162,7 +166,13 @@ fn main() {
                 .enable_all()
                 .build()
                 .expect("init tokio runtime");
-            if let Err(e) = rt.block_on(crate::server::serve(db, &addr, token, auto_compact_secs)) {
+            if let Err(e) = rt.block_on(crate::server::serve(
+                db,
+                &addr,
+                token,
+                auto_compact_secs,
+                Some(max_concurrent_queries),
+            )) {
                 eprintln!("server error: {e}");
                 std::process::exit(1);
             }

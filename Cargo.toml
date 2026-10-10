@@ -38,11 +38,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "signal"] }
 # 内部 crate
 qsdb = { path = "crates/qsdb" }
 
+# panic=unwind（不用 abort）：会话隔离层的 catch_unwind 依赖 unwind 表。
+# 代价实测 +7.8MB（arrow/parquet 泛型代码的 landing pads）——故障隔离优先于体积。
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
 strip = "symbols"
 
 # 基准构建：快编译 + 可观测

@@ -28,7 +28,11 @@ impl ExecNode for OneShotExec {
     }
 }
 
-pub fn build(db: &Qsdb, plan: &LogicalPlan) -> Result<Box<dyn ExecNode>> {
+pub fn build(
+    db: &Qsdb,
+    plan: &LogicalPlan,
+    ctx: &Arc<crate::query::QueryContext>,
+) -> Result<Box<dyn ExecNode>> {
     // M4-3 列裁剪下推：收集全计划引用列，Scan 只读所需列（含谓词列）。
     let mut used: Vec<String> = Vec::new();
     collect_plan_columns(plan, &mut used);
@@ -45,10 +49,10 @@ pub fn build(db: &Qsdb, plan: &LogicalPlan) -> Result<Box<dyn ExecNode>> {
         if proj.len() < all.len() {
             let mapping = build_mapping(&all, &proj);
             let rewritten = rewrite_plan(plan, &mapping, &all);
-            return build_inner(db, &rewritten, Some(proj));
+            return build_inner(db, &rewritten, Some(proj), ctx);
         }
     }
-    build_inner(db, plan, None)
+    build_inner(db, plan, None, ctx)
 }
 
 /// 全计划引用列名（Column 节点）。
@@ -243,6 +247,7 @@ fn build_inner(
     db: &Qsdb,
     plan: &LogicalPlan,
     scan_proj: Option<Vec<String>>,
+    ctx: &Arc<crate::query::QueryContext>,
 ) -> Result<Box<dyn ExecNode>> {
     match plan {
         LogicalPlan::Scan { def, predicate } => {
@@ -252,35 +257,37 @@ fn build_inner(
                 projection: scan_proj,
                 ..Default::default()
             })?;
-            Ok(crate::exec::par_scan::make_scan(scan))
+            Ok(crate::exec::par_scan::make_scan(scan, ctx))
         }
         LogicalPlan::Filter { input, predicate } => Ok(Box::new(FilterExec::new(
-            build_inner(db, input, scan_proj.clone())?,
+            build_inner(db, input, scan_proj.clone(), ctx)?,
             predicate.clone(),
+            Arc::clone(ctx),
         ))),
         LogicalPlan::Project {
             input,
             exprs,
             names,
         } => Ok(Box::new(ProjectExec::new(
-            build_inner(db, input, scan_proj.clone())?,
+            build_inner(db, input, scan_proj.clone(), ctx)?,
             exprs.clone(),
             names.clone(),
         ))),
         LogicalPlan::Aggregate { input, group, aggs } => {
-            build_aggregate(db, input, group, aggs, &scan_proj)
+            build_aggregate(db, input, group, aggs, &scan_proj, ctx)
         }
         LogicalPlan::Sort { input, keys } => Ok(Box::new(SortExec::new(
-            build_inner(db, input, scan_proj.clone())?,
+            build_inner(db, input, scan_proj.clone(), ctx)?,
             keys.clone(),
             None,
+            Arc::clone(ctx),
         ))),
         LogicalPlan::Limit { input, n } => Ok(Box::new(LimitExec {
-            input: build_inner(db, input, scan_proj.clone())?,
+            input: build_inner(db, input, scan_proj.clone(), ctx)?,
             remaining: *n,
         })),
         LogicalPlan::Distinct { input } => Ok(Box::new(crate::exec::DistinctExec::new(
-            build_inner(db, input, scan_proj.clone())?,
+            build_inner(db, input, scan_proj.clone(), ctx)?,
         ))),
     }
 }
@@ -292,12 +299,14 @@ fn build_aggregate(
     group: &[PhysExpr],
     aggs: &[AggExpr],
     scan_proj: &Option<Vec<String>>,
+    ctx: &Arc<crate::query::QueryContext>,
 ) -> Result<Box<dyn ExecNode>> {
-    let Some((shards, filters)) = try_shard_source(db, input, scan_proj) else {
+    let Some((shards, filters)) = try_shard_source(db, input, scan_proj, ctx) else {
         return Ok(Box::new(HashAggExec::new(
-            build_inner(db, input, scan_proj.clone())?,
+            build_inner(db, input, scan_proj.clone(), ctx)?,
             group.to_vec(),
             aggs.to_vec(),
+            Arc::clone(ctx),
         )?));
     };
 
@@ -320,7 +329,7 @@ fn build_aggregate(
     use rayon::prelude::*;
     let tables: Vec<GroupTable> = shards
         .into_par_iter()
-        .map(|s| run_partial(s, &filters, &group, &aggs))
+        .map(|s| run_partial(s, &filters, &group, &aggs, ctx))
         .collect::<Result<Vec<_>>>()?;
 
     // merge（单线程）
@@ -350,23 +359,26 @@ fn run_partial(
     filters: &[PhysExpr],
     group: &[PhysExpr],
     aggs: &[AggExpr],
+    ctx: &Arc<crate::query::QueryContext>,
 ) -> Result<GroupTable> {
     let mut node: Box<dyn ExecNode> = Box::new(ScanExec::new(scan));
     for f in filters {
-        node = Box::new(FilterExec::new(node, f.clone()));
+        node = Box::new(FilterExec::new(node, f.clone(), Arc::clone(ctx)));
     }
-    let mut exec = HashAggExec::new(node, group.to_vec(), aggs.to_vec())?;
-    while exec.next().is_some() {
-        // 驱动至耗尽；状态在 exec.state
+    let mut exec = HashAggExec::new(node, group.to_vec(), aggs.to_vec(), Arc::clone(ctx))?;
+    while let Some(b) = exec.next() {
+        b?; // 取消/超时/内存超限在此冒泡
     }
     Ok(std::mem::take(&mut exec.state))
 }
 
 /// 源分片：`(Scan | Filter)+` 链且 scan 可切多片 → Some((分片, 逆序 filters))。
+#[allow(clippy::too_many_arguments)]
 fn try_shard_source(
     db: &Qsdb,
     plan: &LogicalPlan,
     scan_proj: &Option<Vec<String>>,
+    ctx: &Arc<crate::query::QueryContext>,
 ) -> Option<(Vec<crate::scan::Scan>, Vec<PhysExpr>)> {
     let mut filters: Vec<PhysExpr> = Vec::new();
     let mut cur = plan;
@@ -378,12 +390,15 @@ fn try_shard_source(
             }
             LogicalPlan::Scan { def, predicate } => {
                 let scan = db
-                    .scan(ScanRequest {
-                        table: def.name.clone(),
-                        predicate: predicate.clone(),
-                        projection: scan_proj.clone(),
-                        ..Default::default()
-                    })
+                    .scan_with_context(
+                        ScanRequest {
+                            table: def.name.clone(),
+                            predicate: predicate.clone(),
+                            projection: scan_proj.clone(),
+                            ..Default::default()
+                        },
+                        Arc::clone(ctx),
+                    )
                     .ok()?;
                 let threads = rayon::current_num_threads().clamp(1, 16);
                 let shards = scan.shard(threads)?;

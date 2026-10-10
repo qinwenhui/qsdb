@@ -21,17 +21,19 @@ pub struct ParScanExec {
     schema: SchemaRef,
     /// join 句柄的完成信号（rayon scope 无法跨结构体存活，用 detached 线程）
     done: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ctx: Arc<crate::query::QueryContext>,
 }
 
 impl ParScanExec {
     /// 从 Scan 构造并行执行；不可分片（文件 < 2）返回 None。借用 scan。
-    pub fn new(scan: &Scan, threads: usize) -> Option<Self> {
+    pub fn new(scan: &Scan, threads: usize, ctx: Arc<crate::query::QueryContext>) -> Option<Self> {
         let schema = Arc::clone(scan.schema());
         let shards = scan.shard(threads)?;
         let (tx, rx) = sync_channel::<Result<RecordBatch>>(threads.clamp(2, 16) * 2);
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let done_flag = Arc::clone(&done);
         // 调度线程：rayon 分片并行；结束时 drop tx 关闭 channel
+        let worker_ctx = Arc::clone(&ctx);
         std::thread::spawn(move || {
             use rayon::prelude::*;
             let items: Vec<_> = shards.into_iter().map(|s| (s, tx.clone())).collect();
@@ -39,6 +41,13 @@ impl ParScanExec {
                 .into_par_iter()
                 .map(|(mut shard, tx)| {
                     for item in shard.by_ref() {
+                        if worker_ctx.check().is_err() {
+                            // 取消/超时：把错误发给消费端并停止本分片
+                            let _ = tx.send(Err(crate::error::QsdbError::QueryCancelled(
+                                worker_ctx.query_id.clone(),
+                            )));
+                            break;
+                        }
                         if tx.send(item).is_err() {
                             break; // 消费端提前退出（如 LIMIT 截断）
                         }
@@ -53,6 +62,7 @@ impl ParScanExec {
             rx,
             schema,
             done: Some(done),
+            ctx,
         })
     }
 }
@@ -62,6 +72,9 @@ impl ExecNode for ParScanExec {
         Arc::clone(&self.schema)
     }
     fn next(&mut self) -> Option<Result<RecordBatch>> {
+        if let Err(e) = self.ctx.check() {
+            return Some(Err(e));
+        }
         self.rx.recv().ok()
     }
 }
@@ -91,9 +104,9 @@ impl Drop for ParScanExec {
 }
 
 /// 构造扫描节点：可分片走并行，否则串行。
-pub fn make_scan(scan: Scan) -> Box<dyn ExecNode> {
+pub fn make_scan(scan: Scan, ctx: &Arc<crate::query::QueryContext>) -> Box<dyn ExecNode> {
     let threads = rayon::current_num_threads().clamp(1, 16);
-    if let Some(p) = ParScanExec::new(&scan, threads) {
+    if let Some(p) = ParScanExec::new(&scan, threads, Arc::clone(ctx)) {
         return Box::new(p);
     }
     Box::new(ScanExec::new(scan))

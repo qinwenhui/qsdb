@@ -1010,6 +1010,7 @@ pub struct Scan {
     pending_collector: Option<crate::cache::CacheCollector>,
     remaining: Option<u64>,
     cache: Option<Arc<crate::cache::SegmentCache>>,
+    ctx: Arc<crate::query::QueryContext>,
 }
 
 /// 批来源：parquet 流式 reader 或缓存命中批列表。
@@ -1030,6 +1031,7 @@ impl BatchSource {
 }
 
 impl Scan {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_cache(
         root: &Path,
         table_dir: &Path,
@@ -1038,6 +1040,7 @@ impl Scan {
         predicate: Option<Predicate>,
         limit: Option<u64>,
         cache: Option<Arc<crate::cache::SegmentCache>>,
+        ctx: Arc<crate::query::QueryContext>,
     ) -> Result<Self> {
         let plan = ScanPlan::build(def, projection, predicate, limit)?;
         let files = plan_scan(root, table_dir, &plan)?;
@@ -1048,6 +1051,7 @@ impl Scan {
             pending_collector: None,
             remaining: limit,
             cache,
+            ctx,
         })
     }
 
@@ -1071,6 +1075,7 @@ impl Scan {
                 pending_collector: None,
                 remaining: None,
                 cache: self.cache.clone(),
+                ctx: Arc::clone(&self.ctx),
             })
             .collect();
         for (i, f) in self.files.iter().enumerate() {
@@ -1115,7 +1120,12 @@ impl Scan {
                         &self.plan.read_columns,
                         &file.row_groups,
                     ) {
-                        self.current = Some((BatchSource::Cached(hit.iter().cloned().collect::<Vec<_>>().into_iter()), file));
+                        self.current = Some((
+                            BatchSource::Cached(
+                                hit.iter().cloned().collect::<Vec<_>>().into_iter(),
+                            ),
+                            file,
+                        ));
                         return Ok(true);
                     }
                     // miss：装 collector 供回填
@@ -1181,6 +1191,9 @@ impl Iterator for Scan {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
+            if let Err(e) = self.ctx.check() {
+                return Some(Err(e));
+            }
             // 先取出批次与分区值，结束对 self 的借用
             let taken = match self.current.as_mut() {
                 Some((source, file)) => match source.next_batch() {

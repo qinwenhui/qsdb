@@ -32,15 +32,21 @@ pub struct FilterExec {
     pub input: Box<dyn ExecNode>,
     pub predicate: PhysExpr,
     schema: SchemaRef,
+    ctx: Arc<crate::query::QueryContext>,
 }
 
 impl FilterExec {
-    pub fn new(input: Box<dyn ExecNode>, predicate: PhysExpr) -> Self {
+    pub fn new(
+        input: Box<dyn ExecNode>,
+        predicate: PhysExpr,
+        ctx: Arc<crate::query::QueryContext>,
+    ) -> Self {
         let schema = input.schema();
         Self {
             input,
             predicate,
             schema,
+            ctx,
         }
     }
 }
@@ -51,6 +57,9 @@ impl ExecNode for FilterExec {
     }
     fn next(&mut self) -> Option<Result<RecordBatch>> {
         loop {
+            if let Err(e) = self.ctx.check() {
+                return Some(Err(e));
+            }
             let batch = self.input.next()?;
             let batch = match batch {
                 Ok(b) => b,
@@ -177,27 +186,39 @@ pub struct SortExec {
     pub keys: Vec<SortKey>,
     pub limit: Option<usize>,
     schema: SchemaRef,
+    ctx: Arc<crate::query::QueryContext>,
 }
 
 impl SortExec {
-    pub fn new(input: Box<dyn ExecNode>, keys: Vec<SortKey>, limit: Option<usize>) -> Self {
+    pub fn new(
+        input: Box<dyn ExecNode>,
+        keys: Vec<SortKey>,
+        limit: Option<usize>,
+        ctx: Arc<crate::query::QueryContext>,
+    ) -> Self {
         let schema = input.schema();
         Self {
             input,
             keys,
             limit,
             schema,
+            ctx,
         }
     }
 
     fn collect_all(&mut self) -> Result<RecordBatch> {
         let mut batches = Vec::new();
+        let mut charged = 0u64;
         while let Some(b) = self.input.next() {
-            {
-                let x = b?;
-                batches.push(x)
-            }
+            self.ctx.check()?;
+            let x = b?;
+            // 排序物化是内存大头：逐批记账（超限 → 查询终止而非 OOM 全库）
+            let bytes = x.get_array_memory_size() as u64;
+            self.ctx.charge_memory(bytes)?;
+            charged += bytes;
+            batches.push(x);
         }
+        self.ctx.release_memory(charged);
         if batches.is_empty() {
             return Ok(RecordBatch::new_empty(self.schema()));
         }
@@ -362,10 +383,16 @@ pub struct HashAggExec {
     pub(crate) state: agg::GroupTable,
     schema: SchemaRef,
     emitted: bool,
+    ctx: Arc<crate::query::QueryContext>,
 }
 
 impl HashAggExec {
-    pub fn new(input: Box<dyn ExecNode>, group: Vec<PhysExpr>, aggs: Vec<AggExpr>) -> Result<Self> {
+    pub fn new(
+        input: Box<dyn ExecNode>,
+        group: Vec<PhysExpr>,
+        aggs: Vec<AggExpr>,
+        ctx: Arc<crate::query::QueryContext>,
+    ) -> Result<Self> {
         let mut fields: Vec<arrow::datatypes::Field> = group
             .iter()
             .map(|g| {
@@ -388,6 +415,7 @@ impl HashAggExec {
             state,
             schema: Arc::new(arrow::datatypes::Schema::new(fields)),
             emitted: false,
+            ctx,
         })
     }
 }
@@ -407,10 +435,20 @@ impl ExecNode for HashAggExec {
             return None;
         }
         while let Some(b) = self.input.next() {
+            if let Err(e) = self.ctx.check() {
+                return Some(Err(e));
+            }
             let batch = match b {
                 Ok(x) => x,
                 Err(e) => return Some(Err(e)),
             };
+            // 聚合状态（分组表）随输入增长：按输入批记账近似
+            if let Err(e) = self
+                .ctx
+                .charge_memory(batch.get_array_memory_size() as u64 / 2)
+            {
+                return Some(Err(e));
+            }
             if let Err(e) = self.state.ingest(&self.group, &self.aggs, &batch) {
                 return Some(Err(e));
             }
