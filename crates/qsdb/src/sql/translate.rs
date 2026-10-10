@@ -50,6 +50,14 @@ pub enum LogicalPlan {
     Distinct {
         input: Box<LogicalPlan>,
     },
+    /// 等值连接（left=probe right=build）；输出列 = 左 ++ 右
+    Join {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        left_keys: Vec<PhysExpr>,
+        right_keys: Vec<PhysExpr>,
+        join_type: crate::exec::join::JoinType,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -497,8 +505,10 @@ pub fn translate_select_full(
             )));
         }
     };
-    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
-        return Err(QsdbError::unsupported("JOIN/multi-FROM lands in M4"));
+    if select.from.len() != 1 {
+        return Err(QsdbError::unsupported(
+            "multi-FROM (comma join) not supported",
+        ));
     }
     let table = match &select.from[0].relation {
         TableFactor::Table { name, .. } => object_name_single(name.clone())?,
@@ -509,12 +519,58 @@ pub fn translate_select_full(
         }
     };
     let def = (resolver.resolve)(&table)?;
-    let ctx = SchemaCtx::from_table(&def);
+    let mut ctx = SchemaCtx::from_table(&def);
 
     let mut plan = LogicalPlan::Scan {
         def: Arc::clone(&def),
         predicate: None,
     };
+
+    // JOIN 链（SQL-2：等值 INNER/LEFT）
+    for join in &select.from[0].joins {
+        let (jt, constraint) = match &join.join_operator {
+            sqlparser::ast::JoinOperator::Inner(c) | sqlparser::ast::JoinOperator::Join(c) => {
+                (crate::exec::join::JoinType::Inner, c)
+            }
+            sqlparser::ast::JoinOperator::LeftOuter(c) | sqlparser::ast::JoinOperator::Left(c) => {
+                (crate::exec::join::JoinType::LeftOuter, c)
+            }
+            other => {
+                return Err(QsdbError::unsupported(format!(
+                    "JOIN type {other:?} not supported (INNER/LEFT only)"
+                )));
+            }
+        };
+        let right_name = match &join.relation {
+            TableFactor::Table { name, alias, .. } => match alias {
+                Some(a) => a.name.value.clone(),
+                None => object_name_single(name.clone())?,
+            },
+            other => return Err(QsdbError::unsupported(format!("JOIN target {other:?}"))),
+        };
+        let right_def = (resolver.resolve)(&right_name)?;
+        let sqlparser::ast::JoinConstraint::On(on_expr) = constraint else {
+            return Err(QsdbError::unsupported("JOIN ... ON <equi-cond> required"));
+        };
+        // ctx 扩展：右表列仅以限定名注册（table.col），顺序 = join 输出右段。
+        // 非限定右列引用不支持（SQL-2 约束，歧义保护）。
+        let n_left_plain = ctx.cols.iter().filter(|(n, _)| !n.contains('.')).count();
+        for c in &right_def.columns {
+            ctx.cols
+                .push((format!("{right_name}.{}", c.name), c.logical_type.clone()));
+        }
+        let (lkey, rkey) = split_equi_condition(on_expr, n_left_plain, &ctx)?;
+        plan = LogicalPlan::Join {
+            left: Box::new(plan),
+            right: Box::new(LogicalPlan::Scan {
+                def: Arc::clone(&right_def),
+                predicate: None,
+            }),
+            left_keys: vec![lkey],
+            right_keys: vec![rkey],
+            join_type: jt,
+        };
+    }
 
     // WHERE
     if let Some(w) = select.selection {
@@ -590,8 +646,24 @@ pub fn translate_select_full(
     for it in &items {
         collect_aggs(&it.sql, &ctx, &mut aggs)?;
     }
-    if select.having.is_some() {
-        return Err(QsdbError::unsupported("HAVING lands in M4 (SQL-2)"));
+    // HAVING（SQL-2）：对聚合输出过滤
+    let mut having_pred: Option<PhysExpr> = None;
+    if let Some(h) = &select.having {
+        if group_exprs.is_empty() && aggs.is_empty() {
+            return Err(QsdbError::invalid("HAVING requires aggregation"));
+        }
+        let mut hctx: Vec<(String, LogicalType)> = group_exprs
+            .iter()
+            .map(|g| (g.display(), g.data_type()))
+            .collect();
+        for a in &aggs {
+            hctx.push((a.out_name.clone(), a.out_ty.clone()));
+        }
+        let agg_ctx = SchemaCtx { cols: hctx };
+        having_pred = Some(rebind_over_agg(h, &ctx, &group_exprs, &aggs, &agg_ctx)?);
+        if !having_pred.as_ref().unwrap().is_boolean() {
+            return Err(QsdbError::type_err("HAVING must be boolean"));
+        }
     }
     let is_agg = !aggs.is_empty() || !group_exprs.is_empty();
 
@@ -618,6 +690,12 @@ pub fn translate_select_full(
             group: group_exprs,
             aggs,
         };
+        if let Some(hp) = having_pred {
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate: hp,
+            };
+        }
         plan = LogicalPlan::Project {
             input: Box::new(plan),
             exprs: proj_exprs,
@@ -683,10 +761,13 @@ pub fn translate_select_full(
                 let desc = matches!(&ob.options.sort, Some(sqlparser::ast::OrderBySort::Desc));
                 (&ob.expr, desc)
             };
-            // 别名/输出名优先
+            // 别名/输出名优先：Identifier 查输出名；其他表达式按 display 匹配投影
             let by_output = match key_expr {
                 Expr::Identifier(id) => out_ctx.index_of(&id.value),
-                _ => None,
+                other => {
+                    let d = expr_display(other);
+                    proj_names.iter().position(|n| n.eq_ignore_ascii_case(&d))
+                }
             };
             match by_output {
                 Some(idx) => sort_keys.push(SortKey {
@@ -774,6 +855,38 @@ fn replace_top_project(plan: LogicalPlan, exprs: Vec<PhysExpr>, names: Vec<Strin
     }
 }
 
+/// ON expr：等值条件 a.k = b.k 拆为（左键, 右键）。idx < n_left 属左表。
+fn split_equi_condition(
+    e: &sqlparser::ast::Expr,
+    n_left: usize,
+    ctx: &SchemaCtx,
+) -> Result<(PhysExpr, PhysExpr)> {
+    use sqlparser::ast::Expr as E;
+    let E::BinaryOp { left, op, right } = e else {
+        return Err(QsdbError::unsupported("JOIN ON must be an equality"));
+    };
+    if !matches!(op, sqlparser::ast::BinaryOperator::Eq) {
+        return Err(QsdbError::unsupported(
+            "JOIN ON supports only equality (non-equi lands in M5)",
+        ));
+    }
+    let lb = bind_expr(left, ctx)?;
+    let rb = bind_expr(right, ctx)?;
+    let side = |x: &PhysExpr| -> Option<bool> {
+        match x {
+            PhysExpr::Column { idx, .. } => Some(*idx < n_left),
+            _ => None,
+        }
+    };
+    match (side(&lb), side(&rb)) {
+        (Some(true), Some(false)) => Ok((lb, rb)),
+        (Some(false), Some(true)) => Ok((rb, lb)),
+        _ => Err(QsdbError::invalid(
+            "JOIN ON keys must be column references, one from each side",
+        )),
+    }
+}
+
 fn expr_display(e: &sqlparser::ast::Expr) -> String {
     e.to_string()
 }
@@ -795,35 +908,18 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
                 ty: ctx.cols[idx].1.clone(),
             })
         }
-        E::CompoundIdentifier(parts) => {
-            if parts.len() == 2
-                && parts[0]
-                    .value
-                    .eq_ignore_ascii_case(ctx_table_hint(parts[0].value.as_str()))
-            {
-                // table.col 形式：忽略表前缀（单表）
-                let col = &parts[1].value;
-                let idx = ctx
-                    .index_of(col)
-                    .ok_or_else(|| QsdbError::not_found(format!("column '{col}'")))?;
-                Ok(PhysExpr::Column {
-                    idx,
-                    name: ctx.cols[idx].0.clone(),
-                    ty: ctx.cols[idx].1.clone(),
-                })
-            } else if parts.len() == 2 {
-                let col = &parts[1].value;
-                let idx = ctx
-                    .index_of(col)
-                    .ok_or_else(|| QsdbError::not_found(format!("column '{col}'")))?;
-                Ok(PhysExpr::Column {
-                    idx,
-                    name: ctx.cols[idx].0.clone(),
-                    ty: ctx.cols[idx].1.clone(),
-                })
-            } else {
-                Err(QsdbError::invalid(format!("unsupported identifier {e:?}")))
-            }
+        E::CompoundIdentifier(parts) if parts.len() == 2 => {
+            let qual = format!("{}.{}", parts[0].value, parts[1].value);
+            // 限定名优先（JOIN 右表列以 table.col 注册）；无则退回裸列名
+            let idx = ctx
+                .index_of(&qual)
+                .or_else(|| ctx.index_of(&parts[1].value))
+                .ok_or_else(|| QsdbError::not_found(format!("column '{}'", parts[1].value)))?;
+            Ok(PhysExpr::Column {
+                idx,
+                name: ctx.cols[idx].0.clone(),
+                ty: ctx.cols[idx].1.clone(),
+            })
         }
         E::Value(v) => Ok(PhysExpr::Lit(value_to_literal(v)?)),
         E::TypedString(_) => {
@@ -976,10 +1072,6 @@ fn bind_floor_ceil(e: &sqlparser::ast::Expr, ctx: &SchemaCtx, fname: &str) -> Re
         args: vec![inner],
         ty,
     })
-}
-
-fn ctx_table_hint(_s: &str) -> &str {
-    "" // 单表：任何表前缀都接受
 }
 
 fn zero_of(ty: &LogicalType) -> Result<Literal> {
@@ -1339,6 +1431,21 @@ fn rebind_over_agg(
             bind_scalar_fn_over(e, f, ctx, group, aggs, agg_ctx)
         }
         E::Identifier(id) => {
+            // 聚合别名优先：agg_ctx 已把别名注册在 group.len() 之后
+            if let Some(idx) = agg_ctx
+                .cols
+                .iter()
+                .position(|(n, _)| n.eq_ignore_ascii_case(&id.value))
+            {
+                if idx >= group.len() {
+                    let (name, ty) = &agg_ctx.cols[idx];
+                    return Ok(PhysExpr::Column {
+                        idx,
+                        name: name.clone(),
+                        ty: ty.clone(),
+                    });
+                }
+            }
             // 裸列必须出现在 group by（group 为纯列）
             match group
                 .iter()

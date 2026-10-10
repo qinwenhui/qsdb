@@ -89,6 +89,9 @@ fn collect_plan_columns(plan: &LogicalPlan, out: &mut Vec<String>) {
         LogicalPlan::Limit { input, .. } | LogicalPlan::Distinct { input } => {
             collect_plan_columns(input, out);
         }
+        LogicalPlan::Join { .. } => {
+            // 多表计划不走列裁剪下推（build 的 count_scans guard 兜底）
+        }
     }
 }
 
@@ -124,6 +127,7 @@ fn plan_scan_def(plan: &LogicalPlan) -> Option<Arc<crate::catalog::TableDef>> {
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Distinct { input } => plan_scan_def(input),
+        LogicalPlan::Join { .. } => None,
     }
 }
 
@@ -191,6 +195,7 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
         LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
             input: Box::new(rewrite_plan(input, mapping, all)),
         },
+        LogicalPlan::Join { .. } => plan.clone(),
     }
 }
 
@@ -289,6 +294,37 @@ fn build_inner(
         LogicalPlan::Distinct { input } => Ok(Box::new(crate::exec::DistinctExec::new(
             build_inner(db, input, scan_proj.clone(), ctx)?,
         ))),
+        LogicalPlan::Join {
+            left,
+            right,
+            left_keys,
+            right_keys,
+            join_type,
+        } => {
+            let probe = build_inner(db, left, None, ctx)?;
+            let build = build_inner(db, right, None, ctx)?;
+            // 右键 idx 为全局 ctx 序（左宽 + 局部）→ 减 probe 宽度得右扫描局部序
+            let left_width = probe.schema().fields().len();
+            let local_keys: Vec<PhysExpr> = right_keys
+                .iter()
+                .map(|k| match k {
+                    PhysExpr::Column { idx, name, ty } => PhysExpr::Column {
+                        idx: idx.saturating_sub(left_width),
+                        name: name.clone(),
+                        ty: ty.clone(),
+                    },
+                    other => other.clone(),
+                })
+                .collect();
+            Ok(Box::new(crate::exec::join::HashJoinExec::new(
+                probe,
+                build,
+                left_keys.clone(),
+                local_keys,
+                *join_type,
+                Arc::clone(ctx),
+            )))
+        }
     }
 }
 

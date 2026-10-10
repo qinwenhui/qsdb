@@ -4,6 +4,7 @@
 //! Scan 由 `crate::scan::Scan` 包装。并行聚合见 `agg`（文件级 rayon 展开）。
 
 pub mod agg;
+pub mod join;
 pub mod par_scan;
 
 use std::sync::Arc;

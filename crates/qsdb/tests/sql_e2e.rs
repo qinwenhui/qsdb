@@ -579,6 +579,91 @@ fn error_paths_and_edges() {
 }
 
 // ===========================================================================
+// SQL-2：JOIN / HAVING
+// ===========================================================================
+
+#[test]
+fn join_inner_and_left() {
+    let (db, root) = db("join");
+    db.sql("CREATE TABLE orders (oid BIGINT, uid BIGINT, amt DECIMAL(10,2)) PARTITIONED BY (oid)")
+        .unwrap();
+    db.sql("CREATE TABLE users (uid BIGINT, name STRING) PARTITIONED BY (uid)")
+        .unwrap();
+    db.sql("INSERT INTO orders VALUES (1, 10, 5.00), (2, 20, 7.50), (3, 10, 9.00), (4, 99, 1.00)")
+        .unwrap();
+    db.sql("INSERT INTO users VALUES (10, 'alice'), (20, 'bob'), (30, 'carol')")
+        .unwrap();
+
+    // INNER：匹配行（oid=4 的 uid 99 无匹配 → 不出）
+    let mut r = q(
+        &db,
+        "SELECT orders.oid, users.name FROM orders JOIN users ON orders.uid = users.uid",
+    );
+    r.sort();
+    assert_eq!(r, vec!["1|alice", "2|bob", "3|alice"]);
+
+    // LEFT：左表全保留，未匹配右列 NULL
+    let mut r = q(
+        &db,
+        "SELECT orders.oid, users.name FROM orders LEFT JOIN users ON orders.uid = users.uid",
+    );
+    r.sort();
+    assert_eq!(r, vec!["1|alice", "2|bob", "3|alice", "4|NULL"]);
+
+    // JOIN + 谓词 + 聚合
+    let r = q(
+        &db,
+        "SELECT users.name, count(*), sum(orders.amt) FROM orders JOIN users ON orders.uid = users.uid GROUP BY users.name",
+    );
+    assert_eq!(r.len(), 2);
+    // join 前聚合正确性：alice 2 单 5+9=14.00；bob 1 单 7.50
+    assert!(r.contains(&"alice|2|14.00".to_string()), "{r:?}");
+    assert!(r.contains(&"bob|1|7.50".to_string()), "{r:?}");
+
+    // 非 ON 约束 / 非等值 → 报错
+    assert!(db.sql("SELECT * FROM orders JOIN users").is_err());
+    assert!(
+        db.sql("SELECT * FROM orders JOIN users ON orders.amt > users.uid")
+            .is_err()
+    );
+    // 两侧同名列非限定引用 → 不支持（须限定）
+    db.sql("CREATE TABLE m (k BIGINT, v STRING) PARTITIONED BY (k)")
+        .unwrap();
+    db.sql("CREATE TABLE n (k BIGINT, w STRING) PARTITIONED BY (k)")
+        .unwrap();
+    db.sql("INSERT INTO m VALUES (1,'x')").unwrap();
+    db.sql("INSERT INTO n VALUES (1,'y')").unwrap();
+    let r = q(&db, "SELECT m.v, n.w FROM m JOIN n ON m.k = n.k");
+    assert_eq!(r, vec!["x|y"]);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn having_filters_aggregate_output() {
+    let (db, root) = setup_events("having");
+    // HAVING 过滤聚合结果
+    let r = q(
+        &db,
+        "SELECT tenant, count(*) FROM events GROUP BY tenant HAVING count(*) >= 2",
+    );
+    assert_eq!(r.len(), 2, "{r:?}"); // a=2, b=2（NULL/c 各 1）
+    // HAVING + ORDER BY 聚合输出（函数形态；SELECT 别名在 HAVING 的支持后置）
+    let r = raw(
+        &db,
+        "SELECT tenant, count(*) FROM events GROUP BY tenant HAVING count(*) >= 2 ORDER BY count(*) DESC",
+    );
+    assert!(r.len() == 2 && r[0].ends_with("|2"), "{r:?}");
+    // 非聚合裸列 HAVING → 报错
+    assert!(
+        db.sql("SELECT tenant FROM events GROUP BY tenant HAVING cnt > 1")
+            .is_err()
+    );
+    // 无聚合无分组 HAVING → 报错
+    assert!(db.sql("SELECT cnt FROM events HAVING cnt > 1").is_err());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ===========================================================================
 // 用例计数（gate：≥100）
 // ====================================================================================
 
