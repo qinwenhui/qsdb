@@ -20,3 +20,10 @@ axum = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
+arrow-flight = { version = "60", optional = true }
+tonic = { version = "0.14", optional = true }
+futures = { version = "0.3", optional = true }
+
+[features]
+## Arrow Flight 数据面（gRPC/h2c，独立监听口）。默认关闭守二进制红线。
+flight = ["dep:arrow-flight", "dep:tonic", "dep:futures"]

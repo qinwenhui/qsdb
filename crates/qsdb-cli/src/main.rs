@@ -10,6 +10,8 @@ use arrow::array::Array;
 use arrow::record_batch::RecordBatch;
 use clap::Parser;
 use qsdb::sql::SqlResult;
+#[cfg(feature = "flight")]
+mod flight;
 mod server;
 
 use qsdb::{Qsdb, QsdbOptions};
@@ -67,6 +69,9 @@ enum Cmd {
         /// 配置文件（JSON：query_timeout_ms / query_memory_limit_bytes）
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Arrow Flight 监听口（h2c；需 --features flight 编译）
+        #[arg(long)]
+        flight_bind: Option<String>,
     },
 }
 
@@ -153,6 +158,7 @@ fn main() {
             auto_compact_secs,
             cache_mb,
             max_concurrent_queries,
+            flight_bind,
             config,
         } => {
             let opts = QsdbOptions {
@@ -177,6 +183,7 @@ fn main() {
                 auto_compact_secs,
                 Some(max_concurrent_queries),
                 config.as_deref(),
+                flight_bind,
             )) {
                 eprintln!("server error: {e}");
                 std::process::exit(1);

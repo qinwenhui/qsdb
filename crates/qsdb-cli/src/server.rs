@@ -148,6 +148,7 @@ pub async fn serve(
     auto_compact_secs: Option<u64>,
     max_concurrent_queries: Option<usize>,
     config_file: Option<&std::path::Path>,
+    #[cfg_attr(not(feature = "flight"), allow(unused_variables))] flight_bind: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(path) = config_file {
         let text = std::fs::read_to_string(path)?;
@@ -216,6 +217,18 @@ pub async fn serve(
         if state.token.is_some() { "on" } else { "off" }
     );
 
+    // Arrow Flight（feature-gated）：独立 h2c 口，与 HTTP 并行
+    #[cfg(feature = "flight")]
+    let flight_task = flight_bind.map(|bind| {
+        let db = Arc::clone(&state.db);
+        let token = state.token.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::flight::serve_flight(db, token, &bind).await {
+                eprintln!("flight server error: {e}");
+            }
+        })
+    });
+
     let shutdown = async {
         let _ = tokio::signal::ctrl_c().await;
         eprintln!("shutting down…");
@@ -224,6 +237,10 @@ pub async fn serve(
         .with_graceful_shutdown(shutdown)
         .await;
     if let Some(t) = compact_task {
+        t.abort();
+    }
+    #[cfg(feature = "flight")]
+    if let Some(t) = flight_task {
         t.abort();
     }
     // 退出前 flush 写缓冲
