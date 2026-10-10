@@ -17,6 +17,9 @@ arrow = { workspace = true }
 parquet = { workspace = true }
 rayon = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
 [features]
 # DuckDB 进程内对比（bundled 编译 C++，首次编译数分钟）
 duckdb = ["dep:duckdb"]

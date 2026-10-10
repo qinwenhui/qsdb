@@ -28,7 +28,7 @@ impl ParScanExec {
     /// 从 Scan 构造并行执行；不可分片（文件 < 2）返回 None。借用 scan。
     pub fn new(scan: &Scan, threads: usize, ctx: Arc<crate::query::QueryContext>) -> Option<Self> {
         let schema = Arc::clone(scan.schema());
-        let shards = scan.shard(threads)?;
+        let shards = scan.shard(threads, true)?;
         let (tx, rx) = sync_channel::<Result<RecordBatch>>(threads.clamp(2, 16) * 2);
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let done_flag = Arc::clone(&done);

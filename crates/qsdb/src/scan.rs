@@ -368,6 +368,7 @@ fn upper_bound_may_match(
 // ---------------------------------------------------------------------------
 
 /// 一个待读 parquet 文件。
+#[derive(Clone)]
 struct FilePlan {
     path: PathBuf,
     partition_values: HashMap<String, Literal>,
@@ -1003,6 +1004,15 @@ fn constant_array(lit: &Literal, dt: &DataType, n: usize) -> Result<ArrayRef> {
         .map_err(|e| QsdbError::invalid(format!("const array failed: {e}")))
 }
 
+/// 文件 row group 数（分片细分用；失败由调用方回退文件粒度）。
+fn row_group_count(path: &Path) -> Result<usize> {
+    let f = File::open(path)
+        .map_err(|e| QsdbError::meta(format!("open {} failed: {e}", path.display())))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(f)
+        .map_err(|e| QsdbError::meta(format!("read parquet footer {}: {e}", path.display())))?;
+    Ok(builder.metadata().num_row_groups())
+}
+
 /// 旧 segment 缺列补 NULL（ALTER ADD COLUMN 后向兼容；compaction/宽松写复用）。
 /// missing 按表列序，追加在批尾（列集为表列前缀时序即表列序）。
 pub(crate) fn pad_missing_columns(
@@ -1092,13 +1102,66 @@ impl Scan {
         &self.plan.output_schema
     }
 
-    /// 按（近似）均分把文件切给 n 个分片扫描；不可分（文件数 < 2 或带 limit）
-    /// → None。分片共享计划（投影/谓词），各自独立迭代。
-    pub fn shard(&self, n: usize) -> Option<Vec<Scan>> {
+    /// 按（近似）均分把扫描工作切给 n 个分片。`split_row_groups` = true 时文件数
+    /// 不足 n 则按 parquet row group 细分大文件（读 footer 取 RG 数，LPT 加权均衡）
+    /// ——适合扫描受限路径（过滤扫描）；聚合 partial 路径传 false（高基数分组下
+    /// 细分会使每分片重复构建几乎全量组状态，得不偿失）。
+    /// 不可分（文件数 < 2 或带 limit）→ None。分片共享计划（投影/谓词）。
+    pub fn shard(&self, n: usize, split_row_groups: bool) -> Option<Vec<Scan>> {
         if self.remaining.is_some() || self.files.len() < 2 {
             return None;
         }
-        let n = n.min(self.files.len());
+        // 展开为 RG 级工作单元（文件数 ≥ n 时保持文件粒度）
+        let mut units: Vec<FilePlan> = Vec::new();
+        let split = if split_row_groups {
+            (n / self.files.len()).max(1)
+        } else {
+            1
+        };
+        for f in &self.files {
+            if split > 1 {
+                if let Ok(nrg) = row_group_count(&f.path) {
+                    let universe: Vec<usize> = match &f.row_groups {
+                        Some(list) if !list.is_empty() => list.clone(),
+                        _ => (0..nrg).collect(),
+                    };
+                    let per = universe.len().div_ceil(split);
+                    if universe.len() >= 2 && per < universe.len() {
+                        for chunk in universe.chunks(per) {
+                            units.push(FilePlan {
+                                path: f.path.clone(),
+                                partition_values: f.partition_values.clone(),
+                                row_groups: Some(chunk.to_vec()),
+                            });
+                        }
+                    } else {
+                        units.push(FilePlan {
+                            path: f.path.clone(),
+                            partition_values: f.partition_values.clone(),
+                            row_groups: Some(universe),
+                        });
+                    }
+                    continue;
+                }
+            }
+            units.push(FilePlan {
+                path: f.path.clone(),
+                partition_values: f.partition_values.clone(),
+                row_groups: f.row_groups.clone(),
+            });
+        }
+        // LPT：按 RG 数（缺省 1）加权均衡到 n 个分片
+        let n = n.min(units.len());
+        let weight = |u: &FilePlan| u.row_groups.as_ref().map_or(1, |r| r.len().max(1));
+        let mut order: Vec<usize> = (0..units.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(weight(&units[i])));
+        let mut loads = vec![0usize; n];
+        let mut buckets: Vec<Vec<FilePlan>> = (0..n).map(|_| Vec::new()).collect();
+        for i in order {
+            let (bi, _) = loads.iter().enumerate().min_by_key(|(_, l)| **l).unwrap();
+            buckets[bi].push(units[i].clone());
+            loads[bi] += weight(&units[i]);
+        }
         let mut shards: Vec<Scan> = (0..n)
             .map(|_| Scan {
                 plan: Arc::clone(&self.plan),
@@ -1111,12 +1174,8 @@ impl Scan {
                 ctx: Arc::clone(&self.ctx),
             })
             .collect();
-        for (i, f) in self.files.iter().enumerate() {
-            shards[i * n / self.files.len()].files.push_back(FilePlan {
-                path: f.path.clone(),
-                partition_values: f.partition_values.clone(),
-                row_groups: f.row_groups.clone(),
-            });
+        for (s, b) in shards.iter_mut().zip(buckets) {
+            s.files = b.into();
         }
         Some(shards)
     }

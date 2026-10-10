@@ -433,8 +433,8 @@ impl ExecNode for DistinctExec {
         if self.state.is_empty() {
             return None;
         }
-        let keys = self.state.take_group_keys();
-        let out = match agg::build_output_batch(&keys, &[], &self.schema()) {
+        let keys = self.state.group_keys();
+        let out = match agg::build_output_batch(&keys, &self.schema()) {
             Ok(o) => o,
             Err(e) => return Some(Err(e)),
         };
@@ -546,9 +546,7 @@ impl ExecNode for HashAggExec {
         if self.state.is_empty() {
             return None;
         }
-        let keys = self.state.take_group_keys();
-        let states = self.state.take_states();
-        let out = match agg::finalize(&keys, &states, &self.aggs, &self.group, &self.schema()) {
+        let out = match agg::finalize_table(&self.state, &self.aggs, &self.group, &self.schema()) {
             Ok(o) => o,
             Err(e) => return Some(Err(e)),
         };

@@ -227,56 +227,6 @@ pub fn array_value_to_literal(a: &dyn Array, i: usize) -> Literal {
 // 聚合状态
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default)]
-enum SumState {
-    #[default]
-    None,
-    Int(i128),
-    Dec(i256),
-    /// (sum, kahan c)
-    Flt(f64, f64),
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct AggState {
-    pub count: u64,
-    sum: SumState,
-    min: Option<Literal>,
-    max: Option<Literal>,
-}
-
-impl AggState {
-    fn merge(&mut self, other: &AggState) {
-        self.count += other.count;
-        merge_sum(&mut self.sum, &other.sum);
-        self.min = combine_min(self.min.take(), other.min.clone());
-        self.max = combine_max(self.max.take(), other.max.clone());
-    }
-}
-
-fn merge_sum(a: &mut SumState, b: &SumState) {
-    use SumState::*;
-    match (&mut *a, b) {
-        (None, x) => *a = x.clone(),
-        (Int(x), Int(y)) => *x += y,
-        (Dec(x), Dec(y)) => *x += *y,
-        (Flt(x, c), Flt(y, c2)) => {
-            // Kahan 合并
-            let t = *x + *y;
-            *c += c2 - (t - *x - *y);
-            *x = t;
-        }
-        _ => {}
-    }
-}
-
-fn combine_min(a: Option<Literal>, b: Option<Literal>) -> Option<Literal> {
-    pick(a, b, true)
-}
-fn combine_max(a: Option<Literal>, b: Option<Literal>) -> Option<Literal> {
-    pick(a, b, false)
-}
-
 fn pick(a: Option<Literal>, b: Option<Literal>, keep_min: bool) -> Option<Literal> {
     match (a, b) {
         (None, x) | (x, None) => x,
@@ -299,19 +249,47 @@ fn pick(a: Option<Literal>, b: Option<Literal>, keep_min: bool) -> Option<Litera
 // GroupTable
 // ---------------------------------------------------------------------------
 
-struct GroupRow {
-    key: Vec<u8>,
-    literals: Vec<Literal>,
-    states: Vec<AggState>,
+fn combine_min(a: Option<Literal>, b: Option<Literal>) -> Option<Literal> {
+    pick(a, b, true)
+}
+fn combine_max(a: Option<Literal>, b: Option<Literal>) -> Option<Literal> {
+    pick(a, b, false)
 }
 
+/// 数值累加列（sum/avg 的 sum 部分；按输入类型选一种，SoA 稠密向量）。
+enum SumCol {
+    /// 非数值聚合列（count-only / min-max）不占状态
+    None,
+    /// 整型族 i128 累加（16B/组）
+    Int(Vec<i128>),
+    /// 浮点 Kahan 补偿 (sum, c)（16B/组）
+    Flt(Vec<(f64, f64)>),
+    /// Decimal i256 精确（32B/组）
+    Dec(Vec<i256>),
+}
+
+/// 分组聚合表（SoA：key 单一 arena + 偏移，聚合状态按列稠密——
+/// 百万级组数时散布步长 8~40B，不再逐组堆分配；P3 性能重做）。
 #[derive(Default)]
 pub struct GroupTable {
     by_hash: HashMap<u64, Vec<u32>>,
-    groups: Vec<GroupRow>,
     pending_arity: Option<usize>,
     /// Int64 fast path 的持久化开放寻址索引（(hash, gid)；跨批存活）
     fast_slots: Vec<(u64, u32)>,
+    // —— 组数据（SoA）——
+    /// 全部组 key 的单一 arena（fast 格式定长内联 / 慢路径 tag+bytes 变长）
+    key_arena: Vec<u8>,
+    /// key 偏移（len = 组数+1；组数 = len-1）
+    key_off: Vec<u32>,
+    /// 组键 literal（[分组列][gid]，建组时按 gid 顺序追加）
+    group_lits: Vec<Vec<Literal>>,
+    /// 聚合列状态种类（首批 ingest 初始化）
+    kinds: Vec<crate::expr::AggFunc>,
+    /// Count 值 / Sum·Avg 的非空计数
+    counts: Vec<Vec<u64>>,
+    sums: Vec<SumCol>,
+    /// Min/Max 值（仅 Min/Max 列分配）
+    minmax: Vec<Vec<Option<Literal>>>,
 }
 
 impl GroupTable {
@@ -320,7 +298,87 @@ impl GroupTable {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.groups.is_empty()
+        self.key_off.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.key_off.len().saturating_sub(1)
+    }
+
+    /// 组 g 的 key 字节。
+    #[inline]
+    fn key_of(&self, g: usize) -> &[u8] {
+        &self.key_arena[self.key_off[g] as usize..self.key_off[g + 1] as usize]
+    }
+
+    /// 追加一个新组（key 入 arena，键 literal 与各聚合列状态按 gid 对齐扩展）。
+    fn push_group(&mut self, key: &[u8], lits: Vec<Literal>) -> u32 {
+        if self.key_off.is_empty() {
+            self.key_off.push(0); // 首组前压起点哨兵
+        }
+        let gid = self.len() as u32;
+        self.key_off.push((self.key_arena.len() + key.len()) as u32);
+        self.key_arena.extend_from_slice(key);
+        for (c, l) in self.group_lits.iter_mut().zip(lits) {
+            c.push(l);
+        }
+        for c in &mut self.counts {
+            c.push(0);
+        }
+        for s in &mut self.sums {
+            match s {
+                SumCol::None => {}
+                SumCol::Int(v) => v.push(0),
+                SumCol::Flt(v) => v.push((0.0, 0.0)),
+                SumCol::Dec(v) => v.push(i256::from_i128(0)),
+            }
+        }
+        for m in &mut self.minmax {
+            m.push(None);
+        }
+        gid
+    }
+
+    /// 首批初始化：分组列数 + 各聚合列状态种类。
+    fn init_cols(&mut self, group: &[PhysExpr], aggs: &[AggExpr], arrays: &[Option<ArrayRef>]) {
+        if !self.kinds.is_empty() {
+            return;
+        }
+        if self.group_lits.is_empty() {
+            self.group_lits = vec![Vec::new(); group.len()];
+        }
+        self.kinds = aggs.iter().map(|a| a.func).collect();
+        for (ai, agg) in aggs.iter().enumerate() {
+            let dt = arrays[ai]
+                .as_ref()
+                .map(|a| a.data_type().clone())
+                .unwrap_or(DataType::Int64);
+            use crate::expr::AggFunc::*;
+            match agg.func {
+                Count | Udaf => {
+                    self.counts.push(Vec::new());
+                    self.sums.push(SumCol::None);
+                    self.minmax.push(Vec::new());
+                }
+                Sum | Avg => {
+                    self.counts.push(Vec::new());
+                    self.sums.push(match dt {
+                        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                            SumCol::Int(Vec::new())
+                        }
+                        DataType::Float32 | DataType::Float64 => SumCol::Flt(Vec::new()),
+                        DataType::Decimal128(_, _) => SumCol::Dec(Vec::new()),
+                        _ => SumCol::None,
+                    });
+                    self.minmax.push(Vec::new());
+                }
+                Min | Max => {
+                    self.counts.push(Vec::new());
+                    self.sums.push(SumCol::None);
+                    self.minmax.push(Vec::new());
+                }
+            }
+        }
     }
 
     /// 单批摄入：group 表达式求值 → 行分组 → 各聚合更新。
@@ -334,6 +392,25 @@ impl GroupTable {
         if n == 0 {
             return Ok(());
         }
+        static BATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static ROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static MAXB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static MINB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+        BATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ROWS.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        MAXB.fetch_max(n as u64, std::sync::atomic::Ordering::Relaxed);
+        MINB.fetch_min(n as u64, std::sync::atomic::Ordering::Relaxed);
+        if std::env::var("QSDB_AGG_TIMING").is_ok()
+            && BATCHES.load(std::sync::atomic::Ordering::Relaxed) % 500 == 0
+        {
+            eprintln!(
+                "[agg-timing] batches={} rows={} min={} max={}",
+                BATCHES.load(std::sync::atomic::Ordering::Relaxed),
+                ROWS.load(std::sync::atomic::Ordering::Relaxed),
+                MINB.load(std::sync::atomic::Ordering::Relaxed),
+                MAXB.load(std::sync::atomic::Ordering::Relaxed)
+            );
+        }
         let group_arrays: Vec<ArrayRef> = group
             .iter()
             .map(|g| eval::eval(g, batch))
@@ -345,11 +422,14 @@ impl GroupTable {
                 None => Ok(None),
             })
             .collect::<Result<_>>()?;
+        let fast_cols = int64_group_columns(&group_arrays);
+
+        self.init_cols(group, aggs, &agg_arrays);
 
         // 行 → 组 id
         // fast path：分组列全为非空 Int64 —— 内联 key 拼接 + 开放寻址表
         let mut group_ids: Vec<u32> = Vec::with_capacity(n);
-        if let Some(cols) = int64_group_columns(&group_arrays) {
+        if let Some(cols) = fast_cols {
             self.assign_groups_fast(&cols, &mut group_ids);
         } else {
             let mut key_buf: Vec<u8> = Vec::with_capacity(64);
@@ -359,7 +439,6 @@ impl GroupTable {
                 group_ids.push(gid);
             }
         }
-
         // 各聚合列更新（数组序）
         for (ai, agg) in aggs.iter().enumerate() {
             self.update_aggs(ai, agg, agg_arrays[ai].as_deref(), &group_ids)?;
@@ -373,18 +452,17 @@ impl GroupTable {
     /// 否则每批重建会丢失已建组索引导致组键分裂（M4-1 bug）。
     fn assign_groups_fast(&mut self, cols: &[Vec<i64>], out: &mut Vec<u32>) {
         const EMPTY: u32 = u32::MAX;
-        let arity = self.agg_arity_hint();
         let n = cols.first().map(|c| c.len()).unwrap_or(0);
         if self.fast_slots.is_empty() {
             // 初始容量：2×当前组数与合理下限取大（留扩容余量）
             let mut cap: usize = 16;
-            while cap < (self.groups.len() + n + 1) * 2 {
+            while cap < (self.len() + n + 1) * 2 {
                 cap <<= 1;
             }
             self.fast_slots = vec![(0, EMPTY); cap];
             // 已有组（如 merge 后继续 ingest）回填索引
-            for (gid, row) in self.groups.iter().enumerate() {
-                let h = fxhash_bytes(&row.key) | 1;
+            for gid in 0..self.len() {
+                let h = fxhash_bytes(self.key_of(gid)) | 1;
                 Self::insert_slot(&mut self.fast_slots, h, gid as u32);
             }
         }
@@ -401,19 +479,13 @@ impl GroupTable {
             loop {
                 let slot = self.fast_slots[idx];
                 if slot.1 == EMPTY {
-                    gid = self.groups.len() as u32;
-                    let literals: Vec<Literal> =
-                        cols.iter().map(|c| Literal::Int64(c[row])).collect();
-                    self.groups.push(GroupRow {
-                        key: key_bytes.clone(),
-                        literals,
-                        states: vec![AggState::default(); arity],
-                    });
+                    let lits: Vec<Literal> = cols.iter().map(|c| Literal::Int64(c[row])).collect();
+                    gid = self.push_group(&key_bytes, lits);
                     self.fast_slots[idx] = (h, gid);
                     // 负载因子 >= 50% 扩容重排
-                    if (self.groups.len()) * 2 >= self.fast_slots.len() {
+                    if self.len() * 2 >= self.fast_slots.len() {
                         let mut cap = self.fast_slots.len() * 2;
-                        while cap < (self.groups.len() + 1) * 2 {
+                        while cap < (self.len() + 1) * 2 {
                             cap <<= 1;
                         }
                         let old = std::mem::take(&mut self.fast_slots);
@@ -426,7 +498,7 @@ impl GroupTable {
                     }
                     break;
                 }
-                if slot.0 == h && self.groups[slot.1 as usize].key == key_bytes.as_slice() {
+                if slot.0 == h && self.key_of(slot.1 as usize) == key_bytes.as_slice() {
                     gid = slot.1;
                     break;
                 }
@@ -450,71 +522,129 @@ impl GroupTable {
         let h = fxhash_bytes(key);
         if let Some(cands) = self.by_hash.get(&h) {
             for &gid in cands {
-                if self.groups[gid as usize].key == key {
+                if self.key_of(gid as usize) == key {
                     return gid;
                 }
             }
         }
         // 新组
-        let gid = self.groups.len() as u32;
-        let literals: Vec<Literal> = arrays
+        let lits: Vec<Literal> = arrays
             .iter()
             .map(|a| array_value_to_literal(a, row))
             .collect();
-        let states = vec![AggState::default(); self.agg_arity_hint()];
-        self.groups.push(GroupRow {
-            key: key.to_vec(),
-            literals,
-            states,
-        });
+        let gid = self.push_group(key, lits);
         self.by_hash.entry(h).or_default().push(gid);
         gid
     }
 
-    /// 聚合列数（新组初始化用；与 ingest 的 aggs 长度一致——由首次调用注入）。
-    fn agg_arity_hint(&self) -> usize {
-        self.pending_arity.unwrap_or(0)
-    }
-
     /// merge 另一张 partial 表（两表结构一致：同 group/aggs 语义）。
     /// merge 后 fast 索引置空（下次 fast ingest 时按 groups 惰性回填）。
+    /// 空表首并直接整体接管（move，零拷贝）。
     pub fn merge(&mut self, other: GroupTable, agg_count: usize) {
+        if self.is_empty() {
+            *self = other;
+            self.fast_slots.clear();
+            return;
+        }
+        let other_len = other.len();
+        self.merge_subset(&other, (0..other_len).collect(), agg_count);
+    }
+
+    /// merge 另一张表的指定组子集（并行分区 merge 用：调用方按 hash 把
+    /// shard 组分桶，各桶独立合并）。
+    pub fn merge_subset(&mut self, other: &GroupTable, ogs: Vec<usize>, agg_count: usize) {
         self.fast_slots.clear();
-        for row in other.groups {
-            let h = fxhash_bytes(&row.key);
+        for og in ogs {
+            let key: Vec<u8> = other.key_of(og).to_vec();
+            let h = fxhash_bytes(&key);
             let gid = match self.by_hash.get(&h).and_then(|cands| {
                 cands
                     .iter()
                     .copied()
-                    .find(|&g| self.groups[g as usize].key == row.key)
+                    .find(|&g| self.key_of(g as usize) == key.as_slice())
             }) {
                 Some(g) => g,
                 None => {
-                    let gid = self.groups.len() as u32;
-                    self.groups.push(GroupRow {
-                        key: row.key.clone(),
-                        literals: row.literals.clone(),
-                        states: vec![AggState::default(); agg_count],
-                    });
+                    // 列状态种类未初始化（空表首组）：从 other 继承结构
+                    if self.kinds.is_empty() {
+                        self.kinds = other.kinds.clone();
+                        self.group_lits = other
+                            .group_lits
+                            .iter()
+                            .map(|c| Vec::with_capacity(c.len()))
+                            .collect();
+                        for (ai, _k) in self.kinds.iter().enumerate() {
+                            self.counts.push(Vec::new());
+                            self.sums.push(match &other.sums[ai] {
+                                SumCol::None => SumCol::None,
+                                SumCol::Int(_) => SumCol::Int(Vec::new()),
+                                SumCol::Flt(_) => SumCol::Flt(Vec::new()),
+                                SumCol::Dec(_) => SumCol::Dec(Vec::new()),
+                            });
+                            self.minmax.push(Vec::new());
+                        }
+                    }
+                    let lits: Vec<Literal> =
+                        other.group_lits.iter().map(|c| c[og].clone()).collect();
+                    let gid = self.push_group(&key, lits);
                     self.by_hash.entry(h).or_default().push(gid);
                     gid
                 }
             };
-            let dst = &mut self.groups[gid as usize];
-            debug_assert_eq!(dst.states.len(), row.states.len());
-            for (d, s) in dst.states.iter_mut().zip(&row.states) {
-                d.merge(s);
+            let g = gid as usize;
+            for ai in 0..agg_count {
+                if let (Some(dst), Some(src)) = (self.counts.get_mut(ai), other.counts.get(ai)) {
+                    dst[g] += src[og];
+                }
+                if let (Some(d), Some(s)) = (self.sums.get_mut(ai), other.sums.get(ai)) {
+                    match (d, s) {
+                        (SumCol::Int(d), SumCol::Int(s)) => d[g] += s[og],
+                        (SumCol::Flt(d), SumCol::Flt(s)) => {
+                            let t = d[g].0 + s[og].0;
+                            d[g].1 += s[og].1 - (t - d[g].0 - s[og].0);
+                            d[g].0 = t;
+                        }
+                        (SumCol::Dec(d), SumCol::Dec(s)) => d[g] += s[og],
+                        _ => {}
+                    }
+                }
+                if let (Some(dst), Some(src)) = (self.minmax.get_mut(ai), other.minmax.get(ai)) {
+                    let cur = dst[g].take();
+                    let merged = if self.kinds.get(ai) == Some(&crate::expr::AggFunc::Min) {
+                        combine_min(cur, src[og].clone())
+                    } else {
+                        combine_max(cur, src[og].clone())
+                    };
+                    dst[g] = merged;
+                }
             }
         }
     }
 
-    /// 输出用组键。
-    pub fn take_group_keys(&mut self) -> Vec<Vec<Literal>> {
-        self.groups.iter().map(|g| g.literals.clone()).collect()
+    /// 组 key 的 hash（分区 merge 分桶用）。
+    pub fn group_hash(&self, g: usize) -> u64 {
+        fxhash_bytes(self.key_of(g))
     }
 
-    pub fn take_states(&mut self) -> Vec<Vec<AggState>> {
-        self.groups.iter().map(|g| g.states.clone()).collect()
+    /// partial 分片执行辅助：聚合列数注册（首批前调用；列状态首批 ingest 落地）。
+    pub fn set_arity(&mut self, n: usize) {
+        self.pending_arity = Some(n);
+    }
+
+    pub fn arity(&self) -> usize {
+        self.pending_arity.unwrap_or(0)
+    }
+
+    /// 输出用组键（[gid][分组列]）。
+    pub fn group_keys(&self) -> Vec<Vec<Literal>> {
+        let n = self.len();
+        let mut by_row = vec![Vec::with_capacity(self.group_lits.len()); n];
+        for gid in 0..n {
+            for col in &self.group_lits {
+                by_row[gid].push(col[gid].clone());
+            }
+        }
+        by_row
     }
 
     fn update_aggs(
@@ -527,17 +657,18 @@ impl GroupTable {
         use crate::expr::AggFunc::*;
         match agg.func {
             Count => {
+                let col = &mut self.counts[ai];
                 match arr {
                     None => {
                         // COUNT(*)：全部行
                         for &g in group_ids {
-                            self.groups[g as usize].states[ai].count += 1;
+                            col[g as usize] += 1;
                         }
                     }
                     Some(a) => {
                         for (row, &g) in group_ids.iter().enumerate() {
                             if !a.is_null(row) {
-                                self.groups[g as usize].states[ai].count += 1;
+                                col[g as usize] += 1;
                             }
                         }
                     }
@@ -566,50 +697,48 @@ impl GroupTable {
         match dt {
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
                 let vals: Vec<i64> = downcast_ints(a);
+                let cnt = &mut self.counts[ai];
+                let SumCol::Int(acc) = &mut self.sums[ai] else {
+                    return Err(QsdbError::type_err("sum column kind mismatch (internal)"));
+                };
                 for (row, &g) in group_ids.iter().enumerate() {
-                    // NULL 行不计入 sum/avg（SQL 语义；downcast_ints 以 0 占位丢失 null）
-                    if a.is_null(row) {
-                        continue;
+                    if !a.is_null(row) {
+                        let g = g as usize;
+                        acc[g] += i128::from(vals[row]);
+                        cnt[g] += 1;
                     }
-                    let v = vals[row];
-                    let st = &mut self.groups[g as usize].states[ai];
-                    match &mut st.sum {
-                        SumState::Int(acc) => *acc += i128::from(v),
-                        s => *s = SumState::Int(i128::from(v)),
-                    }
-                    st.count += 1;
                 }
             }
             DataType::Float64 => {
                 let f = a.as_any().downcast_ref::<Float64Array>().unwrap();
+                let cnt = &mut self.counts[ai];
+                let SumCol::Flt(acc) = &mut self.sums[ai] else {
+                    return Err(QsdbError::type_err("sum column kind mismatch (internal)"));
+                };
                 for (row, &g) in group_ids.iter().enumerate() {
                     if !f.is_null(row) {
                         let v = f.value(row);
-                        let st = &mut self.groups[g as usize].states[ai];
-                        match &mut st.sum {
-                            SumState::Flt(acc, c) => {
-                                let y = v - *c;
-                                let t = *acc + y;
-                                *c = (t - *acc) - y;
-                                *acc = t;
-                            }
-                            s => *s = SumState::Flt(v, 0.0),
-                        }
-                        st.count += 1;
+                        let g = g as usize;
+                        let s = &mut acc[g];
+                        let y = v - s.1;
+                        let t = s.0 + y;
+                        s.1 = (t - s.0) - y;
+                        s.0 = t;
+                        cnt[g] += 1;
                     }
                 }
             }
             DataType::Decimal128(_, _) => {
                 let d = a.as_any().downcast_ref::<Decimal128Array>().unwrap();
+                let cnt = &mut self.counts[ai];
+                let SumCol::Dec(acc) = &mut self.sums[ai] else {
+                    return Err(QsdbError::type_err("sum column kind mismatch (internal)"));
+                };
                 for (row, &g) in group_ids.iter().enumerate() {
                     if !d.is_null(row) {
-                        let v = i256::from_i128(d.value(row));
-                        let st = &mut self.groups[g as usize].states[ai];
-                        match &mut st.sum {
-                            SumState::Dec(acc) => *acc += v,
-                            s => *s = SumState::Dec(v),
-                        }
-                        st.count += 1;
+                        let g = g as usize;
+                        acc[g] += i256::from_i128(d.value(row));
+                        cnt[g] += 1;
                     }
                 }
             }
@@ -630,6 +759,7 @@ impl GroupTable {
         group_ids: &[u32],
     ) -> Result<()> {
         use arrow::datatypes::TimeUnit;
+        let col = &mut self.minmax[ai];
         // typed 快路径：直接以原生值比较，跳过逐行 Literal 构造
         macro_rules! fast {
             ($ty:ty, $make:expr) => {{
@@ -639,8 +769,7 @@ impl GroupTable {
                         continue;
                     }
                     let v = arr.value(row);
-                    let st = &mut self.groups[g as usize].states[ai];
-                    let slot = if is_min { &mut st.min } else { &mut st.max };
+                    let slot = &mut col[g as usize];
                     match slot {
                         None => *slot = Some($make(v)),
                         Some(cur) => match cur {
@@ -680,36 +809,14 @@ impl GroupTable {
                 continue;
             }
             let v = array_value_to_literal(a, row);
-            let st = &mut self.groups[g as usize].states[ai];
-            let cur = if is_min { st.min.take() } else { st.max.take() };
-            let merged = if is_min {
+            let cur = col[g as usize].take();
+            col[g as usize] = if is_min {
                 combine_min(cur, Some(v))
             } else {
                 combine_max(cur, Some(v))
             };
-            if is_min {
-                st.min = merged;
-            } else {
-                st.max = merged;
-            }
         }
         Ok(())
-    }
-
-    /// partial 分片执行辅助：聚合列数注册（首批前调用）。
-    pub fn set_arity(&mut self, n: usize) {
-        self.pending_arity = Some(n);
-        for g in &mut self.groups {
-            g.states = vec![AggState::default(); n];
-        }
-    }
-
-    pub fn arity(&self) -> usize {
-        self.pending_arity.unwrap_or(0)
-    }
-
-    pub fn len(&self) -> usize {
-        self.groups.len()
     }
 }
 
@@ -725,9 +832,9 @@ fn int64_group_columns(arrays: &[ArrayRef]) -> Option<Vec<Vec<i64>>> {
         if arr.null_count() > 0 {
             return None;
         }
-        // 注意：不能用 values().to_vec()——slice 批的 values() 不含 offset，
-        // 会读到错位数据导致组键分裂（M4-1 bug）。value(i) 带 offset 语义。
-        out.push((0..arr.len()).map(|i| arr.value(i)).collect());
+        // offset 感知整块拷贝（slice 批 values() 不含 offset——显式加，保 M4-1 语义）
+        let off = arr.offset();
+        out.push(arr.values()[off..off + arr.len()].to_vec());
     }
     Some(out)
 }
@@ -757,13 +864,11 @@ fn downcast_ints(a: &dyn Array) -> Vec<i64> {
             .iter()
             .map(|v| i64::from(v.unwrap_or(0)))
             .collect(),
-        _ => a
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .iter()
-            .map(|v| v.unwrap_or(0))
-            .collect(),
+        _ => {
+            let arr = a.as_any().downcast_ref::<Int64Array>().unwrap();
+            let off = arr.offset();
+            arr.values()[off..off + arr.len()].to_vec()
+        }
     }
 }
 
@@ -772,107 +877,144 @@ fn downcast_ints(a: &dyn Array) -> Vec<i64> {
 // ---------------------------------------------------------------------------
 
 /// 组键 + 状态 → 输出批。
-pub fn finalize(
-    keys: &[Vec<Literal>],
-    states: &[Vec<AggState>],
+pub fn finalize_table(
+    table: &GroupTable,
     aggs: &[AggExpr],
     group: &[PhysExpr],
     schema: &arrow::datatypes::SchemaRef,
 ) -> Result<RecordBatch> {
-    let _n = keys.len();
+    let n = table.len();
     let mut cols: Vec<ArrayRef> = Vec::with_capacity(group.len() + aggs.len());
     // group 列
     for (gi, g) in group.iter().enumerate() {
-        let lits: Vec<&Literal> = keys.iter().map(|k| &k[gi]).collect();
+        let lits: Vec<&Literal> = (0..n).map(|gid| &table.group_lits[gi][gid]).collect();
         cols.push(literals_to_array(&lits, &g.data_type())?);
     }
     // agg 列
     for (ai, agg) in aggs.iter().enumerate() {
-        let arr = finalize_agg(states.iter().map(|s| &s[ai]), agg)?;
-        cols.push(arr);
+        cols.push(finalize_col(table, ai, agg, n)?);
     }
     RecordBatch::try_new(Arc::clone(schema), cols)
         .map_err(|e| QsdbError::invalid(format!("agg output: {e}")))
 }
 
-fn finalize_agg<'a>(states: impl Iterator<Item = &'a AggState>, agg: &AggExpr) -> Result<ArrayRef> {
+/// 单聚合列：SoA 状态 → 输出数组（不做行式 AggState 物化）。
+fn finalize_col(table: &GroupTable, ai: usize, agg: &AggExpr, n: usize) -> Result<ArrayRef> {
     use crate::expr::AggFunc::*;
     match agg.func {
         Udaf => Err(QsdbError::unsupported(
             "UDAF 走 UdafAggExec 串行物化路径（不应到达 finalize）",
         )),
         Count => {
-            let out: arrow::array::Int64Array = states.map(|s| Some(s.count as i64)).collect();
+            let c = &table.counts[ai];
+            let out: Int64Array = c.iter().take(n).map(|v| Some(*v as i64)).collect();
             Ok(Arc::new(out))
         }
-        Sum => match agg.out_ty {
-            LogicalType::Int64 => {
-                let out: arrow::array::Int64Array = states
-                    .map(|s| match s.sum {
-                        SumState::Int(v) => i64::try_from(v).ok(),
-                        _ => None,
-                    })
-                    .collect();
-                Ok(Arc::new(out))
+        Sum => {
+            // count=0（未见任何非空值）→ NULL（全 NULL 组语义）
+            let cnt = &table.counts[ai];
+            match agg.out_ty {
+                LogicalType::Int64 => {
+                    let SumCol::Int(v) = &table.sums[ai] else {
+                        return Err(QsdbError::type_err("sum column kind mismatch (internal)"));
+                    };
+                    let out: Int64Array = (0..n)
+                        .map(|g| {
+                            if cnt[g] == 0 {
+                                None
+                            } else {
+                                i64::try_from(v[g]).ok()
+                            }
+                        })
+                        .collect();
+                    Ok(Arc::new(out))
+                }
+                LogicalType::Float64 => {
+                    let SumCol::Flt(v) = &table.sums[ai] else {
+                        return Err(QsdbError::type_err("sum column kind mismatch (internal)"));
+                    };
+                    let out: Float64Array = (0..n)
+                        .map(|g| if cnt[g] == 0 { None } else { Some(v[g].0) })
+                        .collect();
+                    Ok(Arc::new(out))
+                }
+                LogicalType::Decimal(m) => {
+                    let SumCol::Dec(v) = &table.sums[ai] else {
+                        return Err(QsdbError::type_err("sum column kind mismatch (internal)"));
+                    };
+                    let out: Decimal128Array = (0..n)
+                        .map(|g| if cnt[g] == 0 { None } else { v[g].to_i128() })
+                        .collect();
+                    Ok(Arc::new(out.with_data_type(DataType::Decimal128(
+                        m.precision,
+                        m.scale,
+                    ))))
+                }
+                _ => Err(QsdbError::type_err("bad sum output type")),
             }
-            LogicalType::Float64 => {
-                let out: Float64Array = states
-                    .map(|s| match s.sum {
-                        SumState::Flt(v, _) => Some(v),
-                        _ => None,
-                    })
-                    .collect();
-                Ok(Arc::new(out))
-            }
-            LogicalType::Decimal(m) => {
-                let out: Decimal128Array = states
-                    .map(|s| match s.sum {
-                        SumState::Dec(v) => v.to_i128(),
-                        _ => None,
-                    })
-                    .collect();
-                Ok(Arc::new(out.with_data_type(DataType::Decimal128(
-                    m.precision,
-                    m.scale,
-                ))))
-            }
-            _ => Err(QsdbError::type_err("bad sum output type")),
-        },
+        }
         Avg => match agg.out_ty {
             LogicalType::Float64 => {
-                let out: Float64Array = states
-                    .map(|s| match s.sum {
-                        SumState::Flt(v, _) if s.count > 0 => Some(v / s.count as f64),
-                        SumState::Int(v) if s.count > 0 => Some(v as f64 / s.count as f64),
-                        _ => None,
-                    })
+                let cnt = &table.counts[ai];
+                let out: Float64Array = match &table.sums[ai] {
+                    SumCol::Flt(v) => v
+                        .iter()
+                        .take(n)
+                        .zip(cnt.iter())
+                        .map(|(x, c)| Some(x.0 / *c as f64))
+                        .collect(),
+                    SumCol::Int(v) => v
+                        .iter()
+                        .take(n)
+                        .zip(cnt.iter())
+                        .map(|(x, c)| Some(*x as f64 / *c as f64))
+                        .collect(),
+                    SumCol::Dec(v) => v
+                        .iter()
+                        .take(n)
+                        .zip(cnt.iter())
+                        .map(|(x, c)| Some(x.to_i128().unwrap_or(0) as f64 / *c as f64))
+                        .collect(),
+                    SumCol::None => (0..n).map(|_| None).collect(),
+                };
+                // count = 0 → NULL（空组不产生：组只在见到行时创建，但 merge 后可能）
+                let out: Float64Array = out
+                    .iter()
+                    .zip(cnt.iter())
+                    .map(|(v, c)| if *c == 0 { None } else { v })
                     .collect();
                 Ok(Arc::new(out))
             }
             LogicalType::Decimal(m) => {
+                let cnt = &table.counts[ai];
+                let SumCol::Dec(v) = &table.sums[ai] else {
+                    return Err(QsdbError::type_err("sum column kind mismatch (internal)"));
+                };
                 // HALF_UP(sum / count) 到 avg_result scale
-                let out: Decimal128Array = states
-                    .map(|s| match s.sum {
-                        SumState::Dec(v) if s.count > 0 => {
-                            let cnt = i256::from_i128(s.count as i128);
-                            let q = v / cnt;
-                            let rem = v % cnt;
-                            // HALF_UP
-                            let two = i256::from_i128(2);
-                            let round_up = rem != i256::from_i128(0)
-                                && rem.wrapping_mul(two).wrapping_abs() >= cnt;
-                            let adj = if round_up {
-                                if v >= i256::from_i128(0) {
-                                    q + i256::from_i128(1)
-                                } else {
-                                    q - i256::from_i128(1)
-                                }
-                            } else {
-                                q
-                            };
-                            adj.to_i128()
+                let out: Decimal128Array = v
+                    .iter()
+                    .take(n)
+                    .zip(cnt.iter())
+                    .map(|(x, c)| {
+                        if *c == 0 {
+                            return None;
                         }
-                        _ => None,
+                        let cnt_v = i256::from_i128(*c as i128);
+                        let q = *x / cnt_v;
+                        let rem = *x % cnt_v;
+                        let two = i256::from_i128(2);
+                        let round_up = rem != i256::from_i128(0)
+                            && rem.wrapping_mul(two).wrapping_abs() >= cnt_v;
+                        let adj = if round_up {
+                            if *x >= i256::from_i128(0) {
+                                q + i256::from_i128(1)
+                            } else {
+                                q - i256::from_i128(1)
+                            }
+                        } else {
+                            q
+                        };
+                        adj.to_i128()
                     })
                     .collect();
                 Ok(Arc::new(out.with_data_type(DataType::Decimal128(
@@ -883,16 +1025,9 @@ fn finalize_agg<'a>(states: impl Iterator<Item = &'a AggState>, agg: &AggExpr) -
             _ => Err(QsdbError::type_err("bad avg output type")),
         },
         Min | Max => {
-            let is_min = agg.func == Min;
-            let lits: Vec<&Literal> = states
-                .map(|s| {
-                    if is_min {
-                        s.min.as_ref()
-                    } else {
-                        s.max.as_ref()
-                    }
-                    .unwrap_or(&Literal::Null)
-                })
+            let col = &table.minmax[ai];
+            let lits: Vec<&Literal> = (0..n)
+                .map(|g| col[g].as_ref().unwrap_or(&Literal::Null))
                 .collect();
             let ty = agg
                 .arg
@@ -940,7 +1075,6 @@ pub fn literals_to_array(lits: &[&Literal], ty: &LogicalType) -> Result<ArrayRef
 /// Distinct 输出（group keys → 全列批）。
 pub fn build_output_batch(
     keys: &[Vec<Literal>],
-    _aggs: &[AggExpr],
     schema: &arrow::datatypes::SchemaRef,
 ) -> Result<RecordBatch> {
     let n = schema.fields().len();

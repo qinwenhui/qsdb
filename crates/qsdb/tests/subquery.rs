@@ -177,3 +177,18 @@ fn limit_zero_schema_contract() {
     }
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn predicate_column_not_in_projection() {
+    // 回归：谓词列不在投影中（count(*) WHERE v>15）——下推进 Scan 的谓词
+    // 引用列必须进列裁剪收集，否则投影被裁到只剩分区列、谓词静默失效
+    let (db, root) = setup("predcol");
+    let r = q(&db, "SELECT count(*) FROM sales WHERE amt > 15");
+    // amt>15: b(20), a(30), c(40) → 3（失效则 4）
+    assert_eq!(r, vec!["3"]);
+
+    // 谓词列在投影中（原本就正确）对照
+    let r = q(&db, "SELECT amt FROM sales WHERE amt > 15 ORDER BY amt");
+    assert_eq!(r, vec!["20", "30", "40"]);
+    std::fs::remove_dir_all(&root).ok();
+}

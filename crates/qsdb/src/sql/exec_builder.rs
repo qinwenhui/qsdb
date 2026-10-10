@@ -83,7 +83,19 @@ pub fn build(
 /// 全计划引用列名（Column 节点）。
 fn collect_plan_columns(plan: &LogicalPlan, out: &mut Vec<String>) {
     match plan {
-        LogicalPlan::Scan { .. } => {}
+        // 下推进 Scan 的谓词也引用数据列——必须收集，否则投影被裁到只剩分区列
+        // （M4 期 bug：数据列谓词静默失效——WHERE a>0 读不到 a 列按恒真处理）
+        LogicalPlan::Scan { predicate, .. } => {
+            if let Some(p) = predicate {
+                let mut cols = std::collections::HashSet::new();
+                p.referenced_columns(&mut cols);
+                for c in cols {
+                    if !out.iter().any(|u| u.eq_ignore_ascii_case(&c)) {
+                        out.push(c);
+                    }
+                }
+            }
+        }
         LogicalPlan::Filter { input, predicate } => {
             collect_expr_columns(predicate, out);
             collect_plan_columns(input, out);
@@ -485,21 +497,65 @@ fn build_aggregate(
         .map(|s| run_partial(s, &filters, &group, &aggs, ctx))
         .collect::<Result<Vec<_>>>()?;
 
-    // merge（单线程）
-    let mut merged = GroupTable::new();
-    merged.set_arity(aggs.len());
-    for t in tables {
-        merged.merge(t, aggs.len());
+    // merge：按组 key hash 分区并行（每分区独立合并全部 shard 的对应组——
+    // 分区表小缓存友好；原本单线程串行 merge 是高组数下的瓶颈），
+    // 各分区各自 finalize 后按列 concat。
+    let p = rayon::current_num_threads().clamp(1, 32);
+    // 分区主序桶：parts[pi][ti] = 第 ti 张表中 hash 落 pi 分区的组下标
+    let mut parts: Vec<Vec<Vec<usize>>> = vec![vec![Vec::new(); tables.len()]; p];
+    for (ti, t) in tables.iter().enumerate() {
+        for g in 0..t.len() {
+            parts[(t.group_hash(g) as usize) % p][ti].push(g);
+        }
     }
-    if merged.is_empty() {
+    let group_ref = &group;
+    let aggs_ref = &aggs;
+    let schema_ref = &schema;
+    let batches: Vec<Option<RecordBatch>> = parts
+        .into_par_iter()
+        .map(|mut table_buckets| {
+            let mut merged = GroupTable::new();
+            for (ti, t) in tables.iter().enumerate() {
+                let ogs = std::mem::take(&mut table_buckets[ti]);
+                if !ogs.is_empty() {
+                    merged.merge_subset(t, ogs, aggs_ref.len());
+                }
+            }
+            if merged.is_empty() {
+                return Ok(None);
+            }
+            crate::exec::agg::finalize_table(&merged, aggs_ref, group_ref, schema_ref).map(Some)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let _ = &tables;
+    let some_batches: Vec<RecordBatch> = batches.into_iter().flatten().collect();
+    if some_batches.is_empty() {
         return Ok(Box::new(OneShotExec {
             batch: None,
             schema,
         }));
     }
-    let keys = merged.take_group_keys();
-    let states = merged.take_states();
-    let batch = crate::exec::agg::finalize(&keys, &states, &aggs, &group, &schema)?;
+    let batch = if some_batches.len() == 1 {
+        some_batches.into_iter().next().expect("len checked")
+    } else {
+        let cols = some_batches[0].num_columns();
+        let mut out_cols = Vec::with_capacity(cols);
+        for c in 0..cols {
+            let slices: Vec<&dyn arrow::array::Array> =
+                some_batches.iter().map(|b| b.column(c).as_ref()).collect();
+            out_cols.push(
+                arrow::compute::concat(&slices)
+                    .map_err(|e| crate::error::QsdbError::invalid(format!("agg concat: {e}")))?,
+            );
+        }
+        let n: usize = some_batches.iter().map(|b| b.num_rows()).sum();
+        arrow::record_batch::RecordBatch::try_new_with_options(
+            Arc::clone(&schema),
+            out_cols,
+            &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(n)),
+        )
+        .map_err(|e| crate::error::QsdbError::invalid(format!("agg output concat: {e}")))?
+    };
     Ok(Box::new(OneShotExec {
         batch: Some(batch),
         schema,
@@ -554,7 +610,7 @@ fn try_shard_source(
                     )
                     .ok()?;
                 let threads = rayon::current_num_threads().clamp(1, 16);
-                let shards = scan.shard(threads)?;
+                let shards = scan.shard(threads, false)?;
                 return Some((shards, filters));
             }
             _ => return None,
