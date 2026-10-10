@@ -556,7 +556,6 @@ fn error_paths_and_edges() {
     // 不支持语法明确报错
     for sql in [
         "UPDATE events SET cnt = 1",
-        "DELETE FROM events",
         "SELECT * FROM events a JOIN events b",
         "SELECT cnt FROM events UNION SELECT cnt FROM events",
         "SELECT cnt FROM events HAVING cnt > 1",
@@ -620,12 +619,9 @@ fn join_inner_and_left() {
     assert!(r.contains(&"alice|2|14.00".to_string()), "{r:?}");
     assert!(r.contains(&"bob|1|7.50".to_string()), "{r:?}");
 
-    // 非 ON 约束 / 非等值 → 报错
+    // 非 ON 约束 → 报错；非等值 INNER 现已支持（cross + filter），不再报错
     assert!(db.sql("SELECT * FROM orders JOIN users").is_err());
-    assert!(
-        db.sql("SELECT * FROM orders JOIN users ON orders.amt > users.uid")
-            .is_err()
-    );
+    let _ = db.sql("SELECT * FROM orders JOIN users ON orders.amt > users.uid");
     // 两侧同名列非限定引用 → 不支持（须限定）
     db.sql("CREATE TABLE m (k BIGINT, v STRING) PARTITIONED BY (k)")
         .unwrap();
@@ -660,6 +656,98 @@ fn having_filters_aggregate_output() {
     );
     // 无聚合无分组 HAVING → 报错
     assert!(db.sql("SELECT cnt FROM events HAVING cnt > 1").is_err());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ===========================================================================
+// 评审反馈批次：WITH 属性 / 别名 / DELETE / TRUNCATE / 非等值 JOIN
+// ===========================================================================
+
+#[test]
+fn create_table_with_properties() {
+    let (db, root) = db("with_prop");
+    db.sql("CREATE TABLE t1 (dt DATE, v BIGINT) PARTITIONED BY (dt) WITH (compression = 'snappy')")
+        .unwrap();
+    let def = db.table_def("t1").unwrap();
+    assert_eq!(
+        def.properties.get("compression").map(|s| s.as_str()),
+        Some("snappy")
+    );
+    // 不加 WITH → 空 properties
+    db.sql("CREATE TABLE t2 (dt DATE, v BIGINT) PARTITIONED BY (dt)")
+        .unwrap();
+    let def2 = db.table_def("t2").unwrap();
+    assert!(def2.properties.is_empty());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn delete_partitions_and_truncate() {
+    let (db, root) = setup_events("del");
+    // 分区级 DELETE：清空 dt=2026-01-01
+    match db.sql("DELETE FROM events WHERE dt = DATE '2026-01-01'") {
+        Ok(qsdb::sql::SqlResult::Ok { message }) => {
+            assert!(message.starts_with("3 rows"), "{message}")
+        }
+        _ => panic!("expected Ok"),
+    }
+    let n: usize = q(&db, "SELECT cnt FROM events").len();
+    assert_eq!(n, 3); // 原本 6 行，删 3 行
+    // 非分区键谓词 → 明确报错
+    let r = db.sql("DELETE FROM events WHERE cnt > 1");
+    assert!(r.is_err());
+    // TRUNCATE：清全部
+    match db.sql("TRUNCATE TABLE events") {
+        Ok(qsdb::sql::SqlResult::Ok { message }) => {
+            assert!(message.starts_with("3 rows"), "{message}")
+        }
+        _ => panic!("expected Ok"),
+    }
+    assert_eq!(q(&db, "SELECT cnt FROM events").len(), 0);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn having_and_order_by_select_alias() {
+    let (db, root) = setup_events("alias");
+    // HAVING 引用 SELECT 别名
+    let r = q(
+        &db,
+        "SELECT tenant, count(*) AS c FROM events GROUP BY tenant HAVING c >= 2",
+    );
+    assert_eq!(r.len(), 2, "{r:?}"); // a、b 各 2 行
+    // ORDER BY 引用 SELECT 别名
+    let r = raw(
+        &db,
+        "SELECT tenant, count(*) AS c FROM events GROUP BY tenant ORDER BY c DESC LIMIT 1",
+    );
+    assert_eq!(r.len(), 1);
+    assert!(r[0].ends_with("|2"), "{r:?}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn non_equi_inner_join() {
+    let (db, root) = db("nequi");
+    db.sql("CREATE TABLE a (id BIGINT, val BIGINT) PARTITIONED BY (id)")
+        .unwrap();
+    db.sql("CREATE TABLE b (id BIGINT, threshold BIGINT) PARTITIONED BY (id)")
+        .unwrap();
+    db.sql("INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+    db.sql("INSERT INTO b VALUES (100, 15), (200, 25)").unwrap();
+    // a.val > b.threshold 的组合：(10>15 无,10>25 无,20>15 有,20>25 无,30>15 有,30>25 有)
+    let mut r = q(
+        &db,
+        "SELECT a.val, b.threshold FROM a JOIN b ON a.val > b.threshold",
+    );
+    r.sort();
+    assert_eq!(r, vec!["20|15", "30|15", "30|25"]);
+    // 非等值 LEFT JOIN 仍报错
+    assert!(
+        db.sql("SELECT * FROM a LEFT JOIN b ON a.val > b.threshold")
+            .is_err()
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 

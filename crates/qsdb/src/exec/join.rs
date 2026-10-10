@@ -31,6 +31,131 @@ pub enum JoinType {
     LeftOuter,
 }
 
+/// 笛卡尔积（非等值 INNER JOIN 的底座）：右表首拉时物化，左批逐批 × 右表展开。
+pub struct CrossJoinExec {
+    probe: Box<dyn ExecNode>,
+    build: Option<Box<dyn ExecNode>>,
+    build_state: Option<RecordBatch>,
+    schema: SchemaRef,
+    ctx: Arc<QueryContext>,
+}
+
+impl CrossJoinExec {
+    pub fn new(probe: Box<dyn ExecNode>, build: Box<dyn ExecNode>, ctx: Arc<QueryContext>) -> Self {
+        let fields: Vec<arrow::datatypes::FieldRef> = probe
+            .schema()
+            .fields()
+            .iter()
+            .cloned()
+            .chain(build.schema().fields().iter().cloned())
+            .collect();
+        let schema = Arc::new(arrow::datatypes::Schema::new(fields));
+        Self {
+            probe,
+            build: Some(build),
+            build_state: None,
+            schema,
+            ctx,
+        }
+    }
+
+    fn materialize_build(&mut self) -> Result<()> {
+        if self.build_state.is_some() {
+            return Ok(());
+        }
+        let Some(mut build) = self.build.take() else {
+            return Ok(());
+        };
+        // 右 schema 从 build 节点自身（首批出现前用它 schema 的空批次形状不可行——
+        // 直接收集批，再以首批 schema concat；无批则空表）
+        let mut batches = Vec::new();
+        let mut charged = 0u64;
+        while let Some(b) = build.next() {
+            self.ctx.check()?;
+            let x = b?;
+            let bytes = x.get_array_memory_size() as u64;
+            self.ctx.charge_memory(bytes)?;
+            charged += bytes;
+            batches.push(x);
+        }
+        self.ctx.release_memory(charged);
+        let table = match batches.split_first() {
+            Some((first, _)) => crate::exec::spill::concat_batches(&batches, &first.schema())?,
+            None => RecordBatch::new_empty(build.schema()),
+        };
+        self.build_state = Some(table);
+        Ok(())
+    }
+}
+
+impl ExecNode for CrossJoinExec {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn next(&mut self) -> Option<Result<RecordBatch>> {
+        if let Err(e) = self.ctx.check() {
+            return Some(Err(e));
+        }
+        if let Err(e) = self.materialize_build() {
+            return Some(Err(e));
+        }
+        let batch = self.probe.next()?;
+        let batch = match batch {
+            Ok(b) => b,
+            Err(e) => return Some(Err(e)),
+        };
+        if batch.num_rows() == 0 {
+            return self.next();
+        }
+        // 展开：左批每行 × 右表每行
+        let n_left = batch.num_rows();
+        let n_right = self.build_state.as_ref().map(|b| b.num_rows()).unwrap_or(0);
+        let total = n_left * n_right;
+        let mut left_indices: Vec<u32> = Vec::with_capacity(total);
+        let mut right_indices: Vec<u32> = Vec::with_capacity(total);
+        for l in 0..n_left {
+            for r in 0..n_right {
+                left_indices.push(l as u32);
+                right_indices.push(r as u32);
+            }
+        }
+        let li = UInt32Array::from(left_indices);
+        let ri = UInt32Array::from(right_indices);
+        let mut cols: Vec<ArrayRef> = Vec::with_capacity(self.schema.fields().len());
+        for c in 0..batch.num_columns() {
+            let taken = take(batch.column(c), &li, None)
+                .map_err(|e| QsdbError::invalid(format!("cross take: {e}")));
+            match taken {
+                Ok(a) => cols.push(a),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        if let Some(build) = &self.build_state {
+            for c in 0..build.num_columns() {
+                let taken = take(build.column(c), &ri, None)
+                    .map_err(|e| QsdbError::invalid(format!("cross take: {e}")));
+                match taken {
+                    Ok(a) => cols.push(a),
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+        } else {
+            // 右表为空批：补全空列
+            for f in self.schema.fields().iter().skip(batch.num_columns()) {
+                cols.push(arrow::array::new_null_array(f.data_type(), total));
+            }
+        }
+        let out = RecordBatch::try_new_with_options(
+            Arc::clone(&self.schema),
+            cols,
+            &RecordBatchOptions::new().with_row_count(Some(total)),
+        )
+        .map_err(|e| QsdbError::invalid(format!("cross output: {e}")));
+        Some(out)
+    }
+}
+
 /// 哈希连接执行节点。
 pub struct HashJoinExec {
     probe: Box<dyn ExecNode>,

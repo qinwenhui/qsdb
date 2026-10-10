@@ -50,6 +50,12 @@ pub enum LogicalPlan {
     Distinct {
         input: Box<LogicalPlan>,
     },
+    /// 非等值 INNER：cross join（左 × 右）后在合并 schema 上过滤
+    CrossJoinFilter {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        predicate: PhysExpr,
+    },
     /// 等值连接（left=probe right=build）；输出列 = 左 ++ 右
     Join {
         left: Box<LogicalPlan>,
@@ -90,6 +96,14 @@ pub enum ParsedStatement {
         overwrite: bool,
     },
     Select(Box<sqlparser::ast::Query>),
+    /// DELETE FROM t WHERE <仅分区键谓词>（分区粒度原子清空）
+    Delete {
+        table: String,
+        selection: Option<String>,
+    },
+    Truncate {
+        table: String,
+    },
 }
 
 pub fn parse_statements(sql: &str) -> Result<Vec<ParsedStatement>> {
@@ -150,7 +164,22 @@ fn translate_statement(stmt: SqlStatement, raw: &str) -> Result<ParsedStatement>
                 }
                 _ => parse_partitioned_by(raw)?,
             };
-            let def = TableDef::new(table, defs, part_keys)?;
+            // WITH (k = 'v') / OPTIONS / TBLPROPERTIES → 表属性（compression 等）
+            let mut properties = std::collections::HashMap::new();
+            if let sqlparser::ast::CreateTableOptions::With(opts)
+            | sqlparser::ast::CreateTableOptions::Options(opts)
+            | sqlparser::ast::CreateTableOptions::TableProperties(opts) = &ct.table_options
+            {
+                for opt in opts {
+                    if let sqlparser::ast::SqlOption::KeyValue { key, value } = opt {
+                        if let Ok(v) = option_value_string(value) {
+                            properties.insert(key.value.clone(), v);
+                        }
+                    }
+                }
+            }
+            let mut def = TableDef::new(table, defs, part_keys)?;
+            def.properties = properties;
             let _ = ct.if_not_exists; // 建表冲突按 AlreadyExists 报错
             Ok(ParsedStatement::CreateTable { def })
         }
@@ -209,6 +238,33 @@ fn translate_statement(stmt: SqlStatement, raw: &str) -> Result<ParsedStatement>
                 overwrite: ins.overwrite,
             })
         }
+        SqlStatement::Delete(d) => {
+            use sqlparser::ast::FromTable;
+            let from = match &d.from {
+                FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
+            };
+            let target = from
+                .first()
+                .map(|twj| &twj.relation)
+                .ok_or_else(|| QsdbError::invalid("DELETE needs a target table"))?;
+            let table = match target {
+                sqlparser::ast::TableFactor::Table { name, .. } => {
+                    object_name_single(name.clone())?
+                }
+                other => return Err(QsdbError::unsupported(format!("DELETE target {other:?}"))),
+            };
+            let selection = d.selection.as_ref().map(|e| e.to_string());
+            Ok(ParsedStatement::Delete { table, selection })
+        }
+        SqlStatement::Truncate(tr) => {
+            let target = tr
+                .table_names
+                .first()
+                .ok_or_else(|| QsdbError::invalid("TRUNCATE needs a table"))?;
+            Ok(ParsedStatement::Truncate {
+                table: object_name_single(target.name.clone())?,
+            })
+        }
         SqlStatement::Query(q) => Ok(ParsedStatement::Select(q)),
         other => Err(QsdbError::unsupported(format!(
             "statement {other:?} not supported in this version (SQL-1)"
@@ -241,6 +297,29 @@ fn parse_partitioned_by(raw: &str) -> Result<Vec<String>> {
         .filter(|s| !s.is_empty())
         .collect();
     Ok(keys)
+}
+
+/// DDL 属性值 → 字符串（支持字面量与单值数字/布尔）。
+fn option_value_string(e: &sqlparser::ast::Expr) -> Result<String> {
+    use sqlparser::ast::Expr as E;
+    match e {
+        E::Value(v) => match &v.value {
+            sqlparser::ast::Value::SingleQuotedString(s)
+            | sqlparser::ast::Value::DoubleQuotedString(s) => Ok(s.clone()),
+            sqlparser::ast::Value::Number(n, _) => Ok(n.clone()),
+            sqlparser::ast::Value::Boolean(b) => Ok(b.to_string()),
+            other => Err(QsdbError::invalid(format!(
+                "table property value must be a string/number/bool literal, got {other:?}"
+            ))),
+        },
+        E::UnaryOp {
+            op: sqlparser::ast::UnaryOperator::Minus,
+            expr,
+        } => Ok(format!("-{}", option_value_string(expr)?)),
+        other => Err(QsdbError::invalid(format!(
+            "table property value must be a literal, got {other:?}"
+        ))),
+    }
 }
 
 fn object_name_single(name: sqlparser::ast::ObjectName) -> Result<String> {
@@ -487,6 +566,41 @@ impl SchemaCtx {
 /// 完整 SELECT 翻译（需要 catalog 访问）。
 pub type TableResolverFn<'a> = Box<dyn Fn(&str) -> Result<Arc<TableDef>> + 'a>;
 
+/// DELETE/TRUNCATE 辅助：`WHERE` 文本 → 下推谓词（SELECT 包装走 binder）。
+pub fn predicate_from_where(
+    table: &str,
+    where_sql: &str,
+    resolve: &dyn Fn(&str) -> Result<Arc<TableDef>>,
+) -> Result<Predicate> {
+    let wrapped = format!("SELECT 1 FROM {table} WHERE {where_sql}");
+    let ast = Parser::parse_sql(&GenericDialect {}, &wrapped)
+        .map_err(|e| QsdbError::parse_err(format!("DELETE WHERE parse: {e}")))?;
+    let q = ast
+        .into_iter()
+        .next()
+        .ok_or_else(|| QsdbError::invalid("empty DELETE WHERE"))?;
+    let sqlparser::ast::Statement::Query(q) = q else {
+        return Err(QsdbError::invalid("internal DELETE parse"));
+    };
+    let select = match *q.body {
+        sqlparser::ast::SetExpr::Select(s) => s,
+        _ => return Err(QsdbError::invalid("internal DELETE parse")),
+    };
+    let Some(w) = select.selection else {
+        return Err(QsdbError::invalid("DELETE requires WHERE"));
+    };
+    let def = resolve(table)?;
+    let ctx = SchemaCtx::from_table(&def);
+    let bound = bind_expr(&w, &ctx)?;
+    if !bound.is_boolean() {
+        return Err(QsdbError::type_err("DELETE WHERE must be boolean"));
+    }
+    let (pushdown, _residual) = split_pushdown(&bound);
+    pushdown.ok_or_else(|| {
+        QsdbError::invalid("DELETE WHERE must reference partition columns for pruning")
+    })
+}
+
 pub struct TableResolver<'a> {
     pub resolve: TableResolverFn<'a>,
 }
@@ -559,17 +673,40 @@ pub fn translate_select_full(
             ctx.cols
                 .push((format!("{right_name}.{}", c.name), c.logical_type.clone()));
         }
-        let (lkey, rkey) = split_equi_condition(on_expr, n_left_plain, &ctx)?;
-        plan = LogicalPlan::Join {
-            left: Box::new(plan),
-            right: Box::new(LogicalPlan::Scan {
-                def: Arc::clone(&right_def),
-                predicate: None,
-            }),
-            left_keys: vec![lkey],
-            right_keys: vec![rkey],
-            join_type: jt,
-        };
+        match split_equi_condition(on_expr, n_left_plain, &ctx) {
+            Ok((lkey, rkey)) => {
+                plan = LogicalPlan::Join {
+                    left: Box::new(plan),
+                    right: Box::new(LogicalPlan::Scan {
+                        def: Arc::clone(&right_def),
+                        predicate: None,
+                    }),
+                    left_keys: vec![lkey],
+                    right_keys: vec![rkey],
+                    join_type: jt,
+                };
+            }
+            Err(_) if jt == crate::exec::join::JoinType::Inner => {
+                // 非等值 INNER：cross join + 合并 schema 上过滤原 ON 表达式
+                let combined = bind_expr(on_expr, &ctx)?;
+                if !combined.is_boolean() {
+                    return Err(QsdbError::type_err("JOIN ON must be boolean"));
+                }
+                plan = LogicalPlan::CrossJoinFilter {
+                    left: Box::new(plan),
+                    right: Box::new(LogicalPlan::Scan {
+                        def: Arc::clone(&right_def),
+                        predicate: None,
+                    }),
+                    predicate: combined,
+                };
+            }
+            Err(e) => {
+                return Err(QsdbError::unsupported(format!(
+                    "non-equi LEFT JOIN lands later: {e}"
+                )));
+            }
+        }
     }
 
     // WHERE
@@ -659,8 +796,20 @@ pub fn translate_select_full(
         for a in &aggs {
             hctx.push((a.out_name.clone(), a.out_ty.clone()));
         }
+
         let agg_ctx = SchemaCtx { cols: hctx };
-        having_pred = Some(rebind_over_agg(h, &ctx, &group_exprs, &aggs, &agg_ctx)?);
+        let pairs: Vec<(Expr, String)> = items
+            .iter()
+            .map(|it| (it.sql.clone(), it.name.clone()))
+            .collect();
+        let substituted = substitute_aliases(h, &pairs);
+        having_pred = Some(rebind_over_agg(
+            &substituted,
+            &ctx,
+            &group_exprs,
+            &aggs,
+            &agg_ctx,
+        )?);
         if !having_pred.as_ref().unwrap().is_boolean() {
             return Err(QsdbError::type_err("HAVING must be boolean"));
         }
@@ -884,6 +1033,49 @@ fn split_equi_condition(
         _ => Err(QsdbError::invalid(
             "JOIN ON keys must be column references, one from each side",
         )),
+    }
+}
+
+/// HAVING/ORDER BY 中的 SELECT 别名 → 对应源表达式（AST 级浅替换）。
+fn substitute_aliases(
+    e: &sqlparser::ast::Expr,
+    items: &[(sqlparser::ast::Expr, String)],
+) -> sqlparser::ast::Expr {
+    use sqlparser::ast::Expr as E;
+    match e {
+        E::Identifier(id) => {
+            for it in items {
+                let (sql, name) = it;
+                if name.eq_ignore_ascii_case(&id.value) {
+                    return sql.clone();
+                }
+            }
+            e.clone()
+        }
+        E::Nested(inner) => E::Nested(Box::new(substitute_aliases(inner, items))),
+        E::UnaryOp { op, expr } => E::UnaryOp {
+            op: op.clone(),
+            expr: Box::new(substitute_aliases(expr, items)),
+        },
+        E::BinaryOp { left, op, right } => E::BinaryOp {
+            left: Box::new(substitute_aliases(left, items)),
+            op: op.clone(),
+            right: Box::new(substitute_aliases(right, items)),
+        },
+        E::Cast {
+            kind,
+            expr,
+            data_type,
+            format,
+        } => E::Cast {
+            kind: kind.clone(),
+            expr: Box::new(substitute_aliases(expr, items)),
+            data_type: data_type.clone(),
+            format: format.clone(),
+        },
+        E::IsNull(inner) => E::IsNull(Box::new(substitute_aliases(inner, items))),
+        E::IsNotNull(inner) => E::IsNotNull(Box::new(substitute_aliases(inner, items))),
+        other => other.clone(),
     }
 }
 

@@ -89,7 +89,7 @@ fn collect_plan_columns(plan: &LogicalPlan, out: &mut Vec<String>) {
         LogicalPlan::Limit { input, .. } | LogicalPlan::Distinct { input } => {
             collect_plan_columns(input, out);
         }
-        LogicalPlan::Join { .. } => {
+        LogicalPlan::Join { .. } | LogicalPlan::CrossJoinFilter { .. } => {
             // 多表计划不走列裁剪下推（build 的 count_scans guard 兜底）
         }
     }
@@ -127,7 +127,7 @@ fn plan_scan_def(plan: &LogicalPlan) -> Option<Arc<crate::catalog::TableDef>> {
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Distinct { input } => plan_scan_def(input),
-        LogicalPlan::Join { .. } => None,
+        LogicalPlan::Join { .. } | LogicalPlan::CrossJoinFilter { .. } => None,
     }
 }
 
@@ -195,7 +195,7 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
         LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
             input: Box::new(rewrite_plan(input, mapping, all)),
         },
-        LogicalPlan::Join { .. } => plan.clone(),
+        LogicalPlan::Join { .. } | LogicalPlan::CrossJoinFilter { .. } => plan.clone(),
     }
 }
 
@@ -294,6 +294,22 @@ fn build_inner(
         LogicalPlan::Distinct { input } => Ok(Box::new(crate::exec::DistinctExec::new(
             build_inner(db, input, scan_proj.clone(), ctx)?,
         ))),
+        LogicalPlan::CrossJoinFilter {
+            left,
+            right,
+            predicate,
+        } => {
+            let probe = build_inner(db, left, None, ctx)?;
+            let build = build_inner(db, right, None, ctx)?;
+            // cross：probe 批 × build 全表，再按谓词过滤
+            // 实现为：FilterExec { input: CrossJoinExec } —— CrossJoinExec 内联在此
+            let cross = crate::exec::join::CrossJoinExec::new(probe, build, Arc::clone(ctx));
+            Ok(Box::new(FilterExec::new(
+                Box::new(cross),
+                predicate.clone(),
+                Arc::clone(ctx),
+            )))
+        }
         LogicalPlan::Join {
             left,
             right,

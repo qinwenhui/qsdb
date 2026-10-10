@@ -230,6 +230,18 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
                 })
             }
         }
+        translate::ParsedStatement::Delete { table, selection } => {
+            let rows = db.delete_partitions_where(&table, selection.as_deref())?;
+            Ok(SqlResult::Ok {
+                message: format!("{rows} rows deleted"),
+            })
+        }
+        translate::ParsedStatement::Truncate { table } => {
+            let rows = db.truncate_table(&table)?;
+            Ok(SqlResult::Ok {
+                message: format!("{rows} rows truncated"),
+            })
+        }
         translate::ParsedStatement::Select(q) => {
             let resolver = translate::TableResolver {
                 resolve: Box::new(|name: &str| db.table_def(name)),

@@ -274,6 +274,129 @@ impl Qsdb {
         )
     }
 
+    /// 分区级 DELETE：谓词必须**只引用分区键**（等值/范围/AND 组合）。
+    /// 命中的分区原子清空（空 manifest 替换 + 旧文件 trash）。
+    /// 非分区键谓词 → 报错（行级 DELETE 是独立大特性，见设计文档 M5）。
+    pub fn delete_partitions_where(&self, table: &str, selection: Option<&str>) -> Result<u64> {
+        let def = self.def(None, table)?;
+        let tdir = table_dir(&self.root, DEFAULT_DB, table);
+        // 无 WHERE = 清全表（等价 TRUNCATE）
+        let Some(sel) = selection else {
+            return self.truncate_table(table);
+        };
+        // WHERE → 下推谓词（经 SELECT 包装走 binder + split_pushdown）
+        let predicate =
+            crate::sql::translate::predicate_from_where(table, sel, &|n| self.table_def(n))?;
+        // 谓词必须只引用分区列
+        let mut cols = std::collections::HashSet::new();
+        predicate.referenced_columns(&mut cols);
+        for c in &cols {
+            if !def
+                .partition_keys
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case(c.as_str()))
+            {
+                return Err(QsdbError::unsupported(format!(
+                    "DELETE WHERE references non-partition column '{c}' — only partition-key                      predicates are supported (partition-granular); row-level DELETE is a                      separate feature"
+                )));
+            }
+        }
+        // 逐分区裁剪 + 清空
+        let parts = crate::scan::list_partitions(&tdir, def.partition_keys.len());
+        let mut cleared = 0u64;
+        for (pdir, dir_vals) in parts {
+            let mut pvals: HashMap<String, Literal> = HashMap::new();
+            let mut ok = true;
+            for (k, raw) in &dir_vals {
+                match def.column(k) {
+                    Some(c) => {
+                        match crate::partition::parse_partition_value(raw, &c.logical_type) {
+                            Ok(v) => {
+                                pvals.insert(k.clone(), v);
+                            }
+                            Err(_) => ok = false,
+                        }
+                    }
+                    None => ok = false,
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let lookup: HashMap<&str, &Literal> =
+                pvals.iter().map(|(k, v)| (k.as_str(), v)).collect();
+            // 无法确定裁剪（Unknown）→ 保守清空？不——DELETE 语义要求确定性：
+            // False → 跳过；True/Unknown → 清空（保守删除）
+            if crate::scan::eval_partition_predicate(&predicate, &lookup) == crate::scan::Tri::False
+            {
+                continue;
+            }
+            let cleared_rows = self.clear_partition(&tdir, &def, &pvals)?;
+            cleared += cleared_rows;
+        }
+        Ok(cleared)
+    }
+
+    /// 清空单个分区（空 manifest 原子替换 + 旧文件 trash）。返回清除行数。
+    fn clear_partition(
+        &self,
+        tdir: &std::path::Path,
+        def: &Arc<TableDef>,
+        values: &HashMap<String, Literal>,
+    ) -> Result<u64> {
+        let ordered: Vec<Literal> = def
+            .partition_keys
+            .iter()
+            .map(|k| values.get(k).cloned().unwrap_or(Literal::Null))
+            .collect();
+        let dir = tdir.join(crate::partition::partition_dir(
+            &def.partition_keys,
+            &ordered,
+        )?);
+        let _guard = crate::fsutil::PartitionLock::acquire(&dir.join(".lock"))?;
+        let Some(old) = crate::manifest::PartitionManifest::read(&dir)? else {
+            return Ok(0);
+        };
+        let rows = old.total_rows();
+        let mut empty = crate::manifest::PartitionManifest::new(vec![], def.schema_fingerprint());
+        empty.partition_values = def
+            .partition_keys
+            .iter()
+            .cloned()
+            .zip(ordered.iter().cloned())
+            .collect();
+        empty.segments = Vec::new();
+        empty.commit(&dir)?;
+        let rel = dir
+            .strip_prefix(tdir)
+            .unwrap_or(&dir)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let _ = crate::index::PartitionsIndex::upsert(tdir, &rel, &empty);
+        for f in old.segment_paths(&dir) {
+            let _ = crate::fsutil::move_to_trash(&self.root, &f);
+        }
+        Ok(rows)
+    }
+
+    /// 清空全表所有分区（保留表定义）。
+    pub fn truncate_table(&self, table: &str) -> Result<u64> {
+        let def = self.def(None, table)?;
+        let tdir = table_dir(&self.root, DEFAULT_DB, table);
+        let parts = crate::scan::list_partitions(&tdir, def.partition_keys.len());
+        let mut cleared = 0u64;
+        for (pdir, _) in parts {
+            // 从 manifest 提取分区值
+            if let Some(m) = crate::manifest::PartitionManifest::read(&pdir)? {
+                let vals: HashMap<String, Literal> = m.partition_values.iter().cloned().collect();
+                if !vals.is_empty() {
+                    cleared += self.clear_partition(&tdir, &def, &vals)?;
+                }
+            }
+        }
+        Ok(cleared)
+    }
+
     // -- SQL（M2：SQL-0/1）----------------------------------------------------
 
     /// 新建查询上下文（server 会话层用；嵌入用户也可自建以获得取消/超时能力）。
