@@ -1054,7 +1054,7 @@ fn substitute_aliases(
         }
         E::Nested(inner) => E::Nested(Box::new(substitute_aliases(inner, items))),
         E::UnaryOp { op, expr } => E::UnaryOp {
-            op: op.clone(),
+            op: *op,
             expr: Box::new(substitute_aliases(expr, items)),
         },
         E::BinaryOp { left, op, right } => E::BinaryOp {

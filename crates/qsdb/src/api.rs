@@ -304,7 +304,7 @@ impl Qsdb {
         // 逐分区裁剪 + 清空
         let parts = crate::scan::list_partitions(&tdir, def.partition_keys.len());
         let mut cleared = 0u64;
-        for (pdir, dir_vals) in parts {
+        for (_pdir, dir_vals) in parts {
             let mut pvals: HashMap<String, Literal> = HashMap::new();
             let mut ok = true;
             for (k, raw) in &dir_vals {
