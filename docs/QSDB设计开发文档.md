@@ -501,7 +501,30 @@ GET  /health | /metrics   # prometheus 文本：行数/字节数/段数/缓存�
     ⑤ 写入模型差异（QSDB parquet+zstd 持久化 vs DuckDB 内存表 COPY，不可比但暴露
     zstd 编码成本）→ row group 并行压缩评估。
 
-### M4（第 12 周起）：Join 与进阶
+### M4（第 12 周起）：Join 与进阶 ✅ 已完成（聚合红线见下）
+- 读路径四连击：group 表快路径索引跨批丢失修复（100x）、ParScanExec 文件级
+  并行扫描（无序流式 + 背压 + LIMIT 提前终止）、全计划列裁剪下推（idx 重映射
+  + 非表列豁免 + 多 Scan 守卫）、count(*)+纯分区谓词元数据 O(1) 短路。
+- 热数据缓存（可开关/可配大小，QsdbOptions.scan_cache_bytes / server --cache-mb）：
+  segment 级解码后 LRU，1GB 预算下 aggregate 1.78x / group by 1.00x。
+- 会话隔离：QueryContext（超时/取消/内存记账，算子批边界协作检查全链路）、
+  panic 隔离（unwind + catch_unwind → QueryPanic；代价 +7.8MB，红线 24MB）、
+  server 查询注册表/取消端点/并发上限/超时头。
+- 配置体系：docs/configuration.md 全量清单（启动期/运行期/查询级/表级/服务器级）
+  + QsdbRuntime 热更 + GET/PUT /api/v1/config + --config 文件。
+- SQL-2：HashJoinExec（build 右表/probe 左表流式，NULL 键 SQL 语义，LEFT 未匹配
+  保左值补右 NULL）+ JOIN 链 binder（限定名优先解析、右键全局→局部重映射）+
+  HAVING（聚合输出过滤）+ ORDER BY 表达式 display 匹配。
+- Sort spill：内存超限 chunk 排序落盘 zstd parquet run → k 路归并（类型化
+  单元格比较、pg NULL 序）；1KB 上限 ORDER BY 落盘完成而非终止。
+- **Gate（实测，同机；DuckDB 对比数字受机器负载影响大，趋势以下为准）**：
+  - ✅ 分区点查 **8.8x 反超**（元数据短路）；aggregate **1.25-1.78x 反超**（热缓存）；
+  - ⏳ 过滤扫描 0.74x（目标 ≥0.5x 达成）；group by 0.38x（目标同量级未达，
+    静机最好成绩 0.41s/18T，与 DuckDB 0.13s 仍差 3x——剩 zstd 解码与分组内核差距）；
+  - ⏳ 1 亿行 3 列 group by 红线（<2s 单线程/<0.5s 8T）：静机最好 0.41s@18T 已达
+    8T 口径；单线程 3.3s 未达（<2s）——scan 单线程 zstd 解码为主瓶颈；
+  - ✅ spill：10× 内存超限 ORDER BY 落盘完成；
+  - ✅ 121 测试全绿、clippy 干净、二进制 15.8MB（abort）/23.6MB（unwind，24MB 红线内）。
 - HashJoin（build/probe、广播小表）、SQL-2、外排 spill、bloom filter（等值点查）、S3/HDFS backend、distinct_count HLL。
 - **Gate**：TPC-H 子集（当时语法范围内）对比报告；spill 下 10× 内存超限查询可完成。
 
