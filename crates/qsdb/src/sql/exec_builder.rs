@@ -218,6 +218,7 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
                     arg: a.arg.as_ref().map(|e| rewrite_expr(e, mapping, all)),
                     out_name: a.out_name.clone(),
                     out_ty: a.out_ty.clone(),
+                    udaf: a.udaf.clone(),
                 })
                 .collect(),
         },
@@ -433,7 +434,7 @@ fn build_inner(
     }
 }
 
-/// 聚合构建：可分片源 → 并行 partial/merge；否则串行。
+/// 聚合构建：含 UDAF → 串行物化路径；可分片源 → 并行 partial/merge；否则串行。
 fn build_aggregate(
     db: &Qsdb,
     input: &LogicalPlan,
@@ -442,6 +443,17 @@ fn build_aggregate(
     scan_proj: &Option<Vec<String>>,
     ctx: &Arc<crate::query::QueryContext>,
 ) -> Result<Box<dyn ExecNode>> {
+    if aggs
+        .iter()
+        .any(|a| matches!(a.func, crate::expr::AggFunc::Udaf))
+    {
+        return Ok(Box::new(crate::exec::udaf_agg::UdafAggExec::new(
+            build_inner(db, input, scan_proj.clone(), ctx)?,
+            group.to_vec(),
+            aggs.to_vec(),
+            Arc::clone(ctx),
+        )));
+    }
     let Some((shards, filters)) = try_shard_source(db, input, scan_proj, ctx) else {
         return Ok(Box::new(HashAggExec::new(
             build_inner(db, input, scan_proj.clone(), ctx)?,

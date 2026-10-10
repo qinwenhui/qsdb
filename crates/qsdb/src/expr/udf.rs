@@ -46,7 +46,7 @@ static UDFS: LazyLock<RwLock<HashMap<String, Arc<ScalarFnDef>>>> =
 /// 需替换先 [`unregister`]）。
 pub fn register(name: &str, ret_ty: RetTyFn, eval: EvalFn) -> Result<()> {
     let name = normalize(name)?;
-    if is_builtin(&name) {
+    if is_builtin(&name) || super::udaf::lookup(&name).is_some() {
         return Err(QsdbError::invalid(format!(
             "UDF name '{name}' conflicts with a builtin function"
         )));
@@ -89,7 +89,8 @@ pub(super) fn lookup(name: &str) -> Option<Arc<ScalarFnDef>> {
         .and_then(|g| g.get(&name.to_ascii_lowercase()).cloned())
 }
 
-fn normalize(name: &str) -> Result<String> {
+/// 名字校验（UDF/UDAF 共用：小写归一 + ascii [a-z0-9_]）。
+pub(super) fn normalize(name: &str) -> Result<String> {
     let n = name.trim().to_ascii_lowercase();
     if n.is_empty() || !n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err(QsdbError::invalid(format!(

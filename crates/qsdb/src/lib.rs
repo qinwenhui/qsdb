@@ -31,6 +31,7 @@ pub mod write_buffer;
 pub use api::{Qsdb, QsdbOptions, ScanRequest};
 pub use catalog::{ColumnDef, TableDef};
 pub use error::{QsdbError, Result};
+pub use expr::udaf;
 pub use expr::udf;
 pub use manifest::{ColumnStats, SegmentEntry};
 pub use scan::{Predicate, Scan};

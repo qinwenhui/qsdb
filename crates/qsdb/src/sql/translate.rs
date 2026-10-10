@@ -2270,9 +2270,32 @@ fn is_agg_name(name: &str) -> bool {
     matches!(name, "count" | "sum" | "min" | "max" | "avg")
 }
 
+/// UDAF 聚合绑定：单参数表达式，输出类型由 ret_ty 决定。
+fn try_bind_udaf(
+    f: &sqlparser::ast::Function,
+    name: &str,
+    def: std::sync::Arc<crate::expr::udaf::UdafDef>,
+    ctx: &SchemaCtx,
+) -> Result<AggExpr> {
+    let arg = match fn_args(f) {
+        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e))] => {
+            bind_expr(e, ctx)?
+        }
+        _ => return Err(QsdbError::invalid(format!("{name}(expr) expected (UDAF)"))),
+    };
+    let out_name = format!("{name}({})", arg.display());
+    AggExpr::new_udaf(def, arg, out_name)
+}
+
 fn try_bind_agg(f: &sqlparser::ast::Function, ctx: &SchemaCtx) -> Result<Option<AggExpr>> {
     let name = fn_name(f);
     if !is_agg_name(&name) {
+        // UDAF 注册表（窗口形态的 UDAF 后置）
+        if f.over.is_none() {
+            if let Some(def) = crate::expr::udaf::lookup(&name) {
+                return try_bind_udaf(f, &name, def, ctx).map(Some);
+            }
+        }
         return Ok(None);
     }
     if f.over.is_some() {

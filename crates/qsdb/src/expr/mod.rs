@@ -9,6 +9,7 @@
 
 pub mod eval;
 pub mod scalar;
+pub mod udaf;
 pub mod udf;
 
 use crate::types::{Literal, LogicalType};
@@ -173,6 +174,8 @@ pub enum AggFunc {
     Min,
     Max,
     Avg,
+    /// 用户注册的 UDAF（定义在 AggExpr.udaf；GroupTable 状态路径不处理）
+    Udaf,
 }
 
 impl AggFunc {
@@ -183,14 +186,15 @@ impl AggFunc {
             Self::Min => "min",
             Self::Max => "max",
             Self::Avg => "avg",
+            Self::Udaf => "udaf",
         }
     }
 
-    /// 聚合结果类型（输入类型 → 输出类型）。
+    /// 聚合结果类型（输入类型 → 输出类型）。Udaf 不经此路径（ret_ty 决定）。
     pub fn output_type(self, input: &LogicalType) -> crate::error::Result<LogicalType> {
         use crate::types::{DecimalMeta, LogicalType as Lt};
         Ok(match self {
-            Self::Count => Lt::Int64,
+            Self::Count | Self::Udaf => Lt::Int64,
             Self::Sum => match input {
                 Lt::Int8 | Lt::Int16 | Lt::Int32 | Lt::Int64 => Lt::Int64,
                 Lt::Float32 | Lt::Float64 => Lt::Float64,
@@ -234,6 +238,8 @@ pub struct AggExpr {
     /// 输出列名（SELECT 里的显示名或别名）
     pub out_name: String,
     pub out_ty: LogicalType,
+    /// UDAF 定义（func == Udaf 时必有；其余 None）
+    pub udaf: Option<std::sync::Arc<udaf::UdafDef>>,
 }
 
 impl AggExpr {
@@ -252,6 +258,23 @@ impl AggExpr {
             arg,
             out_name: out_name.into(),
             out_ty,
+            udaf: None,
+        })
+    }
+
+    /// UDAF 聚合（单参数；输出类型由 ret_ty 决定）。
+    pub fn new_udaf(
+        def: std::sync::Arc<udaf::UdafDef>,
+        arg: PhysExpr,
+        out_name: impl Into<String>,
+    ) -> crate::error::Result<Self> {
+        let out_ty = (def.ret_ty)(&[arg.data_type()])?;
+        Ok(Self {
+            func: AggFunc::Udaf,
+            arg: Some(arg),
+            out_name: out_name.into(),
+            out_ty,
+            udaf: Some(def),
         })
     }
 

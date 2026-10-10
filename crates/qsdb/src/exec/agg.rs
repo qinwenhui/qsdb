@@ -50,7 +50,7 @@ fn fxhash_bytes(bytes: &[u8]) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// 把一行各 group 列编码进 buf（tag + bytes）；失败列按 raw 字符串兜底。
-fn encode_key_row(arrays: &[ArrayRef], row: usize, buf: &mut Vec<u8>) {
+pub(crate) fn encode_key_row(arrays: &[ArrayRef], row: usize, buf: &mut Vec<u8>) {
     buf.clear();
     for a in arrays {
         if a.is_null(row) {
@@ -556,6 +556,8 @@ impl GroupTable {
                 })?;
                 self.update_min_max(ai, agg.func == Min, a, group_ids)
             }
+            // UDAF 不走 GroupTable 状态路径（UdafAggExec 串行物化分组）
+            Udaf => Ok(()),
         }
     }
 
@@ -796,6 +798,9 @@ pub fn finalize(
 fn finalize_agg<'a>(states: impl Iterator<Item = &'a AggState>, agg: &AggExpr) -> Result<ArrayRef> {
     use crate::expr::AggFunc::*;
     match agg.func {
+        Udaf => Err(QsdbError::unsupported(
+            "UDAF 走 UdafAggExec 串行物化路径（不应到达 finalize）",
+        )),
         Count => {
             let out: arrow::array::Int64Array = states.map(|s| Some(s.count as i64)).collect();
             Ok(Arc::new(out))
