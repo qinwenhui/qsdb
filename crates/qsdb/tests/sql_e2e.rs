@@ -553,7 +553,7 @@ fn parallel_agg_matches_serial() {
 #[test]
 fn error_paths_and_edges() {
     let (db, root) = setup_events("err");
-    // 不支持语法明确报错
+    // 不支持语法明确报错（M5-A3 后：标量子查询 / IN 值列表已支持，移出清单）
     for sql in [
         "UPDATE events SET cnt = 1",
         "SELECT * FROM events a JOIN events b",
@@ -562,8 +562,6 @@ fn error_paths_and_edges() {
         "CREATE VIEW v AS SELECT 1",
         "SELECT cnt FROM events GROUP BY ALL",
         "INSERT INTO events SELECT * FROM events",
-        "SELECT (SELECT max(cnt) FROM events)",
-        "SELECT cnt FROM events WHERE cnt IN (1, 2)",
         "SELECT cnt FROM events WHERE tenant LIKE 'a%'",
     ] {
         assert!(db.sql(sql).is_err(), "should reject: {sql}");

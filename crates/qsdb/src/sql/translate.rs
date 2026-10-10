@@ -717,6 +717,111 @@ fn resolve_table_source(
     ))
 }
 
+/// 提取表达式内的标量子查询并置换为合成 Identifier（__scalar_sub_{n}）。
+/// 返回（置换后表达式, (合成列名, 子查询) 列表），出现序 = 收集序。
+fn extract_scalar_subqueries(
+    e: &sqlparser::ast::Expr,
+    counter: &mut usize,
+) -> (sqlparser::ast::Expr, Vec<(String, sqlparser::ast::Query)>) {
+    fn go(
+        e: &sqlparser::ast::Expr,
+        counter: &mut usize,
+        out: &mut Vec<(String, sqlparser::ast::Query)>,
+    ) -> sqlparser::ast::Expr {
+        use sqlparser::ast::Expr as E;
+        match e {
+            E::Subquery(query) => {
+                let name = format!("__scalar_sub_{counter}");
+                *counter += 1;
+                out.push((name.clone(), (**query).clone()));
+                E::Identifier(sqlparser::ast::Ident::new(name))
+            }
+            E::BinaryOp { left, op, right } => E::BinaryOp {
+                left: Box::new(go(left, counter, out)),
+                op: op.clone(),
+                right: Box::new(go(right, counter, out)),
+            },
+            E::Nested(inner) => E::Nested(Box::new(go(inner, counter, out))),
+            E::UnaryOp { expr, .. } => {
+                let inner = go(expr, counter, out);
+                let mut u = e.clone();
+                if let E::UnaryOp { expr: slot, .. } = &mut u {
+                    **slot = inner;
+                }
+                u
+            }
+            E::Cast { expr, .. } => {
+                let inner = go(expr, counter, out);
+                let mut c = e.clone();
+                if let E::Cast { expr: slot, .. } = &mut c {
+                    **slot = inner;
+                }
+                c
+            }
+            E::Function(f) if f.over.is_none() => {
+                let mut nf = f.clone();
+                let new_args: Vec<sqlparser::ast::FunctionArg> = fn_args(f)
+                    .iter()
+                    .map(|a| match a {
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(inner),
+                        ) => sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(go(inner, counter, out)),
+                        ),
+                        other => other.clone(),
+                    })
+                    .collect();
+                if let sqlparser::ast::FunctionArguments::List(l) = &mut nf.args {
+                    l.args = new_args;
+                }
+                E::Function(nf)
+            }
+            E::IsNull(inner) => E::IsNull(Box::new(go(inner, counter, out))),
+            E::IsNotNull(inner) => E::IsNotNull(Box::new(go(inner, counter, out))),
+            other => other.clone(),
+        }
+    }
+    let mut out = Vec::new();
+    let replaced = go(e, counter, &mut out);
+    (replaced, out)
+}
+
+/// 标量子查询接线：单列子计划 → Limit 1 → 常真谓词 cross join 叠到主计划上，
+/// 合成列注册进 ctx。子级 CTE defs 并入（先于使用）。
+fn attach_scalar_subqueries(
+    plan: LogicalPlan,
+    ctx: &mut SchemaCtx,
+    cte_defs: &mut Vec<CteDef>,
+    queries: Vec<(String, sqlparser::ast::Query)>,
+    visible: &VisibleCtes,
+    resolver: &TableResolver,
+) -> Result<LogicalPlan> {
+    let mut plan = plan;
+    for (name, q) in queries {
+        let (sub, child_defs) = translate_select_inner(q, resolver, visible)?;
+        cte_defs.extend(child_defs);
+        let cols = plan_output_columns(&sub)?;
+        let ty = match cols.as_slice() {
+            [(_, t)] => t.clone(),
+            _ => {
+                return Err(QsdbError::invalid(
+                    "scalar subquery must return exactly one column",
+                ));
+            }
+        };
+        plan = LogicalPlan::CrossJoinFilter {
+            left: Box::new(plan),
+            right: Box::new(LogicalPlan::Limit {
+                input: Box::new(sub),
+                n: 1,
+            }),
+            predicate: PhysExpr::Lit(Literal::Boolean(true)),
+        };
+        ctx.cols.push((name, ty));
+    }
+    Ok(plan)
+}
+
 /// 过滤未被引用的 CTE（dead CTE 不物化）：
 /// 从主计划收集 Values 引用，沿 CteDef.plan 传递闭包。
 fn filter_reachable_ctes(defs: Vec<CteDef>, main: &LogicalPlan) -> Vec<CteDef> {
@@ -773,14 +878,6 @@ fn translate_select_inner(
             "multi-FROM (comma join) not supported",
         ));
     }
-    let table = match &select.from[0].relation {
-        TableFactor::Table { name, .. } => object_name_single(name.clone())?,
-        other => {
-            return Err(QsdbError::unsupported(format!(
-                "FROM {other:?} not supported"
-            )));
-        }
-    };
     // CTE（非递归）：WITH name AS (...) 内联展开为子计划。
     // 定义期即分配 cte_id；祖先 CTE 可见（后定义可引用先定义，链式）。
     let mut visible: VisibleCtes = ancestors.clone();
@@ -809,9 +906,24 @@ fn translate_select_inner(
         }
     }
 
-    // FROM 主表：CTE 优先（本级 → 祖先），退回实表
-    let (mut plan, mut ctx): (LogicalPlan, SchemaCtx) =
-        resolve_table_source(&table, &visible, resolver)?;
+    // FROM 主表：实表 / CTE（本级 → 祖先）/ 派生表（子查询直接作子计划）
+    let (mut plan, mut ctx): (LogicalPlan, SchemaCtx) = match &select.from[0].relation {
+        TableFactor::Table { name, .. } => {
+            resolve_table_source(&object_name_single(name.clone())?, &visible, resolver)?
+        }
+        TableFactor::Derived { subquery, .. } => {
+            let (sub, child_defs) =
+                translate_select_inner((**subquery).clone(), resolver, &visible)?;
+            cte_defs.extend(child_defs);
+            let cols = plan_output_columns(&sub)?;
+            (sub, SchemaCtx { cols })
+        }
+        other => {
+            return Err(QsdbError::unsupported(format!(
+                "FROM {other:?} not supported"
+            )));
+        }
+    };
 
     // JOIN 链（SQL-2：等值 INNER/LEFT）
     for join in &select.from[0].joins {
@@ -828,45 +940,65 @@ fn translate_select_inner(
                 )));
             }
         };
-        let (right_name, right_orig) = match &join.relation {
-            TableFactor::Table { name, alias, .. } => match alias {
-                Some(a) => (a.name.value.clone(), object_name_single(name.clone())?),
-                None => {
-                    let n = object_name_single(name.clone())?;
-                    (n.clone(), n)
-                }
-            },
+        // 右侧源：实表 / CTE（别名 → 原名 → 祖先）/ 派生表
+        let (right_name, right_plan, right_cols): (
+            String,
+            LogicalPlan,
+            Vec<(String, LogicalType)>,
+        ) = match &join.relation {
+            TableFactor::Table { name, alias, .. } => {
+                let (rn, orig) = match alias {
+                    Some(a) => (a.name.value.clone(), object_name_single(name.clone())?),
+                    None => {
+                        let n = object_name_single(name.clone())?;
+                        (n.clone(), n)
+                    }
+                };
+                let lookup = if visible.contains_key(&rn) {
+                    rn.clone()
+                } else {
+                    orig
+                };
+                let (plan, cols) = if let Some((id, cols)) = visible.get(&lookup) {
+                    (
+                        LogicalPlan::Values {
+                            columns: cols.clone(),
+                            cte_id: *id,
+                        },
+                        cols.clone(),
+                    )
+                } else {
+                    let right_def = (resolver.resolve)(&rn)?;
+                    (
+                        LogicalPlan::Scan {
+                            def: Arc::clone(&right_def),
+                            predicate: None,
+                        },
+                        right_def
+                            .columns
+                            .iter()
+                            .map(|c| (c.name.clone(), c.logical_type.clone()))
+                            .collect(),
+                    )
+                };
+                (rn, plan, cols)
+            }
+            // JOIN 右侧派生表：FROM a JOIN (SELECT …) AS r ON …
+            TableFactor::Derived {
+                subquery, alias, ..
+            } => {
+                let (sub, child_defs) =
+                    translate_select_inner((**subquery).clone(), resolver, &visible)?;
+                cte_defs.extend(child_defs);
+                let cols = plan_output_columns(&sub)?;
+                let name = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_else(|| "subquery".into());
+                (name, sub, cols)
+            }
             other => return Err(QsdbError::unsupported(format!("JOIN target {other:?}"))),
         };
-        // 右侧源：CTE 优先（别名 → 原名 → 祖先），退回实表
-        let right_lookup = if visible.contains_key(&right_name) {
-            right_name.clone()
-        } else {
-            right_orig
-        };
-        let (right_plan, right_cols): (LogicalPlan, Vec<(String, LogicalType)>) =
-            if let Some((id, cols)) = visible.get(&right_lookup) {
-                (
-                    LogicalPlan::Values {
-                        columns: cols.clone(),
-                        cte_id: *id,
-                    },
-                    cols.clone(),
-                )
-            } else {
-                let right_def = (resolver.resolve)(&right_name)?;
-                (
-                    LogicalPlan::Scan {
-                        def: Arc::clone(&right_def),
-                        predicate: None,
-                    },
-                    right_def
-                        .columns
-                        .iter()
-                        .map(|c| (c.name.clone(), c.logical_type.clone()))
-                        .collect(),
-                )
-            };
         let sqlparser::ast::JoinConstraint::On(on_expr) = constraint else {
             return Err(QsdbError::unsupported("JOIN ... ON <equi-cond> required"));
         };
@@ -906,18 +1038,50 @@ fn translate_select_inner(
         }
     }
 
+    // 标量子查询（WHERE/投影中的 (SELECT …)）：提取 → Limit 1 右侧 cross join
+    // （常真谓词）→ AST 置换为合成列引用 __scalar_sub_{n}；>1 行取首行（严格报错后置）。
+    // 关联（引用外层列）子查询不支持——子查询独立绑定，列缺失即报错。
+    let mut scalar_counter = 0usize;
+    let selection_sub;
+    if let Some(w) = &select.selection {
+        let (replaced, qs) = extract_scalar_subqueries(w, &mut scalar_counter);
+        plan = attach_scalar_subqueries(plan, &mut ctx, &mut cte_defs, qs, &visible, resolver)?;
+        selection_sub = Some(replaced);
+    } else {
+        selection_sub = None;
+    }
+    let mut proj_extracted: Vec<Option<Expr>> = Vec::with_capacity(select.projection.len());
+    for item in &select.projection {
+        match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                let (replaced, qs) = extract_scalar_subqueries(e, &mut scalar_counter);
+                plan = attach_scalar_subqueries(
+                    plan,
+                    &mut ctx,
+                    &mut cte_defs,
+                    qs,
+                    &visible,
+                    resolver,
+                )?;
+                proj_extracted.push(Some(replaced));
+            }
+            _ => proj_extracted.push(None),
+        }
+    }
+
     // WHERE
-    if let Some(w) = select.selection {
+    if let Some(w) = selection_sub {
         let bound = bind_expr(&w, &ctx)?;
         if !bound.is_boolean() {
             return Err(QsdbError::type_err("WHERE must be boolean"));
         }
-        // Values（CTE）不可下推（无 Scan 节点）→ 全部留作行过滤
-        let is_values = matches!(plan, LogicalPlan::Values { .. });
-        let (pushdown, residual) = if is_values {
-            (None, Some(bound))
-        } else {
+        // 谓词仅当根为单 Scan 时下推：Join/CrossJoin/Values/派生表根上，
+        // split_pushdown 的 Scan 附着模式不中会静默丢谓词 → 全部留作行过滤
+        let root_is_scan = matches!(plan, LogicalPlan::Scan { .. });
+        let (pushdown, residual) = if root_is_scan {
             split_pushdown(&bound)
+        } else {
+            (None, Some(bound))
         };
         if let Some(p) = pushdown {
             if let LogicalPlan::Scan { predicate, .. } = &mut plan {
@@ -947,14 +1111,14 @@ fn translate_select_inner(
         name: String,
     }
     let mut items = Vec::new();
-    for item in &select.projection {
+    for (i, item) in select.projection.iter().enumerate() {
         match item {
             SelectItem::UnnamedExpr(e) => items.push(ProjItem {
-                sql: e.clone(),
+                sql: proj_extracted[i].clone().expect("scalar-sub extracted"),
                 name: expr_display(e),
             }),
-            SelectItem::ExprWithAlias { expr, alias } => items.push(ProjItem {
-                sql: expr.clone(),
+            SelectItem::ExprWithAlias { alias, .. } => items.push(ProjItem {
+                sql: proj_extracted[i].clone().expect("scalar-sub extracted"),
                 name: alias.value.clone(),
             }),
             SelectItem::Wildcard(_) => {
@@ -1754,6 +1918,27 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
                 other => Err(QsdbError::unsupported(format!(
                     "operator {other:?} not supported"
                 ))),
+            }
+        }
+        // IN (v1, v2, …)：展开为等值 OR 链（NOT IN → 取反）；空列表恒 false
+        E::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let mut acc: Option<PhysExpr> = None;
+            for v in list {
+                let eq = bind_cmp(CmpOp::Eq, expr, v, ctx)?;
+                acc = Some(match acc {
+                    None => eq,
+                    Some(a) => PhysExpr::Or(Box::new(a), Box::new(eq)),
+                });
+            }
+            let e = acc.unwrap_or(PhysExpr::Lit(Literal::Boolean(false)));
+            if *negated {
+                Ok(PhysExpr::Not(Box::new(e)))
+            } else {
+                Ok(e)
             }
         }
         E::Substring {
