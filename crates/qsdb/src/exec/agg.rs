@@ -450,7 +450,7 @@ impl GroupTable {
     ///
     /// 探测表（fast_slots）是 GroupTable 的持久化字段——跨批存活，
     /// 否则每批重建会丢失已建组索引导致组键分裂（M4-1 bug）。
-    fn assign_groups_fast(&mut self, cols: &[Vec<i64>], out: &mut Vec<u32>) {
+    fn assign_groups_fast(&mut self, cols: &[&Int64Array], out: &mut Vec<u32>) {
         const EMPTY: u32 = u32::MAX;
         let n = cols.first().map(|c| c.len()).unwrap_or(0);
         if self.fast_slots.is_empty() {
@@ -471,7 +471,7 @@ impl GroupTable {
         for row in 0..n {
             key_bytes.clear();
             for c in cols {
-                key_bytes.extend_from_slice(&c[row].to_le_bytes());
+                key_bytes.extend_from_slice(&c.value(row).to_le_bytes());
             }
             let h = fxhash_bytes(&key_bytes) | 1;
             let mut idx = (h as usize) & (self.fast_slots.len() - 1);
@@ -479,7 +479,8 @@ impl GroupTable {
             loop {
                 let slot = self.fast_slots[idx];
                 if slot.1 == EMPTY {
-                    let lits: Vec<Literal> = cols.iter().map(|c| Literal::Int64(c[row])).collect();
+                    let lits: Vec<Literal> =
+                        cols.iter().map(|c| Literal::Int64(c.value(row))).collect();
                     gid = self.push_group(&key_bytes, lits);
                     self.fast_slots[idx] = (h, gid);
                     // 负载因子 >= 50% 扩容重排
@@ -696,15 +697,46 @@ impl GroupTable {
         let dt = a.data_type().clone();
         match dt {
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                let vals: Vec<i64> = downcast_ints(a);
+                // 直接迭代类型化数组（零拷贝；整列拷贝在此上下文实测病理级慢）
                 let cnt = &mut self.counts[ai];
                 let SumCol::Int(acc) = &mut self.sums[ai] else {
                     return Err(QsdbError::type_err("sum column kind mismatch (internal)"));
                 };
+                let v8 = a.as_any().downcast_ref::<arrow::array::Int8Array>();
+                let v16 = a.as_any().downcast_ref::<arrow::array::Int16Array>();
+                let v32 = a.as_any().downcast_ref::<arrow::array::Int32Array>();
+                let v64 = a.as_any().downcast_ref::<Int64Array>();
                 for (row, &g) in group_ids.iter().enumerate() {
-                    if !a.is_null(row) {
+                    let val = if let Some(x) = v64 {
+                        if x.is_null(row) {
+                            None
+                        } else {
+                            Some(i128::from(x.value(row)))
+                        }
+                    } else if let Some(x) = v32 {
+                        if x.is_null(row) {
+                            None
+                        } else {
+                            Some(i128::from(x.value(row)))
+                        }
+                    } else if let Some(x) = v16 {
+                        if x.is_null(row) {
+                            None
+                        } else {
+                            Some(i128::from(x.value(row)))
+                        }
+                    } else if let Some(x) = v8 {
+                        if x.is_null(row) {
+                            None
+                        } else {
+                            Some(i128::from(x.value(row)))
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(v) = val {
                         let g = g as usize;
-                        acc[g] += i128::from(vals[row]);
+                        acc[g] += v;
                         cnt[g] += 1;
                     }
                 }
@@ -822,7 +854,8 @@ impl GroupTable {
 
 /// 全部分组列均为非空 Int64 时返回其值副本（否则 None）。
 /// 空分组列表（无 GROUP BY）返回 None——走通用路径（单一全局组）。
-fn int64_group_columns(arrays: &[ArrayRef]) -> Option<Vec<Vec<i64>>> {
+/// 全部分组列为非空 Int64 时返回数组引用（零拷贝；value(i) 带 offset 语义）。
+fn int64_group_columns(arrays: &[ArrayRef]) -> Option<Vec<&Int64Array>> {
     if arrays.is_empty() {
         return None;
     }
@@ -832,44 +865,9 @@ fn int64_group_columns(arrays: &[ArrayRef]) -> Option<Vec<Vec<i64>>> {
         if arr.null_count() > 0 {
             return None;
         }
-        // offset 感知整块拷贝（slice 批 values() 不含 offset——显式加，保 M4-1 语义）
-        let off = arr.offset();
-        out.push(arr.values()[off..off + arr.len()].to_vec());
+        out.push(arr);
     }
     Some(out)
-}
-
-/// 整数列 → i64 值（offset 感知；NULL 以 0 占位，由调用方用 is_null 跳过）。
-fn downcast_ints(a: &dyn Array) -> Vec<i64> {
-    use arrow::datatypes::*;
-    match a.data_type() {
-        DataType::Int8 => a
-            .as_any()
-            .downcast_ref::<arrow::array::Int8Array>()
-            .unwrap()
-            .iter()
-            .map(|v| i64::from(v.unwrap_or(0)))
-            .collect(),
-        DataType::Int16 => a
-            .as_any()
-            .downcast_ref::<arrow::array::Int16Array>()
-            .unwrap()
-            .iter()
-            .map(|v| i64::from(v.unwrap_or(0)))
-            .collect(),
-        DataType::Int32 => a
-            .as_any()
-            .downcast_ref::<arrow::array::Int32Array>()
-            .unwrap()
-            .iter()
-            .map(|v| i64::from(v.unwrap_or(0)))
-            .collect(),
-        _ => {
-            let arr = a.as_any().downcast_ref::<Int64Array>().unwrap();
-            let off = arr.offset();
-            arr.values()[off..off + arr.len()].to_vec()
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
