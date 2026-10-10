@@ -64,6 +64,13 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
                 message: "table created".into(),
             })
         }
+        translate::ParsedStatement::AlterAddColumn { table, column } => {
+            let name = column.name.clone();
+            db.alter_add_column(&table, column)?;
+            Ok(SqlResult::Ok {
+                message: format!("column '{name}' added"),
+            })
+        }
         translate::ParsedStatement::DropTable { name, if_exists } => match db.drop_table(&name) {
             Ok(()) => Ok(SqlResult::Ok {
                 message: "table dropped".into(),

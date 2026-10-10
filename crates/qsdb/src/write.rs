@@ -62,6 +62,50 @@ pub fn writer_props(def: &TableDef) -> Result<WriterProperties> {
         .build())
 }
 
+/// 宽松写：批缺尾列（表数据列前缀）且缺列均 nullable → 补 NULL
+/// （ALTER ADD COLUMN 后同步工具仍投旧 schema 批的场景）。
+/// NOT NULL 缺列不可补 → 报错。
+fn pad_loose_batches<'a>(
+    def: &TableDef,
+    batches: &'a [RecordBatch],
+    expected: &SchemaRef,
+) -> Result<std::borrow::Cow<'a, [RecordBatch]>> {
+    let full = expected.fields().len();
+    if !batches
+        .iter()
+        .any(|b| b.num_columns() != 0 && b.num_columns() < full)
+    {
+        return Ok(std::borrow::Cow::Borrowed(batches));
+    }
+    let mut out: Vec<RecordBatch> = Vec::with_capacity(batches.len());
+    for b in batches {
+        let has = b.num_columns();
+        if has == full || (b.num_rows() == 0 && has == 0) {
+            out.push(b.clone());
+            continue;
+        }
+        if has > full {
+            return Err(QsdbError::invalid(format!(
+                "batch has {has} columns, table expects {full}"
+            )));
+        }
+        let missing: Vec<(String, crate::types::LogicalType)> = def.data_columns()[has..]
+            .iter()
+            .map(|c| (c.name.clone(), c.logical_type.clone()))
+            .collect();
+        if let Some((n, _)) = missing
+            .iter()
+            .find(|(n, _)| def.column(n).is_some_and(|c| !c.nullable))
+        {
+            return Err(QsdbError::invalid(format!(
+                "batch is missing NOT NULL column '{n}'; supply full-width batches"
+            )));
+        }
+        out.push(crate::scan::pad_missing_columns(b.clone(), &missing)?);
+    }
+    Ok(std::borrow::Cow::Owned(out))
+}
+
 /// 校验输入批 schema 与表数据列一致（按 名字+类型；空批忽略）。
 fn validate_batches(batches: &[RecordBatch], expected: &SchemaRef) -> Result<Option<SchemaRef>> {
     let mut src: Option<SchemaRef> = None;
@@ -314,6 +358,8 @@ pub(crate) fn append_partition(
     batches: &[RecordBatch],
 ) -> Result<WriteResult> {
     let schema = data_schema(def);
+    let batches = pad_loose_batches(def, batches, &schema)?;
+    let batches: &[RecordBatch] = batches.as_ref();
     let Some(file_schema) = validate_batches(batches, &schema)? else {
         return Ok(WriteResult::default()); // 全空输入 → no-op
     };
@@ -338,10 +384,17 @@ pub(crate) fn append_partition(
     let mut manifest = PartitionManifest::read(&dir)?.unwrap_or_else(|| {
         PartitionManifest::new(named_values(def, values), def.schema_fingerprint())
     });
+    // 指纹一致 或 旧 schema 为当前前缀（ALTER ADD COLUMN）→ 允许追加并升格分区指纹
     if manifest.schema_fingerprint != def.schema_fingerprint() {
-        return Err(QsdbError::meta(
-            "table schema changed since partition was written; use overwrite_partition",
-        ));
+        if !def
+            .prefix_fingerprints()
+            .contains(&manifest.schema_fingerprint)
+        {
+            return Err(QsdbError::meta(
+                "table schema changed since partition was written; use overwrite_partition",
+            ));
+        }
+        manifest.schema_fingerprint = def.schema_fingerprint();
     }
     manifest.segments.push(entry.clone());
     manifest.commit(&dir)?;
@@ -375,6 +428,8 @@ pub(crate) fn overwrite_partition(
     batches: &[RecordBatch],
 ) -> Result<WriteResult> {
     let schema = data_schema(def);
+    let batches = pad_loose_batches(def, batches, &schema)?;
+    let batches: &[RecordBatch] = batches.as_ref();
     let file_schema = validate_batches(batches, &schema)?;
     check_constraints(def, batches)?;
     let dir = pdir(table_dir, def, values)?;

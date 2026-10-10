@@ -167,6 +167,12 @@ impl Qsdb {
         self.def(None, table)
     }
 
+    /// ALTER TABLE ADD COLUMN（只加不删；列必须 nullable）。
+    /// 旧 segment 读取时缺列补 NULL；宽松写接受缺尾列批。
+    pub fn alter_add_column(&self, table: &str, column: crate::catalog::ColumnDef) -> Result<()> {
+        crate::catalog::alter_add_column(&self.root, crate::catalog::DEFAULT_DB, table, column)
+    }
+
     /// 表名清单。
     pub fn tables(&self) -> Result<Vec<String>> {
         read_table_names(&self.root, DEFAULT_DB)

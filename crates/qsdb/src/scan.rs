@@ -638,7 +638,13 @@ fn add_partition_files(
         }
     }
 
-    if manifest.schema_fingerprint != plan.def.schema_fingerprint() {
+    // 指纹一致 或 旧 schema 为当前 schema 前缀（ALTER ADD COLUMN 后向兼容）
+    if manifest.schema_fingerprint != plan.def.schema_fingerprint()
+        && !plan
+            .def
+            .prefix_fingerprints()
+            .contains(&manifest.schema_fingerprint)
+    {
         let rel = pdir.strip_prefix(root).unwrap_or(pdir);
         return Err(QsdbError::meta(format!(
             "partition {} was written under a different table schema (overwrite it first)",
@@ -997,6 +1003,29 @@ fn constant_array(lit: &Literal, dt: &DataType, n: usize) -> Result<ArrayRef> {
         .map_err(|e| QsdbError::invalid(format!("const array failed: {e}")))
 }
 
+/// 旧 segment 缺列补 NULL（ALTER ADD COLUMN 后向兼容；compaction/宽松写复用）。
+/// missing 按表列序，追加在批尾（列集为表列前缀时序即表列序）。
+pub(crate) fn pad_missing_columns(
+    batch: RecordBatch,
+    missing: &[(String, crate::types::LogicalType)],
+) -> Result<RecordBatch> {
+    let n = batch.num_rows();
+    let mut fields: Vec<arrow::datatypes::FieldRef> =
+        batch.schema().fields().iter().cloned().collect();
+    let mut cols: Vec<ArrayRef> = batch.columns().to_vec();
+    for (name, ty) in missing {
+        fields.push(std::sync::Arc::new(arrow::datatypes::Field::new(
+            name,
+            ty.arrow_type(),
+            true,
+        )));
+        cols.push(arrow::array::new_null_array(&ty.arrow_type(), n));
+    }
+    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
+    RecordBatch::try_new(schema, cols)
+        .map_err(|e| QsdbError::invalid(format!("pad missing columns: {e}")))
+}
+
 // ---------------------------------------------------------------------------
 // 扫描迭代器
 // ---------------------------------------------------------------------------
@@ -1006,6 +1035,8 @@ pub struct Scan {
     plan: Arc<ScanPlan>,
     files: std::collections::VecDeque<FilePlan>,
     current: Option<(BatchSource, FilePlan)>,
+    /// 当前文件缺的列（ALTER ADD COLUMN 后旧 segment）：批读出后补 NULL
+    missing_cols: Vec<(String, crate::types::LogicalType)>,
     /// miss 路径的回填收集器（文件读尽时 finish）
     pending_collector: Option<crate::cache::CacheCollector>,
     remaining: Option<u64>,
@@ -1048,6 +1079,7 @@ impl Scan {
             plan: Arc::new(plan),
             files: files.into(),
             current: None,
+            missing_cols: Vec::new(),
             pending_collector: None,
             remaining: limit,
             cache,
@@ -1072,6 +1104,7 @@ impl Scan {
                 plan: Arc::clone(&self.plan),
                 files: std::collections::VecDeque::new(),
                 current: None,
+                missing_cols: Vec::new(),
                 pending_collector: None,
                 remaining: None,
                 cache: self.cache.clone(),
@@ -1092,21 +1125,29 @@ impl Scan {
         let Some(file) = self.files.pop_front() else {
             return Ok(false);
         };
+        self.missing_cols.clear();
         let f = File::open(&file.path)
             .map_err(|e| QsdbError::meta(format!("open {} failed: {e}", file.path.display())))?;
         let mut builder = ParquetRecordBatchReaderBuilder::try_new(f)
             .map_err(|e| QsdbError::meta(format!("open parquet {}: {e}", file.path.display())))?;
-        // 投影：read_columns → parquet 叶列索引（扁平 schema：列 i = 叶 i）
+        // 投影：read_columns → parquet 叶列索引（扁平 schema：列 i = 叶 i）。
+        // 文件缺列（ALTER ADD COLUMN 前的旧 segment）→ 记入 missing_cols，批读出后补 NULL。
         let file_schema = builder.schema();
         let mut leaves: Vec<usize> = Vec::with_capacity(self.plan.read_columns.len());
         for name in &self.plan.read_columns {
-            let idx = file_schema.index_of(name).map_err(|_| {
-                QsdbError::meta(format!(
-                    "column '{name}' missing in parquet file {}",
-                    file.path.display()
-                ))
-            })?;
-            leaves.push(idx);
+            match file_schema.index_of(name) {
+                Ok(idx) => leaves.push(idx),
+                Err(_) => {
+                    let c = self.plan.def.column(name).ok_or_else(|| {
+                        QsdbError::meta(format!(
+                            "column '{name}' missing in parquet file {}",
+                            file.path.display()
+                        ))
+                    })?;
+                    self.missing_cols
+                        .push((name.clone(), c.logical_type.clone()));
+                }
+            }
         }
         // 热缓存：命中零解码
         if let Some(cache) = &self.cache {
@@ -1159,6 +1200,9 @@ impl Scan {
         partition_values: &HashMap<String, Literal>,
     ) -> Result<Option<RecordBatch>> {
         let mut out = batch;
+        if !self.missing_cols.is_empty() {
+            out = pad_missing_columns(out, &self.missing_cols.clone())?;
+        }
         if let Some(pred) = &self.plan.predicate {
             let mask = eval_mask(pred, &out, partition_values)?;
             out = filter_record_batch(&out, &mask)

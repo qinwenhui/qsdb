@@ -94,3 +94,19 @@
 - 读者遇 `version` 大于自身支持值 → 明确报错（不猜）。
 - 加字段只能加在 postcard 结构尾部且带默认值（serde `#[serde(default)]`）。
 - `LogicalType` 枚举只允许新增 variant（旧数据可读）。
+
+### 7.1 schema 演进（M5-B2 起生效；追加式修订）
+
+**只加不删**：`ALTER TABLE ... ADD COLUMN` 仅允许追加 nullable 列（尾部）。
+
+- **table.json**：新列 `check` 字段 `#[serde(default)]`，旧文件缺字段可读。
+- **schema 指纹**：`fingerprint(columns[..k], partition_keys)`；分区 manifest 指纹
+  ∈ 当前表 `prefix_fingerprints` ⇔ 旧 schema 是当前 schema 前缀 → 兼容。
+  追加写入时分区 manifest 指纹升格为当前值；非前缀差异（改类型/删列/换分区键）
+  仍拒绝（须 overwrite）。
+- **读**：segment 文件列集为表数据列前缀；缺列在批级补 NULL
+  （`scan::pad_missing_columns`；谓词/装配前完成）。
+- **写**：新 segment 携带全列 schema；**宽松写**——批缺尾列且缺列均 nullable
+  时自动补 NULL（NOT NULL 缺列不可补，报错）。
+- **compaction**：合并时旧批补 NULL，产物自然迁移到新 schema。
+- 后置：ADD COLUMN NOT NULL（需 DEFAULT）、DROP COLUMN、类型变更。

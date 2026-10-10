@@ -137,9 +137,20 @@ impl TableDef {
 
     /// schema 指纹：列定义 postcard 字节的 SipHash。
     pub fn schema_fingerprint(&self) -> u64 {
+        Self::fingerprint_of(&self.columns, &self.partition_keys)
+    }
+
+    /// 各列前缀的指纹集合——ALTER ADD COLUMN 后向兼容判据：
+    /// 旧分区 manifest 的指纹 ∈ 此集合 ⇔ 旧 schema 是当前 schema 的前缀。
+    pub fn prefix_fingerprints(&self) -> std::collections::HashSet<u64> {
+        (1..=self.columns.len())
+            .map(|k| Self::fingerprint_of(&self.columns[..k], &self.partition_keys))
+            .collect()
+    }
+
+    fn fingerprint_of(cols: &[ColumnDef], keys: &[String]) -> u64 {
         use std::hash::{Hash, Hasher};
-        let bytes =
-            postcard::to_allocvec(&(&self.columns, &self.partition_keys)).unwrap_or_default();
+        let bytes = postcard::to_allocvec(&(cols, keys)).unwrap_or_default();
         let mut h = std::collections::hash_map::DefaultHasher::new();
         bytes.hash(&mut h);
         h.finish()
@@ -246,6 +257,43 @@ pub fn drop_table(root: &Path, db: &str, table: &str) -> Result<()> {
     crate::fsutil::move_to_trash(root, &tdir)?;
     let names: Vec<String> = names.into_iter().filter(|n| n != table).collect();
     write_table_names(root, db, names)
+}
+
+/// ALTER TABLE ADD COLUMN（只加不删）：catalog 锁内重读 table.json → 追加列 →
+/// 原子替换。约束：列必须 nullable（NOT NULL 需 DEFAULT，后置）、不能与现有列/
+/// 分区键重名。旧 segment 读取时缺列补 NULL（scan::pad_missing_columns）。
+pub fn alter_add_column(root: &Path, db: &str, table: &str, column: ColumnDef) -> Result<()> {
+    let _guard = PartitionLock::acquire(&catalog_lock(root))?;
+    let names = read_table_names(root, db)?;
+    if !names.iter().any(|n| n == table) {
+        return Err(QsdbError::not_found(format!("table {db}.{table}")));
+    }
+    let path = table_json_path(root, db, table);
+    let text = fs::read_to_string(&path)
+        .map_err(|e| QsdbError::meta(format!("read table.json failed: {e}")))?;
+    let mut def: TableDef = serde_json_compat::from_str(&text)
+        .map_err(|e| QsdbError::meta(format!("corrupt table.json: {e}")))?;
+    if !column.nullable {
+        return Err(QsdbError::invalid(
+            "ADD COLUMN must be nullable (NOT NULL needs DEFAULT, lands later)",
+        ));
+    }
+    if def.columns.iter().any(|c| c.name == column.name) {
+        return Err(QsdbError::already_exists(format!(
+            "column '{}'",
+            column.name
+        )));
+    }
+    if def.partition_keys.contains(&column.name) {
+        return Err(QsdbError::invalid(format!(
+            "column '{}' conflicts with a partition key",
+            column.name
+        )));
+    }
+    def.columns.push(column);
+    def.validate()?;
+    let json = serde_json_compat::to_string(&def)?;
+    write_atomic(path, json.as_bytes())
 }
 
 // ---------------------------------------------------------------------------

@@ -109,8 +109,13 @@ fn compact_partition(
         return Ok(None);
     }
 
-    // 读全部 segments → 合并批
+    // 读全部 segments → 合并批（旧 segment 缺列补 NULL → 自然迁移到新 schema）
     let schema = data_schema(def);
+    let want: Vec<(String, crate::types::LogicalType)> = def
+        .data_columns()
+        .iter()
+        .map(|c| (c.name.clone(), c.logical_type.clone()))
+        .collect();
     let mut batches: Vec<RecordBatch> = Vec::new();
     for seg in &manifest.segments {
         let path = pdir.join(&seg.file_name);
@@ -126,6 +131,16 @@ fn compact_partition(
         for b in reader {
             let b = b.map_err(|e| QsdbError::meta(format!("read batch failed: {e}")))?;
             if b.num_rows() > 0 {
+                let missing: Vec<(String, crate::types::LogicalType)> = want
+                    .iter()
+                    .filter(|(n, _)| b.schema().index_of(n).is_err())
+                    .cloned()
+                    .collect();
+                let b = if missing.is_empty() {
+                    b
+                } else {
+                    crate::scan::pad_missing_columns(b, &missing)?
+                };
                 batches.push(b);
             }
         }

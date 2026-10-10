@@ -108,6 +108,11 @@ pub enum ParsedStatement {
         overwrite: bool,
     },
     Select(Box<sqlparser::ast::Query>),
+    /// ALTER TABLE t ADD COLUMN name type（只加不删；列必须 nullable）
+    AlterAddColumn {
+        table: String,
+        column: crate::catalog::ColumnDef,
+    },
     /// DELETE FROM t WHERE <仅分区键谓词>（分区粒度原子清空）
     Delete {
         table: String,
@@ -172,6 +177,49 @@ pub(crate) fn parse_expr_sql(s: &str) -> Result<sqlparser::ast::Expr> {
     }
 }
 
+/// 列选项解析（CREATE TABLE / ALTER ADD COLUMN 共用）。
+/// allow_not_null=false 时 NOT NULL 报错（ADD COLUMN NOT NULL 需 DEFAULT，后置）。
+fn parse_col_options(
+    opts: &[sqlparser::ast::ColumnOption],
+    allow_not_null: bool,
+) -> Result<(bool, Option<String>, Option<String>)> {
+    let mut nullable = true;
+    let mut check = None;
+    let mut comment = None;
+    for opt in opts {
+        match opt {
+            sqlparser::ast::ColumnOption::Null => nullable = true,
+            sqlparser::ast::ColumnOption::NotNull => {
+                if allow_not_null {
+                    nullable = false;
+                } else {
+                    return Err(QsdbError::unsupported(
+                        "ADD COLUMN NOT NULL needs DEFAULT (lands later)",
+                    ));
+                }
+            }
+            sqlparser::ast::ColumnOption::Check(cc) => check = Some(cc.expr.to_string()),
+            sqlparser::ast::ColumnOption::Comment(s) => comment = Some(s.clone()),
+            sqlparser::ast::ColumnOption::Unique(_) => {
+                return Err(QsdbError::unsupported(
+                    "UNIQUE constraint (needs partition-level dedup against old segments) lands later",
+                ));
+            }
+            sqlparser::ast::ColumnOption::PrimaryKey(_) => {
+                return Err(QsdbError::unsupported(
+                    "PRIMARY KEY constraint (implies UNIQUE, needs partition-level dedup) lands later",
+                ));
+            }
+            other => {
+                return Err(QsdbError::unsupported(format!(
+                    "column option {other:?} not supported (allow: NULL / NOT NULL / CHECK / COMMENT)"
+                )));
+            }
+        }
+    }
+    Ok((nullable, check, comment))
+}
+
 /// CHECK 约束 DDL 期校验：仅可引用数据列（分区列不在写入批内）、结果必须布尔。
 fn validate_check_exprs(def: &TableDef) -> Result<()> {
     let has_check = def.columns.iter().any(|c| c.check.is_some());
@@ -204,34 +252,12 @@ fn translate_statement(stmt: SqlStatement, raw: &str) -> Result<ParsedStatement>
             let mut defs = Vec::with_capacity(ct.columns.len());
             for c in &ct.columns {
                 let ty = ast_type_to_logical(&c.data_type)?;
-                let mut nullable = true;
-                let mut check: Option<String> = None;
-                let mut comment: Option<String> = None;
-                for opt in &c.options {
-                    match &opt.option {
-                        sqlparser::ast::ColumnOption::Null => nullable = true,
-                        sqlparser::ast::ColumnOption::NotNull => nullable = false,
-                        sqlparser::ast::ColumnOption::Check(cc) => {
-                            check = Some(cc.expr.to_string());
-                        }
-                        sqlparser::ast::ColumnOption::Comment(s) => comment = Some(s.clone()),
-                        sqlparser::ast::ColumnOption::Unique(_) => {
-                            return Err(QsdbError::unsupported(
-                                "UNIQUE constraint (needs partition-level dedup against old segments) lands later",
-                            ));
-                        }
-                        sqlparser::ast::ColumnOption::PrimaryKey(_) => {
-                            return Err(QsdbError::unsupported(
-                                "PRIMARY KEY constraint (implies UNIQUE, needs partition-level dedup) lands later",
-                            ));
-                        }
-                        other => {
-                            return Err(QsdbError::unsupported(format!(
-                                "column option {other:?} not supported (allow: NULL / NOT NULL / CHECK / COMMENT)"
-                            )));
-                        }
-                    }
-                }
+                let opts = c
+                    .options
+                    .iter()
+                    .map(|o| o.option.clone())
+                    .collect::<Vec<_>>();
+                let (nullable, check, comment) = parse_col_options(&opts, true)?;
                 defs.push(super::make_column(
                     &c.name.value,
                     ty,
@@ -267,6 +293,46 @@ fn translate_statement(stmt: SqlStatement, raw: &str) -> Result<ParsedStatement>
             validate_check_exprs(&def)?;
             let _ = ct.if_not_exists; // 建表冲突按 AlreadyExists 报错
             Ok(ParsedStatement::CreateTable { def })
+        }
+        SqlStatement::AlterTable(at) => {
+            let table = object_name_single(at.name.clone())?;
+            let mut add: Option<crate::catalog::ColumnDef> = None;
+            for op in &at.operations {
+                match op {
+                    sqlparser::ast::AlterTableOperation::AddColumn { column_def, .. } => {
+                        if add.is_some() {
+                            return Err(QsdbError::invalid(
+                                "one ADD COLUMN per ALTER statement (多次 ALTER 分开执行)",
+                            ));
+                        }
+                        let ty = ast_type_to_logical(&column_def.data_type)?;
+                        let opts = column_def
+                            .options
+                            .iter()
+                            .map(|o| o.option.clone())
+                            .collect::<Vec<_>>();
+                        let (nullable, check, comment) = parse_col_options(&opts, false)?;
+                        add = Some(super::make_column(
+                            &column_def.name.value,
+                            ty,
+                            nullable,
+                            check,
+                            comment,
+                        ));
+                    }
+                    other => {
+                        return Err(QsdbError::unsupported(format!(
+                            "ALTER TABLE {other:?} not supported (只支持 ADD COLUMN)"
+                        )));
+                    }
+                }
+            }
+            let Some(column) = add else {
+                return Err(QsdbError::invalid(
+                    "ALTER TABLE ... ADD COLUMN <name> <type> expected",
+                ));
+            };
+            Ok(ParsedStatement::AlterAddColumn { table, column })
         }
         SqlStatement::Drop {
             object_type,
