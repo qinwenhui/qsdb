@@ -1,8 +1,8 @@
-//! UDAF 串行物化聚合（M5-A4）。
+//! UDAF 物化聚合（M5-A4；组求值 M6 后并行化）。
 //!
-//! 查询的聚合集含任何 UDAF 时走本路径：物化输入 → 按 group key 编码分组
-//! （首见序）→ 每组 take 出参数列 → UDAF 整组求值 / 内置聚合按组重算。
-//! 不参与并行 partial/merge——核心聚合热路径（GroupTable 状态机）零改动。
+//! 查询的聚合集含任何 UDAF 时走本路径：物化输入（串行+记账）→ 按 group
+//! key 编码分组（首见序）→ 每组 take 出参数列 → **组间 rayon 并行**求值
+//! （UDAF 整组 / 内置重算）。核心聚合热路径（GroupTable 状态机）零改动。
 //!
 //! 混合查询中内置聚合的按组重算语义：count 精确；sum/avg 数值路径
 //! （float 求和次序与状态机路径不同——浮点和本无结合律）；min/max 经
@@ -10,6 +10,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use rayon::prelude::*;
 
 use arrow::array::{Array, ArrayRef, UInt32Array};
 use arrow::compute::{concat, take};
@@ -97,30 +99,63 @@ impl UdafAggExec {
             return Ok(RecordBatch::new_empty(Arc::clone(&self.schema)));
         }
 
-        // 分组：key 编码 → gid（首见序）+ 组行索引 + 组键 literal
+        // 分组：key 编码 → gid（首见序）+ 组行索引 + 组键 literal。
+        // **分块并行编码**（行级编码是 8M 行级的主要串行成本）：每块本地
+        // HashMap 聚 (key, 行号)；按块序合并保首见序（块内首见序与串行
+        // 扫描一致，块序 = 行序 → 输出次序与原串行路径相同）。
         let key_arrs: Vec<ArrayRef> = self
             .group
             .iter()
             .map(|g| eval::eval(g, &input_batch))
             .collect::<Result<_>>()?;
-        let mut key_buf = Vec::new();
+        const CHUNK: usize = 65536;
+        let starts: Vec<usize> = (0..n).step_by(CHUNK).collect();
+        let locals: Vec<(usize, Vec<(Vec<u8>, Vec<u32>, usize)>)> = starts
+            .into_par_iter()
+            .map(|start| -> (usize, Vec<(Vec<u8>, Vec<u32>, usize)>) {
+                let end = (start + CHUNK).min(n);
+                let mut key_buf = Vec::new();
+                let mut local: HashMap<Vec<u8>, (u32, Vec<u32>)> = HashMap::new();
+                let mut order: Vec<Vec<u8>> = Vec::new();
+                for row in start..end {
+                    encode_key_row(&key_arrs, row, &mut key_buf);
+                    let e = local.entry(key_buf.clone()).or_insert_with(|| {
+                        order.push(key_buf.clone());
+                        ((order.len() - 1) as u32, Vec::new())
+                    });
+                    e.1.push(row as u32);
+                }
+                let flat: Vec<(Vec<u8>, Vec<u32>, usize)> = order
+                    .into_iter()
+                    .map(|k| {
+                        let (lgid, rows) = local.remove(&k).expect("key in order");
+                        (k, rows, lgid as usize)
+                    })
+                    .collect();
+                (start, flat)
+            })
+            .collect();
+        // 串行合并（distinct key 数量级小）
         let mut gid_of_key: HashMap<Vec<u8>, u32> = HashMap::new();
         let mut group_keys: Vec<Vec<Literal>> = Vec::new();
         let mut group_rows: Vec<Vec<u32>> = Vec::new();
-        for row in 0..n {
-            encode_key_row(&key_arrs, row, &mut key_buf);
-            let gid = *gid_of_key.entry(key_buf.clone()).or_insert_with(|| {
-                let gid = group_keys.len() as u32;
-                group_keys.push(
-                    key_arrs
-                        .iter()
-                        .map(|a| array_value_to_literal(a, row))
-                        .collect(),
-                );
-                group_rows.push(Vec::new());
-                gid
-            });
-            group_rows[gid as usize].push(row as u32);
+        for (start, flat) in locals {
+            for (key, rows, _lgid) in flat {
+                let first_row = rows[0] as usize;
+                let gid = *gid_of_key.entry(key).or_insert_with(|| {
+                    let gid = group_keys.len() as u32;
+                    group_keys.push(
+                        key_arrs
+                            .iter()
+                            .map(|a| array_value_to_literal(a, first_row))
+                            .collect(),
+                    );
+                    group_rows.push(Vec::new());
+                    gid
+                });
+                group_rows[gid as usize].extend_from_slice(&rows);
+            }
+            let _ = start;
         }
 
         // 输出：group 列 ++ 聚合列
@@ -138,6 +173,8 @@ impl UdafAggExec {
     }
 
     /// 单个聚合列：每组 take 参数值后求值（UDAF / 内置重算）。
+    /// 组间独立 → **rayon 并行**（EvalFn 本身 Send+Sync；物化与记账保持
+    /// 串行不变——18x 串行差距的收窄点在组求值）。
     fn finalize_column(
         &self,
         agg: &AggExpr,
@@ -148,41 +185,44 @@ impl UdafAggExec {
             Some(a) => Some(eval::eval(a, input_batch)?),
             None => None,
         };
-        let mut lits: Vec<Literal> = Vec::with_capacity(group_rows.len());
-        for rows in group_rows {
-            let taken: Option<ArrayRef> = match &arg_arr {
-                Some(a) => Some(
-                    take(a, &UInt32Array::from(rows.clone()), None)
-                        .map_err(|e| QsdbError::invalid(format!("udaf take: {e}")))?,
-                ),
-                None => None,
-            };
-            lits.push(match agg.func {
-                AggFunc::Udaf => {
-                    let def = agg
-                        .udaf
-                        .as_ref()
-                        .ok_or_else(|| QsdbError::invalid("UDAF agg without UdafDef (internal)"))?;
-                    let out = (def.eval)(&[taken.expect("udaf requires an argument")])?;
-                    if out.len() != 1 {
-                        return Err(QsdbError::invalid(
-                            "UDAF eval must return exactly one value",
-                        ));
+        let lits: Vec<Literal> = group_rows
+            .par_iter()
+            .map(|rows| -> Result<Literal> {
+                let taken: Option<ArrayRef> = match &arg_arr {
+                    Some(a) => Some(
+                        take(a, &UInt32Array::from(rows.clone()), None)
+                            .map_err(|e| QsdbError::invalid(format!("udaf take: {e}")))?,
+                    ),
+                    None => None,
+                };
+                Ok(match agg.func {
+                    AggFunc::Udaf => {
+                        let def = agg.udaf.as_ref().ok_or_else(|| {
+                            QsdbError::invalid("UDAF agg without UdafDef (internal)")
+                        })?;
+                        let out = (def.eval)(&[taken.expect("udaf requires an argument")])?;
+                        if out.len() != 1 {
+                            return Err(QsdbError::invalid(
+                                "UDAF eval must return exactly one value",
+                            ));
+                        }
+                        if out.is_null(0) {
+                            Literal::Null
+                        } else {
+                            array_value_to_literal(out.as_ref(), 0)
+                        }
                     }
-                    if out.is_null(0) {
-                        Literal::Null
-                    } else {
-                        array_value_to_literal(out.as_ref(), 0)
+                    AggFunc::Count => match &taken {
+                        None => Literal::Int64(rows.len() as i64), // COUNT(*)
+                        Some(t) => Literal::Int64((t.len() - t.null_count()) as i64),
+                    },
+                    AggFunc::Sum | AggFunc::Avg => sum_or_avg(agg, taken.as_deref())?,
+                    AggFunc::Min | AggFunc::Max => {
+                        min_max(taken.as_deref(), agg.func == AggFunc::Min)?
                     }
-                }
-                AggFunc::Count => match &taken {
-                    None => Literal::Int64(rows.len() as i64), // COUNT(*)
-                    Some(t) => Literal::Int64((t.len() - t.null_count()) as i64),
-                },
-                AggFunc::Sum | AggFunc::Avg => sum_or_avg(agg, taken.as_deref())?,
-                AggFunc::Min | AggFunc::Max => min_max(taken.as_deref(), agg.func == AggFunc::Min)?,
-            });
-        }
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let refs: Vec<&Literal> = lits.iter().collect();
         literals_to_array(&refs, &agg.out_ty)
     }
