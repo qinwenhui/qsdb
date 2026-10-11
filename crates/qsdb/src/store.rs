@@ -26,6 +26,8 @@ use object_store::ObjectStoreExt;
 #[derive(Debug)]
 pub struct LocalStore {
     root: PathBuf,
+    /// 掉电安全档：segment/元数据写 fsync 后再 rename（见 api::Durability）
+    power_loss: bool,
 }
 
 /// 远端后端（feature `s3`，M6-3）：object_store 句柄 + 虚拟根映射。
@@ -38,6 +40,9 @@ pub struct RemoteStore {
     os: std::sync::Arc<dyn object_store::ObjectStore>,
     /// bucket 内 key 前缀（"" = bucket 根）
     prefix: String,
+    /// 掉电安全档：远端 PUT 由后端保证耐久；此标志只作用于**本地 staging
+    /// 文件**（写盘即 ACK 的数据在 flush 前不能因掉电丢失）
+    power_loss: bool,
 }
 
 /// 存储后端（enum 静态派发，见模块文档）。
@@ -121,10 +126,16 @@ impl RemoteStore {
 }
 
 impl Store {
-    /// 本地后端（默认）。
+    /// 本地后端（默认，ProcessCrash 耐久档）。
     pub fn local(root: impl Into<PathBuf>) -> Self {
+        Self::local_dur(root, false)
+    }
+
+    /// 本地后端 + 耐久档选择（`power_loss = true` = 掉电安全，见 api::Durability）。
+    pub fn local_dur(root: impl Into<PathBuf>, power_loss: bool) -> Self {
         Self::Local(LocalStore {
             root: root.into(),
+            power_loss,
         })
     }
 
@@ -137,11 +148,32 @@ impl Store {
         os: std::sync::Arc<dyn object_store::ObjectStore>,
         prefix: impl Into<String>,
     ) -> Self {
+        Self::remote_dur(root, os, prefix, false)
+    }
+
+    /// 远端后端 + 耐久档（`power_loss` 作用于本地 staging 文件）。
+    #[cfg(feature = "remote")]
+    pub fn remote_dur(
+        root: impl Into<PathBuf>,
+        os: std::sync::Arc<dyn object_store::ObjectStore>,
+        prefix: impl Into<String>,
+        power_loss: bool,
+    ) -> Self {
         Self::Remote(RemoteStore {
             root: root.into(),
             os,
             prefix: prefix.into(),
+            power_loss,
         })
+    }
+
+    /// 掉电安全档（本地文件写 fsync 后 rename；远端 PUT 天然耐久）。
+    pub fn data_sync(&self) -> bool {
+        match self {
+            Self::Local(s) => s.power_loss,
+            #[cfg(feature = "remote")]
+            Self::Remote(s) => s.power_loss,
+        }
     }
 
     /// 后端类别（协议选择）。
@@ -208,7 +240,7 @@ impl Store {
     /// 仅用于无竞争覆盖；竞争路径走 [`Store::put_if_etag`] OCC）。
     pub fn write_atomic(&self, path: &Path, data: &[u8]) -> Result<()> {
         match self {
-            Self::Local(_) => fsutil::write_atomic(path, data),
+            Self::Local(s) => fsutil::write_atomic_opts(path, data, s.power_loss),
             #[cfg(feature = "remote")]
             Self::Remote(_) => self.put_object(path, data),
         }

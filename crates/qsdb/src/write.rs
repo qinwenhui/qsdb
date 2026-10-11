@@ -230,16 +230,27 @@ fn write_segment(
     let final_path = partition_dir.join(&seg_name);
     let tmp_path = crate::fsutil::tmp_sibling(&final_path);
 
+    let durable = store.data_sync();
     let (rows, column_stats) = {
-        let file = File::create(&tmp_path)
-            .map_err(|e| QsdbError::meta(format!("create {} failed: {e}", tmp_path.display())))?;
-        serialize_segment(file, batches, file_schema, props, column_names)?
+        let mut file = File::create(&tmp_path).map_err(|e| {
+            QsdbError::meta(format!("create {} failed: {e}", tmp_path.display()))
+        })?;
+        let out = serialize_segment(&mut file, batches, file_schema, props, column_names)?;
+        if durable {
+            // 掉电安全档：段数据落盘后 rename——manifest 一旦提交，段必然可读
+            file.sync_all()
+                .map_err(|e| QsdbError::meta(format!("fsync segment failed: {e}")))?;
+        }
+        out
     };
     let bytes = store
         .stat(&tmp_path)?
         .ok_or_else(|| QsdbError::meta("stat segment failed: tmp missing after write"))?
         .size;
     store.commit_object(&tmp_path, &final_path)?;
+    if durable {
+        crate::fsutil::dir_sync(&final_path);
+    }
 
     Ok(SegmentEntry {
         file_name: seg_name,
@@ -638,7 +649,8 @@ fn append_partition_remote(
         .collect();
     let entry = match staging {
         Some(st) => stage_segment(
-            st, table_dir, table, def, values, dir, batches, file_schema, col_names, false,
+            st, store.data_sync(), table_dir, table, def, values, dir, batches, file_schema,
+            col_names, false,
         )?,
         None => put_segment_remote(store, dir, batches, file_schema, writer_props(def)?, &col_names)?,
     };
@@ -657,6 +669,7 @@ fn append_partition_remote(
 #[allow(clippy::too_many_arguments)]
 fn stage_segment(
     st: &crate::staging::Staging,
+    durable: bool,
     table_dir: &Path,
     table: &str,
     def: &TableDef,
@@ -693,9 +706,14 @@ fn stage_segment(
     let entry = st.stage(&rec, |parquet| {
         // tmp 先行：崩溃残留 tmp 由 GC 清扫；sidecar 由 stage() 后写
         let tmp = crate::fsutil::tmp_sibling(parquet);
-        let f = File::create(&tmp)
+        let mut f = File::create(&tmp)
             .map_err(|e| QsdbError::meta(format!("create {} failed: {e}", tmp.display())))?;
-        let (rows, stats) = serialize_segment(f, batches, &fs, props, &names_for_closure)?;
+        let (rows, stats) = serialize_segment(&mut f, batches, &fs, props, &names_for_closure)?;
+        if durable {
+            // staged 数据已 ACK 给客户端——掉电档下落盘后才算数
+            f.sync_all()
+                .map_err(|e| QsdbError::meta(format!("fsync staged failed: {e}")))?;
+        }
         let bytes = std::fs::metadata(&tmp)
             .map_err(|e| QsdbError::meta(format!("stat staged failed: {e}")))?
             .len();
@@ -759,7 +777,8 @@ fn overwrite_partition_remote(
     if let Some(fs) = file_schema {
         let entry = match staging {
             Some(st) => stage_segment(
-                st, table_dir, table, def, values, dir, batches, fs, col_names, true,
+                st, store.data_sync(), table_dir, table, def, values, dir, batches, fs,
+                col_names, true,
             )?,
             None => put_segment_remote(store, dir, batches, fs, writer_props(def)?, &col_names)?,
         };

@@ -100,6 +100,10 @@ enum Cmd {
         /// staging 后台上传周期（秒；默认 5）
         #[arg(long, default_value_t = 5)]
         staging_upload_secs: u64,
+        /// 数据耐久性：process-crash（默认，页缓存即持久）/ power-loss
+        /// （segment/元数据 rename 前 fsync，掉电安全，写吞吐实测约 -25%）
+        #[arg(long, default_value = "process-crash")]
+        durability: String,
     },
 }
 
@@ -196,6 +200,7 @@ fn main() {
             storage_prefix,
             staging_dir,
             staging_upload_secs,
+            durability,
             config,
         } => {
             // 存储后端解析（cli 层校验，错误走统一 exit 风格）
@@ -246,8 +251,17 @@ fn main() {
                     std::process::exit(1);
                 }
             };
+            let dur = match durability.as_str() {
+                "process-crash" => qsdb::api::Durability::ProcessCrash,
+                "power-loss" => qsdb::api::Durability::PowerLoss,
+                other => {
+                    eprintln!("error: unknown --durability '{other}' (process-crash|power-loss)");
+                    std::process::exit(1);
+                }
+            };
             let opts = QsdbOptions {
                 storage,
+                durability: dur,
                 scan_cache_bytes: cache_mb * 1024 * 1024,
                 file_cache_bytes: file_cache_mb * 1024 * 1024,
                 staging_dir: staging_dir.clone(),

@@ -164,9 +164,17 @@ fn smoke(rows: usize, repeat: usize) {
     );
 }
 
+fn bench_opts() -> QsdbOptions {
+    let mut o = QsdbOptions::default();
+    if std::env::var("QSDB_DURABILITY").ok().as_deref() == Some("1") {
+        o.durability = qsdb::api::Durability::PowerLoss;
+    }
+    o
+}
+
 fn write_bench(rows: usize, repeat: usize) {
     let root = work_root();
-    let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
+    let db = Qsdb::open(&root, bench_opts()).unwrap();
     db.create_table(events_def()).unwrap();
     println!("write: {rows} rows/batch x {repeat} append（单线程，zstd(3)）");
     let mut total_rows = 0usize;

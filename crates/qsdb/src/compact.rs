@@ -214,11 +214,13 @@ fn write_merged(
     let tmp_path = crate::fsutil::tmp_sibling(&final_path);
 
     let mut rows: u64 = 0;
+    let durable = store.data_sync();
     {
-        let file = File::create(&tmp_path)
-            .map_err(|e| QsdbError::meta(format!("create {} failed: {e}", tmp_path.display())))?;
+        let mut file = File::create(&tmp_path).map_err(|e| {
+            QsdbError::meta(format!("create {} failed: {e}", tmp_path.display()))
+        })?;
         let mut writer =
-            ArrowWriter::try_new(file, Arc::clone(schema), Some(writer_props(def)?))
+            ArrowWriter::try_new(&mut file, Arc::clone(schema), Some(writer_props(def)?))
                 .map_err(|e| QsdbError::meta(format!("parquet writer init failed: {e}")))?;
         for b in batches {
             writer
@@ -229,12 +231,19 @@ fn write_merged(
         writer
             .close()
             .map_err(|e| QsdbError::meta(format!("parquet close failed: {e}")))?;
+        if durable {
+            file.sync_all()
+                .map_err(|e| QsdbError::meta(format!("fsync segment failed: {e}")))?;
+        }
     }
     let bytes = store
         .stat(&tmp_path)?
         .ok_or_else(|| QsdbError::meta("stat segment failed: tmp missing after write"))?
         .size;
     store.commit_object(&tmp_path, &final_path)?;
+    if durable {
+        crate::fsutil::dir_sync(&final_path);
+    }
 
     // 统计重算（跨批合并）
     let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();

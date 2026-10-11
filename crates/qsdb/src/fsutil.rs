@@ -59,8 +59,16 @@ pub fn atomic_replace<T: AsRef<Path>, D: AsRef<Path>>(tmp: T, dest: D) -> Result
     }
 }
 
-/// 原子写文件：`{dest}.{uuid}.tmp` 写入 → fsync → 原子替换到 `dest`。
+/// 原子写文件：`{dest}.{uuid}.tmp` 写入 → fsync（尽力而为）→ 原子替换到 `dest`。
+/// 提交点语义（进程崩溃安全）由 rename 保证；掉电安全用 [`write_atomic_opts`]。
 pub fn write_atomic<D: AsRef<Path>>(dest: D, data: &[u8]) -> Result<()> {
+    write_atomic_opts(dest, data, false)
+}
+
+/// 原子写（耐久性可选）：`sync = true`（PowerLoss 档）时
+/// fsync 错误**上抛**（承诺耐久则不允许静默失败），并在 rename 后同步
+/// 父目录（POSIX；Windows 由 MOVEFILE_WRITE_THROUGH 覆盖文件数据路径）。
+pub fn write_atomic_opts<D: AsRef<Path>>(dest: D, data: &[u8], sync: bool) -> Result<()> {
     let dest = dest.as_ref();
     let tmp = tmp_sibling(dest);
     {
@@ -69,11 +77,34 @@ pub fn write_atomic<D: AsRef<Path>>(dest: D, data: &[u8]) -> Result<()> {
         use std::io::Write;
         f.write_all(data)
             .map_err(|e| QsdbError::meta(format!("write tmp failed: {e}")))?;
-        f.sync_all().ok(); // 元数据落盘尽力而为；提交点语义由 rename 保证
+        if sync {
+            f.sync_all()
+                .map_err(|e| QsdbError::meta(format!("fsync tmp failed: {e}")))?;
+        } else {
+            f.sync_all().ok(); // 尽力而为；提交点语义由 rename 保证
+        }
     }
     atomic_replace(&tmp, dest)?;
+    if sync {
+        dir_sync(dest);
+    }
     Ok(())
 }
+
+/// rename/fsync 后同步父目录（POSIX 耐久性要求；失败尽力而为——
+/// 多数日志型文件系统（ext4 data=ordered）rename 自身已持久目录项）。
+#[cfg(unix)]
+pub fn dir_sync(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(d) = File::open(parent) {
+            let _ = d.sync_all();
+        }
+    }
+}
+
+/// Windows 无目录 fsync；文件数据路径由 MOVEFILE_WRITE_THROUGH 覆盖。
+#[cfg(windows)]
+pub fn dir_sync(_path: &Path) {}
 
 /// 临时文件同目录兄弟路径。
 pub fn tmp_sibling(path: &Path) -> PathBuf {

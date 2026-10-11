@@ -11,6 +11,7 @@
 | 配置 | 类型 / 默认 | 说明 |
 |------|------------|------|
 | `storage` | StorageConfig / Local | 存储后端（M6-3）：`Local`（默认）或 `S3 { endpoint, region, bucket, prefix }` 管理表（需 feature `s3`；`QsdbOptions::s3(...)` 构造）。S3 模式下 manifest 提交走 OCC 条件写、回收走引用扫描 GC（`trash_grace_ms` 即孤儿安全期）；凭据走环境变量链（`AWS_ACCESS_KEY_ID` 等）。测试/嵌入方可经 `Qsdb::open_with_store` 注入任意 object_store 后端。 |
+| `durability` | Durability / ProcessCrash | 耐久性档位（M6 后追加）：`ProcessCrash`（默认，页缓存即持久——kill -9 安全，掉电可能丢最近段）/ `PowerLoss`（segment/元数据/staging 文件 rename 前 fsync + POSIX 目录 sync，掉电安全）。**损耗实测：写吞吐约 -25%**（本机 NVMe，31MB/段每段 fsync ≈190ms；首轮脏页积压时更多）——按性能优先定案默认关；带电容/掉电保护的企业级 SSD 上 fsync 代价远低；WriteBuffer 攒大段可摊薄每字节 fsync 次数。CLI：`--durability process-crash\|power-loss`。 |
 | `trash_grace_ms` | u64 / 10 分钟 | `_trash` 静默期：被换出的旧数据文件至少保留这么久才可被 `gc()` 清理。调小可加速空间回收，但会牺牲正在进行的旧扫描（跨进程长查询）。 |
 | `scan_cache_bytes` | usize / 256MB | 热数据缓存预算（segment 级解码后 LRU）。**0 = 关闭**。预算应能装下热工作集且不超过机器可用内存（预算过大会触发换页反噬——实测 4GB 预算在被其他进程占内存的机器上反而变慢）。 |
 | `query_timeout_ms` | Option\<u64\> / None | 默认查询超时（毫秒）。**这是运行期同名配置的初值**——open 后可经 [`Qsdb::runtime()`] 热更，见下节。 |

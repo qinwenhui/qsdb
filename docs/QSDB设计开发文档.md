@@ -668,6 +668,21 @@ M6-4 staging 写 → M6-5 HDFS → M6-6 可选租约；每阶段独立 gate。
   崩溃重开补传 exactly-once、dedup 防重复计入、staged overwrite 替换、
   配置校验）/180 默认 / clippy 双模式 0 / 默认二进制 24.38MB。
 
+### 耐久性专项（投产前阻塞项 2/3，2026-10-11）✅
+- **Durability 两档**（`QsdbOptions.durability`）：`ProcessCrash`（默认——
+  页缓存即持久，kill -9/进程退出安全）| `PowerLoss`（segment/元数据/staging
+  在 rename 前 fsync + POSIX 目录 sync，掉电安全）；`Store::local_dur/
+  remote_dur` 携带标志，`data_sync()` 贯穿 write/compact/staging；
+  远端 PUT 由后端保证耐久（标志仅作用于 staging 本地文件）。
+- **损耗实测**（qsdb-bench write，3×1M 行/段 ≈31MB 压缩，本机 NVMe）：
+  ProcessCrash 稳态 **1.76M rows/s**（55MB/s）；PowerLoss 稳态
+  **1.32M rows/s**（41.6MB/s，每段 fsync ≈190ms ≈160MB/s 落盘率）
+  ——**−25%**；PowerLoss 首轮脏页积压 0.72M 更差。红线 ≥1M rows/s
+  两档均过，但 25% 损耗按「性能优先」定案**默认 ProcessCrash**，
+  PowerLoss 按部署选配（带掉电保护电容的企业 SSD 代价远低；
+  WriteBuffer 攒大段摊薄每字节 fsync）。
+- 181 默认测试全绿（含 PowerLoss 写读 overwrite 冒烟）；clippy 0。
+
 #### M6-5 HDFS 后端 ✅ 已完成（2026-10-11，真实集群验证）
 - 选型定案（§6.3 R2 关闭）：**hdfs-native 0.14**（纯 Rust HDFS RPC，
   无 JVM/libhdfs/HADOOP_HOME 依赖）+ hdfs-native-object-store 0.17

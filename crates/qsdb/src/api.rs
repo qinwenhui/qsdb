@@ -22,6 +22,20 @@ use crate::store::Store;
 use crate::types::Literal;
 use crate::write::{self, WriteResult};
 
+/// 数据耐久性级别（启动期；写入路径的 fsync 策略）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Durability {
+    /// **进程崩溃安全**（默认）：页缓存即持久——kill -9 / 进程退出后数据完好。
+    /// 掉电可能丢失最近若干 segment 并留下「manifest 引用未落盘段」的损坏
+    /// （GC 可清孤儿，但需人工核对）。
+    #[default]
+    ProcessCrash,
+    /// **掉电安全**：segment / 元数据 / staging 文件均在 rename 前 fsync
+    /// （POSIX 另加目录 sync）。代价 = 每段一次强制落盘（损耗实测见
+    /// docs/QSDB设计开发文档.md 耐久性专项）。
+    PowerLoss,
+}
+
 /// 存储后端配置（启动期，改后需重开句柄）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum StorageConfig {
@@ -70,6 +84,9 @@ pub struct QsdbOptions {
     /// `flush_staged()` 批量上传提交。需 S3 后端。可见性语义：未 flush 的
     /// staged 数据对查询不可见（manifest 唯一真值）。
     pub staging_dir: Option<PathBuf>,
+    /// 耐久性档位（本地文件写 fsync 策略；远端 PUT 由后端保证，仅作用于
+    /// staging 本地文件）。见 [`Durability`]。
+    pub durability: Durability,
 }
 
 impl Default for QsdbOptions {
@@ -82,6 +99,7 @@ impl Default for QsdbOptions {
             query_memory_limit_bytes: None,
             file_cache_bytes: 0,
             staging_dir: None,
+            durability: Durability::ProcessCrash,
         }
     }
 }
@@ -189,12 +207,19 @@ impl Qsdb {
     pub fn open(root: impl AsRef<Path>, opts: QsdbOptions) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let store = match &opts.storage {
-            StorageConfig::Local => Store::local(&root),
+            StorageConfig::Local => {
+                Store::local_dur(&root, opts.durability == Durability::PowerLoss)
+            }
             #[cfg(feature = "hdfs")]
             StorageConfig::Hdfs { url, prefix } => {
                 let os = crate::hdfs_backend::build_hdfs_store(url)?;
                 let vroot = PathBuf::from(format!("{url}/{prefix}"));
-                Store::remote(vroot, os, prefix.clone())
+                Store::remote_dur(
+                    vroot,
+                    os,
+                    prefix.clone(),
+                    opts.durability == Durability::PowerLoss,
+                )
             }
             #[cfg(feature = "s3")]
             StorageConfig::S3 {
@@ -205,7 +230,12 @@ impl Qsdb {
             } => {
                 let os = crate::remote::build_s3_store(endpoint.as_deref(), region.as_deref(), bucket)?;
                 let vroot = PathBuf::from(format!("s3://{bucket}/{prefix}"));
-                Store::remote(vroot, os, prefix.clone())
+                Store::remote_dur(
+                    vroot,
+                    os,
+                    prefix.clone(),
+                    opts.durability == Durability::PowerLoss,
+                )
             }
         };
         Self::open_with_store(root, opts, store)
@@ -1145,6 +1175,42 @@ mod tests {
         db.drop_table("events").unwrap();
         assert!(db.tables().unwrap().is_empty());
         db2.gc().unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn power_loss_durability_smoke() {
+        // 掉电安全档：写入路径全 fsync 后 rename——功能面与默认档一致
+        let root = tmp_root("dur");
+        let db = Qsdb::open(
+            &root,
+            QsdbOptions {
+                durability: Durability::PowerLoss,
+                ..QsdbOptions::default()
+            },
+        )
+        .unwrap();
+        db.create_table(events_def()).unwrap();
+        db.append(
+            "events",
+            &[batch(vec![1, 2], vec!["a", "b"], vec![10, 20])],
+        )
+        .unwrap();
+        db.overwrite_partition(
+            "events",
+            &[("dt", Literal::Date(1))],
+            &[batch(vec![1], vec!["x"], vec![5])],
+        )
+        .unwrap();
+        let batches = db
+            .scan_collect(ScanRequest {
+                table: "events".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        // append 跨 dt=1/dt=2 两分区各 1 行；overwrite 只替换 dt=1（1 行）→ 共 2 行
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+        // tmp 残留由 GC 清（本用例只验证写读路径不因 fsync 报错）
         std::fs::remove_dir_all(&root).ok();
     }
 
