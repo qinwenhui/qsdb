@@ -1,4 +1,4 @@
-# QSDB 主备支持与 qsdb-sync 设计（v0.1 草案）
+# QSDB 主备支持与 qsdb-sync 设计（v0.2 草案）
 
 > 版本：v0.1（2026-10-11，M6 后主备专项设计输入）
 > 状态：**草案**——定案项标 ✅，待定案项标 ⏳，评审后冻结
@@ -143,3 +143,132 @@ qsdb-sync reverse --src --dst        # 旧主恢复后的差异回放（§五 fa
 | R3 | 大段重复拷贝（断点续传中途） | UUID 幂等跳过；checksum 可选校验 ⏳ |
 | R4 | 双主脑裂 | v1 纪律 + generation 回退告警；v2 lease |
 | R5 | sync 与 compaction 竞争（段被合并） | compaction 后旧段进 trash/待 GC——manifest 已不引用，sync 只认 manifest，天然解耦 |
+
+---
+
+# 第二部分：通用数据同步（多数据库接入，v0.2 增补）
+
+> 定位修正：qsdb-sync 不做「任意库 ↔ 任意库」（Airbyte 式 N×M 组合，几百人
+> 维护量的伪需求）。**QSDB 永远是管道的一端**：任意源进得来（多数据库），
+> QSDB 数据出得去（parquet 湖）。连接器数 = N + 2，非 N × M。✅ 定案
+
+## 八、双层架构：Source → Arrow 中枢 → Sink ✅
+
+```text
+Source 连接器                     Sink 连接器
+┌ odbc（通用关系库：MySQL/PG/ ┐   ┌ qsdb（嵌入库直写：WriteBuffer ┐
+│  Oracle/SQLServer…装驱动即通）│   │  + overwrite 幂等回写）        │
+│ mysql / postgres（原生直连）  │   │ parquet-lake（任意后端导出）    │
+│ file（parquet/CSV glob）     │   └───────────────────────────────┘
+│ kafka（Debezium CDC 消费）   │
+│ qsdb（主备复制=物理快路径 §三）│
+└──────────────────────────────┘
+        ↓ 统一中间表示：Arrow RecordBatch + 变更语义（append/replace 批）
+```
+
+两个 trait 定义全部扩展面（连接器=外部 crate，enum/配置注册派发）：
+
+```rust
+trait Source {
+    fn discover(&self) -> Result<Vec<TableDesc>>;            // 表 + 类型清单
+    fn snapshot(&self, table: &str) -> BoxStream<RecordBatch>; // 全量流式读
+    fn changes(&self, table: &str, from: Cursor) -> Option<BoxStream<Change>>; // 增量（可选能力）
+}
+
+trait Sink {
+    fn ensure_table(&self, desc: TableDesc, partition_by: &[&str]) -> Result<()>;
+    fn write(&self, batches: BoxStream<RecordBatch>, mode: WriteMode) -> Result<WriteStat>;
+    // WriteMode = Append | OverwritePartition（幂等）
+}
+```
+
+**Arrow 作中枢是 QSDB 的天然红利**：内核本就 Arrow-native，汇侧零转换；
+每个源连接器只做一次「源类型 → Arrow」映射（类型映射表为连接器的一等
+文档），之后全链路无中间格式、无行列转拷。
+
+## 九、CDC 取舍：不自己采，接生态输出 ✅ 定案
+
+CDC 是同步领域最贵的部分（MySQL binlog 解析 / PG 逻辑复制 / Oracle
+LogMiner 每家都是深坑）。减法方案：
+
+- **采集交给成熟生态**：Debezium / Canal → Kafka
+- **自研只做** Kafka→QSDB sink（rdkafka 消费 + offset 存 checkpoint 表）
+- 源连接器自研模式仅两种简单可靠形态：**全量快照**（流式 SELECT）与
+  **增量轮询**（自增 id / updated_at 游标）——覆盖批量同步的 90%；
+  实时 CDC 场景一律走 Kafka 路线
+
+## 十、同步语义与 QSDB 模型的对接（边界要诚实）
+
+QSDB = append-only + 分区原子替换，**无行级 upsert**。三模式落法：
+
+| 模式 | 机制 | 幂等性 |
+|---|---|---|
+| 全量快照 | 源表按分区聚合 → 逐分区 overwrite_partition | ✅ 重跑无重复 |
+| 增量轮询 | 游标位点 → 追加；需幂等则按 (分区,窗口) overwrite | at-least-once（位点+幂等回写可升 exactly-once） |
+| CDC（Kafka） | 变更按 (分区, 时间窗) 聚合 → 窗口级 overwrite | ✅ 窗口幂等 |
+
+**边界声明**：高频行级 upsert 不是 QSDB 场景（OLTP 域）；CDC 进来的正确
+姿势 = 微批聚合 + 窗口幂等回写。sync 工具不得因此长成 OLTP 引擎。
+
+**Checkpoint 存储**：QSDB 内建 `_sync.checkpoints` 普通表存各管道游标/
+offset——零内核支持，崩溃重启按位点续传。
+
+**Schema drift**：源加列 → sink 侧自动 ALTER ADD COLUMN（内核前缀指纹
+兼容已备）；源删列/改型 → check 报告 + 显式人工处理（不静默）。
+
+## 十一、QSDB 内核供给清单
+
+**已具备（零改动）**：① Arrow-native 嵌入 API（汇侧零转换=架构地基）
+② WriteBuffer 攒批 ③ 分区原子 overwrite（幂等回写原语）④ ALTER ADD
+COLUMN + 宽松写（drift 承接）⑤ LIMIT 0 schema 契约 ⑥ read_parquet 外表
++ 五后端 Store ⑦ 表格式冻结 + manifest/generation（QSDB→QSDB 物理快路径，
+压缩格式原样拷贝，不重编码）。
+
+**需新增（= §4.2 的 S2 两项，无新增）**：read_only / on_commit。
+
+**明确不做**：行级 UPDATE/DELETE、跨分区事务、主键索引。
+
+## 十二、工程结构与配置形态
+
+```text
+qsdb-sync/（独立仓库）
+├── crates/core/          # Source/Sink trait + pipeline 引擎（调度/重试/
+│                         # checkpoint/metrics/限速）+ 类型映射框架
+├── crates/source-odbc/   # 通用关系库（odbc-api；Linux 装驱动即通）
+├── crates/source-mysql/  # 原生直连（快照+轮询；T2）
+├── crates/source-postgres/
+├── crates/source-file/   # parquet/CSV glob（复用 qsdb read_parquet 机件）
+├── crates/source-kafka/  # Debezium CDC（T2）
+├── crates/source-qsdb/   # 主备复制（manifest/generation 物理协议，§三）
+├── crates/sink-qsdb/     # 嵌入 qsdb 库（WriteBuffer + 幂等回写）
+├── crates/sink-parquet/  # 湖导出（任意 Store 后端）
+└── bin/qsdb-sync/        # CLI + YAML pipeline 定义 + prometheus 指标
+```
+
+```yaml
+# pipeline 示例
+pipelines:
+  - name: mysql-orders
+    source: { type: odbc, dsn: env:ODBC_DSN, table: orders,
+              mode: incremental, cursor: { column: updated_at } }
+    sink:   { type: qsdb, path: /data/qsdb, table: orders,
+              partition_by: [dt], write: overwrite_partition }
+    schedule: { interval: 30s }
+```
+
+## 十三、分期（合并主备路线）
+
+| 阶段 | 内容 | 内核改动 |
+|---|---|---|
+| T1/S1 | core 引擎 + source-file + source-odbc + sink-qsdb + sink-parquet + qsdb-sync check；主备物理复制（source-qsdb） | 零 |
+| T2/S2 | 内核 read_only + on_commit；source-mysql/postgres 原生直连；source-kafka（Debezium） | 两小项 |
+| T3/S3 | lease 防脑裂 ⏳；连接器并行/限速/加密链路；lag 与位点监控告警体系 | 按需 |
+
+## 十四、新增风险
+
+| # | 风险 | 对策 |
+|---|---|---|
+| R6 | ODBC 驱动运维成本（每 DB 装驱动） | 原生直连连接器（T2）覆盖 MySQL/PG 高频路径；ODBC 兜长尾 |
+| R7 | 源类型→Arrow 映射不精确（时区/精度/无符号超界） | 每连接器一张映射表 + check 报告差异显式化；不可映射即报错不静默截断 |
+| R8 | CDC 窗口聚合的乱序 | 窗口关闭水位（Debezium ts / 轮询位点）后才开始 overwrite；窗口内乱序按源序回放 |
+| R9 | 大源表快照压垮源库 | 流式读 + 游标分片 + 限速（core 引擎职责） |
