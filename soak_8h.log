@@ -1,0 +1,5 @@
+== soak: 480min, 2 writers, root C:\Users\qin_w\AppData\Local\Temp\qsdb_soak_18dd8b575e4577c0 ==
+time  rows/s  queries  q_avg_ms  rss_mb  peak_mb  cache_MB  segs/part(avg)
+    1m  825548     2920     20.4     341      365      255   12.3  (cache n=170 hit=45361 miss=11208)
+    1m  332604     3001     39.9     547     1055      245    4.3  (cache n=49 hit=46067 miss=13048)
+    2m  276674     3048     58.4     654     1055      250    3.2  (cache n=52 hit=46420 miss=14197)

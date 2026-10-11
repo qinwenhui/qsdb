@@ -4,8 +4,11 @@
 //! × 周期 compaction/gc——报告吞吐、查询时延、RSS、缓存与段数曲线。
 //! 检测目标：内存泄漏（RSS 爬升）、句柄/段数失控、吞吐衰减、错误。
 //!
-//! 运行：cargo run --release -p qsdb-bench --bin soak -- [分钟] [写线程数]
-//!   默认 30 分钟 / 2 写线程；数据落 %TEMP%/qsdb_soak，结束清理。
+//! 运行：cargo run --release -p qsdb-bench --bin soak -- [分钟] [写线程数] [稳态行数上限(百万)]
+//!   默认 30 分钟 / 2 写线程 / 不设上限（短跑验证用）。
+//!   **8h 长跑必须设上限**（如 400 = 4 亿行后停写，查询/compaction/gc
+//!   继续到时长结束——稳态考察内存/句柄/缓存，不写满磁盘）。
+//!   数据落 %TEMP%/qsdb_soak，结束清理。
 #![cfg(windows)] // mem_mb 依赖 Win32；Linux 部署前用 /proc/self/status 移植
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -88,6 +91,11 @@ fn main() {
         .nth(2)
         .and_then(|v| v.parse().ok())
         .unwrap_or(2);
+    let cap_millions: u64 = std::env::args()
+        .nth(3)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0); // 0 = 不设上限（短跑）
+    let cap_rows: u64 = cap_millions * 1_000_000;
     let root = std::env::temp_dir().join(format!(
         "qsdb_soak_{:x}",
         std::time::SystemTime::now()
@@ -117,6 +125,13 @@ fn main() {
             let mut day = 19_000i32;
             let mut n = 0usize;
             while !STOP.load(Ordering::Relaxed) {
+                // 稳态上限：写满即停（查询/compaction/gc 继续跑到结束）
+                if cap_rows > 0 && WRITTEN.load(Ordering::Relaxed) >= cap_rows {
+                    eprintln!(
+                        "[soak] steady-state: {cap_millions}M rows reached, writer exits (queries continue)"
+                    );
+                    break;
+                }
                 // 每轮 writers 个批（等效并发写量）
                 let batch = synth(5_000, day, 0x1000 + n as u64 * 7919);
                 let mut bs = Vec::with_capacity(writers);
@@ -214,6 +229,7 @@ fn main() {
     for h in handles {
         let _ = h.join();
     }
+    // 上限模式：flush 攒批余量（计数以 WRITTEN 为准，flush 只落盘已计批）
     let _ = writer.flush_all();
     let total_rows: i64 = db
         .sql_collect("SELECT count(*) FROM t")

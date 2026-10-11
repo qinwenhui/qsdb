@@ -668,6 +668,26 @@ M6-4 staging 写 → M6-5 HDFS → M6-6 可选租约；每阶段独立 gate。
   崩溃重开补传 exactly-once、dedup 防重复计入、staged overwrite 替换、
   配置校验）/180 默认 / clippy 双模式 0 / 默认二进制 24.38MB。
 
+### 性能专项第三批：全局聚合快路径 + UDAF 并行（2026-10-12）✅
+- **全局聚合零迭代快路径**（`GroupTable::try_global_fast`，group 为空时）：
+  `count(*)` = `num_rows` **O(1)**、`count(col)` = `num_rows − null_count`
+  **O(1)**、整型 sum = 类型化 `values()` 切片直加 i128（null_count=0 免
+  逐行判空，LLVM 自动向量化）、float sum = 切片 Kahan、min/max =
+  arrow compute SIMD 标量。先验证形态后应用（不中回退原路径，零状态
+  变更）；`ingest` 与 `ingest_with_sel`（全选）双钩子，semi 融合全选
+  路径同享。实现坑：min/max 单槽位只取该聚合自己的极值（min 聚合取
+  min——写反会把 max 混进 min 列，e2e 抓到）。
+- **实测（semi_vs 40M 行）**：基线聚合（2 列全局 agg）**0.26s → 0.012s
+  = 41.5x 快于 DuckDB**（此前 0.04x——「缓存直达聚合内核」落地）；
+  连带 semi 全系反超：**IN 3.5x / NOT IN 1.58x / EXISTS 1.45x /
+  过滤+聚合 1.07x**；mem_vs 宽形态 aggregate 0.87→0.61s、filter
+  0.48→0.26s、group by 0.50→0.38s（全系受益）。
+- **UDAF 并行化**：组求值 rayon par_iter（EvalFn 本身 Send+Sync）+
+  分组编码**分块并行**（8M 行级 encode_key_row 是串行瓶颈——64K 分块
+  本地 HashMap + 块序合并保首见输出序）。m5_bench 8M 行 GROUP BY：
+  **vs 内置 22.78x → 7.67x**（剩余为整组物化契约固有：concat+take）。
+- 191 测试绿 × 2 批；clippy 0。
+
 ### EXISTS / IN 子查询 — semi/anti-join（2026-10-12）✅
 - **SQL 面**：WHERE 顶层 AND 合取项级提取——`g IN (SELECT 单列)`、
   关联 `EXISTS (… WHERE 内列 = 外列 [AND 本地谓词])`、`NOT IN`/`NOT EXISTS`
