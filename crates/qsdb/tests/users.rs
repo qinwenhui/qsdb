@@ -127,3 +127,52 @@ fn password_security_basics() {
     assert_eq!(UserStore::verify(db.store(), "case", "PassWord"), Some(Role::Reader));
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn f15_user_export_import() {
+    let (db, root) = setup("f15");
+    UserStore::add(db.store(), "alice", "pass123", Role::Admin).unwrap();
+    UserStore::add(db.store(), "bob", "pass456", Role::Reader).unwrap();
+
+    // 导出（JSON；含哈希不含明文；Role 按 serde 枚举变体名序列化为 "Admin" 等）
+    let json = UserStore::export_json(db.store()).unwrap();
+    assert!(json.contains("\"alice\""));
+    assert!(json.contains("Admin") || json.contains("admin"));
+    assert!(!json.contains("pass123")); // 不含明文密码
+    assert!(json.contains("\"hash\"")); // 含哈希
+
+    // 目标库导入（failover 模拟）
+    let root2 = root.with_extension("target");
+    std::fs::create_dir_all(root2.join("_catalog")).unwrap();
+    let db2 = Qsdb::open(&root2, QsdbOptions::default()).unwrap();
+
+    // merge 模式：只补缺
+    UserStore::add(db2.store(), "carol", "pass789", Role::Writer).unwrap();
+    let n = UserStore::import_json(db2.store(), &json, false).unwrap();
+    assert_eq!(n, 2); // alice + bob
+    // carol 保留
+    assert_eq!(
+        UserStore::verify(db2.store(), "carol", "pass789"),
+        Some(Role::Writer)
+    );
+    // alice 凭证无缝
+    assert_eq!(
+        UserStore::verify(db2.store(), "alice", "pass123"),
+        Some(Role::Admin)
+    );
+
+    // overwrite 模式：整体替换
+    let n = UserStore::import_json(db2.store(), &json, true).unwrap();
+    assert_eq!(n, 2);
+    // carol 被清（不在导出集）
+    assert_eq!(UserStore::verify(db2.store(), "carol", "pass789"), None);
+    assert_eq!(
+        UserStore::verify(db2.store(), "bob", "pass456"),
+        Some(Role::Reader)
+    );
+
+    // 非法 JSON 拒绝
+    assert!(UserStore::import_json(db2.store(), "not json", true).is_err());
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&root2).ok();
+}

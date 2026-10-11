@@ -236,6 +236,71 @@ impl UserStore {
         Self::write_all(store, &users)
     }
 
+    /// 导出用户面（F15）：(用户名, 角色, salt_hex, hash_hex) 序列化——
+    /// **不含明文密码**（哈希可直接导入目标库，凭证无缝）。JSON 格式供
+    /// 工具编排（qsdb-sync failover 调用 → 目标库 import）。
+    pub fn export_json(store: &Store) -> Result<String> {
+        let users = Self::read_all(store)?;
+        let mut list: Vec<&UserDef> = users.values().collect();
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+        #[derive(Serialize)]
+        struct ExportEntry<'a> {
+            name: &'a str,
+            role: &'a Role,
+            salt: &'a str,
+            hash: &'a str,
+        }
+        let entries: Vec<ExportEntry> = list
+            .iter()
+            .map(|u| ExportEntry {
+                name: &u.name,
+                role: &u.role,
+                salt: &u.salt,
+                hash: &u.hash,
+            })
+            .collect();
+        serde_json::to_string_pretty(&serde_json::json!({ "users": entries }))
+            .map_err(|e| QsdbError::meta(format!("export users failed: {e}")))
+    }
+
+    /// 导入用户面（F15）：export_json 的输出 → 整体替换或合并。
+    /// `overwrite = true` = 整体替换（failover 标准姿势）；false = 只补缺。
+    pub fn import_json(store: &Store, json: &str, overwrite: bool) -> Result<usize> {
+        #[derive(Deserialize)]
+        struct ImportEntry {
+            name: String,
+            role: Role,
+            salt: String,
+            hash: String,
+        }
+        #[derive(Deserialize)]
+        struct ImportFile {
+            users: Vec<ImportEntry>,
+        }
+        let f: ImportFile = serde_json::from_str(json)
+            .map_err(|e| QsdbError::invalid(format!("import users parse failed: {e}")))?;
+        let mut users = if overwrite {
+            HashMap::new()
+        } else {
+            Self::read_all(store)?
+        };
+        let count = f.users.len();
+        for e in f.users {
+            validate_username(&e.name)?;
+            users.insert(
+                e.name.clone(),
+                UserDef {
+                    name: e.name,
+                    role: e.role,
+                    salt: e.salt,
+                    hash: e.hash,
+                },
+            );
+        }
+        Self::write_all(store, &users)?;
+        Ok(count)
+    }
+
     /// 用户名清单（SHOW USERS）。
     pub fn list(store: &Store) -> Result<Vec<(String, Role)>> {
         let users = Self::read_all(store)?;

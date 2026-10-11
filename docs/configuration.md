@@ -92,6 +92,17 @@
 
 **零配置零变化**：不建用户 + 不设 `--token` = 完全开放（现状兼容）；建了用户即要求认证。嵌入模式不受影响（宿主自控，`sql_with_role()` 可选）。
 
+**用户面同步（F15，主备 failover 认证无缝）**：
+- `qsdb admin user export` → JSON（含角色+密码哈希，**不含明文密码**）
+- `qsdb admin user import [--file <p>] [--overwrite]`：stdin/文件导入；
+  `--overwrite` = 整体替换（failover 标准姿势）；默认只补缺（merge）
+- 嵌入 API：`UserStore::export_json / import_json`
+- 部署文档：启用用户体系的库做主备时，failover 编排调用 export→import
+
+**writer 角色 × schema drift（F14 回复）**：三角色矩阵是定案。需要
+「源加列→sink 自动 ALTER」的管道用 **admin 凭证**；writer 凭证的管道
+drift 时显式报错转人工 ALTER（最小权限原则）。此矩阵不改。
+
 **密码哈希**：SHA-256(password ‖ 16B salt) 迭代 10,000 次（内网部署口径）。
 
 ## 六、运行时查看 / 修改通道

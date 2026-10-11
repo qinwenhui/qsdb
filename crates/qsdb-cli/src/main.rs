@@ -139,6 +139,15 @@ enum AdminCmd {
     },
     /// 用户清单
     UserList,
+    /// 导出用户面（JSON 到 stdout；含角色+哈希，不含明文密码）
+    UserExport,
+    /// 导入用户面（JSON 从 stdin 或文件；--overwrite 整体替换 / 默认只补缺）
+    UserImport {
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long)]
+        overwrite: bool,
+    },
 }
 
 fn main() {
@@ -237,6 +246,43 @@ fn main() {
                     match qsdb::users::UserStore::set_password(db.store(), &name, &pw) {
                         Ok(()) => {
                             println!("password updated for '{name}'");
+                            return;
+                        }
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                AdminCmd::UserExport => {
+                    match qsdb::users::UserStore::export_json(db.store()) {
+                        Ok(json) => {
+                            println!("{json}");
+                            return;
+                        }
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                AdminCmd::UserImport { file, overwrite } => {
+                    let json = match file {
+                        Some(p) => std::fs::read_to_string(&p).unwrap_or_else(|e| {
+                            eprintln!("error: read {}: {e}", p.display());
+                            std::process::exit(1);
+                        }),
+                        None => {
+                            let mut buf = String::new();
+                            use std::io::Read;
+                            std::io::stdin().read_to_string(&mut buf).unwrap();
+                            buf
+                        }
+                    };
+                    match qsdb::users::UserStore::import_json(db.store(), &json, overwrite) {
+                        Ok(n) => {
+                            println!("imported {n} users ({})",
+                                if overwrite { "overwrite" } else { "merge" });
                             return;
                         }
                         Err(e) => {
