@@ -85,7 +85,7 @@ fn collect_plan_columns(plan: &LogicalPlan, out: &mut Vec<String>) {
     match plan {
         // 下推进 Scan 的谓词也引用数据列——必须收集，否则投影被裁到只剩分区列
         // （M4 期 bug：数据列谓词静默失效——WHERE a>0 读不到 a 列按恒真处理）
-        LogicalPlan::Scan { predicate, .. } => {
+        LogicalPlan::Scan { predicate, .. } | LogicalPlan::ExternalScan { predicate, .. } => {
             if let Some(p) = predicate {
                 let mut cols = std::collections::HashSet::new();
                 p.referenced_columns(&mut cols);
@@ -172,7 +172,9 @@ fn has_window_node(plan: &LogicalPlan) -> bool {
 /// 计划根到叶的 Scan 表定义。
 fn plan_scan_def(plan: &LogicalPlan) -> Option<Arc<crate::catalog::TableDef>> {
     match plan {
-        LogicalPlan::Scan { def, .. } => Some(Arc::clone(def)),
+        LogicalPlan::Scan { def, .. } | LogicalPlan::ExternalScan { def, .. } => {
+            Some(Arc::clone(def))
+        }
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Project { input, .. }
         | LogicalPlan::Aggregate { input, .. }
@@ -199,6 +201,15 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
     match plan {
         LogicalPlan::Scan { def, predicate } => LogicalPlan::Scan {
             def: Arc::clone(def),
+            predicate: predicate.clone(),
+        },
+        LogicalPlan::ExternalScan {
+            def,
+            files,
+            predicate,
+        } => LogicalPlan::ExternalScan {
+            def: Arc::clone(def),
+            files: Arc::clone(files),
             predicate: predicate.clone(),
         },
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
@@ -337,6 +348,20 @@ fn build_inner(
                 projection: scan_proj,
                 ..Default::default()
             })?;
+            Ok(crate::exec::par_scan::make_scan(scan, ctx))
+        }
+        LogicalPlan::ExternalScan {
+            def,
+            files,
+            predicate,
+        } => {
+            let scan = db.external_scan(
+                Arc::clone(def),
+                files.as_ref().clone(),
+                scan_proj,
+                predicate.clone(),
+                Arc::clone(ctx),
+            )?;
             Ok(crate::exec::par_scan::make_scan(scan, ctx))
         }
         LogicalPlan::Filter { input, predicate } => Ok(Box::new(FilterExec::new(
@@ -606,6 +631,24 @@ fn try_shard_source(
                             projection: scan_proj.clone(),
                             ..Default::default()
                         },
+                        Arc::clone(ctx),
+                    )
+                    .ok()?;
+                let threads = rayon::current_num_threads().clamp(1, 16);
+                let shards = scan.shard(threads, false)?;
+                return Some((shards, filters));
+            }
+            LogicalPlan::ExternalScan {
+                def,
+                files,
+                predicate,
+            } => {
+                let scan = db
+                    .external_scan(
+                        Arc::clone(def),
+                        files.as_ref().clone(),
+                        scan_proj.clone(),
+                        predicate.clone(),
                         Arc::clone(ctx),
                     )
                     .ok()?;

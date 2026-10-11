@@ -34,6 +34,9 @@ pub struct QsdbOptions {
     pub query_timeout_ms: Option<u64>,
     /// 默认单查询内存上限（字节）；None = 不限。超限查询被终止而非 OOM 全库。
     pub query_memory_limit_bytes: Option<u64>,
+    /// 远端外表（read_parquet s3://）段文件本地缓存预算（字节）；0 = 关闭。
+    /// 布局 `{root}/_filecache/{url_hash}/{etag}/…`，ETag 键控自动失效。
+    pub file_cache_bytes: u64,
 }
 
 impl Default for QsdbOptions {
@@ -43,6 +46,7 @@ impl Default for QsdbOptions {
             scan_cache_bytes: 256 * 1024 * 1024,
             query_timeout_ms: None,
             query_memory_limit_bytes: None,
+            file_cache_bytes: 0,
         }
     }
 }
@@ -113,6 +117,8 @@ pub struct Qsdb {
     defs: TableDefCache,
     cache: Arc<crate::cache::SegmentCache>,
     runtime: Arc<QsdbRuntime>,
+    /// 远端外表段文件缓存（预算 0 = 禁用实例，API 全 no-op）
+    file_cache: Arc<crate::filecache::FileCache>,
 }
 
 impl Qsdb {
@@ -128,6 +134,10 @@ impl Qsdb {
             .map_err(|e| QsdbError::meta(format!("init default db failed: {e}")))?;
         let cache = Arc::new(crate::cache::SegmentCache::new(opts.scan_cache_bytes));
         let runtime = Arc::new(QsdbRuntime::from_opts(&opts));
+        let file_cache = Arc::new(crate::filecache::FileCache::new(
+            root.join("_filecache"),
+            opts.file_cache_bytes,
+        ));
         Ok(Self {
             root,
             store,
@@ -135,6 +145,7 @@ impl Qsdb {
             defs: TableDefCache::default(),
             cache,
             runtime,
+            file_cache,
         })
     }
 
@@ -286,6 +297,29 @@ impl Qsdb {
             req.predicate,
             req.limit,
             Some(Arc::clone(&self.cache)),
+            ctx,
+        )
+    }
+
+    /// 外表扫描（read_parquet；exec_builder 调用）。
+    pub(crate) fn external_scan(
+        &self,
+        def: Arc<TableDef>,
+        files: Vec<crate::scan::FileLoc>,
+        projection: Option<Vec<String>>,
+        predicate: Option<Predicate>,
+        ctx: Arc<crate::query::QueryContext>,
+    ) -> Result<Scan> {
+        let fc = self.file_cache.is_enabled().then(|| Arc::clone(&self.file_cache));
+        Scan::external(
+            &self.store,
+            def,
+            files,
+            projection,
+            predicate,
+            None,
+            Some(Arc::clone(&self.cache)),
+            fc,
             ctx,
         )
     }

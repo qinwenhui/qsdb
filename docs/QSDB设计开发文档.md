@@ -599,6 +599,31 @@ M6-4 staging 写 → M6-5 HDFS → M6-6 可选租约；每阶段独立 gate。
     中位数持平（757 vs 740 MB/s，带内波动 ±25% 为机器负载）；
   - ✅ **gate 绿**：169 测试全绿、clippy 干净（workspace --all-targets）。
 
+#### M6-2 只读外表 read_parquet ✅ 已完成（2026-10-11）
+- `FROM read_parquet('<路径>')`（含 JOIN 右侧、谓词下推、列裁剪、并行分片、
+  LIMIT 0 schema 契约）：本地路径/glob（`*` 段内、`**` 跨段，零新依赖）与
+  `s3://bucket/key?endpoint=…&region=…`（feature `s3`，object_store 0.14 +
+  tokio 仅此 feature 引入；凭据走环境变量链）。
+- 读路径：parquet `ChunkReader` 派发源 `ChunkSource{Local File | Remote
+  range GET}`——footer 裁剪与「只传选中 RG/列」由 parquet-rs 惰性按需
+  取字节天然成立（存储设计 P5/§10.1 四级裁剪的 1-4 级全链路）。
+- 段缓存（§10.2）：`filecache.rs`（独立模块、无 object_store 依赖），
+  `{root}/_filecache/{url_hash}/{etag}/` 预算制 LRU；ETag 键控自动失效；
+  准入 = 无 RG 裁剪的整读（选择性查询走 range GET 不占预算）；
+  `QsdbOptions.file_cache_bytes`（默认 0 关）/ server `--file-cache-mb`。
+- 顺手修复两个既有 bug：① JOIN 右侧实表带别名解析错名（`JOIN dim d` 按别名
+  当表名 resolve → NotFound）；② HashJoin INNER 存在未匹配行时 `total_rows`
+  恒计入 unmatched → 与列长不符触发批校验失败（现有测试全为全匹配未暴露；
+  外表 join 测试首触发）。
+- **验收**：179 测试全绿（默认）+ 185 全绿（--features s3，含 LocalFileSystem
+  注入的全链路 range/顺序读/parquet 回读单测）；clippy 双模式干净；
+  二进制默认 **24.22MB**（红线 ≤25MB 内，+0.1MB）；s3 feature 30.0MB
+  （+5.8MB，默认关不计红线，cargo tree 验证默认零依赖增量）；
+  管理表路径 mem_vs smoke 无回归（filter/agg/group 均在当日噪声带内）。
+- 后置（M6-3）：S3 管理表（OCC manifest 提交）；远端文件 footer 重复
+  HEAD/range（plan 期 + open 期各一次，v1 已知可优化）；glob 仅常量前缀
+  list（无 key 谓词下推）。
+
 ---
 
 ## 十五、风险与对策

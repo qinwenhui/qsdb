@@ -26,6 +26,7 @@ use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
+use parquet::file::reader::ChunkReader as ChunkReaderParquet;
 
 use crate::catalog::TableDef;
 use crate::error::{QsdbError, Result};
@@ -368,13 +369,277 @@ fn upper_bound_may_match(
 }
 
 // ---------------------------------------------------------------------------
+// 外表数据文件位置（read_parquet，M6-2）
+// ---------------------------------------------------------------------------
+
+/// 外表数据文件位置。
+#[derive(Debug, Clone)]
+pub enum FileLoc {
+    Local(PathBuf),
+    /// 完整 `s3://bucket/key` URL（feature `s3`）
+    #[cfg(feature = "s3")]
+    S3(String),
+}
+
+impl FileLoc {
+    /// 展示/缓存键路径（远端 = URL 字符串本身）。
+    pub fn display_path(&self) -> PathBuf {
+        match self {
+            Self::Local(p) => p.clone(),
+            #[cfg(feature = "s3")]
+            Self::S3(u) => PathBuf::from(u),
+        }
+    }
+}
+
+/// 简单 glob 匹配：`*` 不跨 `/`，`**` 任意（含 `/`），分隔符统一 `/`。
+pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
+    /// 分隔符归一 + 连续星号折叠（≥2 个 → `**`）。
+    fn normalize(p: &str) -> Vec<char> {
+        let cs: Vec<char> = p.replace('\\', "/").chars().collect();
+        let mut res: Vec<char> = Vec::with_capacity(cs.len());
+        let mut i = 0;
+        while i < cs.len() {
+            if cs[i] == '*' {
+                let mut n = 0;
+                while i < cs.len() && cs[i] == '*' {
+                    n += 1;
+                    i += 1;
+                }
+                res.push('*');
+                if n >= 2 {
+                    res.push('*');
+                }
+            } else {
+                res.push(cs[i]);
+                i += 1;
+            }
+        }
+        res
+    }
+    fn m(p: &[char], t: &[char]) -> bool {
+        if p.is_empty() {
+            return t.is_empty();
+        }
+        if p[0] == '*' {
+            if p.len() > 1 && p[1] == '*' {
+                // '**'：任意（含 '/'）——尝试全部吞噬长度
+                let rest = &p[2..];
+                (0..=t.len()).any(|i| m(rest, &t[i..]))
+            } else {
+                // '*'：段内任意
+                let rest = &p[1..];
+                for i in 0..=t.len() {
+                    if m(rest, &t[i..]) {
+                        return true;
+                    }
+                    if i < t.len() && t[i] == '/' {
+                        break;
+                    }
+                }
+                false
+            }
+        } else {
+            !t.is_empty() && t[0] == p[0] && m(&p[1..], &t[1..])
+        }
+    }
+    let p = normalize(pattern);
+    let t: Vec<char> = text.replace('\\', "/").chars().collect();
+    m(&p, &t)
+}
+
+/// 解析 read_parquet 路径模式 → 数据文件位置列表（glob 展开；无匹配报错）。
+pub(crate) fn resolve_file_locs(pattern: &str) -> Result<Vec<FileLoc>> {
+    #[cfg(feature = "s3")]
+    if pattern.starts_with("s3://") {
+        return crate::remote::expand_s3_glob(pattern)
+            .map(|urls| urls.into_iter().map(FileLoc::S3).collect());
+    }
+    #[cfg(not(feature = "s3"))]
+    if pattern.starts_with("s3://") {
+        return Err(QsdbError::unsupported(
+            "s3:// path requires qsdb built with feature 's3'",
+        ));
+    }
+    let norm = pattern.replace('\\', "/");
+    if !norm.contains('*') {
+        let p = PathBuf::from(&norm);
+        if p.is_file() {
+            return Ok(vec![FileLoc::Local(p)]);
+        }
+        return Err(QsdbError::not_found(format!(
+            "read_parquet: file not found: {norm}"
+        )));
+    }
+    // 常量前缀目录 → 递归枚举 → 相对路径 glob 匹配
+    let idx = norm.find('*').expect("checked");
+    let before = &norm[..idx];
+    let (base_str, rel_pat) = match before.rsplit_once('/') {
+        Some((dir, _)) => (dir.to_string(), norm[dir.len() + 1..].to_string()),
+        None => (".".to_string(), norm.clone()),
+    };
+    let base = PathBuf::from(&base_str);
+    if !base.is_dir() {
+        return Err(QsdbError::not_found(format!(
+            "read_parquet: directory not found: {base_str}"
+        )));
+    }
+    let mut all = Vec::new();
+    walk_files(&base, &mut all);
+    let mut out: Vec<FileLoc> = all
+        .into_iter()
+        .filter(|p| {
+            let rel = p
+                .strip_prefix(&base)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            glob_match(&rel_pat, &rel)
+        })
+        .map(FileLoc::Local)
+        .collect();
+    out.sort_by_key(FileLoc::display_path);
+    if out.is_empty() {
+        return Err(QsdbError::not_found(format!(
+            "read_parquet: no file matches {norm}"
+        )));
+    }
+    Ok(out)
+}
+
+fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            walk_files(&p, out);
+        } else if p.is_file() {
+            out.push(p);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// parquet 字节源（本地 File / 远端 range GET，M6-2）
+// ---------------------------------------------------------------------------
+
+/// parquet `ChunkReader` 派发源。本地直开 `File`（§4 热路径现状不变）；
+/// 远端优先段缓存命中（零网络），未命中且整读提示时整文件下载入缓存，
+/// 否则 range GET 惰性取字节（footer/选中 row group 才传输）。
+pub(crate) enum ChunkSource {
+    File(File),
+    #[cfg(feature = "s3")]
+    Remote(crate::remote::RemoteReader),
+}
+
+impl ChunkSource {
+    /// `prefer_whole`：调用方将读取全部 row group 的提示（远端整文件缓存准入）。
+    #[cfg_attr(not(feature = "s3"), allow(unused_variables))]
+    pub(crate) fn open(
+        loc: &FileLoc,
+        file_cache: Option<&crate::filecache::FileCache>,
+        prefer_whole: bool,
+    ) -> Result<Self> {
+        match loc {
+            FileLoc::Local(p) => File::open(p)
+                .map(Self::File)
+                .map_err(|e| QsdbError::meta(format!("open {} failed: {e}", p.display()))),
+            #[cfg(feature = "s3")]
+            FileLoc::S3(url) => {
+                let l = crate::remote::locate(url)?;
+                let meta = crate::remote::head(&l)?;
+                if let (Some(fc), Some(etag)) = (file_cache, meta.e_tag.as_deref()) {
+                    if let Some(p) = fc.get(url, etag) {
+                        return File::open(p).map(Self::File).map_err(|e| {
+                            QsdbError::meta(format!("open cached {} failed: {e}", url))
+                        });
+                    }
+                    if prefer_whole {
+                        let mut rd = crate::remote::stream_reader(&l)?;
+                        let p = fc.insert(url, etag, &mut rd)?;
+                        return File::open(p).map(Self::File).map_err(|e| {
+                            QsdbError::meta(format!("open cached {} failed: {e}", url))
+                        });
+                    }
+                }
+                Ok(Self::Remote(crate::remote::RemoteReader::from_parts(
+                    l.store,
+                    l.location,
+                    meta.size,
+                )))
+            }
+        }
+    }
+}
+
+pub(crate) enum ChunkRead {
+    /// parquet 对 File 的 ChunkReader 实现返回 BufReader<File>
+    File(std::io::BufReader<File>),
+    #[cfg(feature = "s3")]
+    Remote(crate::remote::ChunkedRangeRead),
+}
+
+impl std::io::Read for ChunkRead {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::File(f) => f.read(out),
+            #[cfg(feature = "s3")]
+            Self::Remote(r) => r.read(out),
+        }
+    }
+}
+
+impl parquet::file::reader::Length for ChunkSource {
+    fn len(&self) -> u64 {
+        match self {
+            Self::File(f) => parquet::file::reader::Length::len(f),
+            #[cfg(feature = "s3")]
+            Self::Remote(r) => parquet::file::reader::Length::len(r),
+        }
+    }
+}
+
+impl parquet::file::reader::ChunkReader for ChunkSource {
+    type T = ChunkRead;
+
+    fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
+        Ok(match self {
+            Self::File(f) => {
+                ChunkRead::File(<File as ChunkReaderParquet>::get_read(f, start)?)
+            }
+            #[cfg(feature = "s3")]
+            Self::Remote(r) => ChunkRead::Remote(
+                <crate::remote::RemoteReader as ChunkReaderParquet>::get_read(r, start)?,
+            ),
+        })
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<bytes::Bytes> {
+        match self {
+            Self::File(f) => <File as ChunkReaderParquet>::get_bytes(f, start, length),
+            #[cfg(feature = "s3")]
+            Self::Remote(r) => {
+                <crate::remote::RemoteReader as ChunkReaderParquet>::get_bytes(r, start, length)
+            }
+        }
+    }
+}
+
+/// 读外表单文件的 arrow schema（footer，binder 期调用）。
+pub(crate) fn file_arrow_schema(loc: &FileLoc) -> Result<SchemaRef> {
+    let src = ChunkSource::open(loc, None, false)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(src)
+        .map_err(|e| QsdbError::meta(format!("read parquet footer {}: {e}", loc.display_path().display())))?;
+    Ok(Arc::clone(builder.schema()))
+}
+
+// ---------------------------------------------------------------------------
 // 扫描计划
 // ---------------------------------------------------------------------------
 
 /// 一个待读 parquet 文件。
 #[derive(Clone)]
 struct FilePlan {
-    path: PathBuf,
+    loc: FileLoc,
     partition_values: HashMap<String, Literal>,
     row_groups: Option<Vec<usize>>, // None = 全部
 }
@@ -670,10 +935,10 @@ fn add_partition_files(
                 continue;
             }
         }
-        let path = pdir.join(&seg.file_name);
-        let row_groups = prune_row_groups(&path, plan)?;
+        let loc = FileLoc::Local(pdir.join(&seg.file_name));
+        let row_groups = prune_row_groups(&loc, plan, None)?;
         files.push(FilePlan {
-            path,
+            loc,
             partition_values: pvals.clone(),
             row_groups,
         });
@@ -682,7 +947,12 @@ fn add_partition_files(
 }
 
 /// parquet footer row group 裁剪（数值/字符串；无统计/失败 → 全读）。
-fn prune_row_groups(path: &Path, plan: &ScanPlan) -> Result<Option<Vec<usize>>> {
+/// 字节源经 [`ChunkSource`]（本地 File / 远端 range GET）。
+fn prune_row_groups(
+    loc: &FileLoc,
+    plan: &ScanPlan,
+    file_cache: Option<&crate::filecache::FileCache>,
+) -> Result<Option<Vec<usize>>> {
     let Some(pred) = &plan.predicate else {
         return Ok(None);
     };
@@ -702,10 +972,10 @@ fn prune_row_groups(path: &Path, plan: &ScanPlan) -> Result<Option<Vec<usize>>> 
         return Ok(None);
     }
 
-    let file = File::open(path)
-        .map_err(|e| QsdbError::meta(format!("open {} failed: {e}", path.display())))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| QsdbError::meta(format!("read parquet footer {}: {e}", path.display())))?;
+    let disp = loc.display_path();
+    let src = ChunkSource::open(loc, file_cache, false)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(src)
+        .map_err(|e| QsdbError::meta(format!("read parquet footer {}: {e}", disp.display())))?;
     let meta = builder.metadata();
     let file_schema = builder.schema();
 
@@ -1001,11 +1271,11 @@ fn constant_array(lit: &Literal, dt: &DataType, n: usize) -> Result<ArrayRef> {
 }
 
 /// 文件 row group 数（分片细分用；失败由调用方回退文件粒度）。
-fn row_group_count(path: &Path) -> Result<usize> {
-    let f = File::open(path)
-        .map_err(|e| QsdbError::meta(format!("open {} failed: {e}", path.display())))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(f)
-        .map_err(|e| QsdbError::meta(format!("read parquet footer {}: {e}", path.display())))?;
+fn row_group_count(loc: &FileLoc) -> Result<usize> {
+    let disp = loc.display_path();
+    let src = ChunkSource::open(loc, None, false)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(src)
+        .map_err(|e| QsdbError::meta(format!("read parquet footer {}: {e}", disp.display())))?;
     Ok(builder.metadata().num_row_groups())
 }
 
@@ -1050,6 +1320,8 @@ pub struct Scan {
     ctx: Arc<crate::query::QueryContext>,
     /// 存储句柄（缓存签名 stat；M6-2 起承载远端段缓存路径）
     store: Arc<Store>,
+    /// 远端段文件磁盘缓存（外表专用；管理表本地不启用）
+    file_cache: Option<Arc<crate::filecache::FileCache>>,
 }
 
 /// 批来源：parquet 流式 reader 或缓存命中批列表。
@@ -1093,6 +1365,45 @@ impl Scan {
             cache,
             ctx,
             store: Arc::clone(store),
+            file_cache: None,
+        })
+    }
+
+    /// 外表扫描（read_parquet，M6-2）：显式文件列表，无分区列。
+    /// 每文件 footer row group 裁剪（远端 = range GET footer）。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn external(
+        store: &Arc<Store>,
+        def: Arc<TableDef>,
+        files: Vec<FileLoc>,
+        projection: Option<Vec<String>>,
+        predicate: Option<Predicate>,
+        limit: Option<u64>,
+        cache: Option<Arc<crate::cache::SegmentCache>>,
+        file_cache: Option<Arc<crate::filecache::FileCache>>,
+        ctx: Arc<crate::query::QueryContext>,
+    ) -> Result<Self> {
+        let plan = ScanPlan::build(def, projection, predicate, limit)?;
+        let mut plans = Vec::with_capacity(files.len());
+        for loc in files {
+            let row_groups = prune_row_groups(&loc, &plan, file_cache.as_deref())?;
+            plans.push(FilePlan {
+                loc,
+                partition_values: HashMap::new(),
+                row_groups,
+            });
+        }
+        Ok(Self {
+            plan: Arc::new(plan),
+            files: plans.into(),
+            current: None,
+            missing_cols: Vec::new(),
+            pending_collector: None,
+            remaining: limit,
+            cache,
+            ctx,
+            store: Arc::clone(store),
+            file_cache,
         })
     }
 
@@ -1119,7 +1430,7 @@ impl Scan {
         };
         for f in &self.files {
             if split > 1 {
-                if let Ok(nrg) = row_group_count(&f.path) {
+                if let Ok(nrg) = row_group_count(&f.loc) {
                     let universe: Vec<usize> = match &f.row_groups {
                         Some(list) if !list.is_empty() => list.clone(),
                         _ => (0..nrg).collect(),
@@ -1128,14 +1439,14 @@ impl Scan {
                     if universe.len() >= 2 && per < universe.len() {
                         for chunk in universe.chunks(per) {
                             units.push(FilePlan {
-                                path: f.path.clone(),
+                                loc: f.loc.clone(),
                                 partition_values: f.partition_values.clone(),
                                 row_groups: Some(chunk.to_vec()),
                             });
                         }
                     } else {
                         units.push(FilePlan {
-                            path: f.path.clone(),
+                            loc: f.loc.clone(),
                             partition_values: f.partition_values.clone(),
                             row_groups: Some(universe),
                         });
@@ -1144,7 +1455,7 @@ impl Scan {
                 }
             }
             units.push(FilePlan {
-                path: f.path.clone(),
+                loc: f.loc.clone(),
                 partition_values: f.partition_values.clone(),
                 row_groups: f.row_groups.clone(),
             });
@@ -1172,6 +1483,7 @@ impl Scan {
                 cache: self.cache.clone(),
                 ctx: Arc::clone(&self.ctx),
                 store: Arc::clone(&self.store),
+                file_cache: self.file_cache.clone(),
             })
             .collect();
         for (s, b) in shards.iter_mut().zip(buckets) {
@@ -1185,10 +1497,15 @@ impl Scan {
             return Ok(false);
         };
         self.missing_cols.clear();
-        let f = File::open(&file.path)
-            .map_err(|e| QsdbError::meta(format!("open {} failed: {e}", file.path.display())))?;
-        let mut builder = ParquetRecordBatchReaderBuilder::try_new(f)
-            .map_err(|e| QsdbError::meta(format!("open parquet {}: {e}", file.path.display())))?;
+        let disp = file.loc.display_path();
+        let src = ChunkSource::open(
+            &file.loc,
+            self.file_cache.as_deref(),
+            file.row_groups.is_none(),
+        )
+        .map_err(|e| QsdbError::meta(format!("open {} failed: {e}", disp.display())))?;
+        let mut builder = ParquetRecordBatchReaderBuilder::try_new(src)
+            .map_err(|e| QsdbError::meta(format!("open parquet {}: {e}", disp.display())))?;
         // 投影：read_columns → parquet 叶列索引（扁平 schema：列 i = 叶 i）。
         // 文件缺列（ALTER ADD COLUMN 前的旧 segment）→ 记入 missing_cols，批读出后补 NULL。
         let file_schema = builder.schema();
@@ -1200,7 +1517,7 @@ impl Scan {
                     let c = self.plan.def.column(name).ok_or_else(|| {
                         QsdbError::meta(format!(
                             "column '{name}' missing in parquet file {}",
-                            file.path.display()
+                            disp.display()
                         ))
                     })?;
                     self.missing_cols
@@ -1208,12 +1525,13 @@ impl Scan {
                 }
             }
         }
-        // 热缓存：命中零解码（签名 stat 经 Store）
-        if let Some(cache) = &self.cache {
+        // 热缓存：命中零解码（签名 stat 经 Store；远端文件不经内存批缓存——
+        // 其本地性由段缓存承载）
+        if let (Some(cache), FileLoc::Local(_)) = (&self.cache, &file.loc) {
             if cache.is_enabled() {
-                if let Ok(Some(md)) = self.store.stat(&file.path) {
+                if let Ok(Some(md)) = self.store.stat(&disp) {
                     if let Some(hit) = cache.get(
-                        &file.path,
+                        &disp,
                         md.mtime_ms,
                         md.size,
                         &self.plan.read_columns,
@@ -1229,7 +1547,7 @@ impl Scan {
                     }
                     // miss：装 collector 供回填
                     let collector = cache.collector(
-                        file.path.clone(),
+                        disp.clone(),
                         md.mtime_ms,
                         md.size,
                         self.plan.read_columns.clone(),

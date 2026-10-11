@@ -16,12 +16,15 @@ pub mod compact;
 pub mod error;
 pub mod exec;
 pub mod expr;
+pub mod filecache;
 pub mod fsutil;
 pub mod index;
 pub mod manifest;
 pub mod partition;
 pub mod query;
 pub mod scan;
+#[cfg(feature = "s3")]
+pub mod remote;
 pub mod sql;
 pub mod stats;
 pub mod store;

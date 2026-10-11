@@ -17,7 +17,16 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 fs2 = { workspace = true }
 rayon = { workspace = true }
+# bytes 仅类型引用（parquet ChunkReader::get_bytes 签名；已是 arrow/parquet 传递依赖，不增树）
+bytes = "1"
 sqlparser = { workspace = true }
+object_store = { version = "0.14.2", default-features = false, features = ["aws", "fs"], optional = true }
+tokio = { workspace = true, optional = true }
+futures-util = { version = "0.3", default-features = false, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
+
+[features]
+# S3 及兼容对象存储（只读外表 M6-2；object_store+tokio 仅此 feature 引入，默认关闭）
+s3 = ["dep:object_store", "dep:tokio", "dep:futures-util"]

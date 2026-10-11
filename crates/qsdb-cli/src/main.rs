@@ -72,6 +72,9 @@ enum Cmd {
         /// Arrow Flight 监听口（h2c；需 --features flight 编译）
         #[arg(long)]
         flight_bind: Option<String>,
+        /// 远端外表（read_parquet s3://）段文件本地缓存（MB；0 = 关闭）
+        #[arg(long, default_value_t = 0)]
+        file_cache_mb: u64,
     },
 }
 
@@ -159,10 +162,12 @@ fn main() {
             cache_mb,
             max_concurrent_queries,
             flight_bind,
+            file_cache_mb,
             config,
         } => {
             let opts = QsdbOptions {
                 scan_cache_bytes: cache_mb * 1024 * 1024,
+                file_cache_bytes: file_cache_mb * 1024 * 1024,
                 ..Default::default()
             };
             let db = match Qsdb::open(&path, opts) {

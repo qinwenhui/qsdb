@@ -326,7 +326,9 @@ fn join_batch(
     }
     let n_probe_cols = probe_batch.num_columns();
     let n_build_cols = state.table.num_columns();
-    let total_rows = probe_idx.len() + unmatched.len();
+    // 声明行数 = 实际输出行数：INNER 丢弃未匹配行（M6-2 修复——
+    // 原先恒计入 unmatched，未匹配行存在时与列长不符触发 batch 校验失败）
+    let total_rows = probe_idx.len() + usize::from(emit_unmatched) * unmatched.len();
     // 左（probe）列索引 = 匹配行 ++ 未匹配行（保留左值）
     let mut all_probe = probe_idx.clone();
     if emit_unmatched {

@@ -25,6 +25,13 @@ pub enum LogicalPlan {
         def: Arc<TableDef>,
         predicate: Option<Predicate>,
     },
+    /// 外表 parquet 扫描（read_parquet，M6-2）：文件列表绑定期解析，
+    /// schema 取自首文件 footer；无分区列
+    ExternalScan {
+        def: Arc<TableDef>,
+        files: Arc<Vec<crate::scan::FileLoc>>,
+        predicate: Option<Predicate>,
+    },
     Filter {
         input: Box<LogicalPlan>,
         predicate: PhysExpr,
@@ -760,7 +767,7 @@ fn next_cte_id() -> u32 {
 /// 计划输出列（名字 + 类型）——CTE 内联绑定的列序来源。
 pub fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<(String, LogicalType)>> {
     Ok(match plan {
-        LogicalPlan::Scan { def, .. } => def
+        LogicalPlan::Scan { def, .. } | LogicalPlan::ExternalScan { def, .. } => def
             .columns
             .iter()
             .map(|c| (c.name.clone(), c.logical_type.clone()))
@@ -853,6 +860,80 @@ fn resolve_table_source(
             predicate: None,
         },
         SchemaCtx::from_table(&def),
+    ))
+}
+
+/// 表函数（FROM 子句）：当前仅 `read_parquet('<路径/glob>')`。
+/// 返回（计划, 列上下文）；文件列表绑定期展开，schema 取首文件 footer。
+fn resolve_table_function(
+    name: &str,
+    args: &[sqlparser::ast::FunctionArg],
+) -> Result<(LogicalPlan, SchemaCtx)> {
+    if !name.eq_ignore_ascii_case("read_parquet") {
+        return Err(QsdbError::unsupported(format!(
+            "table function '{name}' not supported (read_parquet only)"
+        )));
+    }
+    use sqlparser::ast::{Expr as E, FunctionArg, FunctionArgExpr};
+    let path = match args {
+        [FunctionArg::Unnamed(FunctionArgExpr::Expr(E::Value(v)))] => match &v.value {
+            sqlparser::ast::Value::SingleQuotedString(s)
+            | sqlparser::ast::Value::DoubleQuotedString(s) => s.clone(),
+            other => {
+                return Err(QsdbError::invalid(format!(
+                    "read_parquet path must be a string literal, got {other:?}"
+                )))
+            }
+        },
+        other => {
+            return Err(QsdbError::invalid(format!(
+                "read_parquet takes exactly one string literal, got {other:?} args"
+            )))
+        }
+    };
+    let files = crate::scan::resolve_file_locs(&path)?;
+    let Some(first) = files.first() else {
+        return Err(QsdbError::not_found(format!("read_parquet: {path}")));
+    };
+    let schema = crate::scan::file_arrow_schema(first)?;
+    let mut columns = Vec::with_capacity(schema.fields().len());
+    for f in schema.fields() {
+        let logical = LogicalType::try_from_arrow(f.data_type()).map_err(|e| {
+            QsdbError::unsupported(format!(
+                "read_parquet column '{}' type {:#?} not supported: {e}",
+                f.name(),
+                f.data_type()
+            ))
+        })?;
+        columns.push(crate::catalog::ColumnDef {
+            name: f.name().clone(),
+            logical_type: logical,
+            nullable: true,
+            check: None,
+            default: None,
+            comment: None,
+        });
+    }
+    let def = Arc::new(TableDef {
+        version: 1,
+        name: "read_parquet".into(),
+        columns,
+        partition_keys: Vec::new(),
+        created_at: 0,
+        properties: std::collections::HashMap::new(),
+    });
+    let cols: Vec<(String, LogicalType)> = def
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), c.logical_type.clone()))
+        .collect();
+    Ok((
+        LogicalPlan::ExternalScan {
+            def,
+            files: Arc::new(files),
+            predicate: None,
+        },
+        SchemaCtx { cols },
     ))
 }
 
@@ -979,7 +1060,7 @@ fn filter_reachable_ctes(defs: Vec<CteDef>, main: &LogicalPlan) -> Vec<CteDef> {
                 collect_refs(left, out);
                 collect_refs(right, out);
             }
-            LogicalPlan::Scan { .. } => {}
+            LogicalPlan::Scan { .. } | LogicalPlan::ExternalScan { .. } => {}
         }
     }
     let mut keep = std::collections::HashSet::new();
@@ -1045,8 +1126,16 @@ fn translate_select_inner(
         }
     }
 
-    // FROM 主表：实表 / CTE（本级 → 祖先）/ 派生表（子查询直接作子计划）
+    // FROM 主表：实表 / 表函数（read_parquet）/ CTE（本级 → 祖先）/ 派生表
     let (mut plan, mut ctx): (LogicalPlan, SchemaCtx) = match &select.from[0].relation {
+        TableFactor::Table {
+            name,
+            args: Some(tf_args),
+            ..
+        } => resolve_table_function(&object_name_single(name.clone())?, &tf_args.args)?,
+        TableFactor::Function { name, args, .. } => {
+            resolve_table_function(&object_name_single(name.clone())?, args)?
+        }
         TableFactor::Table { name, .. } => {
             resolve_table_source(&object_name_single(name.clone())?, &visible, resolver)?
         }
@@ -1079,12 +1168,26 @@ fn translate_select_inner(
                 )));
             }
         };
-        // 右侧源：实表 / CTE（别名 → 原名 → 祖先）/ 派生表
+        // 右侧源：实表 / 表函数（read_parquet）/ CTE（别名 → 原名 → 祖先）/ 派生表
         let (right_name, right_plan, right_cols): (
             String,
             LogicalPlan,
             Vec<(String, LogicalType)>,
         ) = match &join.relation {
+            TableFactor::Table {
+                name,
+                args: Some(tf_args),
+                alias,
+                ..
+            } => {
+                let (p, c) =
+                    resolve_table_function(&object_name_single(name.clone())?, &tf_args.args)?;
+                let rn = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_else(|| "read_parquet".into());
+                (rn, p, c.cols)
+            }
             TableFactor::Table { name, alias, .. } => {
                 let (rn, orig) = match alias {
                     Some(a) => (a.name.value.clone(), object_name_single(name.clone())?),
@@ -1107,7 +1210,8 @@ fn translate_select_inner(
                         cols.clone(),
                     )
                 } else {
-                    let right_def = (resolver.resolve)(&rn)?;
+                    // 实表按原名解析（lookup 已含别名→CTE 优先逻辑）；别名仅用于限定引用
+                    let right_def = (resolver.resolve)(&lookup)?;
                     (
                         LogicalPlan::Scan {
                             def: Arc::clone(&right_def),
@@ -1214,16 +1318,21 @@ fn translate_select_inner(
         if !bound.is_boolean() {
             return Err(QsdbError::type_err("WHERE must be boolean"));
         }
-        // 谓词仅当根为单 Scan 时下推：Join/CrossJoin/Values/派生表根上，
+        // 谓词仅当根为单 Scan/ExternalScan 时下推：Join/CrossJoin/Values/派生表根上，
         // split_pushdown 的 Scan 附着模式不中会静默丢谓词 → 全部留作行过滤
-        let root_is_scan = matches!(plan, LogicalPlan::Scan { .. });
+        let root_is_scan = matches!(
+            plan,
+            LogicalPlan::Scan { .. } | LogicalPlan::ExternalScan { .. }
+        );
         let (pushdown, residual) = if root_is_scan {
             split_pushdown(&bound)
         } else {
             (None, Some(bound))
         };
         if let Some(p) = pushdown {
-            if let LogicalPlan::Scan { predicate, .. } = &mut plan {
+            if let LogicalPlan::Scan { predicate, .. } | LogicalPlan::ExternalScan { predicate, .. } =
+                &mut plan
+            {
                 *predicate = Some(p);
             }
         }
