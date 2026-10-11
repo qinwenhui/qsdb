@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array, PrimitiveArray, StringArray,
+    Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
     Time64NanosecondArray, TimestampNanosecondArray,
 };
 use arrow::datatypes::{DataType, i256};
@@ -292,7 +292,7 @@ fn kahan_slice(it: impl Iterator<Item = f64>, out: &mut (f64, f64)) {
 /// typed 数组 SIMD 最小值 → Literal（忽略 NULL；形态由调用方验证）。
 fn typed_scalar_min(a: &dyn arrow::array::Array) -> Option<crate::types::Literal> {
     use crate::types::Literal;
-    use arrow::compute::{max, min};
+    use arrow::compute::min;
     macro_rules! m {
         ($t:ident, $lit:expr) => {{
             min(a.as_any().downcast_ref::<$t>().unwrap()).map($lit)
@@ -478,12 +478,16 @@ impl GroupTable {
                     let Some(a) = &arrays[ai] else {
                         return Ok(false);
                     };
-                    let ok = match (&self.sums[ai], a.data_type()) {
-                        (SumCol::Int(_), DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Date32) => true,
-                        (SumCol::Flt(_), DataType::Float32 | DataType::Float64) => true,
-                        (SumCol::Dec(_), DataType::Decimal128(_, _)) => true,
-                        _ => false,
-                    };
+                    let ok = matches!(
+                        (&self.sums[ai], a.data_type()),
+                        (SumCol::Int(_), DataType::Int8
+                            | DataType::Int16
+                            | DataType::Int32
+                            | DataType::Int64
+                            | DataType::Date32)
+                            | (SumCol::Flt(_), DataType::Float32 | DataType::Float64)
+                            | (SumCol::Dec(_), DataType::Decimal128(_, _))
+                    );
                     if !ok {
                         return Ok(false);
                     }
@@ -539,7 +543,7 @@ impl GroupTable {
                         (SumCol::Flt(acc), DataType::Float64) => {
                             let f = a.as_any().downcast_ref::<Float64Array>().unwrap();
                             if f.null_count() == 0 {
-                                kahan_slice(f.values().iter().copied().map(f64::from), &mut acc[0])
+                                kahan_slice(f.values().iter().copied(), &mut acc[0])
                             } else {
                                 kahan_slice(
                                     (0..n).filter(|&i| !f.is_null(i)).map(|i| f.value(i)),
@@ -614,10 +618,11 @@ impl GroupTable {
         self.init_cols(group, aggs, &agg_arrays);
 
         // 全选 + 全局聚合 → 零迭代快路径（O(1) 计数 + SIMD 列和）
-        if group.is_empty() && sel.len() == batch.num_rows() {
-            if self.try_global_fast(aggs, &agg_arrays, batch.num_rows())? {
-                return Ok(());
-            }
+        if group.is_empty()
+            && sel.len() == batch.num_rows()
+            && self.try_global_fast(aggs, &agg_arrays, batch.num_rows())?
+        {
+            return Ok(());
         }
 
         // 行 → 组 id（仅选中行；group_id 走通用路径——fast 槽表在其内部
@@ -871,10 +876,8 @@ impl GroupTable {
         self.init_cols(group, aggs, &agg_arrays);
 
         // 全局聚合零迭代快路径（O(1) 计数 + SIMD 列和；形态不中则原路径）
-        if group.is_empty() {
-            if self.try_global_fast(aggs, &agg_arrays, n)? {
-                return Ok(());
-            }
+        if group.is_empty() && self.try_global_fast(aggs, &agg_arrays, n)? {
+            return Ok(());
         }
 
         // 行 → 组 id
