@@ -204,6 +204,7 @@ fn main() {
             staging_dir,
             staging_upload_secs,
             durability,
+            read_only,
             config,
         } => {
             // 存储后端解析（cli 层校验，错误走统一 exit 风格）
