@@ -668,6 +668,30 @@ M6-4 staging 写 → M6-5 HDFS → M6-6 可选租约；每阶段独立 gate。
   崩溃重开补传 exactly-once、dedup 防重复计入、staged overwrite 替换、
   配置校验）/180 默认 / clippy 双模式 0 / 默认二进制 24.38MB。
 
+### EXISTS / IN 子查询 — semi/anti-join（2026-10-12）✅
+- **SQL 面**：WHERE 顶层 AND 合取项级提取——`g IN (SELECT 单列)`、
+  关联 `EXISTS (… WHERE 内列 = 外列 [AND 本地谓词])`、`NOT IN`/`NOT EXISTS`
+  （含 NOT(...) 括号形态）；合取可链式多个 semi join、可与普通谓词混合。
+- **JoinType 扩展**：Semi / Anti / AntiIn（NOT IN 三值语义：build 含 NULL →
+  恒空、probe NULL → 丢弃；NOT EXISTS 的 NULL 键按零命中发射）。
+- **存在集三形态自动选优**（「别人不做的偏门」）：单整数键免编码 i64 集 →
+  稠密域（max−min ≤ 16M 位）**位图探测**（分区键 IN 的标准形态，无哈希）→
+  多键/字符串通用字节集。右表不物化（比 INNER build 省一遍）。
+- **掩码融合并行路径**：semi 存在集 build 一次全分片共享（Arc）；probe 批
+  上 semi 掩码 ∧ 过滤谓词 → 行选择向量 → `GroupTable::ingest_with_sel`
+  掩码摄入——零中间物化、零 take。列裁剪下推穿透 semi 计划（左扫描只读
+  键列+聚合列；右键用子计划局部 idx 消除宽度减法）。
+- 修复三个实现坑：掩码求值必须每批一次（逐行重算整列 = O(n²)）；semi
+  probe 子必须继承裁剪投影（传 None 读全列 → 左键 idx 错位指向 dt）；
+  ExistsState pub 化 + prepare_exists_state 独立（融合路径共享）。
+- **性能（40M 行 × 8 分区，同机）**：semi 融合查询 0.36-0.43s ≈ 自家
+  filter 基线（0.49s）/快于 aggregate 基线（0.87s）——**semi 开销≈0**
+  （掩码+掩码摄入实测 <0.15s/查询）。vs DuckDB（本 micro bench 为
+  窄 2 列 + 预热 buffer 形态）0.14-0.16x；官方 gate 口径（duckdb_vs
+  宽表冷读）仍是 filter 1.6-1.8x / agg 5.3-6.7x / group by 2.4-3.0x
+  反超——本形态差距在扫描底座（2 列窄形态缓存聚合 0.04x），非 semi 本身。
+- 191 默认 / 204 s3 / 208 hdfs / 207 s3+hdfs 全绿；clippy 0；24.64MB。
+
 ### 生态契约交付 + soak 实测修复（2026-10-11）✅
 - **read_only 模式**（`QsdbOptions.read_only` + CLI `--read-only`）：写路径
   全拒（append/overwrite/DDL/TRUNCATE/compact/gc/refresh-index；WriteBuffer

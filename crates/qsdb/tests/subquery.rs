@@ -192,3 +192,170 @@ fn predicate_column_not_in_projection() {
     assert_eq!(r, vec!["20", "30", "40"]);
     std::fs::remove_dir_all(&root).ok();
 }
+
+// ---------------------------------------------------------------------------
+// EXISTS / IN 子查询（semi-join / anti-join）
+// ---------------------------------------------------------------------------
+
+fn setup_semi(tag: &str) -> (Qsdb, std::path::PathBuf) {
+    let root = std::env::temp_dir().join("qsdb_semi_join").join(format!(
+        "{tag}_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
+    db.sql("CREATE TABLE t (dt DATE, g BIGINT, v BIGINT) PARTITIONED BY (dt)")
+        .unwrap();
+    db.sql(
+        "INSERT INTO t VALUES
+        (DATE '2026-01-01', 1, 100), (DATE '2026-01-01', 2, 101),
+        (DATE '2026-01-02', 3, 102), (DATE '2026-01-02', 1, 103)",
+    )
+    .unwrap();
+    db.sql("CREATE TABLE u (dt DATE, g BIGINT) PARTITIONED BY (dt)").unwrap();
+    db.sql(
+        "INSERT INTO u VALUES
+        (DATE '2026-01-01', 1), (DATE '2026-01-01', 1), (DATE '2026-01-02', 2)",
+    )
+    .unwrap();
+    db.sql("CREATE TABLE dims (g BIGINT, label STRING)").unwrap();
+    db.sql("INSERT INTO dims VALUES (1, 'one'), (3, 'three'), (5, 'five')").unwrap();
+    (db, root)
+}
+
+#[test]
+fn in_subquery_basic_and_dupes() {
+    let (db, root) = setup_semi("in");
+    // g IN {1,3,5}：t 的 g=1×2, g=3×1 → 3 行；子查询含重复 g=1 —— semi
+    // 至多发射一次（无重复）是硬语义
+    let r = q(&db, "SELECT count(*) FROM t WHERE g IN (SELECT g FROM dims)");
+    assert_eq!(r, vec!["3"]);
+    let r = q(&db, "SELECT v FROM t WHERE g IN (SELECT g FROM dims) ORDER BY v");
+    assert_eq!(r, vec!["100", "102", "103"]);
+    // NOT IN：g=2 行
+    let r = q(&db, "SELECT v FROM t WHERE g NOT IN (SELECT g FROM dims) ORDER BY v");
+    assert_eq!(r, vec!["101"]);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn in_subquery_with_local_filter() {
+    let (db, root) = setup_semi("infilter");
+    // 子查询内本地谓词：只留 g=3 → 1 行
+    let r = q(&db, "SELECT count(*) FROM t WHERE g IN (SELECT g FROM dims WHERE label = 'three')");
+    assert_eq!(r, vec!["1"]);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn not_in_null_semantics() {
+    let (db, root) = setup_semi("notin-null");
+    // build 含 NULL → NOT IN 恒空（SQL 三值）。引擎既有语义：空输入的
+    // count(*) 返回 0 行（而非一行 "0"）——按现状断言，空输入聚合单行
+    // 化是已记录的后置项
+    db.sql("INSERT INTO dims VALUES (NULL, 'nil')").unwrap();
+    let r = q(&db, "SELECT count(*) FROM t WHERE g NOT IN (SELECT g FROM dims)");
+    assert_eq!(r, Vec::<String>::new());
+    // IN 不受 build NULL 影响（NULL 键不命中）
+    let r = q(&db, "SELECT count(*) FROM t WHERE g IN (SELECT g FROM dims)");
+    assert_eq!(r, vec!["3"]);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn correlated_exists_equi() {
+    let (db, root) = setup_semi("exists");
+    // u 有 (dt,g) 对 {0101-1, 0102-2}；t 按 (dt,g) 匹配：t(0101,1)×2 命中
+    // t(0101,2) 不命中（g 不等），t(0102,3)/(0102,1) 不命中
+    let r = q(
+        &db,
+        "SELECT v FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.g = t.g AND u.dt = t.dt) ORDER BY v",
+    );
+    // u(dt,g) = {(01-01,1)×2, (01-02,2)}：仅 t(01-01, g=1) 命中 → v=100
+    assert_eq!(r, vec!["100"]);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn correlated_exists_multi_key_precise() {
+    let (db, root) = setup_semi("exists2");
+    // 单键 g：u.g={1,1,2} → t.g∈{1,2,3,1} 命中 g∈{1,2} → 三行
+    let r = q(&db, "SELECT v FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.g = t.g) ORDER BY v");
+    assert_eq!(r, vec!["100", "101", "103"]);
+    // NOT EXISTS：g=3 一行
+    let r = q(
+        &db,
+        "SELECT v FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.g = t.g) ORDER BY v",
+    );
+    assert_eq!(r, vec!["102"]);
+    // 本地谓词在子查询内：u.g=2 才算存在 → t.g=2 行
+    let r = q(
+        &db,
+        "SELECT v FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.g = t.g AND u.dt = DATE '2026-01-02') ORDER BY v",
+    );
+    assert_eq!(r, vec!["101"]);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn semi_mixed_with_other_where() {
+    let (db, root) = setup_semi("mix");
+    // semi + 普通谓词混合：g∈{1,3,5} 且 v>100
+    let r = q(
+        &db,
+        "SELECT v FROM t WHERE v > 100 AND g IN (SELECT g FROM dims) ORDER BY v",
+    );
+    assert_eq!(r, vec!["102", "103"]);
+    // 聚合叠加
+    let r = q(
+        &db,
+        "SELECT count(*), sum(v) FROM t WHERE g IN (SELECT g FROM dims)",
+    );
+    assert_eq!(r, vec!["3|305"]);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn semi_join_chained_two_subqueries() {
+    let (db, root) = setup_semi("chain");
+    db.sql("CREATE TABLE dims2 (g BIGINT)").unwrap();
+    db.sql("INSERT INTO dims2 VALUES (1)").unwrap();
+    // 两个 IN 合取 → 两个 semi join 链
+    let r = q(
+        &db,
+        "SELECT v FROM t WHERE g IN (SELECT g FROM dims) AND g IN (SELECT g FROM dims2) ORDER BY v",
+    );
+    assert_eq!(r, vec!["100", "103"]);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn semi_date_key_uses_int_fast_path() {
+    // 分区键 Date32 → 整数快路径/位图路径（执行形态由内核自选，本测试锁语义）
+    let (db, root) = setup_semi("datekey");
+    let r = q(
+        &db,
+        "SELECT count(*) FROM t WHERE dt IN (SELECT dt FROM u WHERE g = 1)",
+    );
+    // u.g=1 的 dt = 2026-01-01 → t 两行
+    assert_eq!(r, vec!["2"]);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn semi_error_paths() {
+    let (db, root) = setup_semi("err");
+    // 非关联 EXISTS：v1 报不支持
+    assert!(db.sql("SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM dims)").is_err());
+    // 多列子查询
+    assert!(db
+        .sql("SELECT 1 FROM t WHERE g IN (SELECT g, label FROM dims)")
+        .is_err());
+    // OR 内 semi：v1 不支持（顶层 AND 合取级）
+    assert!(db
+        .sql("SELECT 1 FROM t WHERE v > 100 OR g IN (SELECT g FROM dims)")
+        .is_err());
+    std::fs::remove_dir_all(&root).ok();
+}

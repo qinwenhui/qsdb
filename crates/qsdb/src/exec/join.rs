@@ -29,6 +29,21 @@ use super::ExecNode;
 pub enum JoinType {
     Inner,
     LeftOuter,
+    /// Semi（IN / EXISTS）：左行命中 build 键集 ≥1 次则发射（至多一次，
+    /// 不重复）；NULL 键不命中（SQL：NULL IN set = UNKNOWN）
+    Semi,
+    /// Anti（NOT EXISTS）：左行零命中则发射；NULL 键零命中 → 发射
+    Anti,
+    /// AntiIn（NOT IN，三值语义）：build 含 NULL 键 → 结果恒空；
+    /// probe NULL 键 → 该行丢弃（NOT IN 对 NULL 的 SQL 语义）
+    AntiIn,
+}
+
+impl JoinType {
+    /// semi/anti 族：输出 = 左 schema；build 侧只需键存在集。
+    pub fn is_semi_family(self) -> bool {
+        matches!(self, Self::Semi | Self::Anti | Self::AntiIn)
+    }
 }
 
 /// 笛卡尔积（非等值 INNER JOIN 的底座）：右表首拉时物化，左批逐批 × 右表展开。
@@ -167,6 +182,8 @@ pub struct HashJoinExec {
     ctx: Arc<QueryContext>,
     /// build 阶段产物（首拉时构建）
     build_state: Option<BuildState>,
+    /// semi/anti 族 build 产物（与 build_state 互斥，按 join_type 选）
+    exists_state: Option<ExistsState>,
     probe_done: bool,
 }
 
@@ -175,6 +192,76 @@ struct BuildState {
     table: RecordBatch,
     /// key bytes → 行号列表
     index: HashMap<Vec<u8>, Vec<u32>>,
+}
+
+/// semi/anti 族 build 产物：存在性三形态（按键形状自动选优——「别人不做
+/// 的偏门」：IN/EXISTS 的键 90% 是单个整数列，走免编码快路径；稠密整数
+/// 域再退化为位图探测）。
+pub struct ExistsState {
+    keys: ExistsKeys,
+    /// build 侧出现过 NULL 键（NOT IN 三值语义用）
+    has_null: bool,
+}
+
+enum ExistsKeys {
+    /// 通用：多键/字符串/浮点 → 键字节编码存在集
+    Bytes(std::collections::HashSet<Vec<u8>>),
+    /// 单整数键（Int8..64/Date32/Boolean）→ 免编码 i64 存在集
+    I64(std::collections::HashSet<i64>),
+    /// 单整数键且域稠密（max−min ≤ 16M 位 = 2MB）→ 位图探测：
+    /// probe = 单 bit 测试（无哈希/无分配/缓存友好；分区键 IN 的标准形态）
+    Bitmap { min: i64, bits: Vec<u64> },
+}
+
+/// 单整数键取值（Int8..64 / Date32 / Boolean → i64）；其他类型 None。
+fn int_key_value(a: &ArrayRef, row: usize) -> Option<i64> {
+    use arrow::datatypes::DataType;
+    macro_rules! as_i64 {
+        ($t:ident) => {{
+            a.as_any().downcast_ref::<$t>().unwrap().value(row) as i64
+        }};
+    }
+    Some(match a.data_type() {
+        DataType::Int8 => as_i64!(Int8Array),
+        DataType::Int16 => as_i64!(Int16Array),
+        DataType::Int32 => as_i64!(Int32Array),
+        DataType::Int64 => as_i64!(Int64Array),
+        // Date32/Timestamp 物理上 i32/i64 但 arrow 数组类型不同——各自 downcast
+        DataType::Date32 => a.as_any().downcast_ref::<Date32Array>().unwrap().value(row) as i64,
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _) => {
+            a.as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap()
+                .value(row)
+        }
+        DataType::Boolean => i64::from(
+            a.as_any().downcast_ref::<BooleanArray>().unwrap().value(row),
+        ),
+        _ => return None,
+    })
+}
+
+impl ExistsState {
+    fn contains(&self, v: i64) -> bool {
+        match &self.keys {
+            ExistsKeys::I64(set) => set.contains(&v),
+            ExistsKeys::Bitmap { min, bits } => {
+                let b = v.wrapping_sub(*min);
+                if b < 0 || b as u64 >= bits.len() as u64 * 64 {
+                    return false;
+                }
+                bits[(b >> 6) as usize] & (1u64 << (b & 63)) != 0
+            }
+            ExistsKeys::Bytes(_) => unreachable!("int path on bytes state"),
+        }
+    }
+
+    fn contains_bytes(&self, k: &[u8]) -> bool {
+        match &self.keys {
+            ExistsKeys::Bytes(set) => set.contains(k),
+            _ => unreachable!("bytes path on int state"),
+        }
+    }
 }
 
 impl HashJoinExec {
@@ -187,14 +274,18 @@ impl HashJoinExec {
         join_type: JoinType,
         ctx: Arc<QueryContext>,
     ) -> Self {
-        // 输出 schema：左（probe）++ 右（build）
-        let fields: Vec<arrow::datatypes::FieldRef> = probe
-            .schema()
-            .fields()
-            .iter()
-            .cloned()
-            .chain(build.schema().fields().iter().cloned())
-            .collect();
+        // 输出 schema：semi/anti 族 = 仅左（probe）；INNER/LEFT = 左 ++ 右
+        let fields: Vec<arrow::datatypes::FieldRef> = if join_type.is_semi_family() {
+            probe.schema().fields().iter().cloned().collect()
+        } else {
+            probe
+                .schema()
+                .fields()
+                .iter()
+                .cloned()
+                .chain(build.schema().fields().iter().cloned())
+                .collect()
+        };
         let schema = Arc::new(arrow::datatypes::Schema::new(fields));
         Self {
             probe,
@@ -205,11 +296,15 @@ impl HashJoinExec {
             schema,
             ctx,
             build_state: None,
+            exists_state: None,
             probe_done: false,
         }
     }
 
     fn build_phase(&mut self) -> Result<()> {
+        if self.join_type.is_semi_family() {
+            return self.build_phase_exists();
+        }
         if self.build_state.is_some() {
             return Ok(());
         }
@@ -246,6 +341,202 @@ impl HashJoinExec {
     }
 }
 
+impl HashJoinExec {
+    /// semi/anti 族 build：流式消费右表逐批求键 → 存在集。
+    fn build_phase_exists(&mut self) -> Result<()> {
+        if self.exists_state.is_some() {
+            return Ok(());
+        }
+        let schema = self.build.schema();
+        let node = std::mem::replace(&mut self.build, Box::new(EmptyExec::new(schema)));
+        let keys = std::mem::take(&mut self.build_keys);
+        let state = prepare_exists_state(node, &keys, &self.ctx)?;
+        self.build_keys = keys;
+        self.exists_state = Some(Arc::try_unwrap(state).unwrap_or_else(|arc| {
+            let _ = arc;
+            unreachable!("hash join owns the only ref")
+        }));
+        Ok(())
+    }
+}
+
+/// 空源（build 节点被 move 走后的占位）。
+struct EmptyExec {
+    schema: SchemaRef,
+}
+impl EmptyExec {
+    fn new(schema: SchemaRef) -> Self {
+        Self { schema }
+    }
+}
+impl ExecNode for EmptyExec {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+    fn next(&mut self) -> Option<Result<RecordBatch>> {
+        None
+    }
+}
+
+/// 独立准备存在集（聚合融合路径共享：build 一次、多分片探测）。
+/// 右表不物化、不 concat；单整数键先走 i64 累积，扫完按域稠密度
+/// 选 HashSet 或位图（2MB 位图 = 稠密整数域的 O(1) 无哈希探测）。
+pub fn prepare_exists_state(
+    mut build: Box<dyn ExecNode>,
+    build_keys: &[PhysExpr],
+    ctx: &Arc<QueryContext>,
+) -> Result<Arc<ExistsState>> {
+    let mut has_null = false;
+    // 单整数键快路径累积（min/max 供位图判定）
+    let mut ints: Option<Vec<i64>> = if build_keys.len() == 1 { Some(Vec::new()) } else { None };
+    let mut bytes: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(b) = build.next() {
+        ctx.check()?;
+        let batch = b?;
+        let mut key_cols: Vec<ArrayRef> = Vec::with_capacity(build_keys.len());
+        for k in build_keys {
+            key_cols.push(eval::eval(k, &batch)?);
+        }
+        if let (Some(acc), [only]) = (&mut ints, key_cols.as_slice()) {
+            let mut fallback = false;
+            for row in 0..batch.num_rows() {
+                if only.is_null(row) {
+                    has_null = true;
+                    continue;
+                }
+                match int_key_value(only, row) {
+                    Some(v) => acc.push(v),
+                    // 非整数键（字符串/浮点等）→ 整体退回通用字节路径
+                    None => {
+                        fallback = true;
+                        break;
+                    }
+                }
+            }
+            if fallback {
+                ints = None;
+                for r in 0..batch.num_rows() {
+                    encode_join_key(&key_cols, r, &mut buf);
+                    if buf.first() == Some(&0) {
+                        has_null = true;
+                    } else {
+                        bytes.insert(buf.clone());
+                    }
+                }
+            }
+        } else {
+            for row in 0..batch.num_rows() {
+                encode_join_key(&key_cols, row, &mut buf);
+                if buf.first() == Some(&0) {
+                    has_null = true;
+                } else {
+                    bytes.insert(buf.clone());
+                }
+            }
+        }
+    }
+    let keys = match ints {
+        Some(vals) if !vals.is_empty() => {
+            let min = *vals.iter().min().unwrap();
+            let max = *vals.iter().max().unwrap();
+            let range = (max as i128 - min as i128) as u128;
+            if range <= 16 * 1024 * 1024 {
+                // 稠密域 → 位图（2MB 上限）
+                let nbits = range as usize + 1;
+                let mut bits = vec![0u64; nbits.div_ceil(64)];
+                for v in vals {
+                    let b = (v - min) as usize;
+                    bits[b / 64] |= 1u64 << (b % 64);
+                }
+                ExistsKeys::Bitmap { min, bits }
+            } else {
+                ExistsKeys::I64(vals.into_iter().collect())
+            }
+        }
+        Some(_) => ExistsKeys::I64(Default::default()), // 空集
+        None => ExistsKeys::Bytes(bytes),
+    };
+    Ok(Arc::new(ExistsState { keys, has_null }))
+}
+
+/// 掩码探测（聚合融合路径）：probe 批 → 半连接布尔掩码（true = 行入选）。
+/// 与 join_batch_semi 同语义：Semi 命中入选；Anti 零命中入选（NULL 键入选）；
+/// AntiIn 零命中入选（NULL 键剔除；build 含 NULL → 全 false）。
+pub fn semi_mask(
+    state: &ExistsState,
+    probe_keys: &[PhysExpr],
+    batch: &RecordBatch,
+    join_type: JoinType,
+    ctx: &Arc<QueryContext>,
+) -> Result<BooleanArray> {
+    let _ = ctx;
+    if join_type == JoinType::AntiIn && state.has_null {
+        return Ok(BooleanArray::from(vec![Some(false); batch.num_rows()]));
+    }
+    let mut key_cols: Vec<ArrayRef> = Vec::with_capacity(probe_keys.len());
+    for k in probe_keys {
+        key_cols.push(eval::eval(k, batch)?);
+    }
+    let n = batch.num_rows();
+    let mut mask: Vec<bool> = Vec::with_capacity(n);
+    if let (ExistsKeys::I64(_) | ExistsKeys::Bitmap { .. }, [only]) =
+        (&state.keys, key_cols.as_slice())
+    {
+        // 零拷贝：类型分派一次（downcast 出循环——逐行 downcast 在 40M 行
+        // 级 probe 上是主要成本，同 P3 教训）
+        macro_rules! probe_int {
+            ($arr:ident) => {{
+                let v = only.as_any().downcast_ref::<$arr>().unwrap();
+                for row in 0..n {
+                    let selected = if v.is_null(row) {
+                        join_type == JoinType::Anti
+                    } else {
+                        let hit = state.contains(v.value(row) as i64);
+                        match join_type {
+                            JoinType::Semi => hit,
+                            JoinType::Anti | JoinType::AntiIn => !hit,
+                            _ => false,
+                        }
+                    };
+                    mask.push(selected);
+                }
+            }};
+        }
+        match only.data_type() {
+            arrow::datatypes::DataType::Int8 => probe_int!(Int8Array),
+            arrow::datatypes::DataType::Int16 => probe_int!(Int16Array),
+            arrow::datatypes::DataType::Int32 => probe_int!(Int32Array),
+            arrow::datatypes::DataType::Int64 => probe_int!(Int64Array),
+            arrow::datatypes::DataType::Date32 => probe_int!(Date32Array),
+            arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _) => {
+                probe_int!(TimestampNanosecondArray)
+            }
+            arrow::datatypes::DataType::Boolean => probe_int!(BooleanArray),
+            _ => {
+                return Err(QsdbError::meta("semi mask: mixed key types"));
+            }
+        }
+    } else {
+        let mut buf: Vec<u8> = Vec::new();
+        for row in 0..n {
+            encode_join_key(&key_cols, row, &mut buf);
+            let selected = if buf.first() == Some(&0) {
+                join_type == JoinType::Anti
+            } else {
+                let hit = state.contains_bytes(buf.as_slice());
+                match join_type {
+                    JoinType::Semi => hit,
+                    JoinType::Anti | JoinType::AntiIn => !hit,
+                    _ => false,
+                }
+            };
+            mask.push(selected);
+        }
+    }
+    Ok(BooleanArray::from(mask))
+}
+
 impl ExecNode for HashJoinExec {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
@@ -261,6 +552,27 @@ impl ExecNode for HashJoinExec {
         let join_type = self.join_type;
         let out_schema = Arc::clone(&self.schema);
         let probe_keys = self.probe_keys.clone();
+        if join_type.is_semi_family() {
+            let exists = self.exists_state.as_ref().unwrap();
+            loop {
+                if let Err(e) = self.ctx.check() {
+                    return Some(Err(e));
+                }
+                let batch = self.probe.next()?;
+                let batch = match batch {
+                    Ok(b) => b,
+                    Err(e) => return Some(Err(e)),
+                };
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                match join_batch_semi(&batch, exists, &probe_keys, &out_schema, join_type) {
+                    Ok(Some(b)) => return Some(Ok(b)),
+                    Ok(None) => continue,
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+        }
         let build = self.build_state.as_ref().unwrap();
         loop {
             if let Err(e) = self.ctx.check() {
@@ -377,6 +689,85 @@ fn join_batch(
     )
     .map(Some)
     .map_err(|e| QsdbError::invalid(format!("join output: {e}")))
+}
+
+/// semi/anti 族单 probe 批：存在集探测 → 选中左行 take（仅左列，
+/// 无右列展开、无重复——semi 语义天然免 distinct）。
+fn join_batch_semi(
+    probe_batch: &RecordBatch,
+    state: &ExistsState,
+    probe_keys: &[PhysExpr],
+    out_schema: &SchemaRef,
+    join_type: JoinType,
+) -> Result<Option<RecordBatch>> {
+    // NOT IN 三值语义：build 含 NULL → 全查询恒空
+    if join_type == JoinType::AntiIn && state.has_null {
+        return Ok(None);
+    }
+    let n = probe_batch.num_rows();
+    let mut key_cols: Vec<ArrayRef> = Vec::with_capacity(probe_keys.len());
+    for k in probe_keys {
+        key_cols.push(eval::eval(k, probe_batch)?);
+    }
+    let mut sel: Vec<u32> = Vec::with_capacity(n);
+    // 单整数键快路径（与 build 侧形态一致才有效）
+    if let (ExistsKeys::I64(_) | ExistsKeys::Bitmap { .. }, [only]) = (&state.keys, key_cols.as_slice())
+    {
+        for row in 0..n {
+            if only.is_null(row) {
+                // probe NULL：Semi 不发射；Anti 发射（零命中）；AntiIn 不发射
+                if join_type == JoinType::Anti {
+                    sel.push(row as u32);
+                }
+                continue;
+            }
+            if let Some(v) = int_key_value(only, row) {
+                let hit = state.contains(v);
+                match (join_type, hit) {
+                    (JoinType::Semi, true)
+                    | (JoinType::Anti, false)
+                    | (JoinType::AntiIn, false) => sel.push(row as u32),
+                    _ => {}
+                }
+            } else {
+                return Err(QsdbError::meta("semi join: mixed key types"));
+            }
+        }
+    } else {
+        let mut buf: Vec<u8> = Vec::new();
+        for row in 0..n {
+            encode_join_key(&key_cols, row, &mut buf);
+            let hit = buf.first() != Some(&0) && state.contains_bytes(buf.as_slice());
+            if buf.first() == Some(&0) && join_type == JoinType::Anti {
+                sel.push(row as u32); // NULL 键零命中 → NOT EXISTS 发射
+                continue;
+            }
+            match (join_type, hit) {
+                (JoinType::Semi, true)
+                | (JoinType::Anti, false)
+                | (JoinType::AntiIn, false) => sel.push(row as u32),
+                _ => {}
+            }
+        }
+    }
+    if sel.is_empty() {
+        return Ok(None);
+    }
+    let indices = UInt32Array::from(sel);
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(probe_batch.num_columns());
+    for c in 0..probe_batch.num_columns() {
+        let taken = take(probe_batch.column(c), &indices, None)
+            .map_err(|e| QsdbError::invalid(format!("semi take: {e}")))?;
+        cols.push(taken);
+    }
+    let n_out = cols.first().map(|c| c.len()).unwrap_or(0);
+    RecordBatch::try_new_with_options(
+        Arc::clone(out_schema),
+        cols,
+        &RecordBatchOptions::new().with_row_count(Some(n_out)),
+    )
+    .map(Some)
+    .map_err(|e| QsdbError::invalid(format!("semi output: {e}")))
 }
 
 fn concat_batches(batches: &[RecordBatch], schema: &SchemaRef) -> Result<RecordBatch> {

@@ -126,8 +126,20 @@ fn collect_plan_columns(plan: &LogicalPlan, out: &mut Vec<String>) {
         LogicalPlan::Limit { input, .. } | LogicalPlan::Distinct { input } => {
             collect_plan_columns(input, out);
         }
+        LogicalPlan::Join {
+            left,
+            left_keys,
+            join_type,
+            ..
+        } if join_type.is_semi_family() => {
+            // semi 族输出 = 左 schema：可安全裁剪左扫描；连接键列必须保留
+            for k in left_keys {
+                collect_expr_columns(k, out);
+            }
+            collect_plan_columns(left, out);
+        }
         LogicalPlan::Join { .. } | LogicalPlan::CrossJoinFilter { .. } => {
-            // 多表计划不走列裁剪下推（build 的 count_scans guard 兜底）
+            // INNER/LEFT 多表计划不走列裁剪下推（build 的 count_scans guard 兜底）
         }
         LogicalPlan::Values { .. } | LogicalPlan::Window { .. } => {} // 内存/窗口源无需裁剪
     }
@@ -181,6 +193,11 @@ fn plan_scan_def(plan: &LogicalPlan) -> Option<Arc<crate::catalog::TableDef>> {
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Distinct { input } => plan_scan_def(input),
+        LogicalPlan::Join {
+            left,
+            join_type,
+            ..
+        } if join_type.is_semi_family() => plan_scan_def(left),
         LogicalPlan::Join { .. }
         | LogicalPlan::CrossJoinFilter { .. }
         | LogicalPlan::Values { .. } => None,
@@ -202,6 +219,23 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
         LogicalPlan::Scan { def, predicate } => LogicalPlan::Scan {
             def: Arc::clone(def),
             predicate: predicate.clone(),
+        },
+        LogicalPlan::Join {
+            left,
+            right,
+            left_keys,
+            right_keys,
+            join_type,
+        } if join_type.is_semi_family() => LogicalPlan::Join {
+            left: Box::new(rewrite_plan(left, mapping, all)),
+            // 右键为右子计划局部 idx（绑定期约定），裁剪不触碰
+            right: Box::new((**right).clone()),
+            left_keys: left_keys
+                .iter()
+                .map(|k| rewrite_expr(k, mapping, all))
+                .collect(),
+            right_keys: right_keys.clone(),
+            join_type: *join_type,
         },
         LogicalPlan::ExternalScan {
             def,
@@ -444,21 +478,37 @@ fn build_inner(
             right_keys,
             join_type,
         } => {
-            let probe = build_inner(db, left, None, ctx)?;
+            // semi 族：左子继承裁剪投影（build() 对 semi 计划做了列裁剪——
+            // 传 None 会读全列使左键 idx 错位；INNER/LEFT 无上游裁剪，None 等价）
+            let probe = build_inner(
+                db,
+                left,
+                if join_type.is_semi_family() {
+                    scan_proj.clone()
+                } else {
+                    None
+                },
+                ctx,
+            )?;
             let build = build_inner(db, right, None, ctx)?;
-            // 右键 idx 为全局 ctx 序（左宽 + 局部）→ 减 probe 宽度得右扫描局部序
-            let left_width = probe.schema().fields().len();
-            let local_keys: Vec<PhysExpr> = right_keys
-                .iter()
-                .map(|k| match k {
-                    PhysExpr::Column { idx, name, ty } => PhysExpr::Column {
-                        idx: idx.saturating_sub(left_width),
-                        name: name.clone(),
-                        ty: ty.clone(),
-                    },
-                    other => other.clone(),
-                })
-                .collect();
+            // 右键 idx：INNER/LEFT 为全局 ctx 序（减 probe 宽度得右局部序）；
+            // semi 族绑定期即用右子计划局部序（列裁剪改写左宽后仍正确）
+            let local_keys: Vec<PhysExpr> = if join_type.is_semi_family() {
+                right_keys.clone()
+            } else {
+                let left_width = probe.schema().fields().len();
+                right_keys
+                    .iter()
+                    .map(|k| match k {
+                        PhysExpr::Column { idx, name, ty } => PhysExpr::Column {
+                            idx: idx.saturating_sub(left_width),
+                            name: name.clone(),
+                            ty: ty.clone(),
+                        },
+                        other => other.clone(),
+                    })
+                    .collect()
+            };
             Ok(Box::new(crate::exec::join::HashJoinExec::new(
                 probe,
                 build,
@@ -491,7 +541,7 @@ fn build_aggregate(
             Arc::clone(ctx),
         )));
     }
-    let Some((shards, filters)) = try_shard_source(db, input, scan_proj, ctx) else {
+    let Some((shards, semis, filters)) = try_shard_source(db, input, scan_proj, ctx) else {
         return Ok(Box::new(HashAggExec::new(
             build_inner(db, input, scan_proj.clone(), ctx)?,
             group.to_vec(),
@@ -516,10 +566,34 @@ fn build_aggregate(
     let group = group.to_vec();
     let aggs = aggs.to_vec();
 
+    // ── semi/anti 融合路径：存在集 build 一次全分片共享；probe 批上
+    // 直接求掩码 → 行选择 → 掩码摄入聚合（零中间物化、零 take）──
+    if !semis.is_empty() {
+        let probes: Vec<SemiProbe> = semis
+            .iter()
+            .map(|st| {
+                let build = build_inner(db, &st.right, None, ctx)?;
+                // semi 右键 = 右子计划局部 idx（绑定期约定）
+                let state =
+                    crate::exec::join::prepare_exists_state(build, &st.right_keys, ctx)?;
+                Ok(SemiProbe {
+                    left_keys: st.left_keys.clone(),
+                    state,
+                    join_type: st.join_type,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let tables: Vec<GroupTable> = shards
+            .into_par_iter()
+            .map(|s| run_partial_fused(s, &probes, &filters, &group, &aggs, ctx))
+            .collect::<Result<Vec<_>>>()?;
+        return finish_partitioned_merge(tables, group, aggs, schema);
+    }
+
     use rayon::prelude::*;
     let tables: Vec<GroupTable> = shards
         .into_par_iter()
-        .map(|s| run_partial(s, &filters, &group, &aggs, ctx))
+        .map(|s| run_partial(db, s, &semis, &filters, &group, &aggs, ctx))
         .collect::<Result<Vec<_>>>()?;
 
     // merge：按组 key hash 分区并行（每分区独立合并全部 shard 的对应组——
@@ -588,14 +662,164 @@ fn build_aggregate(
 }
 
 /// 单分片 partial 聚合（当前线程执行；由 rayon 并行调度调用方决定）。
-fn run_partial(
+/// 预构建的存在集探针（融合路径全分片共享 Arc）。
+struct SemiProbe {
+    left_keys: Vec<PhysExpr>,
+    state: std::sync::Arc<crate::exec::join::ExistsState>,
+    join_type: crate::exec::join::JoinType,
+}
+
+/// 融合 partial：scan 批 → semi 掩码（AND 组合）→ 过滤谓词掩码 →
+/// 掩码摄入聚合。无中间批物化——与 DuckDB 的 filter-into-scan 聚合
+/// 融合同构，且存在集探测是免哈希的（i64 集或位图）。
+fn run_partial_fused(
     scan: crate::scan::Scan,
+    probes: &[SemiProbe],
+    filters: &[PhysExpr],
+    group: &[PhysExpr],
+    aggs: &[AggExpr],
+    ctx: &Arc<crate::query::QueryContext>,
+) -> Result<GroupTable> {
+    use crate::exec::ExecNode;
+    use arrow::array::Array;
+    // 分片任务内串行拉取（ScanExec）——不用 ParScanExec：嵌套并行会与
+    // 分片任务互锁同一 rayon 池（M4 教训；mask+ingest 实测仅 0.07s，
+    // 时间全耗在嵌套并行等待）
+    let mut node: Box<dyn ExecNode> = Box::new(crate::exec::ScanExec::new(scan));
+    let mut table = GroupTable::default();
+    while let Some(b) = node.next() {
+        ctx.check()?;
+        let batch = b?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        // 行选择 = semi 掩码 ∧ 过滤谓词（**每批一次求值**再逐行组合——
+        // 掩码求值是整列向量化，逐行重算整列 = O(n²) 灾难）
+        let mut masks: Vec<arrow::array::BooleanArray> = Vec::with_capacity(
+            probes.len() + filters.len(),
+        );
+        for p in probes {
+            masks.push(crate::exec::join::semi_mask(
+                &p.state,
+                &p.left_keys,
+                &batch,
+                p.join_type,
+                ctx,
+            )?);
+        }
+        for f in filters {
+            let m = crate::expr::eval::eval(f, &batch)?;
+            let ba = m
+                .as_any()
+                .downcast_ref::<arrow::array::BooleanArray>()
+                .ok_or_else(|| crate::error::QsdbError::type_err("filter must be boolean"))?;
+            masks.push(ba.clone());
+        }
+        let mut sel: Vec<u32> = Vec::with_capacity(batch.num_rows());
+        'outer: for row in 0..batch.num_rows() {
+            for m in &masks {
+                if m.is_null(row) || !m.value(row) {
+                    continue 'outer;
+                }
+            }
+            sel.push(row as u32);
+        }
+        table.ingest_with_sel(group, aggs, &batch, &sel)?;
+    }
+    Ok(table)
+}
+
+/// 分片合并 + 分区并行 finalize（融合路径）：与主路径 merge 块同款。
+fn finish_partitioned_merge(
+    tables: Vec<GroupTable>,
+    group: Vec<PhysExpr>,
+    aggs: Vec<AggExpr>,
+    schema: Arc<arrow::datatypes::Schema>,
+) -> Result<Box<dyn ExecNode>> {
+    use rayon::prelude::*;
+    let p = rayon::current_num_threads().clamp(1, 32);
+    let mut parts: Vec<Vec<Vec<usize>>> = vec![vec![Vec::new(); tables.len()]; p];
+    for (ti, t) in tables.iter().enumerate() {
+        for g in 0..t.len() {
+            parts[(t.group_hash(g) as usize) % p][ti].push(g);
+        }
+    }
+    let aggs_ref = &aggs;
+    let group_ref = &group;
+    let schema_ref = &schema;
+    let batches: Vec<Option<RecordBatch>> = parts
+        .into_par_iter()
+        .map(|mut table_buckets| {
+            let mut merged = GroupTable::new();
+            for (ti, t) in tables.iter().enumerate() {
+                let ogs = std::mem::take(&mut table_buckets[ti]);
+                if !ogs.is_empty() {
+                    merged.merge_subset(t, ogs, aggs_ref.len());
+                }
+            }
+            if merged.is_empty() {
+                return Ok(None);
+            }
+            crate::exec::agg::finalize_table(&merged, aggs_ref, group_ref, schema_ref).map(Some)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let some_batches: Vec<RecordBatch> = batches.into_iter().flatten().collect();
+    if some_batches.is_empty() {
+        return Ok(Box::new(OneShotExec { batch: None, schema }));
+    }
+    let batch = if some_batches.len() == 1 {
+        some_batches.into_iter().next().expect("len checked")
+    } else {
+        crate::exec::spill::concat_batches(&some_batches, &schema)?
+    };
+    Ok(Box::new(OneShotExec { batch: Some(batch), schema }))
+}
+
+/// 分片管线中的 semi/anti 阶段（build 侧计划持引用，每分片重建 ExecNode
+/// ——dims 级小表重建成本可忽略）。
+struct SemiStage {
+    left_keys: Vec<PhysExpr>,
+    right: std::sync::Arc<LogicalPlan>,
+    /// 全局 ctx 序（构建时减 probe 宽度）
+    right_keys: Vec<PhysExpr>,
+    join_type: crate::exec::join::JoinType,
+}
+
+fn run_partial(
+    db: &Qsdb,
+    scan: crate::scan::Scan,
+    semis: &[SemiStage],
     filters: &[PhysExpr],
     group: &[PhysExpr],
     aggs: &[AggExpr],
     ctx: &Arc<crate::query::QueryContext>,
 ) -> Result<GroupTable> {
     let mut node: Box<dyn ExecNode> = Box::new(ScanExec::new(scan));
+    // semi 阶段按「自底向上」应用（try_shard_source 剥离序为自顶向下）
+    for st in semis.iter().rev() {
+        let build = build_inner(db, &st.right, None, ctx)?;
+        let left_width = node.schema().fields().len();
+        let local_keys: Vec<PhysExpr> = st
+            .right_keys
+            .iter()
+            .map(|k| match k {
+                PhysExpr::Column { idx, name, ty } => PhysExpr::Column {
+                    idx: idx.saturating_sub(left_width),
+                    name: name.clone(),
+                    ty: ty.clone(),
+                },
+                other => other.clone(),
+            })
+            .collect();
+        node = Box::new(crate::exec::join::HashJoinExec::new(
+            node,
+            build,
+            st.left_keys.clone(),
+            local_keys,
+            st.join_type,
+            Arc::clone(ctx),
+        ));
+    }
     for f in filters {
         node = Box::new(FilterExec::new(node, f.clone(), Arc::clone(ctx)));
     }
@@ -613,14 +837,31 @@ fn try_shard_source(
     plan: &LogicalPlan,
     scan_proj: &Option<Vec<String>>,
     ctx: &Arc<crate::query::QueryContext>,
-) -> Option<(Vec<crate::scan::Scan>, Vec<PhysExpr>)> {
+) -> Option<(Vec<crate::scan::Scan>, Vec<SemiStage>, Vec<PhysExpr>)> {
     let mut filters: Vec<PhysExpr> = Vec::new();
+    let mut semis: Vec<SemiStage> = Vec::new();
     let mut cur = plan;
     loop {
         match cur {
             LogicalPlan::Filter { input, predicate } => {
                 filters.push(predicate.clone());
                 cur = input;
+            }
+            // semi/anti 族穿透：左链继续分片，右侧计划记为 build 阶段
+            LogicalPlan::Join {
+                left,
+                right,
+                left_keys,
+                right_keys,
+                join_type,
+            } if join_type.is_semi_family() => {
+                semis.push(SemiStage {
+                    left_keys: left_keys.clone(),
+                    right: std::sync::Arc::new((**right).clone()),
+                    right_keys: right_keys.clone(),
+                    join_type: *join_type,
+                });
+                cur = left;
             }
             LogicalPlan::Scan { def, predicate } => {
                 let scan = db
@@ -636,7 +877,7 @@ fn try_shard_source(
                     .ok()?;
                 let threads = rayon::current_num_threads().clamp(1, 16);
                 let shards = scan.shard(threads, false)?;
-                return Some((shards, filters));
+                return Some((shards, semis, filters));
             }
             LogicalPlan::ExternalScan {
                 def,
@@ -654,7 +895,7 @@ fn try_shard_source(
                     .ok()?;
                 let threads = rayon::current_num_threads().clamp(1, 16);
                 let shards = scan.shard(threads, false)?;
-                return Some((shards, filters));
+                return Some((shards, semis, filters));
             }
             _ => return None,
         }

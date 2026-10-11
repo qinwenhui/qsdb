@@ -381,6 +381,236 @@ impl GroupTable {
         }
     }
 
+    /// 掩码摄入（semi/anti + 聚合融合路径）：只处理 `sel` 列出的行，
+    /// 全程零中间物化——semi 条件直接变行选择喂聚合内核。
+    pub fn ingest_with_sel(
+        &mut self,
+        group: &[PhysExpr],
+        aggs: &[AggExpr],
+        batch: &RecordBatch,
+        sel: &[u32],
+    ) -> Result<()> {
+        if sel.is_empty() {
+            return Ok(());
+        }
+        let group_arrays: Vec<ArrayRef> = group
+            .iter()
+            .map(|g| eval::eval(g, batch))
+            .collect::<Result<_>>()?;
+        let agg_arrays: Vec<Option<ArrayRef>> = aggs
+            .iter()
+            .map(|a| match &a.arg {
+                Some(e) => eval::eval(e, batch).map(Some),
+                None => Ok(None),
+            })
+            .collect::<Result<_>>()?;
+        self.init_cols(group, aggs, &agg_arrays);
+
+        // 行 → 组 id（仅选中行；group_id 走通用路径——fast 槽表在其内部
+        // 维护，与 ingest 全量路径共用同一张探测表，跨批一致）
+        let mut group_ids: Vec<u32> = Vec::with_capacity(sel.len());
+        {
+            let mut key_buf: Vec<u8> = Vec::with_capacity(64);
+            for &s in sel {
+                encode_key_row(&group_arrays, s as usize, &mut key_buf);
+                let gid = self.group_id(&key_buf, &group_arrays, s as usize);
+                group_ids.push(gid);
+            }
+        }
+        for (ai, agg) in aggs.iter().enumerate() {
+            self.update_aggs_sel(ai, agg, agg_arrays[ai].as_deref(), &group_ids, sel)?;
+        }
+        Ok(())
+    }
+
+    /// update_aggs 的选择向量变体（数组取值按 sel 间接；group_ids 与 sel 等长）。
+    fn update_aggs_sel(
+        &mut self,
+        ai: usize,
+        agg: &AggExpr,
+        arr: Option<&dyn Array>,
+        group_ids: &[u32],
+        sel: &[u32],
+    ) -> Result<()> {
+        use crate::expr::AggFunc::*;
+        match agg.func {
+            Count => {
+                let col = &mut self.counts[ai];
+                match arr {
+                    None => {
+                        for &g in group_ids {
+                            col[g as usize] += 1;
+                        }
+                    }
+                    Some(a) => {
+                        for (&s, &g) in sel.iter().zip(group_ids.iter()) {
+                            if !a.is_null(s as usize) {
+                                col[g as usize] += 1;
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Sum | Avg => {
+                let a = arr.ok_or_else(|| {
+                    QsdbError::invalid(format!("{} requires an argument", agg.func.name()))
+                })?;
+                self.update_sum_sel(ai, a, group_ids, sel)
+            }
+            Min | Max => {
+                let a = arr.ok_or_else(|| {
+                    QsdbError::invalid(format!("{} requires an argument", agg.func.name()))
+                })?;
+                self.update_min_max_sel(ai, agg.func == Min, a, group_ids, sel)
+            }
+            Udaf => Ok(()),
+        }
+    }
+
+    /// update_sum 的选择向量变体：零拷贝类型化迭代 + sel 行间接。
+    fn update_sum_sel(
+        &mut self,
+        ai: usize,
+        a: &dyn Array,
+        group_ids: &[u32],
+        sel: &[u32],
+    ) -> Result<()> {
+        let dt = a.data_type().clone();
+        match dt {
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                let cnt = &mut self.counts[ai];
+                let SumCol::Int(acc) = &mut self.sums[ai] else {
+                    return Err(QsdbError::type_err("sum column kind mismatch (internal)"));
+                };
+                let v8 = a.as_any().downcast_ref::<arrow::array::Int8Array>();
+                let v16 = a.as_any().downcast_ref::<arrow::array::Int16Array>();
+                let v32 = a.as_any().downcast_ref::<arrow::array::Int32Array>();
+                let v64 = a.as_any().downcast_ref::<Int64Array>();
+                for (&s, &g) in sel.iter().zip(group_ids.iter()) {
+                    let row = s as usize;
+                    let val = if let Some(x) = v64 {
+                        (!x.is_null(row)).then(|| i128::from(x.value(row)))
+                    } else if let Some(x) = v32 {
+                        (!x.is_null(row)).then(|| i128::from(x.value(row)))
+                    } else if let Some(x) = v16 {
+                        (!x.is_null(row)).then(|| i128::from(x.value(row)))
+                    } else if let Some(x) = v8 {
+                        (!x.is_null(row)).then(|| i128::from(x.value(row)))
+                    } else {
+                        None
+                    };
+                    if let Some(v) = val {
+                        let g = g as usize;
+                        acc[g] += v;
+                        cnt[g] += 1;
+                    }
+                }
+            }
+            DataType::Float64 => {
+                let f = a.as_any().downcast_ref::<Float64Array>().unwrap();
+                let cnt = &mut self.counts[ai];
+                let SumCol::Flt(acc) = &mut self.sums[ai] else {
+                    return Err(QsdbError::type_err("sum column kind mismatch (internal)"));
+                };
+                for (&s, &g) in sel.iter().zip(group_ids.iter()) {
+                    let row = s as usize;
+                    if !f.is_null(row) {
+                        let v = f.value(row);
+                        let g = g as usize;
+                        let sm = &mut acc[g];
+                        let y = v - sm.1;
+                        let t = sm.0 + y;
+                        sm.1 = (t - sm.0) - y;
+                        sm.0 = t;
+                        cnt[g] += 1;
+                    }
+                }
+            }
+            DataType::Decimal128(_, _) => {
+                let d = a.as_any().downcast_ref::<Decimal128Array>().unwrap();
+                let cnt = &mut self.counts[ai];
+                let SumCol::Dec(acc) = &mut self.sums[ai] else {
+                    return Err(QsdbError::type_err("sum column kind mismatch (internal)"));
+                };
+                for (&s, &g) in sel.iter().zip(group_ids.iter()) {
+                    let row = s as usize;
+                    if !d.is_null(row) {
+                        let g = g as usize;
+                        acc[g] += i256::from_i128(d.value(row));
+                        cnt[g] += 1;
+                    }
+                }
+            }
+            other => {
+                return Err(QsdbError::unsupported(format!(
+                    "sum/avg on {other:?} not supported"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// update_min_max 的选择向量变体（typed 快路径同款，行取值按 sel）。
+    fn update_min_max_sel(
+        &mut self,
+        ai: usize,
+        is_min: bool,
+        a: &dyn Array,
+        group_ids: &[u32],
+        sel: &[u32],
+    ) -> Result<()> {
+        use arrow::datatypes::TimeUnit;
+        let col = &mut self.minmax[ai];
+        macro_rules! fast {
+            ($ty:ty, $make:expr) => {{
+                let arr = a.as_any().downcast_ref::<$ty>().unwrap();
+                for (&s, &g) in sel.iter().zip(group_ids.iter()) {
+                    let row = s as usize;
+                    if arr.is_null(row) {
+                        continue;
+                    }
+                    let v = arr.value(row);
+                    let slot = &mut col[g as usize];
+                    match slot {
+                        None => *slot = Some($make(v)),
+                        Some(cur) => {
+                            let cmp = cur.partial_cmp_literal(&$make(v));
+                            if let Ok(Some(o)) = cmp {
+                                let replace = if is_min {
+                                    o == std::cmp::Ordering::Greater
+                                } else {
+                                    o == std::cmp::Ordering::Less
+                                };
+                                if replace {
+                                    *slot = Some($make(v));
+                                }
+                            }
+                        }
+                    }
+                }
+            }};
+        }
+        match a.data_type() {
+            arrow::datatypes::DataType::Int64 => fast!(Int64Array, Literal::Int64),
+            arrow::datatypes::DataType::Float64 => fast!(Float64Array, Literal::Float64),
+            arrow::datatypes::DataType::Date32 => fast!(Date32Array, Literal::Date),
+            arrow::datatypes::DataType::Utf8 => fast!(StringArray, |v: &str| {
+                Literal::Utf8(v.to_string())
+            }),
+            arrow::datatypes::DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                fast!(TimestampNanosecondArray, |v: i64| Literal::Timestamp(v))
+            }
+            _ => {
+                return Err(QsdbError::unsupported(format!(
+                    "min/max on {:?} in fused path not supported",
+                    a.data_type()
+                )))
+            }
+        }
+        Ok(())
+    }
+
     /// 单批摄入：group 表达式求值 → 行分组 → 各聚合更新。
     pub fn ingest(
         &mut self,

@@ -937,6 +937,378 @@ fn resolve_table_function(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// EXISTS / IN 子查询 → semi/anti-join（v1：WHERE 顶层 AND 合取项级提取）
+// ---------------------------------------------------------------------------
+
+/// AST 顶层 AND 合取拆分（借用视图）。
+fn split_conjuncts(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Expr> {
+    use sqlparser::ast::{BinaryOperator, Expr};
+    match e {
+        Expr::BinaryOp {
+            op: BinaryOperator::And,
+            left,
+            right,
+        } => {
+            let mut v = split_conjuncts(left);
+            v.extend(split_conjuncts(right));
+            v
+        }
+        other => vec![other],
+    }
+}
+
+/// 合取重组（空 → None）。
+fn and_conjuncts(mut parts: Vec<sqlparser::ast::Expr>) -> Option<sqlparser::ast::Expr> {
+    use sqlparser::ast::{BinaryOperator, Expr};
+    let mut acc = parts.pop()?;
+    while let Some(p) = parts.pop() {
+        acc = Expr::BinaryOp {
+            left: Box::new(p),
+            right: Box::new(acc),
+            op: BinaryOperator::And,
+        };
+    }
+    Some(acc)
+}
+
+/// WHERE 合取分类：EXISTS / IN 子查询项 → semi/anti-join 链式叠加到计划；
+/// 其余（含 NOT(EXISTS/IN) 显式括号形态）按原样返回走行过滤。
+#[allow(clippy::too_many_arguments)]
+fn attach_semi_subqueries(
+    plan: LogicalPlan,
+    ctx: &SchemaCtx,
+    resolver: &TableResolver,
+    ancestors: &VisibleCtes,
+    cte_defs: &mut Vec<CteDef>,
+    conjuncts: Vec<&sqlparser::ast::Expr>,
+) -> Result<(LogicalPlan, Vec<sqlparser::ast::Expr>)> {
+    use sqlparser::ast::Expr;
+    let mut plan = plan;
+    let mut regular: Vec<Expr> = Vec::new();
+    for c in conjuncts {
+        match c {
+            Expr::Exists { negated, subquery } => {
+                plan = build_exists_semi_join(
+                    plan,
+                    ctx,
+                    resolver,
+                    ancestors,
+                    cte_defs,
+                    subquery.as_ref(),
+                    *negated,
+                )?;
+            }
+            Expr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => {
+                plan = build_in_semi_join(
+                    plan,
+                    ctx,
+                    resolver,
+                    ancestors,
+                    cte_defs,
+                    expr,
+                    subquery.as_ref(),
+                    *negated,
+                )?;
+            }
+            // 显式 NOT(...) 括号形态（0.63：UnaryOp{op: Not}）
+            Expr::UnaryOp {
+                op: sqlparser::ast::UnaryOperator::Not,
+                expr: inner,
+            } => match inner.as_ref() {
+                Expr::Exists { negated, subquery } => {
+                    plan = build_exists_semi_join(
+                        plan,
+                        ctx,
+                        resolver,
+                        ancestors,
+                        cte_defs,
+                        subquery.as_ref(),
+                        !*negated,
+                    )?;
+                }
+                Expr::InSubquery {
+                    expr,
+                    subquery,
+                    negated,
+                } => {
+                    plan = build_in_semi_join(
+                        plan,
+                        ctx,
+                        resolver,
+                        ancestors,
+                        cte_defs,
+                        expr,
+                        subquery.as_ref(),
+                        !*negated,
+                    )?;
+                }
+                _ => regular.push(sqlparser::ast::Expr::UnaryOp {
+                    op: sqlparser::ast::UnaryOperator::Not,
+                    expr: Box::new((**inner).clone()),
+                }),
+            },
+            _ => regular.push(c.clone()),
+        }
+    }
+    Ok((plan, regular))
+}
+
+/// 子查询 FROM 的表名/别名集合（限定名前缀归属判定用）。
+fn subquery_table_names(q: &sqlparser::ast::Query) -> Vec<String> {
+    use sqlparser::ast::{SetExpr, TableFactor};
+    let mut names = Vec::new();
+    let SetExpr::Select(s) = &*q.body else {
+        return names;
+    };
+    fn push_factor(f: &TableFactor, names: &mut Vec<String>) {
+        match f {
+            TableFactor::Table { name, alias, .. } => {
+                if let Some(a) = alias {
+                    names.push(a.name.value.to_ascii_lowercase());
+                } else if let Some(sqlparser::ast::ObjectNamePart::Identifier(last)) = name.0.last()
+                {
+                    names.push(last.value.to_ascii_lowercase());
+                }
+            }
+            TableFactor::Derived {
+                alias: Some(a), ..
+            } => names.push(a.name.value.to_ascii_lowercase()),
+            _ => {}
+        }
+    }
+    for twj in &s.from {
+        push_factor(&twj.relation, &mut names);
+        for j in &twj.joins {
+            push_factor(&j.relation, &mut names);
+        }
+    }
+    names
+}
+
+/// 合取项某一侧的归属。
+enum Side {
+    Inner(PhysExpr),
+    Outer(PhysExpr),
+}
+
+/// 侧归属：限定名前缀优先（限定符 ∈ 子表 → 子侧；否则先外层后子侧裸名）。
+fn classify_side(
+    ast: &sqlparser::ast::Expr,
+    sub_ctx: &SchemaCtx,
+    outer_ctx: &SchemaCtx,
+    sub_tables: &[String],
+) -> Result<Side> {
+    use sqlparser::ast::Expr as A;
+    match ast {
+        A::CompoundIdentifier(parts) if parts.len() == 2 => {
+            let q = parts[0].value.to_ascii_lowercase();
+            if sub_tables.contains(&q) {
+                Ok(Side::Inner(bind_expr(ast, sub_ctx)?))
+            } else {
+                match bind_expr(ast, outer_ctx) {
+                    Ok(e) => Ok(Side::Outer(e)),
+                    // 限定符既非子表也解析不到外层 → 交子侧报真实错误
+                    Err(_) => Ok(Side::Inner(bind_expr(ast, sub_ctx)?)),
+                }
+            }
+        }
+        A::Identifier(id) => {
+            if sub_ctx.index_of(&id.value).is_some() {
+                Ok(Side::Inner(bind_expr(ast, sub_ctx)?))
+            } else {
+                Ok(Side::Outer(bind_expr(ast, outer_ctx)?))
+            }
+        }
+        // 表达式形态：整体先子侧；失败且外层可解析 → 外侧（要求仅外层列）
+        other => match bind_expr(other, sub_ctx) {
+            Ok(e) => Ok(Side::Inner(e)),
+            Err(_) => Ok(Side::Outer(bind_expr(other, outer_ctx)?)),
+        },
+    }
+}
+
+/// 关联 EXISTS → Semi/Anti join。子查询 WHERE 的合取分类：
+/// 本地谓词（仅引用子查询列）留子查询内作 Filter；`外列 = 内列` 等值
+/// 合取拆为连接键（v1：键必须为简单列、类型一致）；非等值关联不支持。
+#[allow(clippy::too_many_arguments)]
+fn build_exists_semi_join(
+    plan: LogicalPlan,
+    ctx: &SchemaCtx,
+    resolver: &TableResolver,
+    ancestors: &VisibleCtes,
+    cte_defs: &mut Vec<CteDef>,
+    subquery: &sqlparser::ast::Query,
+    negated: bool,
+) -> Result<LogicalPlan> {
+    use sqlparser::ast::{BinaryOperator, Expr};
+    // ① 无 WHERE + 全列投影版本先建：EXISTS 的输出无关紧要，但关联列
+    // 不能被 SELECT 1 投影裁掉——改 Wildcard 保留 FROM 全列作 SchemaCtx
+    let mut stripped = subquery.clone();
+    let mut selection = None;
+    if let sqlparser::ast::SetExpr::Select(s) = &mut *stripped.body {
+        selection = s.selection.take();
+        s.projection = vec![sqlparser::ast::SelectItem::Wildcard(Default::default())];
+    }
+    let (sub_plan, extra) = translate_select_inner(stripped, resolver, ancestors)?;
+    cte_defs.extend(extra);
+    let sub_cols = plan_output_columns(&sub_plan)?;
+    let sub_ctx = SchemaCtx { cols: sub_cols };
+    let left_width = ctx.cols.len();
+
+    // ② WHERE 合取分类。归属判定按**限定名前缀**：限定符 ∈ 子查询 FROM
+    // 表名/别名 → 子侧；否则先试外层解析。裸名仅在单侧可见时才归该侧
+    // （防「裸名回退静默解析到子查询自身列」——关联引用要求写限定名）
+    let sub_tables = subquery_table_names(subquery);
+    let mut local: Vec<PhysExpr> = Vec::new();
+    let mut left_keys: Vec<PhysExpr> = Vec::new();
+    let mut right_keys: Vec<PhysExpr> = Vec::new();
+    if let Some(sel) = &selection {
+        for conj in split_conjuncts(sel) {
+            let Expr::BinaryOp {
+                op: BinaryOperator::Eq,
+                left,
+                right,
+            } = conj
+            else {
+                // 非 Eq 合取：须整体为本地（子侧可解析）
+                let b = bind_expr(conj, &sub_ctx).map_err(|_| {
+                    QsdbError::unsupported(format!(
+                        "correlated EXISTS: only 'inner_col = outer_col' predicates supported (near {conj})"
+                    ))
+                })?;
+                if !b.is_boolean() {
+                    return Err(QsdbError::type_err(
+                        "EXISTS subquery predicate must be boolean",
+                    ));
+                }
+                local.push(b);
+                continue;
+            };
+            match (
+                classify_side(left, &sub_ctx, ctx, &sub_tables)?,
+                classify_side(right, &sub_ctx, ctx, &sub_tables)?,
+            ) {
+                (Side::Inner(_), Side::Inner(_)) => {
+                    let b = bind_expr(conj, &sub_ctx)?;
+                    if !b.is_boolean() {
+                        return Err(QsdbError::type_err(
+                            "EXISTS subquery predicate must be boolean",
+                        ));
+                    }
+                    local.push(b);
+                }
+                (Side::Inner(i), Side::Outer(o)) | (Side::Outer(o), Side::Inner(i)) => {
+                    let (PhysExpr::Column { .. }, PhysExpr::Column { .. }) = (&o, &i) else {
+                        return Err(QsdbError::unsupported(
+                            "correlated EXISTS: join keys must be simple columns (v1)",
+                        ));
+                    };
+                    if o.data_type() != i.data_type() {
+                        return Err(QsdbError::unsupported(format!(
+                            "EXISTS join key type mismatch: {} vs {} (cast lands later)",
+                            o.data_type(),
+                            i.data_type()
+                        )));
+                    }
+                    let _ = left_width;
+                    left_keys.push(o);
+                    right_keys.push(i);
+                }
+                (Side::Outer(_), Side::Outer(_)) => {
+                    return Err(QsdbError::unsupported(
+                        "correlated EXISTS: predicate references only outer columns",
+                    ));
+                }
+            }
+        }
+    }
+    if left_keys.is_empty() {
+        return Err(QsdbError::unsupported(
+            "uncorrelated EXISTS: v1 requires correlation (inner_col = outer_col); rewrite with IN or JOIN",
+        ));
+    }
+    // ③ 本地谓词 → 子计划内 Filter
+    let mut sub_plan = sub_plan;
+    if let Some(pred) = local.into_iter().reduce(|a, b| PhysExpr::And(Box::new(a), Box::new(b))) {
+        sub_plan = LogicalPlan::Filter {
+            input: Box::new(sub_plan),
+            predicate: pred,
+        };
+    }
+    let join_type = if negated {
+        crate::exec::join::JoinType::Anti
+    } else {
+        crate::exec::join::JoinType::Semi
+    };
+    Ok(LogicalPlan::Join {
+        left: Box::new(plan),
+        right: Box::new(sub_plan),
+        left_keys,
+        right_keys,
+        join_type,
+    })
+}
+
+/// IN (SELECT 单列) → Semi；NOT IN → AntiIn（三值 NULL 语义在 exec）。
+/// 子查询必须非关联（其谓词仅引用自身列）；左操作数 v1 须为简单列。
+#[allow(clippy::too_many_arguments)]
+fn build_in_semi_join(
+    plan: LogicalPlan,
+    ctx: &SchemaCtx,
+    resolver: &TableResolver,
+    ancestors: &VisibleCtes,
+    cte_defs: &mut Vec<CteDef>,
+    lhs: &sqlparser::ast::Expr,
+    subquery: &sqlparser::ast::Query,
+    negated: bool,
+) -> Result<LogicalPlan> {
+    let (sub_plan, extra) = translate_select_inner(subquery.clone(), resolver, ancestors)?;
+    cte_defs.extend(extra);
+    let sub_cols = plan_output_columns(&sub_plan)?;
+    if sub_cols.len() != 1 {
+        return Err(QsdbError::invalid(format!(
+            "IN subquery must select exactly one column (got {})",
+            sub_cols.len()
+        )));
+    }
+    let outer_key = bind_expr(lhs, ctx)?;
+    if !matches!(outer_key, PhysExpr::Column { .. }) {
+        return Err(QsdbError::unsupported(
+            "IN lhs must be a simple column (v1)",
+        ));
+    }
+    let (name0, ty0) = &sub_cols[0];
+    if outer_key.data_type() != *ty0 {
+        return Err(QsdbError::unsupported(format!(
+            "IN key type mismatch: {} vs {ty0} (cast lands later)",
+            outer_key.data_type()
+        )));
+    }
+    // 右键 = 右子计划局部 idx（0 位 = 子查询首列；绑定期约定）
+    let right_key = PhysExpr::Column {
+        idx: 0,
+        name: name0.clone(),
+        ty: ty0.clone(),
+    };
+    let join_type = if negated {
+        crate::exec::join::JoinType::AntiIn
+    } else {
+        crate::exec::join::JoinType::Semi
+    };
+    Ok(LogicalPlan::Join {
+        left: Box::new(plan),
+        right: Box::new(sub_plan),
+        left_keys: vec![outer_key],
+        right_keys: vec![right_key],
+        join_type,
+    })
+}
+
 /// 提取表达式内的标量子查询并置换为合成 Identifier（__scalar_sub_{n}）。
 /// 返回（置换后表达式, (合成列名, 子查询) 列表），出现序 = 收集序。
 fn extract_scalar_subqueries(
@@ -1313,7 +1685,18 @@ fn translate_select_inner(
     }
 
     // WHERE
-    if let Some(w) = selection_sub {
+    // ① EXISTS / IN 子查询合取 → semi/anti-join（链式叠加；v1 顶层 AND）
+    let selection_rest = if let Some(w) = selection_sub {
+        let conjuncts = split_conjuncts(&w);
+        let (p, regular) =
+            attach_semi_subqueries(plan, &ctx, resolver, &visible, &mut cte_defs, conjuncts)?;
+        plan = p;
+        and_conjuncts(regular)
+    } else {
+        None
+    };
+    // ② 其余谓词照常绑定
+    if let Some(w) = selection_rest {
         let bound = bind_expr(&w, &ctx)?;
         if !bound.is_boolean() {
             return Err(QsdbError::type_err("WHERE must be boolean"));
