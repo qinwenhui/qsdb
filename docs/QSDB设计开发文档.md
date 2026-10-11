@@ -548,9 +548,56 @@ GET  /health | /metrics   # prometheus 文本：行数/字节数/段数/缓存�
   - ✅ LIMIT 0 schema 契约（同步工具 schema 协商依赖）测试锁定；
   - ⚠️ **二进制红线**：默认 feature release 24.1MB，超红线 24MB 0.1MB
     （M4 gate 23.6MB + M5 SQL-3 核心代码 ~0.5MB；strip=symbols 已开）。
-    处置待用户定案：调整红线至 25MB（范围驱动）或 M6 瘦身。flight feature 构建
+    处置：红线放宽至 **≤25MB**（用户定案，范围驱动）；flight feature 构建
     25.3MB（默认关闭，不计红线）；
   - ✅ 165 测试全绿、clippy 干净（默认+flight 双模式）。
+
+### M5 后性能专项（P1-P3，2026-10-10/11）✅ 已完成
+- **group by 反超**（0.37x → **2.4-3.0x 快于 DuckDB**）：GroupTable AoS→SoA
+  （key arena + 列式聚合状态，高基数 9.1GB→3.8GB）；聚合路径零拷贝化
+  （gcol 返回 `&[&Int64Array]` 引用 + update_sum 直接迭代类型化数组——
+  全列 to_vec/collect 在执行上下文病态慢 ~235MB/s，裸 SIMD 读 0.8ns/元素）；
+  分片策略按调用方分化（过滤=RG 级细分 LPT 均衡，聚合=文件粒度——高基数下
+  细分重复构建组状态 +20% 反而劣化）；finalize 直读 SoA（替代 take_states）。
+- **mem 单行对比误报排查**：微基准 950M rows/s vs 引擎 9s/分片同形状——
+  排除 merge（0.014s）/分片/逐列后定位为整列拷贝；用户基准方法论修正：
+  同机同噪声相对对比 + 少轮数人工判断（生产环境必噪声，赢要赢在噪声中）。
+- **CacheCollector 爆内存修复**：整文件累积后 put × 8 分片 ≈1.6GB →
+  budget/8 累积上界超限弃缓存（4GB 预算 → 512MB 上界）。
+- **Scan 谓词列被列裁剪丢弃**（M4 正确性 bug）：count(*) WHERE a>15 当 a
+  不在投影时谓词失效——collect_plan_columns 补 Scan 谓词列 + 回归测试。
+- 终态（40M 行×8 分区，18 线程，中负载）：**全四项快于 DuckDB**——
+  filter 1.6-1.8x、aggregate 5.3-6.7x、group by 2.4-3.0x、点查 7.4-11.4x；
+  内存：qsdb 查询工作集 **15-17MB** vs DuckDB-parquet 26-56MB vs
+  DuckDB 驻留 2.8GB（mem_vs 分进程峰值口径）。
+
+---
+
+### M6：多后端存储（2026-10-11 起，`docs/存储层设计.md` 为准）
+
+设计输入：`docs/存储层设计.md`（v0.1 已评审定案，✅/⏳ 标记冻结）。
+分期 M6-1 抽象收口 → M6-2 只读 S3 外表 → M6-3 S3 管理表（OCC）→
+M6-4 staging 写 → M6-5 HDFS → M6-6 可选租约；每阶段独立 gate。
+
+#### M6-1 Store 抽象收口 ✅ 已完成（2026-10-11）
+- 新增 `store.rs`：`enum Store { Local }` 静态派发（贴合项目 enum 惯例，
+  零虚调用）；方法面 = 现有调用实际用到的原语（read/read_to_string/
+  write_atomic/stat/exists/create_dir_all/read_dir/commit_object + root()）；
+  **条件写原语（put_if_absent/put_if_etag）不预建**——随 M6-3 协议层落地。
+- 路径契约：方法收 db root 下绝对路径；Local 原样使用，远端按 root strip
+  推 key（与本地路径一一映射）。热路径豁免（§4）：parquet 列读本地直开
+  `File`；分区锁/trash/tmp 命名保持 fsutil 本地原语（M6-3 按 BackendCaps 分支）。
+- 收口面：catalog / manifest / index / write / compact / scan（发现+缓存签名
+  stat）/ api / write_buffer；`Qsdb` 持 `Arc<Store>` 并暴露 `store()`。
+- **零回退 gate（A/B：本提交 vs 前提交 worktree 交替对跑，同机中负载）**：
+  - mem_vs 40M 行×3 轮：write −2.6% / filter −1.5% / aggregate +2.2% /
+    group by +0.4% —— 全部 ±3% 内（gate 线 ±5%）；峰值 RSS 543 vs 542MB、
+    查询工作集 11-14MB 持平；
+  - meta（万分区）：发现+读 manifest 24.5→18.6ms（红线 <50ms 稳）、
+    热重复 20.1→21.5ms、万分区写 221→223.5s（+1%）；write 单线程
+    1.68M→1.66M rows/s（−1.7%，红线 ≥1M 稳）；scan 单线程同噪声带内
+    中位数持平（757 vs 740 MB/s，带内波动 ±25% 为机器负载）；
+  - ✅ **gate 绿**：169 测试全绿、clippy 干净（workspace --all-targets）。
 
 ---
 
