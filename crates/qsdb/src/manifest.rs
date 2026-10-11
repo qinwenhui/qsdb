@@ -42,6 +42,10 @@ pub struct PartitionManifest {
     pub partition_values: Vec<(String, Literal)>,
     pub segments: Vec<SegmentEntry>,
     pub schema_fingerprint: u64,
+    /// 远端多写者诊断（存储设计 §7.2）：写者进程标识，仅用于 GC/诊断，
+    /// 不参与正确性。本地提交恒 0（旧 manifest 兼容：字段缺省即 0）。
+    #[serde(default)]
+    pub writer_epoch: u64,
 }
 
 impl PartitionManifest {
@@ -52,6 +56,7 @@ impl PartitionManifest {
             partition_values,
             segments: Vec::new(),
             schema_fingerprint,
+            writer_epoch: 0,
         }
     }
 

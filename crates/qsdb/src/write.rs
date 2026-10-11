@@ -156,6 +156,66 @@ fn type_compatible(a: &DataType, b: &DataType) -> bool {
     a == b
 }
 
+/// 批列统计（跨批合并）——本地/远端 segment 写共用。
+fn merged_column_stats(
+    batches: &[RecordBatch],
+    column_names: &[String],
+) -> Result<Vec<(String, crate::manifest::ColumnStats)>> {
+    let mut merged: Vec<(String, stats_merge::Acc)> = column_names
+        .iter()
+        .map(|n| (n.clone(), stats_merge::Acc::default()))
+        .collect();
+    for b in batches.iter().filter(|b| b.num_rows() > 0) {
+        for (i, (_, acc)) in merged.iter_mut().enumerate() {
+            let st = stats::column_stats(b.column(i))?;
+            acc.nulls += st.null_count;
+            acc.min = stats_merge::min_opt(acc.min.take(), st.min);
+            acc.max = stats_merge::max_opt(acc.max.take(), st.max);
+        }
+    }
+    Ok(merged
+        .into_iter()
+        .map(|(n, a)| {
+            (
+                n,
+                crate::manifest::ColumnStats {
+                    min: a.min,
+                    max: a.max,
+                    null_count: a.nulls,
+                },
+            )
+        })
+        .collect())
+}
+
+/// 序列化批集到 parquet 字节（行数 + 列统计一并产出）。
+/// 本地 = 写文件句柄；远端 = 写内存缓冲（segment 整体 PUT，§7.2）。
+fn serialize_segment<W: std::io::Write + Send>(
+    mut w: W,
+    batches: &[RecordBatch],
+    file_schema: &SchemaRef,
+    props: WriterProperties,
+    column_names: &[String],
+) -> Result<(u64, Vec<(String, crate::manifest::ColumnStats)>)> {
+    let mut writer = ArrowWriter::try_new(&mut w, Arc::clone(file_schema), Some(props))
+        .map_err(|e| QsdbError::meta(format!("parquet writer init failed: {e}")))?;
+    let mut rows: u64 = 0;
+    for b in batches {
+        if b.num_rows() == 0 {
+            continue;
+        }
+        writer
+            .write(b)
+            .map_err(|e| QsdbError::meta(format!("parquet write failed: {e}")))?;
+        rows += b.num_rows() as u64;
+    }
+    writer
+        .close()
+        .map_err(|e| QsdbError::meta(format!("parquet close failed: {e}")))?;
+    let stats = merged_column_stats(batches, column_names)?;
+    Ok((rows, stats))
+}
+
 /// 写一个 segment：所有批进一个 parquet 文件（tmp → rename 定名）。
 /// 序列化直写本地文件（§4 热路径豁免）；stat/定名经 Store。
 fn write_segment(
@@ -170,65 +230,48 @@ fn write_segment(
     let final_path = partition_dir.join(&seg_name);
     let tmp_path = crate::fsutil::tmp_sibling(&final_path);
 
-    let mut rows: u64 = 0;
-    {
+    let (rows, column_stats) = {
         let file = File::create(&tmp_path)
             .map_err(|e| QsdbError::meta(format!("create {} failed: {e}", tmp_path.display())))?;
-        let mut writer = ArrowWriter::try_new(file, Arc::clone(file_schema), Some(props))
-            .map_err(|e| QsdbError::meta(format!("parquet writer init failed: {e}")))?;
-        for b in batches {
-            if b.num_rows() == 0 {
-                continue;
-            }
-            writer
-                .write(b)
-                .map_err(|e| QsdbError::meta(format!("parquet write failed: {e}")))?;
-            rows += b.num_rows() as u64;
-        }
-        writer
-            .close()
-            .map_err(|e| QsdbError::meta(format!("parquet close failed: {e}")))?;
-    }
+        serialize_segment(file, batches, file_schema, props, column_names)?
+    };
     let bytes = store
         .stat(&tmp_path)?
         .ok_or_else(|| QsdbError::meta("stat segment failed: tmp missing after write"))?
         .size;
     store.commit_object(&tmp_path, &final_path)?;
 
-    // 统计：跨批合并
-    let mut merged: Vec<(String, stats_merge::Acc)> = column_names
-        .iter()
-        .map(|n| (n.clone(), stats_merge::Acc::default()))
-        .collect();
-    for b in batches {
-        if b.num_rows() == 0 {
-            continue;
-        }
-        for (i, (_, acc)) in merged.iter_mut().enumerate() {
-            let st = stats::column_stats(b.column(i))?;
-            acc.nulls += st.null_count;
-            acc.min = stats_merge::min_opt(acc.min.take(), st.min);
-            acc.max = stats_merge::max_opt(acc.max.take(), st.max);
-        }
-    }
-    let column_stats = merged
-        .into_iter()
-        .map(|(n, a)| {
-            (
-                n,
-                crate::manifest::ColumnStats {
-                    min: a.min,
-                    max: a.max,
-                    null_count: a.nulls,
-                },
-            )
-        })
-        .collect();
-
     Ok(SegmentEntry {
         file_name: seg_name,
         row_count: rows,
         byte_size: bytes,
+        created_at: now_ms() as i64,
+        column_stats,
+    })
+}
+
+/// 远端 segment 写（feature `s3`，§7.2 不可变对象）：parquet 序列化到内存
+/// 缓冲 → 整体 PUT（UUID 名永不冲突，幂等）。compaction 复用。
+/// v1 内存上限 = 单次 flush 的攒批量（默认 128MB 逻辑列，压缩后远小于）；
+/// staging 落盘 M6-4。
+#[cfg(feature = "s3")]
+pub(crate) fn put_segment_remote(
+    store: &Store,
+    partition_dir: &Path,
+    batches: &[RecordBatch],
+    file_schema: &SchemaRef,
+    props: WriterProperties,
+    column_names: &[String],
+) -> Result<SegmentEntry> {
+    let seg_name = format!("seg_{}.parquet", uuid::Uuid::now_v7().simple());
+    let mut buf = Vec::new();
+    let (rows, column_stats) =
+        serialize_segment(&mut buf, batches, file_schema, props, column_names)?;
+    store.put_object(&partition_dir.join(&seg_name), &buf)?;
+    Ok(SegmentEntry {
+        file_name: seg_name,
+        row_count: rows,
+        byte_size: buf.len() as u64,
         created_at: now_ms() as i64,
         column_stats,
     })
@@ -370,6 +413,20 @@ pub(crate) fn append_partition(
     check_constraints(def, batches)?;
     let dir = pdir(table_dir, def, values)?;
     store.create_dir_all(&dir)?;
+    if !store.is_local() {
+        #[cfg(feature = "s3")]
+        return append_partition_remote(
+            store,
+            def,
+            values,
+            &dir,
+            batches,
+            &schema,
+            &file_schema,
+        );
+        #[cfg(not(feature = "s3"))]
+        return Err(QsdbError::unsupported("remote store requires feature 's3'"));
+    }
     let _guard = PartitionLock::acquire(&lock_path(&dir))?;
 
     let entry = write_segment(
@@ -402,7 +459,9 @@ pub(crate) fn append_partition(
     }
     manifest.segments.push(entry.clone());
     manifest.commit(store, &dir)?;
-    sync_index(store, table_dir, &dir, &manifest);
+    if store.is_local() {
+        sync_index(store, table_dir, &dir, &manifest);
+    }
     drop(_guard);
 
     Ok(WriteResult {
@@ -438,6 +497,14 @@ pub(crate) fn overwrite_partition(
     check_constraints(def, batches)?;
     let dir = pdir(table_dir, def, values)?;
     store.create_dir_all(&dir)?;
+    if !store.is_local() {
+        #[cfg(feature = "s3")]
+        return overwrite_partition_remote(
+            store, def, values, &dir, batches, &schema, &file_schema,
+        );
+        #[cfg(not(feature = "s3"))]
+        return Err(QsdbError::unsupported("remote store requires feature 's3'"));
+    }
     let _guard = PartitionLock::acquire(&lock_path(&dir))?;
 
     // 旧 manifest（不存在 = 新分区）
@@ -483,14 +550,119 @@ pub(crate) fn overwrite_partition(
     manifest.segments = new_segments;
     let old_files: Vec<PathBuf> = old.map(|m| m.segment_paths(&dir)).unwrap_or_default();
     manifest.commit(store, &dir)?;
-    sync_index(store, table_dir, &dir, &manifest);
+    if store.is_local() {
+        sync_index(store, table_dir, &dir, &manifest);
+    }
     drop(_guard);
 
-    // 旧数据文件延迟善后（提交后；失败不影响正确性，GC 兜底）
-    for f in old_files {
-        let _ = move_to_trash(store.root(), &f);
+    // 旧数据文件延迟善后（提交后；失败不影响正确性，GC 兜底；远端由引用 GC 回收）
+    if store.is_local() {
+        for f in old_files {
+            let _ = move_to_trash(store.root(), &f);
+        }
     }
 
+    Ok(result)
+}
+
+// --- 远端写协议（feature `s3`，存储设计 §7.2 ProtocolOCC） ------------------
+
+/// append（远端）：segment PUT（不可变，无协议）→ manifest OCC 重放提交。
+/// 进程内分区 Mutex 串行化（§8）——跨进程/多实例由 OCC 收敛，无锁多写者。
+#[cfg(feature = "s3")]
+fn append_partition_remote(
+    store: &Store,
+    def: &TableDef,
+    values: &[crate::types::Literal],
+    dir: &Path,
+    batches: &[RecordBatch],
+    schema: &SchemaRef,
+    file_schema: &SchemaRef,
+) -> Result<WriteResult> {
+    let entry = put_segment_remote(
+        store,
+        dir,
+        batches,
+        file_schema,
+        writer_props(def)?,
+        &schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect::<Vec<_>>(),
+    )?;
+    let mpath = PartitionManifest::manifest_path(dir);
+    crate::remote::with_partition_mutex(dir, || {
+        crate::remote::occ_commit(store, &mpath, |cur| {
+            let mut m = cur.unwrap_or_else(|| {
+                PartitionManifest::new(named_values(def, values), def.schema_fingerprint())
+            });
+            // 指纹一致 或 旧 schema 为当前前缀（ALTER ADD COLUMN）→ 升格
+            if m.schema_fingerprint != def.schema_fingerprint() {
+                if !def.prefix_fingerprints().contains(&m.schema_fingerprint) {
+                    return Err(QsdbError::meta(
+                        "table schema changed since partition was written; use overwrite_partition",
+                    ));
+                }
+                m.schema_fingerprint = def.schema_fingerprint();
+            }
+            // 重放：基于最新 cur 追加（并发写者的 segment 不丢）
+            m.generation += 1;
+            m.segments.push(entry.clone());
+            Ok(m)
+        })
+    })?;
+    Ok(WriteResult {
+        rows: entry.row_count,
+        bytes: entry.byte_size,
+        segments: 1,
+    })
+}
+
+/// overwrite（远端）：segment PUT → OCC 替换提交（重放只继承 generation）。
+/// 旧 segment 不搬 trash——不被引用即不可见，引用 GC 安全期后回收（§12）。
+#[cfg(feature = "s3")]
+fn overwrite_partition_remote(
+    store: &Store,
+    def: &TableDef,
+    values: &[crate::types::Literal],
+    dir: &Path,
+    batches: &[RecordBatch],
+    schema: &SchemaRef,
+    file_schema: &Option<SchemaRef>,
+) -> Result<WriteResult> {
+    let mut result = WriteResult::default();
+    let mut new_segments: Vec<SegmentEntry> = Vec::new();
+    if let Some(fs) = file_schema {
+        let entry = put_segment_remote(
+            store,
+            dir,
+            batches,
+            fs,
+            writer_props(def)?,
+            &schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>(),
+        )?;
+        result = WriteResult {
+            rows: entry.row_count,
+            bytes: entry.byte_size,
+            segments: 1,
+        };
+        new_segments.push(entry);
+    }
+    let mpath = PartitionManifest::manifest_path(dir);
+    crate::remote::with_partition_mutex(dir, || {
+        crate::remote::occ_commit(store, &mpath, |cur| {
+            let mut m =
+                PartitionManifest::new(named_values(def, values), def.schema_fingerprint());
+            m.generation = cur.map_or(0, |c| c.generation);
+            m.segments = new_segments.clone();
+            Ok(m)
+        })
+    })?;
     Ok(result)
 }
 

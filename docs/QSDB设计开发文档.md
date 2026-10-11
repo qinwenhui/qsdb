@@ -624,6 +624,33 @@ M6-4 staging 写 → M6-5 HDFS → M6-6 可选租约；每阶段独立 gate。
   HEAD/range（plan 期 + open 期各一次，v1 已知可优化）；glob 仅常量前缀
   list（无 key 谓词下推）。
 
+#### M6-3 S3 管理表（OCC）✅ 已完成（2026-10-11）
+- `Store::Remote` 变体（feature `s3`）：**虚拟根** `s3://bucket/prefix` 承接
+  M6-1 路径契约——catalog/manifest/write/scan/compact 全调用面零改动直通；
+  object_store 0.14 桥接（get/head/list_with_delimiter/put_opts）。
+- **ProtocolOCC（§7.2 定案落地）**：OCC 原语 `get_with_etag` +
+  `put_if_etag`（PutMode::Create/Update，Precondition/AlreadyExists →
+  冲突 false）；`occ_commit` 重放循环 ≤8 轮（每轮基于最新 cur 重建，
+  天然无 ABA 丢写）；manifest 新增 `writer_epoch`（`serde(default)`，
+  本地恒 0 兼容）。写路径：segment 内存缓冲整体 PUT（不可变无协议）
+  → OCC 提交；compaction/overwrite/clear 同协议（替换语义重放）。
+- catalog/table.json 远端 = 单对象 OCC（`occ_update_bytes`）；drop =
+  清单 OCC 去名 + 前缀尽力删除；**远端 GC（§12）**= 引用扫描式
+  （list 表前缀 → manifest 真值比对 → 未引用且过安全期才删）；
+  进程内分区 Mutex 串行化（§8），跨进程由 OCC 收敛——无锁多写者。
+- 分区发现：远端跳过 `partitions.idx`（stale 索引 = 丢分区数据的风险，
+  真值单一原则）走 list + 逐分区 manifest；`_index` 加速对象后置。
+- `QsdbOptions.storage`（StorageConfig::S3）+ server CLI
+  `--storage-type/--storage-endpoint/--storage-region/--storage-bucket/
+  --storage-prefix`；`Qsdb::open_with_store` 注入自定义后端（测试/嵌入方）。
+- **验收**：187 测试全绿（--features s3，含 InMemory 注入的协议全链路：
+  OCC 原语冲突矩阵、**冲突重放不丢并发写者 segment**、全生命周期
+  建表/追加/overwrite/compaction/TRUNCATE/drop/stats、孤儿不可见 +
+  GC 安全期回收、双实例 16 并发写无丢失）/179 默认全绿 / workspace
+  clippy 双模式 0 警告 / 默认二进制 24.34MB（红线内）/ 本地路径
+  mem_vs smoke 无回归。真实 MinIO/AWS 的 If-Match 行为差异（R1）
+  留探测套件任务；staging 写（M6-4）后置。
+
 ---
 
 ## 十五、风险与对策

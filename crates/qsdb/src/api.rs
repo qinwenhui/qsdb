@@ -22,10 +22,31 @@ use crate::store::Store;
 use crate::types::Literal;
 use crate::write::{self, WriteResult};
 
+/// 存储后端配置（启动期，改后需重开句柄）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum StorageConfig {
+    /// 本地文件系统（默认）
+    #[default]
+    Local,
+    /// S3 及兼容对象存储管理表（feature `s3`；存储设计 §5/§7.2）
+    #[cfg(feature = "s3")]
+    S3 {
+        /// S3 兼容端点（AWS 官方留空走默认链；`http://` 端点自动 allow_http）
+        endpoint: Option<String>,
+        region: Option<String>,
+        bucket: String,
+        /// bucket 内 key 前缀（多租户/多库共存）
+        prefix: String,
+    },
+}
+
 /// 打开选项。
 #[derive(Debug, Clone)]
 pub struct QsdbOptions {
+    /// 存储后端（默认本地；`StorageConfig::S3` 需编译 feature `s3`）
+    pub storage: StorageConfig,
     /// trash 静默期（毫秒）；`gc()` 只清理更早的条目
+    /// （远端模式 = 孤儿对象安全期：不被 manifest 引用且早于该期限才可删）
     pub trash_grace_ms: u64,
     /// 热数据缓存预算（字节）：segment 级解码后 LRU 缓存。
     /// `0` = 关闭；默认 256MB。
@@ -42,11 +63,38 @@ pub struct QsdbOptions {
 impl Default for QsdbOptions {
     fn default() -> Self {
         Self {
+            storage: StorageConfig::Local,
             trash_grace_ms: 10 * 60 * 1000,
             scan_cache_bytes: 256 * 1024 * 1024,
             query_timeout_ms: None,
             query_memory_limit_bytes: None,
             file_cache_bytes: 0,
+        }
+    }
+}
+
+impl QsdbOptions {
+    /// 本地后端默认选项（等价 `Default`，语义显式）。
+    pub fn local() -> Self {
+        Self::default()
+    }
+
+    /// S3 后端选项（feature `s3`）。
+    #[cfg(feature = "s3")]
+    pub fn s3(
+        endpoint: Option<String>,
+        region: Option<String>,
+        bucket: impl Into<String>,
+        prefix: impl Into<String>,
+    ) -> Self {
+        Self {
+            storage: StorageConfig::S3 {
+                endpoint,
+                region,
+                bucket: bucket.into(),
+                prefix: prefix.into(),
+            },
+            ..Self::default()
         }
     }
 }
@@ -122,15 +170,37 @@ pub struct Qsdb {
 }
 
 impl Qsdb {
-    /// 打开（目录不存在则初始化为空库）。
+    /// 打开（目录不存在则初始化为空库；`opts.storage` 选后端，默认本地）。
     pub fn open(root: impl AsRef<Path>, opts: QsdbOptions) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        let store = Arc::new(Store::local(&root));
+        let store = match &opts.storage {
+            StorageConfig::Local => Store::local(&root),
+            #[cfg(feature = "s3")]
+            StorageConfig::S3 {
+                endpoint,
+                region,
+                bucket,
+                prefix,
+            } => {
+                let os = crate::remote::build_s3_store(endpoint.as_deref(), region.as_deref(), bucket)?;
+                let vroot = PathBuf::from(format!("s3://{bucket}/{prefix}"));
+                Store::remote(vroot, os, prefix.clone())
+            }
+        };
+        Self::open_with_store(root, opts, store)
+    }
+
+    /// 打开并注入自定义存储后端（测试/嵌入方；生产用 [`Qsdb::open`]）。
+    /// `root` 仍为本地目录（段缓存/文件锁等本地状态），命名空间以
+    /// `store.root()` 为准（Remote = 虚拟根 `s3://bucket/prefix`）。
+    pub fn open_with_store(root: impl AsRef<Path>, opts: QsdbOptions, store: Store) -> Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        let store = Arc::new(store);
         store
-            .create_dir_all(&root.join("_catalog"))
+            .create_dir_all(&store.root().join("_catalog"))
             .map_err(|e| QsdbError::meta(format!("init db root failed: {e}")))?;
         store
-            .create_dir_all(&db_dir(&root, DEFAULT_DB))
+            .create_dir_all(&db_dir(store.root(), DEFAULT_DB))
             .map_err(|e| QsdbError::meta(format!("init default db failed: {e}")))?;
         let cache = Arc::new(crate::cache::SegmentCache::new(opts.scan_cache_bytes));
         let runtime = Arc::new(QsdbRuntime::from_opts(&opts));
@@ -204,7 +274,7 @@ impl Qsdb {
     /// 批量追加：自动按分区列路由（跨分区自动拆分）。
     pub fn append(&self, table: &str, batches: &[RecordBatch]) -> Result<WriteResult> {
         let def = self.def(None, table)?;
-        let tdir = table_dir(&self.root, DEFAULT_DB, table);
+        let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
         let mut total = WriteResult::default();
         for batch in batches {
             for (values, data) in split_by_partition(batch, &def)? {
@@ -248,7 +318,7 @@ impl Qsdb {
             };
             ordered.push(v);
         }
-        let tdir = table_dir(&self.root, DEFAULT_DB, table);
+        let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
         // 输入与 append 同约定：全列批；库内剥离分区列并校验与目标分区一致
         let mut data_batches: Vec<RecordBatch> = Vec::with_capacity(batches.len());
         for batch in batches {
@@ -288,7 +358,7 @@ impl Qsdb {
 
     fn scan_inner(&self, req: ScanRequest, ctx: Arc<crate::query::QueryContext>) -> Result<Scan> {
         let def = self.def(req.db.as_deref(), &req.table)?;
-        let tdir = table_dir(&self.root, self.db_name(req.db.as_deref()), &req.table);
+        let tdir = table_dir(self.store.root(), self.db_name(req.db.as_deref()), &req.table);
         Scan::with_cache(
             &self.store,
             &tdir,
@@ -329,7 +399,7 @@ impl Qsdb {
     /// 非分区键谓词 → 报错（行级 DELETE 是独立大特性，见设计文档 M5）。
     pub fn delete_partitions_where(&self, table: &str, selection: Option<&str>) -> Result<u64> {
         let def = self.def(None, table)?;
-        let tdir = table_dir(&self.root, DEFAULT_DB, table);
+        let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
         // 无 WHERE = 清全表（等价 TRUNCATE）
         let Some(sel) = selection else {
             return self.truncate_table(table);
@@ -387,7 +457,8 @@ impl Qsdb {
         Ok(cleared)
     }
 
-    /// 清空单个分区（空 manifest 原子替换 + 旧文件 trash）。返回清除行数。
+    /// 清空单个分区（本地：空 manifest 原子替换 + 旧文件 trash；
+    /// 远端：OCC 空替换，旧对象由引用 GC 回收）。返回清除行数。
     fn clear_partition(
         &self,
         tdir: &std::path::Path,
@@ -403,6 +474,12 @@ impl Qsdb {
             &def.partition_keys,
             &ordered,
         )?);
+        if !self.store.is_local() {
+            #[cfg(feature = "s3")]
+            return self.clear_partition_remote(&dir, def, &ordered);
+            #[cfg(not(feature = "s3"))]
+            return Err(QsdbError::unsupported("remote store requires feature 's3'"));
+        }
         let _guard = crate::fsutil::PartitionLock::acquire(&dir.join(".lock"))?;
         let Some(old) = crate::manifest::PartitionManifest::read(&self.store, &dir)? else {
             return Ok(0);
@@ -432,7 +509,7 @@ impl Qsdb {
     /// 清空全表所有分区（保留表定义）。
     pub fn truncate_table(&self, table: &str) -> Result<u64> {
         let def = self.def(None, table)?;
-        let tdir = table_dir(&self.root, DEFAULT_DB, table);
+        let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
         let parts = crate::scan::list_partitions(&self.store, &tdir, def.partition_keys.len());
         let mut cleared = 0u64;
         for (pdir, _) in parts {
@@ -507,9 +584,16 @@ impl Qsdb {
 
     /// trash 清理 + 孤儿数据文件清扫。
     ///
-    /// 孤儿 = 分区目录内不被 manifest 引用且早于 `orphan_grace_ms` 的
+    /// 本地：孤儿 = 分区目录内不被 manifest 引用且早于 `orphan_grace_ms` 的
     /// `seg_*.parquet` / `*.tmp`。
+    /// 远端（§12 引用扫描式 GC）：list 表前缀全部对象 → 读分区 manifest（真值）
+    /// → 未被引用且 mtime 超过安全期（`orphan_grace_ms`，覆盖在途上传与
+    /// OCC 重试窗口）→ delete。安全期内的孤儿绝不删。
     pub fn gc(&self) -> Result<(u64, u64)> {
+        #[cfg(feature = "s3")]
+        if !self.store.is_local() {
+            return self.gc_remote();
+        }
         let (purged, mut freed) = purge_trash(&self.root, self.opts.trash_grace_ms)?;
         let orphan_grace = self.opts.trash_grace_ms;
         let tables = self.tables()?;
@@ -517,7 +601,7 @@ impl Qsdb {
             let Some(def) = self.def(None, table).ok() else {
                 continue;
             };
-            let tdir = table_dir(&self.root, DEFAULT_DB, table);
+            let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
             for (pdir, _) in crate::scan::list_partitions(&self.store, &tdir, def.partition_keys.len()) {
                 let Some(manifest) = crate::manifest::PartitionManifest::read(&self.store, &pdir)?
                 else {
@@ -561,23 +645,119 @@ impl Qsdb {
         Ok((purged, freed))
     }
 
-    /// 库统计（表数/总字节，含 trash）。
+    /// 远端清空分区：OCC 空替换（重放继承 generation）；旧对象由引用 GC 回收。
+    #[cfg(feature = "s3")]
+    fn clear_partition_remote(
+        &self,
+        dir: &std::path::Path,
+        def: &Arc<TableDef>,
+        ordered: &[Literal],
+    ) -> Result<u64> {
+        let mut rows = 0u64;
+        let mpath = crate::manifest::PartitionManifest::manifest_path(dir);
+        crate::remote::with_partition_mutex(dir, || {
+            crate::remote::occ_commit(&self.store, &mpath, |cur| {
+                let mut m = cur.unwrap_or_else(|| {
+                    crate::manifest::PartitionManifest::new(vec![], def.schema_fingerprint())
+                });
+                rows = m.total_rows();
+                m.partition_values = def
+                    .partition_keys
+                    .iter()
+                    .cloned()
+                    .zip(ordered.iter().cloned())
+                    .collect();
+                m.segments = Vec::new();
+                Ok(m)
+            })
+        })?;
+        Ok(rows)
+    }
+
+    /// 远端引用扫描式 GC（§12）：逐表 list 全部对象 → manifest 真值比对 →
+    /// 未引用且超安全期的 seg 对象删除。
+    #[cfg(feature = "s3")]
+    fn gc_remote(&self) -> Result<(u64, u64)> {
+        let grace = self.opts.trash_grace_ms;
+        let now = crate::fsutil::now_ms();
+        let mut freed = 0u64;
+        let tables = self.tables()?;
+        for table in &tables {
+            let Some(def) = self.def(None, table).ok() else {
+                continue;
+            };
+            let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
+            let objects = self.store.list_all(&tdir)?;
+            // manifest 真值：引用集（manifest 自身与 table.json/_index 恒保留）
+            let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for obj in &objects {
+                let name = obj.key.rsplit('/').next().unwrap_or_default();
+                if name == crate::manifest::MANIFEST_FILE {
+                    if let Some(bytes) = self.store.read(&self.store.root().join(&obj.key))? {
+                        if let Ok(m) =
+                            postcard::from_bytes::<crate::manifest::PartitionManifest>(&bytes)
+                        {
+                            for seg in &m.segments {
+                                if let Some(parent) = obj.key.rsplit_once('/') {
+                                    referenced.insert(format!("{}/{}", parent.0, seg.file_name));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for obj in objects {
+                let name = obj.key.rsplit('/').next().unwrap_or_default();
+                let is_seg = name.starts_with("seg_") && name.ends_with(".parquet");
+                if !is_seg || referenced.contains(&obj.key) {
+                    continue;
+                }
+                // 安全期：覆盖在途上传与 OCC 重试窗口
+                if now.saturating_sub(obj.mtime_ms) < grace {
+                    continue;
+                }
+                let _ = def.as_ref();
+                if self.store.delete_object(&self.store.root().join(&obj.key)).is_ok() {
+                    freed += obj.size;
+                }
+            }
+        }
+        Ok((0, freed))
+    }
+
+    /// 库统计（表数/总字节；本地含 trash，远端 = list 求和）。
     pub fn stats(&self) -> Result<(usize, u64)> {
         let tables = self.tables()?;
         let mut bytes = 0u64;
         for t in &tables {
-            bytes += dir_size(&table_dir(&self.root, DEFAULT_DB, t));
+            let tdir = table_dir(self.store.root(), DEFAULT_DB, t);
+            if self.store.is_local() {
+                bytes += dir_size(&tdir);
+            } else {
+                #[cfg(feature = "s3")]
+                {
+                    bytes += self.store.list_all(&tdir)?.iter().map(|o| o.size).sum::<u64>();
+                }
+                #[cfg(not(feature = "s3"))]
+                {
+                    let _ = tdir;
+                    return Err(QsdbError::unsupported("remote store requires feature 's3'"));
+                }
+            }
         }
-        bytes += dir_size(&self.root.join("_trash"));
+        if self.store.is_local() {
+            bytes += dir_size(&self.root.join("_trash"));
+        }
         Ok((tables.len(), bytes))
     }
 
     /// 表级 compaction（小文件合并；详见 `compact` 模块）。
     pub fn compact_table(&self, table: &str) -> Result<crate::compact::CompactResult> {
         let def = self.def(None, table)?;
-        let tdir = table_dir(&self.root, DEFAULT_DB, table);
+        let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
         crate::compact::compact_table(
             &self.store,
+            Some(&self.file_cache),
             &tdir,
             &def,
             &crate::compact::CompactOptions::default(),
@@ -591,8 +771,8 @@ impl Qsdb {
         opts: crate::compact::CompactOptions,
     ) -> Result<crate::compact::CompactResult> {
         let def = self.def(None, table)?;
-        let tdir = table_dir(&self.root, DEFAULT_DB, table);
-        crate::compact::compact_table(&self.store, &tdir, &def, &opts)
+        let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
+        crate::compact::compact_table(&self.store, Some(&self.file_cache), &tdir, &def, &opts)
     }
 
     /// 元数据应答：按谓词裁剪分区后，从 manifest 统计直接合成结果（不打开 parquet）。
@@ -608,7 +788,7 @@ impl Qsdb {
         if def.partition_keys.is_empty() {
             return Ok(None);
         }
-        let tdir = table_dir(&self.root, DEFAULT_DB, table);
+        let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
         let depth = def.partition_keys.len();
         let parts = crate::scan::list_partitions(&self.store, &tdir, depth);
         let mut total = 0u64;
@@ -675,7 +855,7 @@ impl Qsdb {
     /// 场景：索引损坏、跨进程写入造成 stale、或旧版本目录首次启用索引。
     pub fn refresh_index(&self, table: &str) -> Result<()> {
         let def = self.def(None, table)?;
-        let tdir = table_dir(&self.root, DEFAULT_DB, table);
+        let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
         crate::index::PartitionsIndex::rebuild(&self.store, &tdir, def.partition_keys.len())?;
         Ok(())
     }

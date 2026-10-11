@@ -51,6 +51,7 @@ impl Default for CompactOptions {
 /// 表级 compaction：遍历分区，满足条件的合并。返回累计结果。
 pub fn compact_table(
     store: &Store,
+    file_cache: Option<&Arc<crate::filecache::FileCache>>,
     table_dir: &Path,
     def: &Arc<TableDef>,
     opts: &CompactOptions,
@@ -59,7 +60,7 @@ pub fn compact_table(
     let partitions = list_partitions(store, table_dir, def.partition_keys.len());
     let results: Vec<Result<Option<SingleResult>>> = partitions
         .par_iter()
-        .map(|(pdir, _)| compact_partition(store, table_dir, def, pdir, opts))
+        .map(|(pdir, _)| compact_partition(store, file_cache, table_dir, def, pdir, opts))
         .collect();
     let mut total = CompactResult::default();
     for r in results {
@@ -80,7 +81,26 @@ struct SingleResult {
 }
 
 /// 单分区 compaction（不满足条件 → Ok(None)，不动任何文件）。
+#[cfg_attr(not(feature = "s3"), allow(unused_variables))]
 fn compact_partition(
+    store: &Store,
+    file_cache: Option<&Arc<crate::filecache::FileCache>>,
+    table_dir: &Path,
+    def: &Arc<TableDef>,
+    pdir: &Path,
+    opts: &CompactOptions,
+) -> Result<Option<SingleResult>> {
+    if !store.is_local() {
+        #[cfg(feature = "s3")]
+        return compact_partition_remote(store, file_cache, table_dir, def, pdir, opts);
+        #[cfg(not(feature = "s3"))]
+        return Err(QsdbError::unsupported("remote store requires feature 's3'"));
+    }
+    compact_partition_inner(store, table_dir, def, pdir, opts)
+}
+
+/// 本地 compaction（现状协议：flock + tmp+rename + trash + 索引）。
+fn compact_partition_inner(
     store: &Store,
     table_dir: &Path,
     def: &Arc<TableDef>,
@@ -257,6 +277,121 @@ fn write_merged(
 #[allow(unused)]
 fn _opts_hint(_: &RecordBatchOptions) {}
 
+// --- 远端 compaction（feature `s3`，§11：读走段缓存 → 内存合并 → PUT → OCC） ---
+
+#[cfg(feature = "s3")]
+fn compact_partition_remote(
+    store: &Store,
+    file_cache: Option<&Arc<crate::filecache::FileCache>>,
+    table_dir: &Path,
+    def: &Arc<TableDef>,
+    pdir: &Path,
+    opts: &CompactOptions,
+) -> Result<Option<SingleResult>> {
+    let Some(manifest) = PartitionManifest::read(store, pdir)? else {
+        return Ok(None);
+    };
+    if manifest.segments.len() < opts.min_segments.max(2) {
+        return Ok(None);
+    }
+    let avg = manifest
+        .segments
+        .iter()
+        .map(|s| s.byte_size)
+        .sum::<u64>()
+        / manifest.segments.len() as u64;
+    if avg >= opts.max_avg_segment_bytes {
+        return Ok(None);
+    }
+
+    crate::remote::with_partition_mutex(pdir, || {
+        // 进程内互斥下重读（等待期间可能已被其他写者变更）
+        let Some(manifest) = PartitionManifest::read(store, pdir)? else {
+            return Ok(None);
+        };
+        if manifest.segments.len() < 2 {
+            return Ok(None);
+        }
+
+        let schema = data_schema(def);
+        let want: Vec<(String, crate::types::LogicalType)> = def
+            .data_columns()
+            .iter()
+            .map(|c| (c.name.clone(), c.logical_type.clone()))
+            .collect();
+        // 读全部 segments（compaction 全读 → 段缓存准入 prefer_whole）
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        for seg in &manifest.segments {
+            let path = pdir.join(&seg.file_name);
+            let src = crate::scan::ChunkSource::open(
+                Some(store),
+                &crate::scan::FileLoc::Managed(path.clone()),
+                file_cache.map(|f| f.as_ref()),
+                true,
+            )?;
+            let reader = ParquetRecordBatchReaderBuilder::try_new(src)
+                .map_err(|e| QsdbError::meta(format!("read parquet {path:?}: {e}")))?
+                .with_batch_size(8192)
+                .with_projection(parquet::arrow::ProjectionMask::all())
+                .build()
+                .map_err(|e| QsdbError::meta(format!("build reader failed: {e}")))?;
+            for b in reader {
+                let b = b.map_err(|e| QsdbError::meta(format!("read batch failed: {e}")))?;
+                if b.num_rows() > 0 {
+                    let missing: Vec<(String, crate::types::LogicalType)> = want
+                        .iter()
+                        .filter(|(n, _)| b.schema().index_of(n).is_err())
+                        .cloned()
+                        .collect();
+                    let b = if missing.is_empty() {
+                        b
+                    } else {
+                        crate::scan::pad_missing_columns(b, &missing)?
+                    };
+                    batches.push(b);
+                }
+            }
+        }
+        let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        if rows == 0 {
+            return Ok(None);
+        }
+
+        // 合并写新 segment（内存缓冲 → PUT）
+        let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+        let entry = crate::write::put_segment_remote(
+            store,
+            pdir,
+            &batches,
+            &schema,
+            crate::write::writer_props(def)?,
+            &names,
+        )?;
+        let merged = manifest.segments.len() as u64;
+
+        // manifest OCC 替换提交（重放继承最新 generation）
+        let mpath = PartitionManifest::manifest_path(pdir);
+        let new_entry = entry.clone();
+        crate::remote::occ_commit(store, &mpath, |cur| {
+            let mut m = cur.unwrap_or_else(|| {
+                PartitionManifest::new(
+                    manifest.partition_values.clone(),
+                    def.schema_fingerprint(),
+                )
+            });
+            m.generation += 1;
+            m.segments = vec![new_entry.clone()];
+            Ok(m)
+        })?;
+        let _ = table_dir;
+        Ok(Some(SingleResult {
+            merged,
+            rows,
+            bytes_written: entry.byte_size,
+        }))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,7 +449,7 @@ mod tests {
 
         // compaction（默认阈值）
         let def = db.table_def("t").unwrap();
-        let r = compact_table(&store, &tdir, &def, &CompactOptions::default()).unwrap();
+        let r = compact_table(&store, None, &tdir, &def, &CompactOptions::default()).unwrap();
         assert_eq!(r.partitions_compacted, 1);
         assert_eq!(r.segments_merged, 6);
         assert_eq!(r.rows, 12);
@@ -355,6 +490,7 @@ mod tests {
         // min_segments=3：2 个不触发
         let r = compact_table(
             &store,
+            None,
             &tdir,
             &def,
             &CompactOptions {
@@ -367,6 +503,7 @@ mod tests {
         // min_segments=2：触发
         let r = compact_table(
             &store,
+            None,
             &tdir,
             &def,
             &CompactOptions {

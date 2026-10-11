@@ -28,6 +28,7 @@ struct Cli {
 }
 
 #[derive(Debug, clap::Subcommand)]
+#[allow(clippy::large_enum_variant)] // Server 参数最多、进程内单次构造
 enum Cmd {
     /// 交互式 SQL shell
     Shell {
@@ -75,6 +76,20 @@ enum Cmd {
         /// 远端外表（read_parquet s3://）段文件本地缓存（MB；0 = 关闭）
         #[arg(long, default_value_t = 0)]
         file_cache_mb: u64,
+        /// 存储后端类型：local（默认）| s3（需 --features s3 编译）
+        #[arg(long, default_value = "local")]
+        storage_type: String,
+        /// S3 兼容端点（AWS 官方留空；http:// 端点自动 allow_http）
+        #[arg(long)]
+        storage_endpoint: Option<String>,
+        #[arg(long)]
+        storage_region: Option<String>,
+        /// S3 bucket（storage type = s3 时必填）
+        #[arg(long)]
+        storage_bucket: Option<String>,
+        /// bucket 内 key 前缀（多租户/多库共存）
+        #[arg(long, default_value = "")]
+        storage_prefix: String,
     },
 }
 
@@ -163,9 +178,44 @@ fn main() {
             max_concurrent_queries,
             flight_bind,
             file_cache_mb,
+            storage_type,
+            storage_endpoint,
+            storage_region,
+            storage_bucket,
+            storage_prefix,
             config,
         } => {
+            // 存储后端解析（cli 层校验，错误走统一 exit 风格）
+            let storage = match storage_type.as_str() {
+                "local" => qsdb::api::StorageConfig::Local,
+                "s3" => {
+                    #[cfg(feature = "s3")]
+                    {
+                        let Some(bucket) = storage_bucket.clone() else {
+                            eprintln!("error: --storage-bucket is required for --storage-type s3");
+                            std::process::exit(1);
+                        };
+                        qsdb::api::StorageConfig::S3 {
+                            endpoint: storage_endpoint,
+                            region: storage_region,
+                            bucket,
+                            prefix: storage_prefix,
+                        }
+                    }
+                    #[cfg(not(feature = "s3"))]
+                    {
+                        let _ = (storage_endpoint, storage_region, storage_bucket, storage_prefix);
+                        eprintln!("error: --storage-type s3 requires building with --features s3");
+                        std::process::exit(1);
+                    }
+                }
+                other => {
+                    eprintln!("error: unknown --storage-type '{other}' (local|s3)");
+                    std::process::exit(1);
+                }
+            };
             let opts = QsdbOptions {
+                storage,
                 scan_cache_bytes: cache_mb * 1024 * 1024,
                 file_cache_bytes: file_cache_mb * 1024 * 1024,
                 ..Default::default()

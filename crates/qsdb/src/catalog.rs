@@ -222,8 +222,14 @@ fn write_table_names(store: &Store, db: &str, mut names: Vec<String>) -> Result<
 
 /// 建表：catalog 锁内（清单+目录+table.json）一次性落地。
 pub fn create_table(store: &Store, db: &str, def: &TableDef) -> Result<()> {
-    let root = store.root();
     def.validate()?;
+    if !store.is_local() {
+        #[cfg(feature = "s3")]
+        return create_table_remote(store, db, def);
+        #[cfg(not(feature = "s3"))]
+        return Err(QsdbError::unsupported("remote store requires feature 's3'"));
+    }
+    let root = store.root();
     let _guard = PartitionLock::acquire(&catalog_lock(root))?;
     let mut names = read_table_names(store, db)?;
     if names.iter().any(|n| n == &def.name) {
@@ -249,6 +255,12 @@ pub fn create_table(store: &Store, db: &str, def: &TableDef) -> Result<()> {
 
 /// 删表：目录整体移 trash，清单去名。
 pub fn drop_table(store: &Store, db: &str, table: &str) -> Result<()> {
+    if !store.is_local() {
+        #[cfg(feature = "s3")]
+        return drop_table_remote(store, db, table);
+        #[cfg(not(feature = "s3"))]
+        return Err(QsdbError::unsupported("remote store requires feature 's3'"));
+    }
     let root = store.root();
     let _guard = PartitionLock::acquire(&catalog_lock(root))?;
     let names = read_table_names(store, db)?;
@@ -265,6 +277,12 @@ pub fn drop_table(store: &Store, db: &str, table: &str) -> Result<()> {
 /// 原子替换。约束：列必须 nullable（NOT NULL 需 DEFAULT，后置）、不能与现有列/
 /// 分区键重名。旧 segment 读取时缺列补 NULL（scan::pad_missing_columns）。
 pub fn alter_add_column(store: &Store, db: &str, table: &str, column: ColumnDef) -> Result<()> {
+    if !store.is_local() {
+        #[cfg(feature = "s3")]
+        return alter_add_column_remote(store, db, table, column);
+        #[cfg(not(feature = "s3"))]
+        return Err(QsdbError::unsupported("remote store requires feature 's3'"));
+    }
     let root = store.root();
     let _guard = PartitionLock::acquire(&catalog_lock(root))?;
     let names = read_table_names(store, db)?;
@@ -371,6 +389,119 @@ pub(crate) mod serde_json_compat {
         serde_json::from_str(s)
             .map_err(|e| QsdbError::meta(format!("deserialize table.json failed: {e}")))
     }
+}
+
+// --- 远端 DDL（feature `s3`，存储设计 §5/§7.2：单对象 OCC） ------------------
+
+/// catalog 清单 OCC 更新（postcard Vec<String>；进程内 catalog 互斥）。
+/// `mutate` 必须可重放（幂等作用于最新清单）。
+#[cfg(feature = "s3")]
+fn catalog_occ(store: &Store, db: &str, mutate: impl Fn(Vec<String>) -> Result<Vec<String>>) -> Result<()> {
+    let path = catalog_file(store.root(), db);
+    crate::remote::occ_update_bytes(store, &path, |cur| {
+        let names: Vec<String> = cur
+            .as_deref()
+            .and_then(|b| postcard::from_bytes(b).ok())
+            .unwrap_or_default();
+        let next = mutate(names)?;
+        postcard::to_allocvec(&next)
+            .map_err(|e| QsdbError::meta(format!("serialize catalog failed: {e}")))
+    })
+}
+
+#[cfg(feature = "s3")]
+fn create_table_remote(store: &Store, db: &str, def: &TableDef) -> Result<()> {
+    let tdir = table_dir(store.root(), db, &def.name);
+    if store.exists(&tdir) {
+        return Err(QsdbError::already_exists(format!(
+            "table dir exists: {}",
+            tdir.display()
+        )));
+    }
+    let json = serde_json_compat::to_string(def)?;
+    // table.json 条件创建：不存在才写（并发建同表的互斥点）
+    if !store.put_if_etag(
+        &table_json_path(store.root(), db, &def.name),
+        json.as_bytes(),
+        None,
+    )? {
+        return Err(QsdbError::already_exists(format!(
+            "table {db}.{}",
+            def.name
+        )));
+    }
+    // 进程内 catalog 互斥（跨进程由 OCC 收敛）
+    crate::remote::with_partition_mutex(&store.root().join("_catalog"), || {
+        catalog_occ(store, db, |mut names| {
+            if names.iter().any(|n| n == &def.name) {
+                return Err(QsdbError::already_exists(format!(
+                    "table {db}.{}",
+                    def.name
+                )));
+            }
+            names.push(def.name.clone());
+            Ok(names)
+        })
+    })
+}
+
+#[cfg(feature = "s3")]
+fn drop_table_remote(store: &Store, db: &str, table: &str) -> Result<()> {
+    // 清单先去名（OCC）——此后表即「不存在」；对象随后尽力删除，
+    // 中断残留由 `gc` 引用扫描回收（不被任何表引用 = 孤儿）
+    crate::remote::with_partition_mutex(&store.root().join("_catalog"), || {
+        catalog_occ(store, db, |names| {
+            if !names.iter().any(|n| n == table) {
+                return Err(QsdbError::not_found(format!("table {db}.{table}")));
+            }
+            Ok(names.into_iter().filter(|n| n != table).collect())
+        })
+    })?;
+    let tdir = table_dir(store.root(), db, table);
+    for obj in store.list_all(&tdir)? {
+        let _ = store.delete_object(&store.root().join(obj.key));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "s3")]
+fn alter_add_column_remote(
+    store: &Store,
+    db: &str,
+    table: &str,
+    column: ColumnDef,
+) -> Result<()> {
+    let names = read_table_names(store, db)?;
+    if !names.iter().any(|n| n == table) {
+        return Err(QsdbError::not_found(format!("table {db}.{table}")));
+    }
+    let path = table_json_path(store.root(), db, table);
+    crate::remote::occ_update_bytes(store, &path, |cur| {
+        let text = cur
+            .map(String::from_utf8)
+            .transpose()
+            .map_err(|e| QsdbError::meta(format!("table.json not utf8: {e}")))?
+            .ok_or_else(|| QsdbError::meta("read table.json failed: not found"))?;
+        let mut def: TableDef = serde_json_compat::from_str(&text)?;
+        if !column.nullable {
+            return Err(QsdbError::invalid(
+                "ADD COLUMN must be nullable (NOT NULL needs DEFAULT, lands later)",
+            ));
+        }
+        if def.columns.iter().any(|c| c.name == column.name) {
+            return Err(QsdbError::already_exists(format!("column '{}'", column.name)));
+        }
+        if def.partition_keys.contains(&column.name) {
+            return Err(QsdbError::invalid(format!(
+                "column '{}' conflicts with a partition key",
+                column.name
+            )));
+        }
+        def.columns.push(column.clone());
+        def.validate()?;
+        let json = serde_json_compat::to_string(&def)?;
+        Ok(json.into_bytes())
+    })
 }
 
 #[cfg(test)]

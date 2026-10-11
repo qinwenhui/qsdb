@@ -37,6 +37,121 @@ static CTX: LazyLock<Ctx> = LazyLock::new(|| Ctx {
     stores: Mutex::new(HashMap::new()),
 });
 
+/// 共享 tokio 反应器（store.rs 桥接用）。
+pub(crate) fn rt() -> &'static tokio::runtime::Runtime {
+    &CTX.rt
+}
+
+/// 本进程 writer_epoch（manifest 诊断字段；每次进程启动随机）。
+/// 设计 §7.2：epoch 仅用于 GC 与诊断（识别过期写者孤儿），不参与正确性。
+pub(crate) fn writer_epoch() -> u64 {
+    static EPOCH: LazyLock<u64> = LazyLock::new(|| {
+        uuid::Uuid::now_v7()
+            .as_u64_pair()
+            .0
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    });
+    *EPOCH
+}
+
+// ---------------------------------------------------------------------------
+// OCC 提交协议（§7.2，M6-3 管理表）
+// ---------------------------------------------------------------------------
+
+/// OCC 提交循环：每轮重读 cur → `build(cur)` 生成新 manifest → 条件写；
+/// 冲突（并发写者先提交）→ 重试（**重放**而非报错——提交语义是
+/// 「至少一次加入」，重试对上层透明）。≤ 8 轮耗尽 → 报错。
+///
+/// `build` 收到 `None` = manifest 不存在（新分区）；每轮都基于最新 cur
+/// 重建，天然无 ABA 丢写。
+pub fn occ_commit(
+    store: &crate::store::Store,
+    manifest_path: &std::path::Path,
+    mut build: impl FnMut(Option<crate::manifest::PartitionManifest>) -> Result<crate::manifest::PartitionManifest>,
+) -> Result<()> {
+    const MAX_RETRIES: usize = 8;
+    let mut last_conflict = 0usize;
+    for round in 0..MAX_RETRIES {
+        let cur_bytes = store.get_with_etag(manifest_path)?;
+        let (etag, cur) = match cur_bytes {
+            Some((bytes, etag)) => {
+                let m: crate::manifest::PartitionManifest = postcard::from_bytes(&bytes)
+                    .map_err(|e| {
+                        crate::error::QsdbError::meta(format!(
+                            "corrupt manifest {}: {e}",
+                            manifest_path.display()
+                        ))
+                    })?;
+                (Some(etag), Some(m))
+            }
+            None => (None, None),
+        };
+        let mut next = build(cur)?;
+        next.writer_epoch = writer_epoch();
+        let bytes = postcard::to_allocvec(&next).map_err(|e| {
+            crate::error::QsdbError::meta(format!("serialize manifest failed: {e}"))
+        })?;
+        if store.put_if_etag(manifest_path, &bytes, etag.as_deref())? {
+            return Ok(());
+        }
+        last_conflict = round + 1;
+    }
+    Err(crate::error::QsdbError::meta(format!(
+        "OCC commit retries exhausted ({last_conflict} conflicts) on {} — \
+         too many concurrent writers on this partition",
+        manifest_path.display()
+    )))
+}
+
+/// 通用 OCC（字节级 read-mod-conditional-write）：catalog 清单 / table.json
+/// 等非 manifest 元数据对象的并发更新（§5：单对象 OCC）。
+pub(crate) fn occ_update_bytes(
+    store: &crate::store::Store,
+    path: &std::path::Path,
+    mut build: impl FnMut(Option<Vec<u8>>) -> Result<Vec<u8>>,
+) -> Result<()> {
+    const MAX_RETRIES: usize = 8;
+    for _ in 0..MAX_RETRIES {
+        let cur_bytes = store.get_with_etag(path)?;
+        let (etag, cur) = match cur_bytes {
+            Some((bytes, etag)) => (Some(etag), Some(bytes)),
+            None => (None, None),
+        };
+        let next = build(cur)?;
+        if store.put_if_etag(path, &next, etag.as_deref())? {
+            return Ok(());
+        }
+    }
+    Err(crate::error::QsdbError::meta(format!(
+        "OCC update retries exhausted on {} — too many concurrent writers",
+        path.display()
+    )))
+}
+
+// --- 进程内分区互斥（§8：进程内串行化后走 OCC，进程内无冲突重试） -----------
+
+static PARTITION_MUTEXES: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 进程内同分区写互斥（远端锁等价物：跨进程/多实例由 OCC 收敛）。
+/// 临界区经闭包执行，避免 guard 生命周期问题。
+pub(crate) fn with_partition_mutex<T>(
+    partition_dir: &std::path::Path,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let key = partition_dir.to_string_lossy().replace('\\', "/");
+    let mutex = {
+        let mut map = PARTITION_MUTEXES
+            .lock()
+            .map_err(|_| crate::error::QsdbError::meta("partition mutex map poisoned"))?;
+        Arc::clone(map.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))))
+    };
+    let _guard = mutex
+        .lock()
+        .map_err(|_| crate::error::QsdbError::meta("partition mutex poisoned"))?;
+    f()
+}
+
 /// 解析后的 S3 定位（单对象）。
 pub struct S3Locator {
     pub store: Arc<dyn ObjectStore>,
@@ -111,16 +226,14 @@ fn param<'a>(params: &'a [(String, String)], k: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
-/// 定位单对象（构建/复用 store 句柄）。
-pub(crate) fn locate(url: &str) -> Result<S3Locator> {
-    let (bucket, location, params) = split_url(url)?;
-    let endpoint = param(&params, "endpoint");
-    let region = param(&params, "region");
-    let key = format!("{}|{}|{}", endpoint.unwrap_or(""), region.unwrap_or(""), bucket);
-    if let Some(store) = CTX.stores.lock().ok().and_then(|m| m.get(&key).cloned()) {
-        return Ok(S3Locator { store, location });
-    }
-    let mut b = object_store::aws::AmazonS3Builder::from_env().with_bucket_name(&bucket);
+/// 构建 AmazonS3 句柄（QsdbOptions.storage 与 locate 共用配置规则：
+/// 环境变量凭据链 + endpoint/region 覆盖；`http://` 端点自动 allow_http）。
+pub fn build_s3_store(
+    endpoint: Option<&str>,
+    region: Option<&str>,
+    bucket: &str,
+) -> Result<Arc<dyn ObjectStore>> {
+    let mut b = object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
     if let Some(ep) = endpoint {
         if ep.starts_with("http://") {
             b = b.with_allow_http(true);
@@ -130,10 +243,22 @@ pub(crate) fn locate(url: &str) -> Result<S3Locator> {
     if let Some(r) = region {
         b = b.with_region(r);
     }
-    let store: Arc<dyn ObjectStore> = Arc::new(
+    Ok(Arc::new(
         b.build()
-            .map_err(|e| QsdbError::meta(format!("s3 client for {url}: {e}")))?,
-    );
+            .map_err(|e| QsdbError::meta(format!("s3 client for bucket {bucket}: {e}")))?,
+    ))
+}
+
+/// 定位单对象（构建/复用 store 句柄）。
+pub(crate) fn locate(url: &str) -> Result<S3Locator> {
+    let (bucket, location, params) = split_url(url)?;
+    let endpoint = param(&params, "endpoint");
+    let region = param(&params, "region");
+    let key = format!("{}|{}|{}", endpoint.unwrap_or(""), region.unwrap_or(""), bucket);
+    if let Some(store) = CTX.stores.lock().ok().and_then(|m| m.get(&key).cloned()) {
+        return Ok(S3Locator { store, location });
+    }
+    let store = build_s3_store(endpoint, region, &bucket)?;
     if let Ok(mut m) = CTX.stores.lock() {
         m.insert(key, Arc::clone(&store));
     }
@@ -142,17 +267,28 @@ pub(crate) fn locate(url: &str) -> Result<S3Locator> {
 
 /// HEAD：ETag + size。
 pub(crate) fn head(loc: &S3Locator) -> Result<ObjectMeta> {
-    CTX.rt
-        .block_on(loc.store.head(&loc.location))
-        .map_err(|e| QsdbError::meta(format!("s3 head {}: {e}", loc.location)))
+    head_parts(Arc::clone(&loc.store), &loc.location)
 }
 
-/// 流式整读（段缓存回填用）。
-pub(crate) fn stream_reader(loc: &S3Locator) -> Result<impl Read> {
+/// HEAD（句柄 + key 直用；管理表远端读取共用）。
+pub(crate) fn head_parts(
+    store: Arc<dyn ObjectStore>,
+    location: &StorePath,
+) -> Result<ObjectMeta> {
+    CTX.rt
+        .block_on(store.head(location))
+        .map_err(|e| QsdbError::meta(format!("s3 head {location}: {e}")))
+}
+
+/// 流式整读（句柄 + key 直用）。
+pub(crate) fn stream_parts(
+    store: Arc<dyn ObjectStore>,
+    location: StorePath,
+) -> Result<impl Read> {
     let result = CTX
         .rt
-        .block_on(loc.store.get(&loc.location))
-        .map_err(|e| QsdbError::meta(format!("s3 get {}: {e}", loc.location)))?;
+        .block_on(store.get(&location))
+        .map_err(|e| QsdbError::meta(format!("s3 get {location}: {e}")))?;
     Ok(StreamRead {
         stream: result.into_stream(),
         buf: Bytes::new(),

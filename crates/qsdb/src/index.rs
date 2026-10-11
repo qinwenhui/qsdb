@@ -123,6 +123,7 @@ mod tests {
                 column_stats: vec![],
             }],
             schema_fingerprint: 7,
+            writer_epoch: 0,
         }
     }
 

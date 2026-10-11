@@ -372,20 +372,23 @@ fn upper_bound_may_match(
 // 外表数据文件位置（read_parquet，M6-2）
 // ---------------------------------------------------------------------------
 
-/// 外表数据文件位置。
+/// 外表/管理表数据文件位置。
 #[derive(Debug, Clone)]
 pub enum FileLoc {
     Local(PathBuf),
-    /// 完整 `s3://bucket/key` URL（feature `s3`）
+    /// 完整 `s3://bucket/key` URL（feature `s3`，外表独立定位）
     #[cfg(feature = "s3")]
     S3(String),
+    /// 管理表 segment（虚拟路径；由持有者的 Store 解析——Local=真实路径直开，
+    /// Remote=按 root strip 推 key 走 range GET/段缓存）
+    Managed(PathBuf),
 }
 
 impl FileLoc {
-    /// 展示/缓存键路径（远端 = URL 字符串本身）。
+    /// 展示/缓存键路径（远端 = URL/虚拟路径字符串本身）。
     pub fn display_path(&self) -> PathBuf {
         match self {
-            Self::Local(p) => p.clone(),
+            Self::Local(p) | Self::Managed(p) => p.clone(),
             #[cfg(feature = "s3")]
             Self::S3(u) => PathBuf::from(u),
         }
@@ -533,8 +536,10 @@ pub(crate) enum ChunkSource {
 
 impl ChunkSource {
     /// `prefer_whole`：调用方将读取全部 row group 的提示（远端整文件缓存准入）。
-    #[cfg_attr(not(feature = "s3"), allow(unused_variables))]
+    /// `store`：Managed 位置的解析源（外表 Local/S3 不需要）。
+    #[allow(unused_variables)]
     pub(crate) fn open(
+        store: Option<&Store>,
         loc: &FileLoc,
         file_cache: Option<&crate::filecache::FileCache>,
         prefer_whole: bool,
@@ -546,29 +551,75 @@ impl ChunkSource {
             #[cfg(feature = "s3")]
             FileLoc::S3(url) => {
                 let l = crate::remote::locate(url)?;
-                let meta = crate::remote::head(&l)?;
-                if let (Some(fc), Some(etag)) = (file_cache, meta.e_tag.as_deref()) {
-                    if let Some(p) = fc.get(url, etag) {
-                        return File::open(p).map(Self::File).map_err(|e| {
-                            QsdbError::meta(format!("open cached {} failed: {e}", url))
-                        });
-                    }
-                    if prefer_whole {
-                        let mut rd = crate::remote::stream_reader(&l)?;
-                        let p = fc.insert(url, etag, &mut rd)?;
-                        return File::open(p).map(Self::File).map_err(|e| {
-                            QsdbError::meta(format!("open cached {} failed: {e}", url))
-                        });
-                    }
-                }
-                Ok(Self::Remote(crate::remote::RemoteReader::from_parts(
+                open_remote_object(
                     l.store,
                     l.location,
-                    meta.size,
-                )))
+                    url.to_string(),
+                    file_cache,
+                    prefer_whole,
+                )
+            }
+            FileLoc::Managed(p) => {
+                let Some(store) = store else {
+                    return Err(QsdbError::meta("managed file loc requires the db store"));
+                };
+                match store.kind() {
+                    crate::store::StoreKind::Local => {
+                        File::open(p).map(Self::File).map_err(|e| {
+                            QsdbError::meta(format!("open {} failed: {e}", p.display()))
+                        })
+                    }
+                    #[cfg(feature = "s3")]
+                    crate::store::StoreKind::Remote => {
+                        let handle = store.remote_handle().expect("remote kind implies handle");
+                        let key = store.remote_obj_key(p).expect("remote kind implies key");
+                        let disp = p.to_string_lossy().replace('\\', "/");
+                        open_remote_object(
+                            Arc::clone(handle),
+                            key,
+                            disp,
+                            file_cache,
+                            prefer_whole,
+                        )
+                    }
+                    #[cfg(not(feature = "s3"))]
+                    crate::store::StoreKind::Remote => {
+                        Err(QsdbError::unsupported("remote store requires feature 's3'"))
+                    }
+                }
             }
         }
     }
+}
+
+/// 远端对象打开（外表 s3:// 与管理表远端共用）：段缓存命中/整读回填 → 本地
+/// File；否则 range GET 惰性 reader。
+#[cfg(feature = "s3")]
+fn open_remote_object(
+    handle: Arc<dyn object_store::ObjectStore>,
+    key: object_store::path::Path,
+    cache_key: String,
+    file_cache: Option<&crate::filecache::FileCache>,
+    prefer_whole: bool,
+) -> Result<ChunkSource> {
+    let meta = crate::remote::head_parts(Arc::clone(&handle), &key)?;
+    if let (Some(fc), Some(etag)) = (file_cache, meta.e_tag.as_deref()) {
+        if let Some(lp) = fc.get(&cache_key, etag) {
+            return File::open(lp).map(ChunkSource::File).map_err(|e| {
+                QsdbError::meta(format!("open cached {cache_key} failed: {e}"))
+            });
+        }
+        if prefer_whole {
+            let mut rd = crate::remote::stream_parts(Arc::clone(&handle), key.clone())?;
+            let lp = fc.insert(&cache_key, etag, &mut rd)?;
+            return File::open(lp).map(ChunkSource::File).map_err(|e| {
+                QsdbError::meta(format!("open cached {cache_key} failed: {e}"))
+            });
+        }
+    }
+    Ok(ChunkSource::Remote(crate::remote::RemoteReader::from_parts(
+        handle, key, meta.size,
+    )))
 }
 
 pub(crate) enum ChunkRead {
@@ -626,7 +677,8 @@ impl parquet::file::reader::ChunkReader for ChunkSource {
 
 /// 读外表单文件的 arrow schema（footer，binder 期调用）。
 pub(crate) fn file_arrow_schema(loc: &FileLoc) -> Result<SchemaRef> {
-    let src = ChunkSource::open(loc, None, false)?;
+    // 外表专用（Local/S3），无需管理表 store
+    let src = ChunkSource::open(None, loc, None, false)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(src)
         .map_err(|e| QsdbError::meta(format!("read parquet footer {}: {e}", loc.display_path().display())))?;
     Ok(Arc::clone(builder.schema()))
@@ -935,8 +987,8 @@ fn add_partition_files(
                 continue;
             }
         }
-        let loc = FileLoc::Local(pdir.join(&seg.file_name));
-        let row_groups = prune_row_groups(&loc, plan, None)?;
+        let loc = FileLoc::Managed(pdir.join(&seg.file_name));
+        let row_groups = prune_row_groups(store, &loc, plan, None)?;
         files.push(FilePlan {
             loc,
             partition_values: pvals.clone(),
@@ -949,6 +1001,7 @@ fn add_partition_files(
 /// parquet footer row group 裁剪（数值/字符串；无统计/失败 → 全读）。
 /// 字节源经 [`ChunkSource`]（本地 File / 远端 range GET）。
 fn prune_row_groups(
+    store: &Store,
     loc: &FileLoc,
     plan: &ScanPlan,
     file_cache: Option<&crate::filecache::FileCache>,
@@ -973,7 +1026,7 @@ fn prune_row_groups(
     }
 
     let disp = loc.display_path();
-    let src = ChunkSource::open(loc, file_cache, false)?;
+    let src = ChunkSource::open(Some(store), loc, file_cache, false)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(src)
         .map_err(|e| QsdbError::meta(format!("read parquet footer {}: {e}", disp.display())))?;
     let meta = builder.metadata();
@@ -1271,9 +1324,9 @@ fn constant_array(lit: &Literal, dt: &DataType, n: usize) -> Result<ArrayRef> {
 }
 
 /// 文件 row group 数（分片细分用；失败由调用方回退文件粒度）。
-fn row_group_count(loc: &FileLoc) -> Result<usize> {
+fn row_group_count(store: &Store, loc: &FileLoc) -> Result<usize> {
     let disp = loc.display_path();
-    let src = ChunkSource::open(loc, None, false)?;
+    let src = ChunkSource::open(Some(store), loc, None, false)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(src)
         .map_err(|e| QsdbError::meta(format!("read parquet footer {}: {e}", disp.display())))?;
     Ok(builder.metadata().num_row_groups())
@@ -1386,7 +1439,7 @@ impl Scan {
         let plan = ScanPlan::build(def, projection, predicate, limit)?;
         let mut plans = Vec::with_capacity(files.len());
         for loc in files {
-            let row_groups = prune_row_groups(&loc, &plan, file_cache.as_deref())?;
+            let row_groups = prune_row_groups(store, &loc, &plan, file_cache.as_deref())?;
             plans.push(FilePlan {
                 loc,
                 partition_values: HashMap::new(),
@@ -1430,7 +1483,7 @@ impl Scan {
         };
         for f in &self.files {
             if split > 1 {
-                if let Ok(nrg) = row_group_count(&f.loc) {
+                if let Ok(nrg) = row_group_count(&self.store, &f.loc) {
                     let universe: Vec<usize> = match &f.row_groups {
                         Some(list) if !list.is_empty() => list.clone(),
                         _ => (0..nrg).collect(),
@@ -1499,6 +1552,7 @@ impl Scan {
         self.missing_cols.clear();
         let disp = file.loc.display_path();
         let src = ChunkSource::open(
+            Some(&self.store),
             &file.loc,
             self.file_cache.as_deref(),
             file.row_groups.is_none(),
@@ -1525,9 +1579,13 @@ impl Scan {
                 }
             }
         }
-        // 热缓存：命中零解码（签名 stat 经 Store；远端文件不经内存批缓存——
-        // 其本地性由段缓存承载）
-        if let (Some(cache), FileLoc::Local(_)) = (&self.cache, &file.loc) {
+        // 热缓存：命中零解码（签名 stat 经 Store）。外表 s3:// 不经内存批缓存
+        // （路径非本地，其本地性由段缓存承载）；管理表（本地/远端）照常。
+        #[cfg(feature = "s3")]
+        let cacheable = !matches!(file.loc, FileLoc::S3(_));
+        #[cfg(not(feature = "s3"))]
+        let cacheable = true;
+        if let (Some(cache), true) = (&self.cache, cacheable) {
             if cache.is_enabled() {
                 if let Ok(Some(md)) = self.store.stat(&disp) {
                     if let Some(hit) = cache.get(
