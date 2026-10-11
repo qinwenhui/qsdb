@@ -122,6 +122,23 @@ enum AdminCmd {
     Gc,
     /// 小文件合并
     Compact { table: String },
+    /// 添加用户（角色 admin|writer|reader；密码可经 --password 或交互输入）
+    UserAdd {
+        name: String,
+        role: String,
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// 删除用户
+    UserDrop { name: String },
+    /// 改密码
+    UserPasswd {
+        name: String,
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// 用户清单
+    UserList,
 }
 
 fn main() {
@@ -167,6 +184,85 @@ fn main() {
                         std::process::exit(1);
                     }
                 },
+                AdminCmd::UserAdd { name, role, password } => {
+                    let r = qsdb::users::Role::from_name(&role)
+                        .unwrap_or_else(|e| {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        });
+                    let pw = match password {
+                        Some(p) => p,
+                        None => {
+                            eprint!("password for '{name}': ");
+                            std::io::stdout().flush().unwrap();
+                            let mut line = String::new();
+                            std::io::stdin().read_line(&mut line).unwrap();
+                            line.trim().to_string()
+                        }
+                    };
+                    match qsdb::users::UserStore::add(db.store(), &name, &pw, r) {
+                        Ok(()) => {
+                            println!("user '{name}' added ({})", r.name());
+                            return;
+                        }
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                AdminCmd::UserDrop { name } => {
+                    match qsdb::users::UserStore::drop_user(db.store(), &name) {
+                        Ok(()) => {
+                            println!("user '{name}' dropped");
+                            return;
+                        }
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                AdminCmd::UserPasswd { name, password } => {
+                    let pw = match password {
+                        Some(p) => p,
+                        None => {
+                            eprint!("new password for '{name}': ");
+                            std::io::stdout().flush().unwrap();
+                            let mut line = String::new();
+                            std::io::stdin().read_line(&mut line).unwrap();
+                            line.trim().to_string()
+                        }
+                    };
+                    match qsdb::users::UserStore::set_password(db.store(), &name, &pw) {
+                        Ok(()) => {
+                            println!("password updated for '{name}'");
+                            return;
+                        }
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                AdminCmd::UserList => {
+                    match qsdb::users::UserStore::list(db.store()) {
+                        Ok(users) => {
+                            if users.is_empty() {
+                                println!("(no users)");
+                            } else {
+                                for (n, r) in users {
+                                    println!("{n:<20} {}", r.name());
+                                }
+                            }
+                            return;
+                        }
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
                 AdminCmd::Gc => match db.gc() {
                     Ok((purged, freed)) => {
                         println!("gc: {purged} entries, {} bytes freed", freed);

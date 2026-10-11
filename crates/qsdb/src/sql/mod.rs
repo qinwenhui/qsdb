@@ -44,6 +44,63 @@ pub fn execute_sql_ctx(
     crate::query::run_isolated(|| execute_inner(db, sql, ctx))
 }
 
+/// 角色权限检查（server 传入；嵌入方可选使用 sql_with_role）。
+/// 语句类型 × 角色矩阵——拒绝在 parse 后、执行前。
+pub fn check_role_permission(
+    stmt: &translate::ParsedStatement,
+    role: crate::users::Role,
+) -> Result<()> {
+    use translate::ParsedStatement as PS;
+    let deny = |what: &str| {
+        Err(QsdbError::invalid(format!(
+            "role '{}' cannot execute {} (requires {})",
+            role.name(),
+            what,
+            match what {
+                "write operations" => "writer",
+                _ => "admin",
+            }
+        )))
+    };
+    match stmt {
+        // 只读：任意角色
+        PS::Select(_) | PS::Describe { .. } | PS::ShowTables | PS::ShowPartitions { .. }
+        | PS::ShowUsers => Ok(()),
+        // 写：Writer 及以上
+        PS::Insert { .. } | PS::Delete { .. } => {
+            if role.can_write() { Ok(()) } else { deny("write operations") }
+        }
+        // DDL + 运维 + 用户管理：Admin
+        PS::CreateTable { .. } | PS::DropTable { .. } | PS::AlterAddColumn { .. }
+        | PS::Truncate { .. } | PS::CreateUser { .. } | PS::DropUser { .. }
+        | PS::AlterUser { .. } => {
+            if role.is_admin() { Ok(()) } else { deny("DDL/admin operations") }
+        }
+    }
+}
+
+/// 带角色闸门的 SQL 执行（server 认证后传入用户角色；嵌入方宿主可选使用）。
+pub fn execute_sql_with_role(
+    db: &Qsdb,
+    sql: &str,
+    role: crate::users::Role,
+    ctx: &Arc<crate::query::QueryContext>,
+) -> Result<SqlResult> {
+    crate::query::run_isolated(|| {
+        let mut stmts = translate::parse_statements(sql)?;
+        if stmts.len() != 1 {
+            return Err(QsdbError::invalid(
+                "multiple statements in one call are not supported; execute one by one",
+            ));
+        }
+        let stmt = stmts.pop().unwrap();
+        check_role_permission(&stmt, role)?;
+        // 复用主执行器：重新序列化回单条再走 execute（避免复制整个 match）
+        drop(stmt);
+        execute_inner(db, sql, ctx)
+    })
+}
+
 fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) -> Result<SqlResult> {
     ctx.check()?;
     let mut stmts = translate::parse_statements(sql)?;
@@ -142,6 +199,53 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
                 schema,
                 batches: vec![batch],
             })
+        }
+        translate::ParsedStatement::ShowUsers => {
+            let users = crate::users::UserStore::list(db.store())?;
+            let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("user", arrow::datatypes::DataType::Utf8, true),
+                arrow::datatypes::Field::new("role", arrow::datatypes::DataType::Utf8, true),
+            ]));
+            use arrow::array::StringArray;
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(
+                        users.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        users.iter().map(|(_, r)| r.name().to_string()).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .map_err(|e| QsdbError::invalid(format!("show users output: {e}")))?;
+            Ok(SqlResult::Query { schema, batches: vec![batch] })
+        }
+        translate::ParsedStatement::CreateUser { name, password, role } => {
+            crate::users::UserStore::add(db.store(), &name, &password, role)?;
+            Ok(SqlResult::Ok { message: format!("user '{name}' created ({})", role.name()) })
+        }
+        translate::ParsedStatement::DropUser { name, if_exists } => {
+            match crate::users::UserStore::drop_user(db.store(), &name) {
+                Ok(()) => Ok(SqlResult::Ok { message: format!("user '{name}' dropped") }),
+                Err(e) if if_exists && matches!(e, QsdbError::NotFound(_)) => {
+                    Ok(SqlResult::Ok { message: format!("user '{name}' dropped") })
+                }
+                Err(e) => Err(e),
+            }
+        }
+        translate::ParsedStatement::AlterUser { name, action } => {
+            use translate::UserAlterAction;
+            match action {
+                UserAlterAction::SetPassword(pw) => {
+                    crate::users::UserStore::set_password(db.store(), &name, &pw)?;
+                    Ok(SqlResult::Ok { message: format!("password updated for '{name}'") })
+                }
+                UserAlterAction::SetRole(r) => {
+                    crate::users::UserStore::set_role(db.store(), &name, r)?;
+                    Ok(SqlResult::Ok { message: format!("role updated to {} for '{name}'", r.name()) })
+                }
+            }
         }
         translate::ParsedStatement::ShowPartitions { table } => {
             let def = db.table_def(&table)?;

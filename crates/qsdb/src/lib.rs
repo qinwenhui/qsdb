@@ -33,6 +33,7 @@ pub mod staging;
 pub mod stats;
 pub mod store;
 pub mod types;
+pub mod users;
 pub mod write;
 pub mod write_buffer;
 
@@ -45,4 +46,5 @@ pub use manifest::{ColumnStats, SegmentEntry};
 pub use scan::{Predicate, Scan};
 pub use store::Store;
 pub use types::{Literal, LogicalType};
+pub use users::{Role, UserStore};
 pub use write::WriteResult;

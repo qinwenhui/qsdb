@@ -67,6 +67,33 @@
 | compaction 触发 | CompactOptions（代码默认 ≥4 段且均值 <64MB） | ❌ | 见 `qsdb admin compact` |
 | Flight 监听口 | `--flight-bind` / 关 | ❌ | Arrow Flight 数据面（h2c，独立于 HTTP）；需 `--features flight` 编译（默认关闭守二进制红线）。鉴权复用 `--token`（Bearer metadata）。do_get ticket=SQL；do_put 首帧 descriptor cmd=`table:<名>` |
 
+## 五·五、用户体系（M7-A）
+
+三角色（`admin | writer | reader`）：
+| 能力 | reader | writer | admin |
+|---|---|---|---|
+| SELECT / SHOW / DESCRIBE | ✓ | ✓ | ✓ |
+| INSERT / POST /write | ✗ | ✓ | ✓ |
+| DDL（CREATE/DROP/ALTER/TRUNCATE/DELETE） | ✗ | ✗ | ✓ |
+| compact / gc / refresh-index / 用户管理 / PUT /config | ✗ | ✗ | ✓ |
+
+**认证方式**（server）：
+| 方式 | 形态 | 说明 |
+|---|---|---|
+| Bearer 用户 token | `Authorization: Bearer <token>` | `POST /api/v1/auth/login`（Basic）签发，进程内存态（重启重登） |
+| Basic | `Authorization: Basic base64(user:pass)` | 每次请求校验（~5ms 密码哈希） |
+| `--token` 超级凭证 | `Authorization: Bearer <--token值>` | Admin 等效（运维后门，保留） |
+
+**用户存储**：`_catalog/users.json`（进程外可直接读不可改——密码哈希 + catalog 锁内原子写）。
+
+**SQL 管理**（Admin 专属）：`CREATE USER name WITH PASSWORD 'pw' [ROLE r]`、`DROP USER name [IF EXISTS]`、`ALTER USER name SET PASSWORD 'pw' / SET ROLE r`、`SHOW USERS`。默认角色 = writer。
+
+**CLI**：`qsdb admin user add <名> <角色> [--password <密码>]`（未传则交互输入）、`user drop <名>`、`user passwd <名>`、`user list`。
+
+**零配置零变化**：不建用户 + 不设 `--token` = 完全开放（现状兼容）；建了用户即要求认证。嵌入模式不受影响（宿主自控，`sql_with_role()` 可选）。
+
+**密码哈希**：SHA-256(password ‖ 16B salt) 迭代 10,000 次（内网部署口径）。
+
 ## 六、运行时查看 / 修改通道
 
 ```

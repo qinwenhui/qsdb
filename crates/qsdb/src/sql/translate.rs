@@ -89,6 +89,11 @@ pub enum LogicalPlan {
 // 语句解析
 // ---------------------------------------------------------------------------
 
+pub enum UserAlterAction {
+    SetPassword(String),
+    SetRole(crate::users::Role),
+}
+
 /// INSERT VALUES 行集（每行按给定列序的字面量）
 pub type InsertRows = Vec<Vec<Literal>>;
 
@@ -125,6 +130,24 @@ pub enum ParsedStatement {
         table: String,
         selection: Option<String>,
     },
+    // -- 用户体系（M7-A；Admin 专属，见 check_role_permission）----------
+    /// CREATE USER name WITH PASSWORD 'pw' [ROLE admin|writer|reader]
+    CreateUser {
+        name: String,
+        password: String,
+        role: crate::users::Role,
+    },
+    /// DROP USER name [IF EXISTS]
+    DropUser {
+        name: String,
+        if_exists: bool,
+    },
+    /// ALTER USER name SET PASSWORD 'pw' / SET ROLE r
+    AlterUser {
+        name: String,
+        action: UserAlterAction,
+    },
+    ShowUsers,
     Truncate {
         table: String,
     },
@@ -136,6 +159,33 @@ pub fn parse_statements(sql: &str) -> Result<Vec<ParsedStatement>> {
     // 轻量语句手解析（SHOW/DESCRIBE 不在通用方言稳定支持范围）
     if upper == "SHOW TABLES" {
         return Ok(vec![ParsedStatement::ShowTables]);
+    }
+    // -- 用户体系手工解析（sqlparser 无用户语法；Admin 专属）----------
+    if upper == "SHOW USERS" {
+        return Ok(vec![ParsedStatement::ShowUsers]);
+    }
+    if let Some(rest) = upper.strip_prefix("CREATE USER ") {
+        // CREATE USER name WITH PASSWORD 'pw' [ROLE r]
+        if let Some(caps) = parse_create_user(rest, trimmed) {
+            return Ok(vec![caps]);
+        }
+    }
+    if let Some(rest) = upper.strip_prefix("DROP USER ") {
+        let rest = rest.trim();
+        let if_exists = rest.starts_with("IF EXISTS ");
+        let name = rest.trim_start_matches("IF EXISTS ").trim();
+        if is_ident_str(name) {
+            return Ok(vec![ParsedStatement::DropUser {
+                name: name.to_ascii_lowercase(),
+                if_exists,
+            }]);
+        }
+    }
+    if let Some(rest) = upper.strip_prefix("ALTER USER ") {
+        // ALTER USER name SET PASSWORD 'pw' | SET ROLE r
+        if let Some((name, action)) = parse_alter_user(rest, trimmed) {
+            return Ok(vec![ParsedStatement::AlterUser { name, action }]);
+        }
     }
     if upper.starts_with("SHOW PARTITIONS ") {
         let rest = &trimmed["SHOW PARTITIONS".len()..].trim_start();
@@ -428,6 +478,79 @@ fn translate_statement(stmt: SqlStatement, raw: &str) -> Result<ParsedStatement>
             "statement {other:?} not supported in this version (SQL-1)"
         ))),
     }
+}
+
+fn is_ident_str(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// CREATE USER 解析（upper 前缀已剥；原串用于密码提取保留大小写）。
+fn parse_create_user(upper_rest: &str, orig: &str) -> Option<ParsedStatement> {
+    // upper_rest: "NAME WITH PASSWORD 'pw' [ROLE r]"（密码在 orig 中同位置）
+    let mut parts = upper_rest.splitn(2, " WITH PASSWORD ");
+    let name = parts.next()?.trim();
+    if !is_ident_str(name) || name.contains(' ') {
+        return None;
+    }
+    let after_pw = parts.next()?.trim();
+    // 密码：'pw' 到闭合单引号（跳过开头的 '）
+    if !after_pw.starts_with('\'') {
+        return None;
+    }
+    let close = after_pw[1..].find('\'').map(|i| i + 1)?;
+    let pw_upper = &after_pw[1..close];
+    let role_part = after_pw[close + 1..].trim();
+    // 密码原样大小写：在原串中找同名段（upper 位置一致）
+    let pw = extract_password(orig, pw_upper)?;
+    let role = if role_part.is_empty() {
+        crate::users::Role::Writer // 默认写角色
+    } else {
+        let r = role_part.strip_prefix("ROLE ")?;
+        crate::users::Role::from_name(r.trim()).ok()?
+    };
+    Some(ParsedStatement::CreateUser {
+        name: name.to_ascii_lowercase(),
+        password: pw,
+        role,
+    })
+}
+
+/// 密码从原 SQL 提取（upper 变换保留原大小写）。
+fn extract_password(orig: &str, pw_upper: &str) -> Option<String> {
+    // 找 upper 中 pw_upper 的位置，取原串同位置（密码含引号内任意字符）
+    let orig_upper = orig.to_ascii_uppercase();
+    let idx = orig_upper.find(pw_upper)?;
+    Some(orig[idx..idx + pw_upper.len()].to_string())
+}
+
+/// ALTER USER name SET PASSWORD 'pw' | SET ROLE r。
+fn parse_alter_user(upper_rest: &str, orig: &str) -> Option<(String, UserAlterAction)> {
+    let rest = upper_rest.trim();
+    let (name, action_str) = rest.split_once(" SET ")?;
+    let name = name.trim().to_ascii_lowercase();
+    if !is_ident_str(&name) {
+        return None;
+    }
+    let action_str = action_str.trim();
+    if let Some(pw_part) = action_str.strip_prefix("PASSWORD ") {
+        let pw_part = pw_part.trim();
+        if pw_part.starts_with('\'') && pw_part.ends_with('\'') && pw_part.len() >= 2 {
+            // 密码保留原大小写：从原 SQL 提取（upper 变换会丢失）
+            let pw_upper = &pw_part[1..pw_part.len() - 1];
+            let pw = extract_password(orig, pw_upper)?;
+            return Some((name, UserAlterAction::SetPassword(pw)));
+        }
+        return None;
+    }
+    if let Some(r) = action_str.strip_prefix("ROLE ") {
+        let role = crate::users::Role::from_name(r.trim()).ok()?;
+        return Some((name, UserAlterAction::SetRole(role)));
+    }
+    None
 }
 
 /// `PARTITIONED BY (dt, region)` / `PARTITION BY (...)` 手工提取

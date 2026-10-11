@@ -12,6 +12,7 @@ name = "qsdb"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.22"
 qsdb = { workspace = true }
 clap = { workspace = true }
 rustyline = { workspace = true }
@@ -31,3 +32,4 @@ flight = ["dep:arrow-flight", "dep:tonic", "dep:futures"]
 s3 = ["qsdb/s3"]
 ## HDFS 管理表（hdfs-native 纯 Rust 客户端）。默认关闭守二进制红线。
 hdfs = ["qsdb/hdfs"]
+

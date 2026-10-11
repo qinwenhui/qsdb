@@ -37,6 +37,8 @@ pub struct QueryEntry {
 
 /// 服务共享状态。
 pub struct AppState {
+    /// 用户 token 表（token → role；登录签发，进程内存态）
+    pub tokens: std::sync::Mutex<std::collections::HashMap<String, qsdb::users::Role>>,
     pub db: Arc<Qsdb>,
     pub writer: WriteBuffer,
     pub token: Option<String>,
@@ -166,6 +168,7 @@ pub async fn serve(
     }
     let writer = db.writer(WriteBufferOptions::default());
     let state = Arc::new(AppState {
+        tokens: std::sync::Mutex::new(HashMap::new()),
         db,
         writer,
         token,
@@ -179,6 +182,7 @@ pub async fn serve(
     let app = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
+        .route("/api/v1/auth/login", post(auth_login))
         .route("/api/v1/query", post(query))
         .route("/api/v1/write", post(write))
         .route("/api/v1/tables", get(tables))
@@ -284,22 +288,114 @@ pub async fn serve(
 // handlers
 // ---------------------------------------------------------------------------
 
-fn auth(state: &AppState, headers: &HeaderMap) -> StatusCode {
-    match &state.token {
-        None => StatusCode::OK,
-        Some(expect) => match headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-        {
-            Some(got) if got == expect => StatusCode::OK,
-            _ => StatusCode::UNAUTHORIZED,
-        },
+/// 认证结果：角色（None = 401）。
+/// 优先级：Bearer 用户 token > Basic 用户名密码 > Bearer 超级 token > 超级 token 直连 > 开放。
+fn auth_role(state: &AppState, headers: &HeaderMap) -> Option<qsdb::users::Role> {
+    let auth_header = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    // 用户 token 表（登录后签发的 Bearer）
+    if let Some(h) = &auth_header {
+        if let Some(token) = h.strip_prefix("Bearer ") {
+            if let Some(role) = state.tokens.lock().ok()?.get(token).copied() {
+                return Some(role);
+            }
+        }
     }
+    // Basic 用户名密码
+    if let Some(h) = &auth_header {
+        if let Some(b64) = h.strip_prefix("Basic ") {
+            if let Some(role) = auth_basic(state, b64) {
+                return Some(role);
+            }
+        }
+    }
+    // 超级 token（向后兼容：Admin 等效）
+    match (&state.token, &auth_header) {
+        (Some(expect), Some(h)) => {
+            if h.strip_prefix("Bearer ").map(|t| t == expect.as_str()).unwrap_or(false) {
+                return Some(qsdb::users::Role::Admin);
+            }
+            None
+        }
+        (Some(_), None) => None,
+        // 无 token 配置 = 用户体系关闭？若有用户文件则要求认证，否则开放
+        (None, _) => {
+            let has_users = qsdb::users::UserStore::read_all(state.db.store())
+                .map(|u| !u.is_empty())
+                .unwrap_or(false);
+            if has_users {
+                None // 有用户但未认证 → 401
+            } else {
+                Some(qsdb::users::Role::Admin) // 完全开放（现状兼容）
+            }
+        }
+    }
+}
+
+fn auth_basic(state: &AppState, b64: &str) -> Option<qsdb::users::Role> {
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .ok()?;
+    let text = String::from_utf8(decoded).ok()?;
+    let (user, pass) = text.split_once(':')?;
+    qsdb::users::UserStore::verify(state.db.store(), user, pass)
+}
+
+/// 兼容旧调用（仅查 401）。
+fn auth(state: &AppState, headers: &HeaderMap) -> StatusCode {
+    match auth_role(state, headers) {
+        Some(_) => StatusCode::OK,
+        None => StatusCode::UNAUTHORIZED,
+    }
+}
+
+/// 生成随机 token（hex 32 字节）。
+fn new_token() -> String {
+    // base64(时间戳 ns + 计数器 + 进程启动随机盐)——足够随机且无新依赖
+    use std::time::Instant;
+    use std::sync::atomic::AtomicU64;
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    static BOOT: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    let boot = *BOOT.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    });
+    let c = CTR.fetch_add(1, Ordering::Relaxed);
+    let now = Instant::now().elapsed().as_nanos();
+    let seed = boot ^ (now << 64) ^ ((c as u128) << 32);
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(seed.to_le_bytes())
 }
 
 fn err_response(status: StatusCode, msg: String) -> Response {
     (status, Json(serde_json::json!({ "error": msg }))).into_response()
+}
+
+/// POST /api/v1/auth/login：Basic 认证 → 签发 Bearer token（进程内存态）。
+async fn auth_login(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(role) = auth_role(&s, &headers) else {
+        return err_response(StatusCode::UNAUTHORIZED, "invalid credentials".into());
+    };
+    let token = new_token();
+    if let Ok(mut t) = s.tokens.lock() {
+        t.insert(token.clone(), role);
+    }
+    Json(serde_json::json!({
+        "token": token,
+        "role": role.name(),
+        "note": "process-lifetime token; restart requires re-login"
+    }))
+    .into_response()
 }
 
 async fn health(State(_s): State<Arc<AppState>>) -> impl IntoResponse {
@@ -338,9 +434,9 @@ async fn query(
     headers: HeaderMap,
     Json(body): Json<QueryBody>,
 ) -> Response {
-    if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
+    let Some(role) = auth_role(&s, &headers) else {
         return err_response(StatusCode::UNAUTHORIZED, "unauthorized".into());
-    }
+    };
     s.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
     // 会话：每请求一个 QueryContext（超时可经 X-QSDB-Timeout 头覆盖）
     let timeout_ms: Option<u64> = headers
@@ -359,7 +455,9 @@ async fn query(
     let sql = body.sql;
     let fmt = body.format.unwrap_or_else(|| "json".into());
     let ctx_exec = Arc::clone(&ctx);
-    let result = tokio::task::spawn_blocking(move || st.db.sql_with_context(&sql, &ctx_exec)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        st.db.sql_with_role_and_context(&sql, role, &ctx_exec)
+    }).await;
     reg.unregister_query(&query_id);
     let elapsed = t.elapsed().as_nanos() as u64;
     s.metrics.observe_query(elapsed);

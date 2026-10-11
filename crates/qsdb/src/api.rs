@@ -712,6 +712,27 @@ impl Qsdb {
         self.sql_with_context(sql, &ctx)
     }
 
+    /// 带角色闸门的 SQL 执行（server 认证后调用；嵌入方宿主可选）。
+    /// 语句类型 × 角色矩阵在 parse 后执行前检查（见 sql::check_role_permission）。
+    pub fn sql_with_role(
+        &self,
+        sql: &str,
+        role: crate::users::Role,
+    ) -> Result<crate::sql::SqlResult> {
+        let ctx = self.new_query_context(None);
+        crate::sql::execute_sql_with_role(self, sql, role, &ctx)
+    }
+
+    /// 带角色 + 上下文（server 用，可取消/超时）。
+    pub fn sql_with_role_and_context(
+        &self,
+        sql: &str,
+        role: crate::users::Role,
+        ctx: &Arc<crate::query::QueryContext>,
+    ) -> Result<crate::sql::SqlResult> {
+        crate::sql::execute_sql_with_role(self, sql, role, ctx)
+    }
+
     /// 带外部上下文执行（可取消/超时/记账）。
     pub fn sql_with_context(
         &self,
