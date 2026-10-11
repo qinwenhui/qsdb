@@ -19,6 +19,7 @@ use crate::index::PartitionsIndex;
 use crate::manifest::{PartitionManifest, SegmentEntry};
 use crate::scan::list_partitions;
 use crate::stats;
+use crate::store::Store;
 use crate::write::{data_schema, writer_props};
 
 /// Compaction 结果。
@@ -49,16 +50,16 @@ impl Default for CompactOptions {
 
 /// 表级 compaction：遍历分区，满足条件的合并。返回累计结果。
 pub fn compact_table(
-    root: &Path,
+    store: &Store,
     table_dir: &Path,
     def: &Arc<TableDef>,
     opts: &CompactOptions,
 ) -> Result<CompactResult> {
     use rayon::prelude::*;
-    let partitions = list_partitions(table_dir, def.partition_keys.len());
+    let partitions = list_partitions(store, table_dir, def.partition_keys.len());
     let results: Vec<Result<Option<SingleResult>>> = partitions
         .par_iter()
-        .map(|(pdir, _)| compact_partition(root, table_dir, def, pdir, opts))
+        .map(|(pdir, _)| compact_partition(store, table_dir, def, pdir, opts))
         .collect();
     let mut total = CompactResult::default();
     for r in results {
@@ -80,13 +81,13 @@ struct SingleResult {
 
 /// 单分区 compaction（不满足条件 → Ok(None)，不动任何文件）。
 fn compact_partition(
-    root: &Path,
+    store: &Store,
     table_dir: &Path,
     def: &Arc<TableDef>,
     pdir: &Path,
     opts: &CompactOptions,
 ) -> Result<Option<SingleResult>> {
-    let Some(mut manifest) = PartitionManifest::read(pdir)? else {
+    let Some(mut manifest) = PartitionManifest::read(store, pdir)? else {
         return Ok(None);
     };
     if manifest.segments.len() < opts.min_segments.max(2) {
@@ -104,7 +105,7 @@ fn compact_partition(
     // 分区锁（写路径同一把锁，天然互斥）
     let _guard = PartitionLock::acquire(&pdir.join(".lock"))?;
     // 锁内重读（等待期间可能已被其他提交者变更）
-    manifest = PartitionManifest::read(pdir)?.unwrap_or(manifest);
+    manifest = PartitionManifest::read(store, pdir)?.unwrap_or(manifest);
     if manifest.segments.len() < 2 {
         return Ok(None);
     }
@@ -151,7 +152,7 @@ fn compact_partition(
     }
 
     // 合并写新 segment
-    let entry = write_merged(pdir, &batches, &schema, def)?;
+    let entry = write_merged(store, pdir, &batches, &schema, def)?;
     let old_files: Vec<std::path::PathBuf> = manifest
         .segments
         .iter()
@@ -161,17 +162,17 @@ fn compact_partition(
 
     // 原子提交：单 segment manifest
     manifest.segments = vec![entry.clone()];
-    manifest.commit(pdir)?;
+    manifest.commit(store, pdir)?;
     let rel = pdir
         .strip_prefix(table_dir)
         .unwrap_or(pdir)
         .to_string_lossy()
         .replace('\\', "/");
-    let _ = PartitionsIndex::upsert(table_dir, &rel, &manifest);
+    let _ = PartitionsIndex::upsert(store, table_dir, &rel, &manifest);
 
     // 旧文件延迟善后
     for f in old_files {
-        let _ = move_to_trash(root, &f);
+        let _ = move_to_trash(store.root(), &f);
     }
     Ok(Some(SingleResult {
         merged,
@@ -180,8 +181,9 @@ fn compact_partition(
     }))
 }
 
-/// 合并写单个大 segment（统计重算）。
+/// 合并写单个大 segment（统计重算）。序列化直写本地文件（§4 热路径豁免）。
 fn write_merged(
+    store: &Store,
     pdir: &Path,
     batches: &[RecordBatch],
     schema: &Arc<arrow::datatypes::Schema>,
@@ -208,11 +210,11 @@ fn write_merged(
             .close()
             .map_err(|e| QsdbError::meta(format!("parquet close failed: {e}")))?;
     }
-    let bytes = std::fs::metadata(&tmp_path)
-        .map_err(|e| QsdbError::meta(format!("stat segment failed: {e}")))?
-        .len();
-    std::fs::rename(&tmp_path, &final_path)
-        .map_err(|e| QsdbError::meta(format!("rename segment failed: {e}")))?;
+    let bytes = store
+        .stat(&tmp_path)?
+        .ok_or_else(|| QsdbError::meta("stat segment failed: tmp missing after write"))?
+        .size;
+    store.commit_object(&tmp_path, &final_path)?;
 
     // 统计重算（跨批合并）
     let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
@@ -260,6 +262,7 @@ mod tests {
     use super::*;
     use crate::api::{Qsdb, QsdbOptions};
     use crate::catalog::DEFAULT_DB;
+    use crate::store::Store;
     use arrow::array::{Date32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
 
@@ -305,18 +308,19 @@ mod tests {
         }
         let tdir = root.join(DEFAULT_DB).join("t");
         let pdir = tdir.join("dt=2022-04-18");
-        let m = PartitionManifest::read(&pdir).unwrap().unwrap();
+        let store = Store::local(&root);
+        let m = PartitionManifest::read(&store, &pdir).unwrap().unwrap();
         assert_eq!(m.segments.len(), 6);
 
         // compaction（默认阈值）
         let def = db.table_def("t").unwrap();
-        let r = compact_table(&root, &tdir, &def, &CompactOptions::default()).unwrap();
+        let r = compact_table(&store, &tdir, &def, &CompactOptions::default()).unwrap();
         assert_eq!(r.partitions_compacted, 1);
         assert_eq!(r.segments_merged, 6);
         assert_eq!(r.rows, 12);
 
         // manifest 变单 segment，数据完整
-        let m2 = PartitionManifest::read(&pdir).unwrap().unwrap();
+        let m2 = PartitionManifest::read(&store, &pdir).unwrap().unwrap();
         assert_eq!(m2.segments.len(), 1);
         assert_eq!(m2.total_rows(), 12);
         let batches = db
@@ -347,9 +351,10 @@ mod tests {
         db.append("t", &[batch(19_000, vec![2])]).unwrap();
         let def = db.table_def("t").unwrap();
         let tdir = root.join(DEFAULT_DB).join("t");
+        let store = Store::local(&root);
         // min_segments=3：2 个不触发
         let r = compact_table(
-            &root,
+            &store,
             &tdir,
             &def,
             &CompactOptions {
@@ -361,7 +366,7 @@ mod tests {
         assert_eq!(r.partitions_compacted, 0);
         // min_segments=2：触发
         let r = compact_table(
-            &root,
+            &store,
             &tdir,
             &def,
             &CompactOptions {

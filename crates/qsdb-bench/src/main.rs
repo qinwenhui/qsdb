@@ -391,9 +391,12 @@ fn meta_bench(parts: usize) {
     let rows: u64 = {
         let def = db2.table_def("events").unwrap();
         let tdir = root.join("default").join("events");
-        qsdb::scan::list_partitions(&tdir, def.partition_keys.len())
+        let store = qsdb::Store::local(&root);
+        qsdb::scan::list_partitions(&store, &tdir, def.partition_keys.len())
             .iter()
-            .filter_map(|(p, _)| qsdb::manifest::PartitionManifest::read(p).ok().flatten())
+            .filter_map(|(p, _)| {
+                qsdb::manifest::PartitionManifest::read(&store, p).ok().flatten()
+            })
             .map(|m| m.total_rows())
             .sum()
     };

@@ -125,10 +125,11 @@ impl WriteBuffer {
         }
         // 分区级并行提交（不同分区互不阻塞；分区锁保证正确性）
         let tdir = table_dir(self.db.root(), crate::catalog::DEFAULT_DB, table);
+        let store = Arc::clone(self.db.store());
         use rayon::prelude::*;
         let results: Vec<Result<WriteResult>> = merged
             .into_par_iter()
-            .map(|(_key, (vals, list))| write::append_partition(&tdir, &def, &vals, &list))
+            .map(|(_key, (vals, list))| write::append_partition(&store, &tdir, &def, &vals, &list))
             .collect();
         let mut total = WriteResult::default();
         for r in results {
@@ -298,7 +299,8 @@ mod tests {
             .join(crate::catalog::DEFAULT_DB)
             .join("t")
             .join("dt=2022-01-08");
-        let m = crate::manifest::PartitionManifest::read(&pdir)
+        let store = crate::store::Store::local(&root);
+        let m = crate::manifest::PartitionManifest::read(&store, &pdir)
             .unwrap()
             .unwrap();
         assert_eq!(m.segments.len(), 1);

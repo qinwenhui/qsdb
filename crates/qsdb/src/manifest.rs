@@ -5,13 +5,12 @@
 //! - manifest 不存在 = 空分区（合法状态）
 //! - rename 即提交；rename 前中断产生的孤儿数据文件由 GC 回收
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{QsdbError, Result};
-use crate::fsutil::write_atomic;
+use crate::store::Store;
 use crate::types::Literal;
 
 pub const MANIFEST_FILE: &str = "manifest.postcard";
@@ -61,10 +60,10 @@ impl PartitionManifest {
     }
 
     /// 读取 manifest；不存在 → Ok(None)（空分区）。
-    pub fn read(partition_dir: &Path) -> Result<Option<Self>> {
+    pub fn read(store: &Store, partition_dir: &Path) -> Result<Option<Self>> {
         let path = Self::manifest_path(partition_dir);
-        match fs::read(&path) {
-            Ok(bytes) => {
+        match store.read(&path)? {
+            Some(bytes) => {
                 let m: Self = postcard::from_bytes(&bytes).map_err(|e| {
                     QsdbError::meta(format!("corrupt manifest {}: {e}", path.display()))
                 })?;
@@ -77,20 +76,16 @@ impl PartitionManifest {
                 }
                 Ok(Some(m))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(QsdbError::meta(format!(
-                "read manifest {} failed: {e}",
-                path.display()
-            ))),
+            None => Ok(None),
         }
     }
 
     /// 原子提交（在分区锁内调用）：generation+1 后替换磁盘文件。
-    pub fn commit(&mut self, partition_dir: &Path) -> Result<()> {
+    pub fn commit(&mut self, store: &Store, partition_dir: &Path) -> Result<()> {
         self.generation += 1;
         let bytes = postcard::to_allocvec(self)
             .map_err(|e| QsdbError::meta(format!("serialize manifest failed: {e}")))?;
-        write_atomic(Self::manifest_path(partition_dir), &bytes)
+        store.write_atomic(&Self::manifest_path(partition_dir), &bytes)
     }
 
     pub fn stats_of(&self, column: &str) -> Option<&ColumnStats> {
@@ -119,14 +114,15 @@ impl PartitionManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Store;
     use crate::types::DecimalMeta;
 
-    fn tmpdir(tag: &str) -> PathBuf {
+    fn tmpdir(tag: &str) -> (Store, PathBuf) {
         let d = std::env::temp_dir()
             .join("qsdb_manifest_test")
             .join(format!("{tag}_{}", uuid::Uuid::now_v7().simple()));
-        fs::create_dir_all(&d).unwrap();
-        d
+        std::fs::create_dir_all(&d).unwrap();
+        (Store::local(&d), d)
     }
 
     fn sample(vals: Vec<(String, Literal)>) -> PartitionManifest {
@@ -150,18 +146,18 @@ mod tests {
 
     #[test]
     fn read_missing_is_empty_partition() {
-        let dir = tmpdir("empty");
-        assert!(PartitionManifest::read(&dir).unwrap().is_none());
-        fs::remove_dir_all(&dir).ok();
+        let (store, dir) = tmpdir("empty");
+        assert!(PartitionManifest::read(&store, &dir).unwrap().is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn commit_roundtrip_and_generation() {
-        let dir = tmpdir("rt");
+        let (store, dir) = tmpdir("rt");
         let mut m = sample(vec![("dt".into(), Literal::Date(1))]);
-        m.commit(&dir).unwrap();
+        m.commit(&store, &dir).unwrap();
         assert_eq!(m.generation, 1);
-        let back = PartitionManifest::read(&dir).unwrap().unwrap();
+        let back = PartitionManifest::read(&store, &dir).unwrap().unwrap();
         assert_eq!(back, m);
         assert_eq!(back.total_rows(), 10);
         // 二次提交 generation 递增
@@ -173,13 +169,13 @@ mod tests {
             created_at: 2,
             column_stats: vec![],
         });
-        m2.commit(&dir).unwrap();
-        let back2 = PartitionManifest::read(&dir).unwrap().unwrap();
+        m2.commit(&store, &dir).unwrap();
+        let back2 = PartitionManifest::read(&store, &dir).unwrap().unwrap();
         assert_eq!(back2.generation, 2);
         assert_eq!(back2.total_rows(), 15);
         assert_eq!(back2.segment_paths(&dir).len(), 2);
         assert_eq!(back2.stats_of("a").unwrap().min, Some(Literal::Int64(1)));
-        fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

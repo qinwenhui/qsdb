@@ -4,7 +4,6 @@
 //! 同目录可多实例/多进程共存（分区 flock 协调）。
 
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,6 +18,7 @@ use crate::error::{QsdbError, Result};
 use crate::fsutil::{dir_size, purge_trash};
 use crate::partition::split_by_partition;
 use crate::scan::{Predicate, Scan};
+use crate::store::Store;
 use crate::types::Literal;
 use crate::write::{self, WriteResult};
 
@@ -108,6 +108,7 @@ impl QsdbRuntime {
 /// QSDB 句柄。
 pub struct Qsdb {
     root: PathBuf,
+    store: Arc<Store>,
     opts: QsdbOptions,
     defs: TableDefCache,
     cache: Arc<crate::cache::SegmentCache>,
@@ -118,14 +119,18 @@ impl Qsdb {
     /// 打开（目录不存在则初始化为空库）。
     pub fn open(root: impl AsRef<Path>, opts: QsdbOptions) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(root.join("_catalog"))
+        let store = Arc::new(Store::local(&root));
+        store
+            .create_dir_all(&root.join("_catalog"))
             .map_err(|e| QsdbError::meta(format!("init db root failed: {e}")))?;
-        fs::create_dir_all(db_dir(&root, DEFAULT_DB))
+        store
+            .create_dir_all(&db_dir(&root, DEFAULT_DB))
             .map_err(|e| QsdbError::meta(format!("init default db failed: {e}")))?;
         let cache = Arc::new(crate::cache::SegmentCache::new(opts.scan_cache_bytes));
         let runtime = Arc::new(QsdbRuntime::from_opts(&opts));
         Ok(Self {
             root,
+            store,
             opts,
             defs: TableDefCache::default(),
             cache,
@@ -137,29 +142,34 @@ impl Qsdb {
         &self.root
     }
 
+    /// 存储后端句柄（本地默认；M6-2/3 起可配置远端）。
+    pub fn store(&self) -> &Arc<Store> {
+        &self.store
+    }
+
     fn db_name<'a>(&self, db: Option<&'a str>) -> &'a str {
         db.unwrap_or(DEFAULT_DB)
     }
 
     fn def(&self, db: Option<&str>, table: &str) -> Result<Arc<TableDef>> {
         let db = self.db_name(db);
-        let names = read_table_names(&self.root, db)?;
+        let names = read_table_names(&self.store, db)?;
         if !names.iter().any(|n| n == table) {
             return Err(QsdbError::not_found(format!("table {db}.{table}")));
         }
-        self.defs.get(&self.root, db, table)
+        self.defs.get(&self.store, db, table)
     }
 
     // -- DDL ----------------------------------------------------------------
 
     /// 建表。
     pub fn create_table(&self, def: TableDef) -> Result<()> {
-        create_table(&self.root, DEFAULT_DB, &def)
+        create_table(&self.store, DEFAULT_DB, &def)
     }
 
     /// 删表（目录进 trash，`gc` 后真正释放）。
     pub fn drop_table(&self, table: &str) -> Result<()> {
-        drop_table(&self.root, DEFAULT_DB, table)
+        drop_table(&self.store, DEFAULT_DB, table)
     }
 
     /// 表定义。
@@ -170,12 +180,12 @@ impl Qsdb {
     /// ALTER TABLE ADD COLUMN（只加不删；列必须 nullable）。
     /// 旧 segment 读取时缺列补 NULL；宽松写接受缺尾列批。
     pub fn alter_add_column(&self, table: &str, column: crate::catalog::ColumnDef) -> Result<()> {
-        crate::catalog::alter_add_column(&self.root, crate::catalog::DEFAULT_DB, table, column)
+        crate::catalog::alter_add_column(&self.store, crate::catalog::DEFAULT_DB, table, column)
     }
 
     /// 表名清单。
     pub fn tables(&self) -> Result<Vec<String>> {
-        read_table_names(&self.root, DEFAULT_DB)
+        read_table_names(&self.store, DEFAULT_DB)
     }
 
     // -- 写 ------------------------------------------------------------------
@@ -189,7 +199,7 @@ impl Qsdb {
             for (values, data) in split_by_partition(batch, &def)? {
                 total = merge_write(
                     total,
-                    write::append_partition(&tdir, &def, &values, &[data])?,
+                    write::append_partition(&self.store, &tdir, &def, &values, &[data])?,
                 );
             }
         }
@@ -246,7 +256,7 @@ impl Qsdb {
                 data_batches.push(data);
             }
         }
-        write::overwrite_partition(&self.root, &tdir, &def, &ordered, &data_batches)
+        write::overwrite_partition(&self.store, &tdir, &def, &ordered, &data_batches)
     }
 
     // -- 读 ------------------------------------------------------------------
@@ -269,7 +279,7 @@ impl Qsdb {
         let def = self.def(req.db.as_deref(), &req.table)?;
         let tdir = table_dir(&self.root, self.db_name(req.db.as_deref()), &req.table);
         Scan::with_cache(
-            &self.root,
+            &self.store,
             &tdir,
             def,
             req.projection,
@@ -308,7 +318,7 @@ impl Qsdb {
             }
         }
         // 逐分区裁剪 + 清空
-        let parts = crate::scan::list_partitions(&tdir, def.partition_keys.len());
+        let parts = crate::scan::list_partitions(&self.store, &tdir, def.partition_keys.len());
         let mut cleared = 0u64;
         for (_pdir, dir_vals) in parts {
             let mut pvals: HashMap<String, Literal> = HashMap::new();
@@ -360,7 +370,7 @@ impl Qsdb {
             &ordered,
         )?);
         let _guard = crate::fsutil::PartitionLock::acquire(&dir.join(".lock"))?;
-        let Some(old) = crate::manifest::PartitionManifest::read(&dir)? else {
+        let Some(old) = crate::manifest::PartitionManifest::read(&self.store, &dir)? else {
             return Ok(0);
         };
         let rows = old.total_rows();
@@ -372,13 +382,13 @@ impl Qsdb {
             .zip(ordered.iter().cloned())
             .collect();
         empty.segments = Vec::new();
-        empty.commit(&dir)?;
+        empty.commit(&self.store, &dir)?;
         let rel = dir
             .strip_prefix(tdir)
             .unwrap_or(&dir)
             .to_string_lossy()
             .replace('\\', "/");
-        let _ = crate::index::PartitionsIndex::upsert(tdir, &rel, &empty);
+        let _ = crate::index::PartitionsIndex::upsert(&self.store, tdir, &rel, &empty);
         for f in old.segment_paths(&dir) {
             let _ = crate::fsutil::move_to_trash(&self.root, &f);
         }
@@ -389,11 +399,11 @@ impl Qsdb {
     pub fn truncate_table(&self, table: &str) -> Result<u64> {
         let def = self.def(None, table)?;
         let tdir = table_dir(&self.root, DEFAULT_DB, table);
-        let parts = crate::scan::list_partitions(&tdir, def.partition_keys.len());
+        let parts = crate::scan::list_partitions(&self.store, &tdir, def.partition_keys.len());
         let mut cleared = 0u64;
         for (pdir, _) in parts {
             // 从 manifest 提取分区值
-            if let Some(m) = crate::manifest::PartitionManifest::read(&pdir)? {
+            if let Some(m) = crate::manifest::PartitionManifest::read(&self.store, &pdir)? {
                 let vals: HashMap<String, Literal> = m.partition_values.iter().cloned().collect();
                 if !vals.is_empty() {
                     cleared += self.clear_partition(&tdir, &def, &vals)?;
@@ -474,8 +484,9 @@ impl Qsdb {
                 continue;
             };
             let tdir = table_dir(&self.root, DEFAULT_DB, table);
-            for (pdir, _) in crate::scan::list_partitions(&tdir, def.partition_keys.len()) {
-                let Some(manifest) = crate::manifest::PartitionManifest::read(&pdir)? else {
+            for (pdir, _) in crate::scan::list_partitions(&self.store, &tdir, def.partition_keys.len()) {
+                let Some(manifest) = crate::manifest::PartitionManifest::read(&self.store, &pdir)?
+                else {
                     continue;
                 };
                 let live: std::collections::HashSet<String> = manifest
@@ -483,33 +494,31 @@ impl Qsdb {
                     .iter()
                     .map(|s| s.file_name.clone())
                     .collect();
-                let Ok(rd) = fs::read_dir(&pdir) else {
+                let Ok(entries) = self.store.read_dir(&pdir) else {
                     continue;
                 };
-                for entry in rd.flatten() {
-                    let name = entry.file_name();
-                    let name = name.to_string_lossy();
+                for entry in entries {
+                    let name = entry.name;
                     let is_data = name.starts_with("seg_") && name.ends_with(".parquet");
                     let is_tmp = name.ends_with(".tmp");
                     if !is_data && !is_tmp {
                         continue;
                     }
-                    if live.contains(name.as_ref()) {
+                    if live.contains(name.as_str()) {
                         continue;
                     }
                     // mtime 静默期，防止误清正在写的文件
-                    let fresh = entry
-                        .metadata()
+                    let fresh = self
+                        .store
+                        .stat(&entry.path)
                         .ok()
-                        .and_then(|m| m.modified().ok())
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_millis() as u64)
-                        .map(|mt| crate::fsutil::now_ms().saturating_sub(mt) < orphan_grace)
+                        .flatten()
+                        .map(|md| crate::fsutil::now_ms().saturating_sub(md.mtime_ms) < orphan_grace)
                         .unwrap_or(true);
                     if fresh {
                         continue;
                     }
-                    let p = entry.path();
+                    let p = entry.path;
                     freed += dir_size(&p);
                     let _ = crate::fsutil::move_to_trash(&self.root, &p);
                 }
@@ -534,7 +543,7 @@ impl Qsdb {
         let def = self.def(None, table)?;
         let tdir = table_dir(&self.root, DEFAULT_DB, table);
         crate::compact::compact_table(
-            &self.root,
+            &self.store,
             &tdir,
             &def,
             &crate::compact::CompactOptions::default(),
@@ -549,7 +558,7 @@ impl Qsdb {
     ) -> Result<crate::compact::CompactResult> {
         let def = self.def(None, table)?;
         let tdir = table_dir(&self.root, DEFAULT_DB, table);
-        crate::compact::compact_table(&self.root, &tdir, &def, &opts)
+        crate::compact::compact_table(&self.store, &tdir, &def, &opts)
     }
 
     /// 元数据应答：按谓词裁剪分区后，从 manifest 统计直接合成结果（不打开 parquet）。
@@ -567,7 +576,7 @@ impl Qsdb {
         }
         let tdir = table_dir(&self.root, DEFAULT_DB, table);
         let depth = def.partition_keys.len();
-        let parts = crate::scan::list_partitions(&tdir, depth);
+        let parts = crate::scan::list_partitions(&self.store, &tdir, depth);
         let mut total = 0u64;
         let mut any = false;
         for (pdir, dir_vals) in parts {
@@ -603,7 +612,7 @@ impl Qsdb {
                     continue;
                 }
             }
-            let Some(m) = crate::manifest::PartitionManifest::read(&pdir)? else {
+            let Some(m) = crate::manifest::PartitionManifest::read(&self.store, &pdir)? else {
                 continue;
             };
             any = true;
@@ -633,7 +642,7 @@ impl Qsdb {
     pub fn refresh_index(&self, table: &str) -> Result<()> {
         let def = self.def(None, table)?;
         let tdir = table_dir(&self.root, DEFAULT_DB, table);
-        crate::index::PartitionsIndex::rebuild(&tdir, def.partition_keys.len())?;
+        crate::index::PartitionsIndex::rebuild(&self.store, &tdir, def.partition_keys.len())?;
         Ok(())
     }
 }
@@ -669,7 +678,7 @@ mod tests {
         let d = std::env::temp_dir()
             .join("qsdb_api_test")
             .join(format!("{tag}_{}", uuid::Uuid::now_v7().simple()));
-        fs::create_dir_all(&d).unwrap();
+        std::fs::create_dir_all(&d).unwrap();
         d
     }
 
@@ -768,7 +777,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
-        fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -812,7 +821,7 @@ mod tests {
         db.drop_table("events").unwrap();
         assert!(db.tables().unwrap().is_empty());
         db2.gc().unwrap();
-        fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -830,6 +839,6 @@ mod tests {
             })
             .is_err()
         );
-        fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root).ok();
     }
 }

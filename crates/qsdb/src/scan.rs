@@ -6,6 +6,9 @@
 //! - segment 级：min/max 统计，只有「确定无匹配」才丢弃；无统计的列不裁剪
 //! - row group 级：parquet footer 统计（数值/字符串），同上保守策略
 //! - 行级：arrow cmp kernels；NULL 比较结果为 NULL → 行被过滤（SQL 语义）
+//!
+//! 存储收口（M6-1）：发现/manifest/元数据经 `Store`；parquet 列读本地
+//! 直开 `File`（存储设计 §4 热路径豁免），远端走段缓存路径（M6-2）。
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -28,6 +31,7 @@ use crate::catalog::TableDef;
 use crate::error::{QsdbError, Result};
 use crate::manifest::{ColumnStats, PartitionManifest};
 use crate::partition::{parse_partition_dir, parse_partition_value};
+use crate::store::Store;
 use crate::types::cast::cast_literal;
 use crate::types::{Literal, LogicalType};
 
@@ -539,7 +543,11 @@ fn resolve_value(column: &str, value: Literal, def: &TableDef) -> Result<Literal
 // ---------------------------------------------------------------------------
 
 /// 列出表的分区目录（Hive 风格逐层下钻；隐藏/下划线目录跳过）。
-pub fn list_partitions(table_dir: &Path, depth: usize) -> Vec<(PathBuf, Vec<(String, String)>)> {
+pub fn list_partitions(
+    store: &Store,
+    table_dir: &Path,
+    depth: usize,
+) -> Vec<(PathBuf, Vec<(String, String)>)> {
     if depth == 0 {
         return Vec::new(); // 非分区表
     }
@@ -547,19 +555,16 @@ pub fn list_partitions(table_dir: &Path, depth: usize) -> Vec<(PathBuf, Vec<(Str
     for _ in 0..depth {
         let mut next = Vec::new();
         for dir in &level_dirs {
-            let Ok(rd) = std::fs::read_dir(dir) else {
+            let Ok(entries) = store.read_dir(dir) else {
                 continue;
             };
-            for entry in rd.flatten() {
-                let p = entry.path();
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if p.is_dir()
-                    && name.contains('=')
-                    && !name.starts_with('_')
-                    && !name.starts_with('.')
+            for entry in entries {
+                if entry.is_dir
+                    && entry.name.contains('=')
+                    && !entry.name.starts_with('_')
+                    && !entry.name.starts_with('.')
                 {
-                    next.push(p);
+                    next.push(entry.path);
                 }
             }
         }
@@ -578,19 +583,19 @@ pub fn list_partitions(table_dir: &Path, depth: usize) -> Vec<(PathBuf, Vec<(Str
 ///
 /// 优先走表级索引 `partitions.idx`（单文件，万级分区 <50ms）；
 /// 索引缺失/损坏时回退为 readdir + 逐分区读 manifest。
-fn plan_scan(root: &Path, table_dir: &Path, plan: &ScanPlan) -> Result<Vec<FilePlan>> {
+fn plan_scan(store: &Store, table_dir: &Path, plan: &ScanPlan) -> Result<Vec<FilePlan>> {
     let mut files = Vec::new();
-    if let Some(idx) = crate::index::PartitionsIndex::read(table_dir) {
+    if let Some(idx) = crate::index::PartitionsIndex::read(store, table_dir) {
         for (rel, manifest) in &idx.entries {
             let pdir = table_dir.join(rel);
             // 索引内 manifest 自带分区值 Literal，无需解析目录名
             let pvals: HashMap<String, Literal> =
                 manifest.partition_values.iter().cloned().collect();
-            add_partition_files(root, &pdir, pvals, manifest, plan, &mut files)?;
+            add_partition_files(store, &pdir, pvals, manifest, plan, &mut files)?;
         }
         return Ok(files);
     }
-    for (pdir, dir_vals) in list_partitions(table_dir, plan.def.partition_keys.len()) {
+    for (pdir, dir_vals) in list_partitions(store, table_dir, plan.def.partition_keys.len()) {
         // 分区值 → Literal（按表列类型解析；失败跳过该分区）
         let mut pvals: HashMap<String, Literal> = HashMap::new();
         let mut ok = true;
@@ -614,17 +619,17 @@ fn plan_scan(root: &Path, table_dir: &Path, plan: &ScanPlan) -> Result<Vec<FileP
         if !ok {
             continue;
         }
-        let Some(manifest) = PartitionManifest::read(&pdir)? else {
+        let Some(manifest) = PartitionManifest::read(store, &pdir)? else {
             continue;
         };
-        add_partition_files(root, &pdir, pvals, &manifest, plan, &mut files)?;
+        add_partition_files(store, &pdir, pvals, &manifest, plan, &mut files)?;
     }
     Ok(files)
 }
 
 /// 单分区的裁剪与文件规划（分区裁剪 + fingerprint 校验 + segment 裁剪）。
 fn add_partition_files(
-    root: &Path,
+    store: &Store,
     pdir: &Path,
     pvals: HashMap<String, Literal>,
     manifest: &PartitionManifest,
@@ -646,7 +651,7 @@ fn add_partition_files(
             .prefix_fingerprints()
             .contains(&manifest.schema_fingerprint)
     {
-        let rel = pdir.strip_prefix(root).unwrap_or(pdir);
+        let rel = pdir.strip_prefix(store.root()).unwrap_or(pdir);
         return Err(QsdbError::meta(format!(
             "partition {} was written under a different table schema (overwrite it first)",
             rel.display()
@@ -926,15 +931,6 @@ fn clone_batch(b: &RecordBatch) -> RecordBatch {
     b.clone()
 }
 
-/// 文件 mtime → epoch 毫秒。
-fn file_mtime_ms(md: &std::fs::Metadata) -> u64 {
-    md.modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// `&dyn Array` → Datum 适配器（Datum 仅为 Sized 数组实现）。
 struct ArrDatum<'a>(&'a dyn Array);
 
@@ -1052,6 +1048,8 @@ pub struct Scan {
     remaining: Option<u64>,
     cache: Option<Arc<crate::cache::SegmentCache>>,
     ctx: Arc<crate::query::QueryContext>,
+    /// 存储句柄（缓存签名 stat；M6-2 起承载远端段缓存路径）
+    store: Arc<Store>,
 }
 
 /// 批来源：parquet 流式 reader 或缓存命中批列表。
@@ -1074,7 +1072,7 @@ impl BatchSource {
 impl Scan {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_cache(
-        root: &Path,
+        store: &Arc<Store>,
         table_dir: &Path,
         def: Arc<TableDef>,
         projection: Option<Vec<String>>,
@@ -1084,7 +1082,7 @@ impl Scan {
         ctx: Arc<crate::query::QueryContext>,
     ) -> Result<Self> {
         let plan = ScanPlan::build(def, projection, predicate, limit)?;
-        let files = plan_scan(root, table_dir, &plan)?;
+        let files = plan_scan(store, table_dir, &plan)?;
         Ok(Self {
             plan: Arc::new(plan),
             files: files.into(),
@@ -1094,6 +1092,7 @@ impl Scan {
             remaining: limit,
             cache,
             ctx,
+            store: Arc::clone(store),
         })
     }
 
@@ -1172,6 +1171,7 @@ impl Scan {
                 remaining: None,
                 cache: self.cache.clone(),
                 ctx: Arc::clone(&self.ctx),
+                store: Arc::clone(&self.store),
             })
             .collect();
         for (s, b) in shards.iter_mut().zip(buckets) {
@@ -1208,15 +1208,14 @@ impl Scan {
                 }
             }
         }
-        // 热缓存：命中零解码
+        // 热缓存：命中零解码（签名 stat 经 Store）
         if let Some(cache) = &self.cache {
             if cache.is_enabled() {
-                if let Ok(md) = std::fs::metadata(&file.path) {
-                    let mtime_ms = file_mtime_ms(&md);
+                if let Ok(Some(md)) = self.store.stat(&file.path) {
                     if let Some(hit) = cache.get(
                         &file.path,
-                        mtime_ms,
-                        md.len(),
+                        md.mtime_ms,
+                        md.size,
                         &self.plan.read_columns,
                         &file.row_groups,
                     ) {
@@ -1231,8 +1230,8 @@ impl Scan {
                     // miss：装 collector 供回填
                     let collector = cache.collector(
                         file.path.clone(),
-                        mtime_ms,
-                        md.len(),
+                        md.mtime_ms,
+                        md.size,
                         self.plan.read_columns.clone(),
                         file.row_groups.clone(),
                     );

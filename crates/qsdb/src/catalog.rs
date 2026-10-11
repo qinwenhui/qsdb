@@ -5,14 +5,14 @@
 //! 「stat 比对 + 锁内提交」）。
 
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{QsdbError, Result};
-use crate::fsutil::{PartitionLock, now_ms, write_atomic};
+use crate::fsutil::{PartitionLock, now_ms};
+use crate::store::Store;
 use crate::types::{Literal, LogicalType};
 
 pub const DEFAULT_DB: &str = "default";
@@ -203,28 +203,29 @@ pub fn catalog_lock(root: &Path) -> PathBuf {
 // 表名清单（_catalog/{db}.postcard = 排序表名表）
 // ---------------------------------------------------------------------------
 
-pub fn read_table_names(root: &Path, db: &str) -> Result<Vec<String>> {
+pub fn read_table_names(store: &Store, db: &str) -> Result<Vec<String>> {
+    let root = store.root();
     let path = catalog_file(root, db);
-    match fs::read(&path) {
-        Ok(bytes) => postcard::from_bytes(&bytes)
+    match store.read(&path)? {
+        Some(bytes) => postcard::from_bytes(&bytes)
             .map_err(|e| QsdbError::meta(format!("corrupt catalog {db}: {e}"))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(QsdbError::meta(format!("read catalog {db} failed: {e}"))),
+        None => Ok(Vec::new()),
     }
 }
 
-fn write_table_names(root: &Path, db: &str, mut names: Vec<String>) -> Result<()> {
+fn write_table_names(store: &Store, db: &str, mut names: Vec<String>) -> Result<()> {
     names.sort();
     let bytes = postcard::to_allocvec(&names)
         .map_err(|e| QsdbError::meta(format!("serialize catalog failed: {e}")))?;
-    write_atomic(catalog_file(root, db), &bytes)
+    store.write_atomic(&catalog_file(store.root(), db), &bytes)
 }
 
 /// 建表：catalog 锁内（清单+目录+table.json）一次性落地。
-pub fn create_table(root: &Path, db: &str, def: &TableDef) -> Result<()> {
+pub fn create_table(store: &Store, db: &str, def: &TableDef) -> Result<()> {
+    let root = store.root();
     def.validate()?;
     let _guard = PartitionLock::acquire(&catalog_lock(root))?;
-    let mut names = read_table_names(root, db)?;
+    let mut names = read_table_names(store, db)?;
     if names.iter().any(|n| n == &def.name) {
         return Err(QsdbError::already_exists(format!(
             "table {db}.{}",
@@ -232,45 +233,48 @@ pub fn create_table(root: &Path, db: &str, def: &TableDef) -> Result<()> {
         )));
     }
     let tdir = table_dir(root, db, &def.name);
-    if tdir.exists() {
+    if store.exists(&tdir) {
         return Err(QsdbError::already_exists(format!(
             "table dir exists: {}",
             tdir.display()
         )));
     }
-    fs::create_dir_all(&tdir).map_err(|e| QsdbError::meta(format!("mkdir table failed: {e}")))?;
+    store.create_dir_all(&tdir)?;
     let json = serde_json_compat::to_string(def)?;
-    write_atomic(table_json_path(root, db, &def.name), json.as_bytes())?;
+    store.write_atomic(&table_json_path(root, db, &def.name), json.as_bytes())?;
     names.push(def.name.clone());
-    write_table_names(root, db, names)?;
+    write_table_names(store, db, names)?;
     Ok(())
 }
 
 /// 删表：目录整体移 trash，清单去名。
-pub fn drop_table(root: &Path, db: &str, table: &str) -> Result<()> {
+pub fn drop_table(store: &Store, db: &str, table: &str) -> Result<()> {
+    let root = store.root();
     let _guard = PartitionLock::acquire(&catalog_lock(root))?;
-    let names = read_table_names(root, db)?;
+    let names = read_table_names(store, db)?;
     if !names.iter().any(|n| n == table) {
         return Err(QsdbError::not_found(format!("table {db}.{table}")));
     }
     let tdir = table_dir(root, db, table);
     crate::fsutil::move_to_trash(root, &tdir)?;
     let names: Vec<String> = names.into_iter().filter(|n| n != table).collect();
-    write_table_names(root, db, names)
+    write_table_names(store, db, names)
 }
 
 /// ALTER TABLE ADD COLUMN（只加不删）：catalog 锁内重读 table.json → 追加列 →
 /// 原子替换。约束：列必须 nullable（NOT NULL 需 DEFAULT，后置）、不能与现有列/
 /// 分区键重名。旧 segment 读取时缺列补 NULL（scan::pad_missing_columns）。
-pub fn alter_add_column(root: &Path, db: &str, table: &str, column: ColumnDef) -> Result<()> {
+pub fn alter_add_column(store: &Store, db: &str, table: &str, column: ColumnDef) -> Result<()> {
+    let root = store.root();
     let _guard = PartitionLock::acquire(&catalog_lock(root))?;
-    let names = read_table_names(root, db)?;
+    let names = read_table_names(store, db)?;
     if !names.iter().any(|n| n == table) {
         return Err(QsdbError::not_found(format!("table {db}.{table}")));
     }
     let path = table_json_path(root, db, table);
-    let text = fs::read_to_string(&path)
-        .map_err(|e| QsdbError::meta(format!("read table.json failed: {e}")))?;
+    let text = store
+        .read_to_string(&path)?
+        .ok_or_else(|| QsdbError::meta("read table.json failed: not found"))?;
     let mut def: TableDef = serde_json_compat::from_str(&text)
         .map_err(|e| QsdbError::meta(format!("corrupt table.json: {e}")))?;
     if !column.nullable {
@@ -293,7 +297,7 @@ pub fn alter_add_column(root: &Path, db: &str, table: &str, column: ColumnDef) -
     def.columns.push(column);
     def.validate()?;
     let json = serde_json_compat::to_string(&def)?;
-    write_atomic(path, json.as_bytes())
+    store.write_atomic(&path, json.as_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -314,16 +318,11 @@ struct CacheEntry {
 
 impl TableDefCache {
     /// 读取表定义：缓存命中且 stat 未变 → 直接返回；否则读盘解析。
-    pub fn get(&self, root: &Path, db: &str, table: &str) -> Result<Arc<TableDef>> {
-        let path = table_json_path(root, db, table);
-        let md =
-            fs::metadata(&path).map_err(|_| QsdbError::not_found(format!("table {db}.{table}")))?;
-        let mtime_ms = md
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+    pub fn get(&self, store: &Store, db: &str, table: &str) -> Result<Arc<TableDef>> {
+        let path = table_json_path(store.root(), db, table);
+        let md = store
+            .stat(&path)?
+            .ok_or_else(|| QsdbError::not_found(format!("table {db}.{table}")))?;
         let key = (db.to_string(), table.to_string());
         {
             let cache = self
@@ -331,13 +330,14 @@ impl TableDefCache {
                 .read()
                 .map_err(|_| QsdbError::meta("table cache poisoned"))?;
             if let Some(e) = cache.get(&key) {
-                if e.mtime_ms == mtime_ms && e.size == md.len() {
+                if e.mtime_ms == md.mtime_ms && e.size == md.size {
                     return Ok(Arc::clone(&e.def));
                 }
             }
         }
-        let text = fs::read_to_string(&path)
-            .map_err(|e| QsdbError::meta(format!("read table.json failed: {e}")))?;
+        let text = store
+            .read_to_string(&path)?
+            .ok_or_else(|| QsdbError::meta("read table.json failed: not found"))?;
         let def: TableDef = serde_json_compat::from_str(&text).map_err(|e| {
             QsdbError::meta(format!("parse table.json of {db}.{table} failed: {e}"))
         })?;
@@ -349,8 +349,8 @@ impl TableDefCache {
             .insert(
                 key,
                 CacheEntry {
-                    mtime_ms,
-                    size: md.len(),
+                    mtime_ms: md.mtime_ms,
+                    size: md.size,
                     def: Arc::clone(&arc),
                 },
             );
@@ -389,12 +389,12 @@ mod tests {
         }
     }
 
-    fn tmp_root(tag: &str) -> PathBuf {
+    fn tmp_root(tag: &str) -> (crate::store::Store, PathBuf) {
         let d = std::env::temp_dir()
             .join("qsdb_catalog_test")
             .join(format!("{tag}_{}", uuid::Uuid::now_v7().simple()));
-        fs::create_dir_all(&d).unwrap();
-        d
+        std::fs::create_dir_all(&d).unwrap();
+        (crate::store::Store::local(&d), d)
     }
 
     fn sample_def() -> TableDef {
@@ -442,27 +442,27 @@ mod tests {
 
     #[test]
     fn create_read_drop_roundtrip() {
-        let root = tmp_root("rt");
+        let (store, root) = tmp_root("rt");
         let def = sample_def();
-        create_table(&root, DEFAULT_DB, &def).unwrap();
+        create_table(&store, DEFAULT_DB, &def).unwrap();
         // 重复建表
-        assert!(create_table(&root, DEFAULT_DB, &def).is_err());
+        assert!(create_table(&store, DEFAULT_DB, &def).is_err());
         // 清单
-        let names = read_table_names(&root, DEFAULT_DB).unwrap();
+        let names = read_table_names(&store, DEFAULT_DB).unwrap();
         assert_eq!(names, vec!["events".to_string()]);
         // 读取 + 缓存
         let cache = TableDefCache::default();
-        let got = cache.get(&root, DEFAULT_DB, "events").unwrap();
+        let got = cache.get(&store, DEFAULT_DB, "events").unwrap();
         assert_eq!(*got, def);
         // 不存在
-        assert!(cache.get(&root, DEFAULT_DB, "nope").is_err());
+        assert!(cache.get(&store, DEFAULT_DB, "nope").is_err());
         // 删除
-        drop_table(&root, DEFAULT_DB, "events").unwrap();
-        assert!(read_table_names(&root, DEFAULT_DB).unwrap().is_empty());
-        assert!(cache.get(&root, DEFAULT_DB, "events").is_err());
+        drop_table(&store, DEFAULT_DB, "events").unwrap();
+        assert!(read_table_names(&store, DEFAULT_DB).unwrap().is_empty());
+        assert!(cache.get(&store, DEFAULT_DB, "events").is_err());
         // trash 立即清理
         crate::fsutil::purge_trash(&root, 0).unwrap();
-        fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

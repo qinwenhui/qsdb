@@ -234,7 +234,7 @@ fn crash_orphan_segment_invisible() {
 
     // 模拟「数据文件已写、manifest 未提交」：往分区目录塞一个不受引用的 seg 文件
     let pdir = root.join("default").join("events").join("dt=2022-01-09");
-    let manifest = qsdb::manifest::PartitionManifest::read(&pdir)
+    let manifest = qsdb::manifest::PartitionManifest::read(db.store(), &pdir)
         .unwrap()
         .unwrap();
     let live: Vec<String> = manifest
@@ -285,7 +285,7 @@ fn crash_between_overwrite_steps_keeps_old_data_visible() {
 
     // 手工执行 overwrite 的前半段：写新数据文件，但不动 manifest
     let pdir = root.join("default").join("events").join("dt=2022-01-11");
-    let manifest_before = qsdb::manifest::PartitionManifest::read(&pdir)
+    let manifest_before = qsdb::manifest::PartitionManifest::read(db.store(), &pdir)
         .unwrap()
         .unwrap();
     let ghost = pdir.join("seg_ghost00000000000000000000000000.parquet");
@@ -295,7 +295,7 @@ fn crash_between_overwrite_steps_keeps_old_data_visible() {
     }
     // 旧数据仍然完整可读（manifest 未变）
     assert_eq!(count_rows(&db, "events"), 100);
-    let manifest_after = qsdb::manifest::PartitionManifest::read(&pdir)
+    let manifest_after = qsdb::manifest::PartitionManifest::read(db.store(), &pdir)
         .unwrap()
         .unwrap();
     assert_eq!(manifest_after, manifest_before, "manifest 未被触碰");
@@ -344,7 +344,7 @@ fn multi_instance_same_partition_appends_are_serialized() {
     assert_eq!(total, 2 * N * ROWS, "两实例同分区 append 无丢失无重复");
     // manifest 行数一致
     let pdir = root.join("default").join("events").join("dt=2022-01-12");
-    let m = qsdb::manifest::PartitionManifest::read(&pdir)
+    let m = qsdb::manifest::PartitionManifest::read(d1.store(), &pdir)
         .unwrap()
         .unwrap();
     assert_eq!(m.total_rows(), (2 * N * ROWS) as u64);

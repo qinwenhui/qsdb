@@ -4,7 +4,7 @@
 //! overwrite：锁内 写新数据 → 只含新 segment 的 manifest 原子替换（提交点）
 //!            → 旧数据文件移 `_trash`
 
-use std::fs::{self, File};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -21,6 +21,7 @@ use crate::fsutil::{PartitionLock, move_to_trash, now_ms};
 use crate::manifest::{PartitionManifest, SegmentEntry};
 use crate::partition::partition_dir;
 use crate::stats;
+use crate::store::Store;
 
 /// 写入结果。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -156,7 +157,9 @@ fn type_compatible(a: &DataType, b: &DataType) -> bool {
 }
 
 /// 写一个 segment：所有批进一个 parquet 文件（tmp → rename 定名）。
+/// 序列化直写本地文件（§4 热路径豁免）；stat/定名经 Store。
 fn write_segment(
+    store: &Store,
     partition_dir: &Path,
     batches: &[RecordBatch],
     file_schema: &SchemaRef,
@@ -186,11 +189,11 @@ fn write_segment(
             .close()
             .map_err(|e| QsdbError::meta(format!("parquet close failed: {e}")))?;
     }
-    let bytes = fs::metadata(&tmp_path)
-        .map_err(|e| QsdbError::meta(format!("stat segment failed: {e}")))?
-        .len();
-    fs::rename(&tmp_path, &final_path)
-        .map_err(|e| QsdbError::meta(format!("rename segment failed: {e}")))?;
+    let bytes = store
+        .stat(&tmp_path)?
+        .ok_or_else(|| QsdbError::meta("stat segment failed: tmp missing after write"))?
+        .size;
+    store.commit_object(&tmp_path, &final_path)?;
 
     // 统计：跨批合并
     let mut merged: Vec<(String, stats_merge::Acc)> = column_names
@@ -352,6 +355,7 @@ pub(crate) fn check_constraints(def: &TableDef, batches: &[RecordBatch]) -> Resu
 
 /// append（单分区；输入批必须已按分区分组，含全表数据列）。
 pub(crate) fn append_partition(
+    store: &Store,
     table_dir: &Path,
     def: &TableDef,
     values: &[crate::types::Literal],
@@ -365,11 +369,11 @@ pub(crate) fn append_partition(
     };
     check_constraints(def, batches)?;
     let dir = pdir(table_dir, def, values)?;
-    fs::create_dir_all(&dir)
-        .map_err(|e| QsdbError::meta(format!("mkdir partition failed: {e}")))?;
+    store.create_dir_all(&dir)?;
     let _guard = PartitionLock::acquire(&lock_path(&dir))?;
 
     let entry = write_segment(
+        store,
         &dir,
         batches,
         &file_schema,
@@ -381,7 +385,7 @@ pub(crate) fn append_partition(
             .collect::<Vec<_>>(),
     )?;
 
-    let mut manifest = PartitionManifest::read(&dir)?.unwrap_or_else(|| {
+    let mut manifest = PartitionManifest::read(store, &dir)?.unwrap_or_else(|| {
         PartitionManifest::new(named_values(def, values), def.schema_fingerprint())
     });
     // 指纹一致 或 旧 schema 为当前前缀（ALTER ADD COLUMN）→ 允许追加并升格分区指纹
@@ -397,8 +401,8 @@ pub(crate) fn append_partition(
         manifest.schema_fingerprint = def.schema_fingerprint();
     }
     manifest.segments.push(entry.clone());
-    manifest.commit(&dir)?;
-    sync_index(table_dir, &dir, &manifest);
+    manifest.commit(store, &dir)?;
+    sync_index(store, table_dir, &dir, &manifest);
     drop(_guard);
 
     Ok(WriteResult {
@@ -410,18 +414,18 @@ pub(crate) fn append_partition(
 
 /// 提交成功后同步表级索引（best-effort：失败不影响已提交数据，可由重建兜底）。
 /// 必须在分区锁持有期间调用（锁顺序：分区锁 → 索引锁）。
-fn sync_index(table_dir: &Path, partition_dir: &Path, manifest: &PartitionManifest) {
+fn sync_index(store: &Store, table_dir: &Path, partition_dir: &Path, manifest: &PartitionManifest) {
     let rel = partition_dir
         .strip_prefix(table_dir)
         .unwrap_or(partition_dir)
         .to_string_lossy()
         .replace('\\', "/");
-    let _ = crate::index::PartitionsIndex::upsert(table_dir, &rel, manifest);
+    let _ = crate::index::PartitionsIndex::upsert(store, table_dir, &rel, manifest);
 }
 
 /// overwrite（单分区原子替换；空输入 = 清空分区）。
 pub(crate) fn overwrite_partition(
-    root: &Path,
+    store: &Store,
     table_dir: &Path,
     def: &TableDef,
     values: &[crate::types::Literal],
@@ -433,17 +437,17 @@ pub(crate) fn overwrite_partition(
     let file_schema = validate_batches(batches, &schema)?;
     check_constraints(def, batches)?;
     let dir = pdir(table_dir, def, values)?;
-    fs::create_dir_all(&dir)
-        .map_err(|e| QsdbError::meta(format!("mkdir partition failed: {e}")))?;
+    store.create_dir_all(&dir)?;
     let _guard = PartitionLock::acquire(&lock_path(&dir))?;
 
     // 旧 manifest（不存在 = 新分区）
-    let old = PartitionManifest::read(&dir)?;
+    let old = PartitionManifest::read(store, &dir)?;
 
     let mut result = WriteResult::default();
     let mut new_segments: Vec<SegmentEntry> = Vec::new();
     if let Some(fs) = &file_schema {
         let entry = write_segment(
+            store,
             &dir,
             batches,
             fs,
@@ -478,13 +482,13 @@ pub(crate) fn overwrite_partition(
     };
     manifest.segments = new_segments;
     let old_files: Vec<PathBuf> = old.map(|m| m.segment_paths(&dir)).unwrap_or_default();
-    manifest.commit(&dir)?;
-    sync_index(table_dir, &dir, &manifest);
+    manifest.commit(store, &dir)?;
+    sync_index(store, table_dir, &dir, &manifest);
     drop(_guard);
 
     // 旧数据文件延迟善后（提交后；失败不影响正确性，GC 兜底）
     for f in old_files {
-        let _ = move_to_trash(root, &f);
+        let _ = move_to_trash(store.root(), &f);
     }
 
     Ok(result)
@@ -505,6 +509,7 @@ fn named_values(
 mod tests {
     use super::*;
     use crate::catalog::ColumnDef;
+    use crate::store::Store;
     use crate::types::{Literal, LogicalType};
     use arrow::array::{Int64Array, StringArray};
 
@@ -540,42 +545,42 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vals))]).unwrap()
     }
 
-    fn tmp_root(tag: &str) -> PathBuf {
+    fn tmp_root(tag: &str) -> (Store, PathBuf) {
         let d = std::env::temp_dir()
             .join("qsdb_write_test")
             .join(format!("{tag}_{}", uuid::Uuid::now_v7().simple()));
-        fs::create_dir_all(&d).unwrap();
-        d
+        std::fs::create_dir_all(&d).unwrap();
+        (Store::local(&d), d)
     }
 
     #[test]
     fn append_creates_manifest_and_files() {
-        let root = tmp_root("append");
+        let (store, root) = tmp_root("append");
         let d = def();
         let tdir = root.join("t");
         let vals = [Literal::Date(1)];
-        let r = append_partition(&tdir, &d, &vals, &[data_batch(vec![Some(10)])]).unwrap();
+        let r = append_partition(&store, &tdir, &d, &vals, &[data_batch(vec![Some(10)])]).unwrap();
         assert_eq!(r.rows, 1);
         let pdir = tdir.join("dt=1970-01-02");
-        let m = PartitionManifest::read(&pdir).unwrap().unwrap();
+        let m = PartitionManifest::read(&store, &pdir).unwrap().unwrap();
         assert_eq!(m.segments.len(), 1);
         assert_eq!(m.total_rows(), 1);
         assert_eq!(m.generation, 1);
         assert!(pdir.join(&m.segments[0].file_name).exists());
-        fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn append_accumulates_and_overwrite_replaces() {
-        let root = tmp_root("ow");
+        let (store, root) = tmp_root("ow");
         let d = def();
         let tdir = root.join("t");
         let vals = [Literal::Date(1)];
-        append_partition(&tdir, &d, &vals, &[data_batch(vec![Some(10)])]).unwrap();
-        append_partition(&tdir, &d, &vals, &[data_batch(vec![Some(20)])]).unwrap();
+        append_partition(&store, &tdir, &d, &vals, &[data_batch(vec![Some(10)])]).unwrap();
+        append_partition(&store, &tdir, &d, &vals, &[data_batch(vec![Some(20)])]).unwrap();
         let pdir = tdir.join("dt=1970-01-02");
         assert_eq!(
-            PartitionManifest::read(&pdir)
+            PartitionManifest::read(&store, &pdir)
                 .unwrap()
                 .unwrap()
                 .total_rows(),
@@ -584,34 +589,34 @@ mod tests {
 
         // overwrite：只剩新数据
         overwrite_partition(
-            &root,
+            &store,
             &tdir,
             &d,
             &vals,
             &[data_batch(vec![Some(7), Some(8)])],
         )
         .unwrap();
-        let m = PartitionManifest::read(&pdir).unwrap().unwrap();
+        let m = PartitionManifest::read(&store, &pdir).unwrap().unwrap();
         assert_eq!(m.segments.len(), 1);
         assert_eq!(m.total_rows(), 2);
         assert_eq!(m.generation, 3);
         // 旧文件进 trash
         assert!(root.join("_trash").exists());
         // 空 overwrite = 清空分区
-        overwrite_partition(&root, &tdir, &d, &vals, &[]).unwrap();
-        let m = PartitionManifest::read(&pdir).unwrap().unwrap();
+        overwrite_partition(&store, &tdir, &d, &vals, &[]).unwrap();
+        let m = PartitionManifest::read(&store, &pdir).unwrap().unwrap();
         assert_eq!(m.total_rows(), 0);
         assert!(m.segments.is_empty());
-        fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn schema_mismatch_rejected() {
-        let root = tmp_root("mismatch");
+        let (store, root) = tmp_root("mismatch");
         let d = def();
         let tdir = root.join("t");
         let vals = [Literal::Date(1)];
-        append_partition(&tdir, &d, &vals, &[data_batch(vec![Some(1)])]).unwrap();
+        append_partition(&store, &tdir, &d, &vals, &[data_batch(vec![Some(1)])]).unwrap();
         // 错列名
         let schema = Arc::new(Schema::new(vec![Field::new(
             "wrong",
@@ -623,21 +628,22 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1]))],
         )
         .unwrap();
-        assert!(append_partition(&tdir, &d, &vals, &[b]).is_err());
+        assert!(append_partition(&store, &tdir, &d, &vals, &[b]).is_err());
         // 错类型
         let schema2 = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, true)]));
         let b2 =
             RecordBatch::try_new(schema2, vec![Arc::new(StringArray::from(vec!["x"]))]).unwrap();
-        assert!(append_partition(&tdir, &d, &vals, &[b2]).is_err());
-        fs::remove_dir_all(&root).ok();
+        assert!(append_partition(&store, &tdir, &d, &vals, &[b2]).is_err());
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn stats_recorded_in_manifest() {
-        let root = tmp_root("stats");
+        let (store, root) = tmp_root("stats");
         let d = def();
         let tdir = root.join("t");
         append_partition(
+            &store,
             &tdir,
             &d,
             &[Literal::Date(1)],
@@ -645,12 +651,12 @@ mod tests {
         )
         .unwrap();
         let pdir = tdir.join("dt=1970-01-02");
-        let m = PartitionManifest::read(&pdir).unwrap().unwrap();
+        let m = PartitionManifest::read(&store, &pdir).unwrap().unwrap();
         let (name, vstats) = &m.segments[0].column_stats[0];
         assert_eq!(name, "v");
         assert_eq!(vstats.min, Some(Literal::Int64(5)));
         assert_eq!(vstats.max, Some(Literal::Int64(5)));
         assert_eq!(vstats.null_count, 1);
-        fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root).ok();
     }
 }
