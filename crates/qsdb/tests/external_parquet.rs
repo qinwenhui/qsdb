@@ -307,3 +307,58 @@ fn f3_microsecond_timestamp_cast_to_ns() {
     assert_eq!(rows, vec![vec![String::from("2")], vec![String::from("3")]]);
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn f12_hive_directory_semantics() {
+    let root = tmp_root("f12hive");
+    let lake = root.join("lake");
+    for d in ["lake/dt=2026-01-01", "lake/dt=2026-01-02"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    write_parquet(&lake.join("dt=2026-01-01/p1.parquet"), 0, 3);
+    write_parquet(&lake.join("dt=2026-01-02/p2.parquet"), 100, 3);
+    let db = db_at(&root);
+
+    // hive 目录：dt 列从路径重建（文件内不含 dt）
+    let pat = format!("{}/**/*.parquet", lake.to_string_lossy().replace('\\', "/"));
+    let rows = rows_of(
+        &db,
+        &format!("SELECT count(*), sum(amount) FROM read_parquet('{pat}')"),
+    );
+    assert_eq!(rows[0][0], "6");
+    assert_eq!(rows[0][1], "306"); // (0+1+2)+(100+101+102)
+
+    // hive 分区列投影 + WHERE 裁剪
+    let rows = rows_of(
+        &db,
+        &format!(
+            "SELECT dt, count(*) FROM read_parquet('{pat}') WHERE dt = DATE '2026-01-01' GROUP BY dt"
+        ),
+    );
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0][0].contains("2026-01-01"));
+    assert_eq!(rows[0][1], "3");
+
+    // 不匹配分区 → 0 行（裁剪生效）
+    let rows = rows_of(
+        &db,
+        &format!(
+            "SELECT count(*) FROM read_parquet('{pat}') WHERE dt = DATE '2025-01-01'"
+        ),
+    );
+    // 0 行可能返回空（引擎空输入 count 语义）或 "0"
+    assert!(rows.is_empty() || rows[0][0] == "0");
+
+    // 无 hive 目录的普通外表不受影响
+    let rows = rows_of(
+        &db,
+        &format!(
+            "SELECT count(*) FROM read_parquet('{}')",
+            lake.join("dt=2026-01-01/p1.parquet")
+                .to_string_lossy()
+                .replace('\\', "/")
+        ),
+    );
+    assert_eq!(rows[0][0], "3");
+    std::fs::remove_dir_all(&root).ok();
+}

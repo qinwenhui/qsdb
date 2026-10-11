@@ -42,7 +42,11 @@ pub use catalog::{ColumnDef, TableDef};
 pub use error::{QsdbError, Result};
 pub use expr::udaf;
 pub use expr::udf;
-pub use manifest::{ColumnStats, SegmentEntry};
+pub use manifest::{ColumnStats, PartitionManifest, SegmentEntry};
+// format-spec 原语（F13：生态工具实现合规布局的契约级稳定面）
+pub use partition::{
+    encode_partition_value, parse_partition_dir, parse_partition_value, partition_dir,
+};
 pub use scan::{Predicate, Scan};
 pub use store::Store;
 pub use types::{Literal, LogicalType};

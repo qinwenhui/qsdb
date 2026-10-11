@@ -1019,6 +1019,8 @@ fn resolve_table_function(
         return Err(QsdbError::not_found(format!("read_parquet: {path}")));
     };
     let schema = crate::scan::file_arrow_schema(first)?;
+    // F12：hive 目录语义——路径含 k=v 段 → 目录名组装分区列常量
+    let hive = crate::scan::extract_hive_partitions(&files);
     let mut columns = Vec::with_capacity(schema.fields().len());
     for f in schema.fields() {
         let logical = LogicalType::try_from_arrow(f.data_type()).map_err(|e| {
@@ -1037,11 +1039,30 @@ fn resolve_table_function(
             comment: None,
         });
     }
+    // F12：hive 分区列追加为 nullable 列 + partition_keys（类型由首个值推断）
+    let mut all_columns = columns;
+    let partition_keys: Vec<String> = if let Some(hive) = &hive {
+        for (k, vals) in hive {
+            if let Some(lit) = vals.first() {
+                all_columns.push(crate::catalog::ColumnDef {
+                    name: k.clone(),
+                    logical_type: lit.logical_type().unwrap_or(LogicalType::Varchar { max_chars: None }),
+                    nullable: true,
+                    check: None,
+                    default: None,
+                    comment: None,
+                });
+            }
+        }
+        hive.keys().cloned().collect()
+    } else {
+        Vec::new()
+    };
     let def = Arc::new(TableDef {
         version: 1,
         name: "read_parquet".into(),
-        columns,
-        partition_keys: Vec::new(),
+        columns: all_columns,
+        partition_keys,
         created_at: 0,
         properties: std::collections::HashMap::new(),
     });

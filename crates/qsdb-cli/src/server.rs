@@ -183,6 +183,7 @@ pub async fn serve(
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/api/v1/auth/login", post(auth_login))
+        .route("/api/v1/files", get(download_file))
         .route("/api/v1/query", post(query))
         .route("/api/v1/write", post(write))
         .route("/api/v1/tables", get(tables))
@@ -396,6 +397,62 @@ async fn auth_login(
         "note": "process-lifetime token; restart requires re-login"
     }))
     .into_response()
+}
+
+/// GET /api/v1/files?path=<相对 db root 的路径>——物理复制源（qsdb-sync F11）。
+/// 路径白名单：禁止 `_trash`/`_filecache`/`..`；其余（manifest/segment/table.json/
+/// partitions.idx）均可下载。配合 read_only 模式即成为标准复制源。
+#[derive(serde::Deserialize)]
+struct FileParams {
+    path: String,
+}
+
+async fn download_file(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(p): Query<FileParams>,
+) -> Response {
+    let Some(role) = auth_role(&s, &headers) else {
+        return err_response(StatusCode::UNAUTHORIZED, "unauthorized".into());
+    };
+    if !role.is_admin() {
+        return err_response(
+            StatusCode::FORBIDDEN,
+            "file download requires admin".into(),
+        );
+    }
+    // 路径安全检查
+    let rel = p.path.replace('\\', "/");
+    if rel.contains("..") || rel.starts_with('/') {
+        return err_response(StatusCode::BAD_REQUEST, "invalid path".into());
+    }
+    if rel.starts_with("_trash/") || rel.starts_with("_filecache/") {
+        return err_response(StatusCode::FORBIDDEN, "internal paths not downloadable".into());
+    }
+    let full = s.db.root().join(&rel);
+    let result = tokio::task::spawn_blocking(move || std::fs::read(&full)).await;
+    match result {
+        Ok(Ok(bytes)) => {
+            let len = bytes.len().to_string();
+            (
+                StatusCode::OK,
+                [
+                    ("content-type", "application/octet-stream"),
+                    ("content-length", len.as_str()),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Ok(Err(e)) => err_response(
+            StatusCode::NOT_FOUND,
+            format!("file not found: {e}"),
+        ),
+        Err(e) => err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("io task: {e}"),
+        ),
+    }
 }
 
 async fn health(State(_s): State<Arc<AppState>>) -> impl IntoResponse {

@@ -395,6 +395,88 @@ impl FileLoc {
     }
 }
 
+/// F12：从外表文件位置提取 hive 分区（路径含 `k=v` 段 → 列名 → 值列表）。
+/// 返回 None = 无 hive 目录（普通外表）。类型由首个值推断（parse 分区值
+/// 的类型推导链：先试 Date/Int64/Bool，失败回退 Utf8）。
+pub(crate) fn extract_hive_partitions(
+    files: &[FileLoc],
+) -> Option<HashMap<String, Vec<Literal>>> {
+    let mut hive: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new(); // (name, [(value, base)])
+    for loc in files {
+        let p = match loc {
+            FileLoc::Local(p) => p,
+            #[cfg(feature = "s3")]
+            FileLoc::S3(u) => PathBuf::from(u),
+            FileLoc::Managed(p) => p,
+        };
+        // 逐段找 k=v
+        for anc in p.ancestors().skip(1) {
+            if let Some(name) = anc.file_name().and_then(|n| n.to_str()) {
+                if let Some((k, v)) = name.split_once('=') {
+                    if k.is_empty() || v.is_empty() {
+                        continue;
+                    }
+                    // 记录 (value, 文件本身) 以便后续按文件取值
+                    hive.entry(k.to_string())
+                        .or_default()
+                        .push((v.to_string(), p.clone()));
+                }
+            }
+        }
+    }
+    if hive.is_empty() {
+        return None;
+    }
+    // 每列：推断类型 + 去重值列表（按首次出现序）
+    let mut out: HashMap<String, Vec<Literal>> = HashMap::new();
+    for (k, pairs) in &hive {
+        let first_val = pairs.first().map(|(v, _)| v.as_str()).unwrap_or("");
+        let ty = infer_partition_type(first_val);
+        let mut vals: Vec<Literal> = Vec::new();
+        for (v, _) in pairs {
+            let lit = parse_partition_value(v, &ty).unwrap_or(Literal::Utf8(v.clone()));
+            if !vals.contains(&lit) {
+                vals.push(lit);
+            }
+        }
+        out.insert(k.clone(), vals);
+    }
+    Some(out)
+}
+
+/// 分区值类型推断（从字符串值）。
+fn infer_partition_type(v: &str) -> crate::types::LogicalType {
+    use crate::types::LogicalType;
+    if crate::types::temporal::parse_date(v).is_ok() {
+        return LogicalType::Date;
+    }
+    if v.parse::<i64>().is_ok() {
+        return LogicalType::Int64;
+    }
+    if v == "true" || v == "false" {
+        return LogicalType::Boolean;
+    }
+    LogicalType::Varchar { max_chars: None }
+}
+
+/// 为单个文件提取 hive 分区值（按文件路径解析 k=v 段）。
+pub(crate) fn hive_values_for(path: &Path) -> HashMap<String, Literal> {
+    let mut out = HashMap::new();
+    for anc in path.ancestors().skip(1) {
+        if let Some(name) = anc.file_name().and_then(|n| n.to_str()) {
+            if let Some((k, v)) = name.split_once('=') {
+                if k.is_empty() || v.is_empty() {
+                    continue;
+                }
+                let ty = infer_partition_type(v);
+                let lit = parse_partition_value(v, &ty).unwrap_or(Literal::Utf8(v.to_string()));
+                out.insert(k.to_string(), lit);
+            }
+        }
+    }
+    out
+}
+
 /// 简单 glob 匹配：`*` 不跨 `/`，`**` 任意（含 `/`），分隔符统一 `/`。
 pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
     /// 分隔符归一 + 连续星号折叠（≥2 个 → `**`）。
@@ -1476,13 +1558,49 @@ impl Scan {
         file_cache: Option<Arc<crate::filecache::FileCache>>,
         ctx: Arc<crate::query::QueryContext>,
     ) -> Result<Self> {
-        let plan = ScanPlan::build(def, projection, predicate, limit)?;
+        let plan = ScanPlan::build(Arc::clone(&def), projection, predicate, limit)?;
+        // F12：hive 目录语义——外表路径含 k=v 段 → 逐文件组装分区值
+        // （分区裁剪谓词在 plan 侧已可评估；值在 assemble_output 重建列）
+        let has_hive = def.partition_keys.iter().any(|k| !k.is_empty())
+            && files.iter().any(|loc| {
+                let p = match loc {
+                    FileLoc::Local(p) | FileLoc::Managed(p) => p.clone(),
+                    #[cfg(feature = "s3")]
+                    FileLoc::S3(u) => PathBuf::from(u),
+                };
+                p.ancestors().any(|a| {
+                    a.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.contains('=') && !n.starts_with('_'))
+                })
+            });
         let mut plans = Vec::with_capacity(files.len());
         for loc in files {
+            // 分区裁剪：hive 路径值与谓词不可裁剪才跳过（无谓词 = 全读）
+            let pvals: HashMap<String, Literal> = if has_hive {
+                let p = match &loc {
+                    FileLoc::Local(p) | FileLoc::Managed(p) => p.clone(),
+                    #[cfg(feature = "s3")]
+                    FileLoc::S3(u) => PathBuf::from(u),
+                };
+                hive_values_for(&p)
+            } else {
+                HashMap::new()
+            };
+            // 谓词裁剪（分区列常量：确定为假 → 跳过该文件）
+            if let Some(pred) = &plan.predicate {
+                if !pvals.is_empty() {
+                    let lookup: HashMap<&str, &Literal> =
+                        pvals.iter().map(|(k, v)| (k.as_str(), v)).collect();
+                    if crate::scan::eval_partition_predicate(pred, &lookup) == Tri::False {
+                        continue;
+                    }
+                }
+            }
             let row_groups = prune_row_groups(store, &loc, &plan, file_cache.as_deref())?;
             plans.push(FilePlan {
                 loc,
-                partition_values: HashMap::new(),
+                partition_values: pvals,
                 row_groups,
             });
         }
