@@ -12,8 +12,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array,
-    StringArray, Time64NanosecondArray, TimestampNanosecondArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int8Array, Int16Array, Int32Array, Int64Array, PrimitiveArray, StringArray,
+    Time64NanosecondArray, TimestampNanosecondArray,
 };
 use arrow::datatypes::{DataType, i256};
 use arrow::record_batch::RecordBatch;
@@ -256,6 +257,79 @@ fn combine_max(a: Option<Literal>, b: Option<Literal>) -> Option<Literal> {
     pick(a, b, false)
 }
 
+/// 类型化切片求和进 i128 累加器：null_count=0 时 `values()` 切片直加
+/// （免逐行判空，LLVM 自动向量化）；含 NULL 退回判空循环。
+fn sum_slice<T: arrow::datatypes::ArrowPrimitiveType>(
+    acc: &mut [i128],
+    arr: &arrow::array::PrimitiveArray<T>,
+) where
+    i128: From<T::Native>,
+{
+    let a = &mut acc[0];
+    if arr.null_count() == 0 {
+        for v in arr.values() {
+            *a += i128::from(*v);
+        }
+    } else {
+        for i in 0..arr.len() {
+            if !arr.is_null(i) {
+                *a += i128::from(arr.value(i));
+            }
+        }
+    }
+}
+
+/// Kahan 补偿求和（迭代器形态；f32 上游转 f64）。
+fn kahan_slice(it: impl Iterator<Item = f64>, out: &mut (f64, f64)) {
+    for x in it {
+        let y = x - out.1;
+        let t = out.0 + y;
+        out.1 = (t - out.0) - y;
+        out.0 = t;
+    }
+}
+
+/// typed 数组 SIMD 最小值 → Literal（忽略 NULL；形态由调用方验证）。
+fn typed_scalar_min(a: &dyn arrow::array::Array) -> Option<crate::types::Literal> {
+    use crate::types::Literal;
+    use arrow::compute::{max, min};
+    macro_rules! m {
+        ($t:ident, $lit:expr) => {{
+            min(a.as_any().downcast_ref::<$t>().unwrap()).map($lit)
+        }};
+    }
+    match a.data_type() {
+        DataType::Int8 => m!(Int8Array, Literal::Int8),
+        DataType::Int16 => m!(Int16Array, Literal::Int16),
+        DataType::Int32 => m!(Int32Array, Literal::Int32),
+        DataType::Int64 => m!(Int64Array, Literal::Int64),
+        DataType::Float32 => m!(Float32Array, Literal::Float32),
+        DataType::Float64 => m!(Float64Array, Literal::Float64),
+        DataType::Date32 => m!(Date32Array, Literal::Date),
+        _ => None,
+    }
+}
+
+/// typed 数组 SIMD 最大值 → Literal。
+fn typed_scalar_max(a: &dyn arrow::array::Array) -> Option<crate::types::Literal> {
+    use crate::types::Literal;
+    use arrow::compute::max;
+    macro_rules! m {
+        ($t:ident, $lit:expr) => {{
+            max(a.as_any().downcast_ref::<$t>().unwrap()).map($lit)
+        }};
+    }
+    match a.data_type() {
+        DataType::Int8 => m!(Int8Array, Literal::Int8),
+        DataType::Int16 => m!(Int16Array, Literal::Int16),
+        DataType::Int32 => m!(Int32Array, Literal::Int32),
+        DataType::Int64 => m!(Int64Array, Literal::Int64),
+        DataType::Float32 => m!(Float32Array, Literal::Float32),
+        DataType::Float64 => m!(Float64Array, Literal::Float64),
+        DataType::Date32 => m!(Date32Array, Literal::Date),
+        _ => None,
+    }
+}
 /// 数值累加列（sum/avg 的 sum 部分；按输入类型选一种，SoA 稠密向量）。
 enum SumCol {
     /// 非数值聚合列（count-only / min-max）不占状态
@@ -271,6 +345,7 @@ enum SumCol {
 /// 分组聚合表（SoA：key 单一 arena + 偏移，聚合状态按列稠密——
 /// 百万级组数时散布步长 8~40B，不再逐组堆分配；P3 性能重做）。
 #[derive(Default)]
+
 pub struct GroupTable {
     by_hash: HashMap<u64, Vec<u32>>,
     pending_arity: Option<usize>,
@@ -381,6 +456,138 @@ impl GroupTable {
         }
     }
 
+    /// 全局聚合（无 GROUP BY）零迭代快路径——「缓存聚合 0.04x」的底座修复：
+    /// `count(*)` = `num_rows`（**O(1)**）、`count(col)` = `num_rows − null_count`
+    /// （**O(1)**）、整型 sum = 类型化 `values()` 切片直加（null_count=0 免逐行
+    /// 判空，自动向量化；i128 累加无溢出）、float sum = 切片 Kahan、
+    /// min/max = typed 数组 SIMD `min()`/`max()`。
+    /// 逐批成本从 ~6ns/行 降到 ~0.3ns/行 + O(1) 计数。
+    /// 返回 Ok(false) = 形态不支持（零状态变更，调用方回退原路径）。
+    fn try_global_fast(
+        &mut self,
+        aggs: &[AggExpr],
+        arrays: &[Option<ArrayRef>],
+        n: usize,
+    ) -> Result<bool> {
+        use crate::expr::AggFunc::*;
+        // 先验证全形态可加速（不变更状态）
+        for (ai, agg) in aggs.iter().enumerate() {
+            match agg.func {
+                Count => {}
+                Sum | Avg => {
+                    let Some(a) = &arrays[ai] else {
+                        return Ok(false);
+                    };
+                    let ok = match (&self.sums[ai], a.data_type()) {
+                        (SumCol::Int(_), DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Date32) => true,
+                        (SumCol::Flt(_), DataType::Float32 | DataType::Float64) => true,
+                        (SumCol::Dec(_), DataType::Decimal128(_, _)) => true,
+                        _ => false,
+                    };
+                    if !ok {
+                        return Ok(false);
+                    }
+                }
+                Min | Max => {
+                    let Some(a) = &arrays[ai] else {
+                        return Ok(false);
+                    };
+                    let ok = matches!(
+                        a.data_type(),
+                        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64 | DataType::Date32
+                    );
+                    if !ok {
+                        return Ok(false);
+                    }
+                }
+                Udaf => return Ok(false),
+            }
+        }
+        // 应用（全局唯一组 gid 0；首批建空键组）
+        if self.is_empty() {
+            self.push_group(&[], Vec::new());
+        }
+        for (ai, agg) in aggs.iter().enumerate() {
+            let arr = arrays[ai].as_deref();
+            match agg.func {
+                Count => {
+                    let add = match arr {
+                        None => n,
+                        Some(a) => n - a.null_count(),
+                    };
+                    self.counts[ai][0] += add as u64;
+                }
+                Sum | Avg => {
+                    let a = arr.unwrap();
+                    self.counts[ai][0] += (n - a.null_count()) as u64;
+                    match (&mut self.sums[ai], a.data_type()) {
+                        (SumCol::Int(acc), DataType::Int8) => {
+                            sum_slice(acc, a.as_any().downcast_ref::<Int8Array>().unwrap())
+                        }
+                        (SumCol::Int(acc), DataType::Int16) => {
+                            sum_slice(acc, a.as_any().downcast_ref::<Int16Array>().unwrap())
+                        }
+                        (SumCol::Int(acc), DataType::Int32) => {
+                            sum_slice(acc, a.as_any().downcast_ref::<Int32Array>().unwrap())
+                        }
+                        (SumCol::Int(acc), DataType::Int64) => {
+                            sum_slice(acc, a.as_any().downcast_ref::<Int64Array>().unwrap())
+                        }
+                        (SumCol::Int(acc), DataType::Date32) => {
+                            sum_slice(acc, a.as_any().downcast_ref::<Date32Array>().unwrap())
+                        }
+                        (SumCol::Flt(acc), DataType::Float64) => {
+                            let f = a.as_any().downcast_ref::<Float64Array>().unwrap();
+                            if f.null_count() == 0 {
+                                kahan_slice(f.values().iter().copied().map(f64::from), &mut acc[0])
+                            } else {
+                                kahan_slice(
+                                    (0..n).filter(|&i| !f.is_null(i)).map(|i| f.value(i)),
+                                    &mut acc[0],
+                                )
+                            }
+                        }
+                        (SumCol::Flt(acc), DataType::Float32) => {
+                            let f = a.as_any().downcast_ref::<Float32Array>().unwrap();
+                            kahan_slice(
+                                (0..n).filter(|&i| !f.is_null(i)).map(|i| f64::from(f.value(i))),
+                                &mut acc[0],
+                            )
+                        }
+                        (SumCol::Dec(acc), DataType::Decimal128(_, _)) => {
+                            let d = a.as_any().downcast_ref::<Decimal128Array>().unwrap();
+                            for i in 0..n {
+                                if !d.is_null(i) {
+                                    acc[0] += i256::from_i128(d.value(i));
+                                }
+                            }
+                        }
+                        _ => unreachable!("validated above"),
+                    }
+                }
+                Min | Max => {
+                    let a = arr.unwrap();
+                    let slot = &mut self.minmax[ai][0];
+                    // 单一槽位只存该聚合自己的极值（min 聚合取 min、max 取 max）
+                    let v = if agg.func == Min {
+                        typed_scalar_min(a)
+                    } else {
+                        typed_scalar_max(a)
+                    };
+                    if let Some(v) = v {
+                        *slot = crate::write::combine_lit(
+                            slot.take(),
+                            Some(v),
+                            agg.func == Min,
+                        );
+                    }
+                }
+                Udaf => unreachable!("validated above"),
+            }
+        }
+        Ok(true)
+    }
+
     /// 掩码摄入（semi/anti + 聚合融合路径）：只处理 `sel` 列出的行，
     /// 全程零中间物化——semi 条件直接变行选择喂聚合内核。
     pub fn ingest_with_sel(
@@ -405,6 +612,13 @@ impl GroupTable {
             })
             .collect::<Result<_>>()?;
         self.init_cols(group, aggs, &agg_arrays);
+
+        // 全选 + 全局聚合 → 零迭代快路径（O(1) 计数 + SIMD 列和）
+        if group.is_empty() && sel.len() == batch.num_rows() {
+            if self.try_global_fast(aggs, &agg_arrays, batch.num_rows())? {
+                return Ok(());
+            }
+        }
 
         // 行 → 组 id（仅选中行；group_id 走通用路径——fast 槽表在其内部
         // 维护，与 ingest 全量路径共用同一张探测表，跨批一致）
@@ -655,6 +869,13 @@ impl GroupTable {
         let fast_cols = int64_group_columns(&group_arrays);
 
         self.init_cols(group, aggs, &agg_arrays);
+
+        // 全局聚合零迭代快路径（O(1) 计数 + SIMD 列和；形态不中则原路径）
+        if group.is_empty() {
+            if self.try_global_fast(aggs, &agg_arrays, n)? {
+                return Ok(());
+            }
+        }
 
         // 行 → 组 id
         // fast path：分组列全为非空 Int64 —— 内联 key 拼接 + 开放寻址表

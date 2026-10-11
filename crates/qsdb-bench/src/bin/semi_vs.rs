@@ -132,6 +132,14 @@ fn main() {
     ))
     .unwrap();
     duck.execute_batch("SELECT count(*) FROM t").unwrap();
+
+    let queries: &[(&str, &str)] = &[
+        ("基线聚合(无semi)", "SELECT count(*), sum(a) FROM t"),
+        ("基线过滤+聚合", "SELECT count(*), sum(a) FROM t WHERE g > 100"),
+        ("IN 子查询", "SELECT count(*), sum(a) FROM t WHERE g IN (SELECT g FROM dims)"),
+        ("NOT IN", "SELECT count(*) FROM t WHERE g NOT IN (SELECT g FROM dims)"),
+        ("EXISTS(关联)", "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM dims WHERE dims.g = t.g)"),
+    ];
     println!("\n（QSDB = 位图/免编码快路径；DuckDB = hash semi join；交替 2 轮）");
     for (name, sql) in queries {
         for round in 0..2 {
