@@ -20,7 +20,7 @@ use arrow::record_batch::RecordBatch;
 #[cfg(feature = "duckdb")]
 use duckdb::Connection;
 #[cfg(feature = "duckdb")]
-use qsdb::api::{Qsdb, QsdbOptions, ScanRequest};
+use qsdb::api::{Qsdb, QsdbOptions};
 
 #[cfg(feature = "duckdb")]
 fn main() {

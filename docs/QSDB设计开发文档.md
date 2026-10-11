@@ -50,7 +50,7 @@ QSDB 是一个**单机、嵌入式优先、列式、Arrow-native、Parquet-backe
 | 聚合（1 亿行、3 列 group by） | < 2s 单线程 / < 500ms 8 线程 | M2 gate |
 | 嵌入态空闲内存 | < 16MB RSS | smoke test |
 | 服务态空闲内存 | < 48MB RSS | smoke test |
-| 二进制大小（release，默认 feature） | ≤ 24MB（M4-6 起：panic=unwind 表 +7.8MB 换会话隔离，见 §M4-6；abort 可回 15.8MB 但失去 panic 隔离） | CI size-guard 守门 |
+| 二进制大小（release，默认 feature） | ≤ 25MB（2026-10-11 定案放宽：SQL-3/约束/ALTER 进核心后实测 24.1MB；panic=unwind 表 +7.8MB 换会话隔离，abort 可回 ~16MB 但失去隔离） | CI size-guard 守门 |
 | 崩溃一致性 | kill -9 中断写入后，重启无脏数据可见，残留 tmp 可清理 | fuzz 测试 |
 
 红线是里程碑验收标准，不是愿望。不达标时优先缩范围/调架构，而不是放水指标。

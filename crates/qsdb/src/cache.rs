@@ -205,7 +205,8 @@ impl SegmentCache {
     }
 
     /// 惰性收集器：miss 路径逐批 yield 的同时收集（Arc clone 零拷贝），
-    /// Drop 或 finish 时回填。
+    /// Drop 或 finish 时回填。累积上界 = 预算/8（并行分片各持一个收集器，
+    /// 超界弃缓存——防「整文件累积后一次性 put」在多分片下爆内存）。
     pub fn collector(
         self: &Arc<Self>,
         path: PathBuf,
@@ -214,10 +215,14 @@ impl SegmentCache {
         projection: Vec<String>,
         row_groups: Option<Vec<usize>>,
     ) -> CacheCollector {
+        let cap = (self.budget / 8).max(16 * 1024 * 1024);
         CacheCollector {
             cache: Arc::clone(self),
             sig: (path, mtime_ms, size, projection, row_groups),
             batches: Vec::new(),
+            acc_bytes: 0,
+            cap_bytes: cap,
+            aborted: false,
         }
     }
 }
@@ -227,14 +232,30 @@ pub struct CacheCollector {
     cache: Arc<SegmentCache>,
     sig: (PathBuf, u64, u64, Vec<String>, Option<Vec<usize>>),
     batches: Vec<RecordBatch>,
+    acc_bytes: usize,
+    cap_bytes: usize,
+    aborted: bool,
 }
 
 impl CacheCollector {
     pub fn push(&mut self, b: RecordBatch) {
+        if self.aborted {
+            return;
+        }
+        self.acc_bytes += b.get_array_memory_size();
+        if self.acc_bytes > self.cap_bytes {
+            // 超上界：放弃本条目缓存（大文件不进缓存，扫描内存有界）
+            self.batches.clear();
+            self.aborted = true;
+            return;
+        }
         self.batches.push(b);
     }
 
     pub fn finish(self) {
+        if self.aborted {
+            return;
+        }
         let (path, mt, sz, proj, rgs) = self.sig;
         self.cache.put(&path, mt, sz, &proj, &rgs, self.batches);
     }
