@@ -372,6 +372,17 @@ impl Qsdb {
         drop_table(&self.store, DEFAULT_DB, table)
     }
 
+    /// 表 schema（生态工具高频路径——schema 协商 / LIMIT 0 的便捷替代；
+    /// qsdb-sync F4）。内部 = LIMIT 0 契约同款 `SqlResult::Query { schema }`。
+    pub fn table_schema(&self, table: &str) -> Result<arrow::datatypes::SchemaRef> {
+        match self.sql(&format!("SELECT * FROM {table} LIMIT 0"))? {
+            crate::sql::SqlResult::Query { schema, .. } => Ok(schema),
+            crate::sql::SqlResult::Ok { message } => {
+                Err(QsdbError::invalid(format!("not a table: {message}")))
+            }
+        }
+    }
+
     /// 表定义。
     pub fn table_def(&self, table: &str) -> Result<Arc<TableDef>> {
         self.def(None, table)
@@ -632,6 +643,9 @@ impl Qsdb {
         };
         let rows = old.total_rows();
         let mut empty = crate::manifest::PartitionManifest::new(vec![], def.schema_fingerprint());
+        // generation 继承（F2 修复，qsdb-sync 反馈）：与远端路径一致——
+        // 清空是「提交」不是「重置」，单调递增是同步工具的增量判据契约
+        empty.generation = old.generation;
         empty.partition_values = def
             .partition_keys
             .iter()

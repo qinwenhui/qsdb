@@ -36,7 +36,7 @@ pub mod types;
 pub mod write;
 pub mod write_buffer;
 
-pub use api::{Qsdb, QsdbOptions, ScanRequest};
+pub use api::{PartitionStat, Qsdb, QsdbOptions, ScanRequest};
 pub use catalog::{ColumnDef, TableDef};
 pub use error::{QsdbError, Result};
 pub use expr::udaf;

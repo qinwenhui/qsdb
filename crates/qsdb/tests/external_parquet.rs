@@ -257,3 +257,53 @@ fn s3_without_feature_clear_error() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn f3_microsecond_timestamp_cast_to_ns() {
+    use arrow::array::TimestampMicrosecondArray;
+    let root = tmp_root("f3ts");
+    let dir = root.join("lake");
+    std::fs::create_dir_all(&dir).unwrap();
+    // 写一个 us 时间戳列的 parquet（Spark/DuckDB/pandas 生态事实标准）
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "evt_ts",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            true,
+        ),
+        Field::new("v", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                Some(1_000i64),
+                Some(2_000),
+                None,
+            ])),
+            Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3)])),
+        ],
+    )
+    .unwrap();
+    let f = std::fs::File::create(dir.join("ts.parquet")).unwrap();
+    let mut w = ArrowWriter::try_new(f, schema, None).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+
+    let db = db_at(&root);
+    // read_parquet 收纳 us → ns（不再报 unsupported）
+    let sql = format!(
+        "SELECT count(*), max(v) FROM read_parquet('{}')",
+        dir.join("ts.parquet").to_string_lossy().replace('\\', "/")
+    );
+    let rows = rows_of(&db, &sql);
+    assert_eq!(rows, vec![vec![String::from("3"), String::from("3")]]);
+    // 谓词在 cast 后的 ns 列上工作
+    let sql = format!(
+        "SELECT v FROM read_parquet('{}') WHERE v > 1 ORDER BY v",
+        dir.join("ts.parquet").to_string_lossy().replace('\\', "/")
+    );
+    let rows = rows_of(&db, &sql);
+    assert_eq!(rows, vec![vec![String::from("2")], vec![String::from("3")]]);
+    std::fs::remove_dir_all(&root).ok();
+}

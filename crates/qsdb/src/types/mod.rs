@@ -165,16 +165,22 @@ impl LogicalType {
             DataType::Float64 => Self::Float64,
             DataType::Decimal128(p, s) => Self::Decimal(DecimalMeta::try_new(*p, *s)?),
             DataType::Utf8 => Self::Varchar { max_chars: None },
+            // F3（qsdb-sync 反馈）：parquet 生态的 us/ms/s 时间戳是事实标准
+            // （Spark/DuckDB/pandas 默认）——收纳并归一到 ns（内部只存 ns；
+            // 数据列在 scan 路径 cast，见 scan::cast_external_columns）
+            DataType::Timestamp(_, tz) => Self::Timestamp {
+                timezone: tz.as_ref().map(|s| s.to_string()),
+            },
+            // 同理：字符串视图/大字符串归一 Utf8；Date64 归一 Date32
+            DataType::Utf8View | DataType::LargeUtf8 => Self::Varchar { max_chars: None },
+            DataType::Date64 => Self::Date,
             DataType::Binary => Self::Binary,
             DataType::Date32 => Self::Date,
             DataType::Time64(TimeUnit::Nanosecond) => Self::Time,
-            DataType::Timestamp(TimeUnit::Nanosecond, tz) => Self::Timestamp {
-                timezone: tz.as_ref().map(|s| s.to_string()),
-            },
             DataType::Interval(IntervalUnit::MonthDayNano) => Self::Interval,
             other => {
                 return Err(QsdbError::unsupported(format!(
-                    "arrow type {other:?} has no QSDB logical mapping"
+                    "arrow type {other:?} has no QSDB logical mapping (hint: cast timestamp to ns, string to utf8)"
                 )));
             }
         };
@@ -412,11 +418,19 @@ mod tests {
 
     #[test]
     fn arrow_unsupported_mappings() {
-        assert!(LogicalType::try_from_arrow(&DataType::Utf8View).is_err());
-        assert!(LogicalType::try_from_arrow(&DataType::Date64).is_err());
-        assert!(
-            LogicalType::try_from_arrow(&DataType::Timestamp(TimeUnit::Microsecond, None)).is_err()
+        // F3 后：us/ms/s 时间戳、Utf8View/Date64 收纳归一（不再是 unsupported）
+        assert_eq!(
+            LogicalType::try_from_arrow(&DataType::Timestamp(TimeUnit::Microsecond, None)).unwrap(),
+            LogicalType::Timestamp { timezone: None }
         );
+        assert_eq!(
+            LogicalType::try_from_arrow(&DataType::Date64).unwrap(),
+            LogicalType::Date
+        );
+        assert!(LogicalType::try_from_arrow(&DataType::Utf8View).is_ok());
+        // 仍不收纳的例子
+        assert!(LogicalType::try_from_arrow(&DataType::Float16).is_err());
+        assert!(LogicalType::try_from_arrow(&DataType::Time64(TimeUnit::Microsecond)).is_err());
     }
 
     #[test]

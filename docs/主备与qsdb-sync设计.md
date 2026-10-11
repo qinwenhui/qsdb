@@ -210,7 +210,7 @@ QSDB = append-only + 分区原子替换，**无行级 upsert**。三模式落法
 **边界声明**：高频行级 upsert 不是 QSDB 场景（OLTP 域）；CDC 进来的正确
 姿势 = 微批聚合 + 窗口幂等回写。sync 工具不得因此长成 OLTP 引擎。
 
-**Checkpoint 存储**：QSDB 内建 `_sync.checkpoints` 普通表存各管道游标/
+**Checkpoint 存储**：QSDB 内建 `sync_checkpoints` 普通表（原拟 `_sync.checkpoints`——点号与 ident 规则冲突，qsdb-sync 反馈 F1 后定名）存各管道游标/
 offset——零内核支持，崩溃重启按位点续传。
 
 **Schema drift**：源加列 → sink 侧自动 ALTER ADD COLUMN（内核前缀指纹

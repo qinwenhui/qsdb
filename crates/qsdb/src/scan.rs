@@ -1243,6 +1243,49 @@ fn cmp_mask(
     Ok(mask)
 }
 
+/// 外表列类型归一的准入判定（F3）：只放行无损/语义等价的归一。
+pub(crate) fn is_castable_external(got: &DataType, want: &DataType) -> bool {
+    use arrow::datatypes::TimeUnit as TU;
+    matches!(
+        (got, want),
+        (
+            DataType::Timestamp(TU::Microsecond | TU::Millisecond | TU::Second, _),
+            DataType::Timestamp(TU::Nanosecond, _)
+        ) | (
+            DataType::Timestamp(TU::Microsecond | TU::Millisecond | TU::Second, _),
+            DataType::Timestamp(TU::Microsecond | TU::Millisecond | TU::Second, _)
+        ) | (DataType::Utf8View | DataType::LargeUtf8, DataType::Utf8)
+            | (DataType::Date64, DataType::Date32)
+    )
+}
+
+/// 逐列 cast（只转登记的列；其余列原样保留——Arc 零拷贝）。
+fn cast_external_columns(batch: RecordBatch, casts: &[(String, DataType)]) -> Result<RecordBatch> {
+    if casts.is_empty() {
+        return Ok(batch);
+    }
+    let schema = batch.schema();
+    let mut cols: Vec<Arc<dyn arrow::array::Array>> = batch.columns().to_vec();
+    let mut fields: Vec<arrow::datatypes::FieldRef> = schema.fields().iter().cloned().collect();
+    for (name, want) in casts {
+        let idx = schema
+            .index_of(name)
+            .map_err(|_| QsdbError::meta(format!("cast col '{name}' missing")))?;
+        let field = schema.field(idx);
+        let target = arrow::datatypes::Field::new(field.name(), want.clone(), field.is_nullable());
+        let arr = arrow::compute::cast(&batch.column(idx), target.data_type())
+            .map_err(|e| QsdbError::type_err(format!("cast {name} to {want:?}: {e}")))?;
+        cols[idx] = arr;
+        fields[idx] = Arc::new(target);
+    }
+    RecordBatch::try_new_with_options(
+        Arc::new(arrow::datatypes::Schema::new(fields)),
+        cols,
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(|e| QsdbError::invalid(format!("cast external batch: {e}")))
+}
+
 /// RecordBatch 浅克隆（列 Arc 共享，零拷贝）。
 fn clone_batch(b: &RecordBatch) -> RecordBatch {
     b.clone()
@@ -1360,6 +1403,8 @@ pub struct Scan {
     current: Option<(BatchSource, FilePlan)>,
     /// 当前文件缺的列（ALTER ADD COLUMN 后旧 segment）：批读出后补 NULL
     missing_cols: Vec<(String, crate::types::LogicalType)>,
+    /// 外表列类型归一（F3）：(列名, 表侧 arrow 类型)——文件侧类型 ≠ 表侧时逐批 cast
+    cast_cols: Vec<(String, DataType)>,
     /// miss 路径的回填收集器（文件读尽时 finish）
     pending_collector: Option<crate::cache::CacheCollector>,
     remaining: Option<u64>,
@@ -1407,6 +1452,7 @@ impl Scan {
             files: files.into(),
             current: None,
             missing_cols: Vec::new(),
+            cast_cols: Vec::new(),
             pending_collector: None,
             remaining: limit,
             cache,
@@ -1445,6 +1491,7 @@ impl Scan {
             files: plans.into(),
             current: None,
             missing_cols: Vec::new(),
+            cast_cols: Vec::new(),
             pending_collector: None,
             remaining: limit,
             cache,
@@ -1525,6 +1572,7 @@ impl Scan {
                 files: std::collections::VecDeque::new(),
                 current: None,
                 missing_cols: Vec::new(),
+                cast_cols: Vec::new(),
                 pending_collector: None,
                 remaining: None,
                 cache: self.cache.clone(),
@@ -1544,6 +1592,7 @@ impl Scan {
             return Ok(false);
         };
         self.missing_cols.clear();
+        self.cast_cols.clear();
         let disp = file.loc.display_path();
         let src = ChunkSource::open(
             Some(&self.store),
@@ -1570,6 +1619,24 @@ impl Scan {
                     })?;
                     self.missing_cols
                         .push((name.clone(), c.logical_type.clone()));
+                }
+            }
+        }
+        // F3 列类型归一检测：文件侧 arrow 类型 ≠ 表侧期望 → 登记 cast
+        // （us/ms/s 时间戳、字符串视图、Date64；纳秒表收纳非纳秒入参）
+        {
+            let file_schema = builder.schema();
+            for (i, name) in self.plan.read_columns.iter().enumerate() {
+                let want = match self.plan.def.column(name) {
+                    Some(c) => c.logical_type.arrow_type(),
+                    None => continue,
+                };
+                let _ = i;
+                if let Ok(idx) = file_schema.index_of(name) {
+                    let got = file_schema.field(idx).data_type();
+                    if got != &want && crate::scan::is_castable_external(got, &want) {
+                        self.cast_cols.push((name.clone(), want));
+                    }
                 }
             }
         }
@@ -1628,6 +1695,11 @@ impl Scan {
         partition_values: &HashMap<String, Literal>,
     ) -> Result<Option<RecordBatch>> {
         let mut out = batch;
+        // F3：外表列类型归一（us/ms/s 时间戳/字符串视图/Date64 → 表逻辑类型；
+        // 仅 read_parquet 外表路径会登记 cast 列）
+        if !self.cast_cols.is_empty() {
+            out = cast_external_columns(out, &self.cast_cols)?;
+        }
         if !self.missing_cols.is_empty() {
             out = pad_missing_columns(out, &self.missing_cols.clone())?;
         }

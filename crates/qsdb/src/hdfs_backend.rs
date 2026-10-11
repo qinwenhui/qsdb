@@ -115,6 +115,10 @@ impl LockingStore {
                 }
                 Err(e) => return Err(e),
             }
+            if round % 8 == 7 {
+                tracing::debug!(target: "qsdb::occ", key = %location, round,
+                    "CAS lock contention, backing off");
+            }
             if round % 4 == 3 {
                 tokio::time::sleep(std::time::Duration::from_millis(LOCK_RETRY_MS)).await;
             }

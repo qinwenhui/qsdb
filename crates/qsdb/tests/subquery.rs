@@ -388,3 +388,44 @@ fn semi_error_paths() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+// ---------------------------------------------------------------------------
+// qsdb-sync 反馈回归：F2 generation 继承 / F3 us 时间戳外表 / F4 table_schema
+// ---------------------------------------------------------------------------
+
+#[test]
+fn f2_clear_partition_inherits_generation() {
+    let (db, root) = setup("f2gen");
+    // 三次提交 → generation 3
+    let sql = "SELECT count(*) FROM sales";
+    let _ = q(&db, sql);
+    let store = qsdb::Store::local(&root);
+    let pdir = root.join("default").join("sales").join("dt=2026-01-01");
+    let m1 = qsdb::manifest::PartitionManifest::read(&store, &pdir)
+        .unwrap()
+        .unwrap();
+    assert!(m1.generation >= 1);
+    // TRUNCATE（清空）→ generation 必须继承 +1（不回退为 1）
+    db.sql("TRUNCATE TABLE sales").unwrap();
+    let m2 = qsdb::manifest::PartitionManifest::read(&store, &pdir)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        m2.generation,
+        m1.generation + 1,
+        "F2: clear must inherit generation (sync 的增量判据契约)"
+    );
+    assert_eq!(m2.total_rows(), 0);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn f4_table_schema_method() {
+    let (db, root) = setup("f4schema");
+    let schema = db.table_schema("sales").unwrap();
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(names, vec!["dt", "tenant", "amt"]);
+    // 不存在的表报错
+    assert!(db.table_schema("nope").is_err());
+    std::fs::remove_dir_all(&root).ok();
+}

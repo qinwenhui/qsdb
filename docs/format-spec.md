@@ -9,13 +9,17 @@
 {qsdb_root}/
 ├── _catalog/
 │   └── {db}.postcard              # db → 表名清单（默认 db：default）
+├── _trash/{ts}/…                  # 待清理文件（root 级；静默期后删除）
+├── _filecache/…                   # 远端段缓存（工具可忽略，不可删除）
 ├── {db}/{table}/
 │   ├── table.json                 # 表定义（低频变更，人类可读）
+│   ├── partitions.idx             # 表级分区索引（工具加速结构，可重建）
 │   ├── {p1}={v1}[/{p2}={v2}/…]/   # 分区目录（Hive 风格，可嵌套）
 │   │   ├── manifest.postcard      # ★ 分区唯一提交点
 │   │   ├── seg_{uuid7}.parquet    # 数据文件
-│   │   └── .lock                  # 分区互斥锁（fs2）
-│   └── _trash/{ts}/…              # 待清理文件（静默期后删除）
+│   │   ├── .lock                  # 分区互斥锁（fs2）
+│   │   └── {seg}.{uuid}.tmp       # 写入中的临时文件（崩溃残留，GC 清）
+│   └── _index.lock                # partitions.idx 的互斥锁（可重建）
 ```
 
 - 隐藏文件与 `_` 开头目录不参与分区发现。
@@ -69,7 +73,11 @@
 
 **提交语义**：
 - append：锁内 `旧 manifest + 新 segment` → generation+1 → `.tmp` + rename。
-- overwrite：锁内写全新 segments 的新 manifest → rename；旧数据文件移入 `_trash/{table}/{ts}/`。
+- overwrite：锁内写全新 segments 的新 manifest → rename。**旧数据文件留原地**（延迟回收：
+  按 manifest 快照规划的在途扫描在安全期内仍可打开；GC 按「替换 manifest 的 mtime
+  年龄 ≥ 静默期」清理孤儿——qsdb-sync soak 反馈修正，2026-10-12）。
+- clear/TRUNCATE：锁内空 manifest 替换，**generation 继承 +1**（单调递增是同步工具
+  的增量判据契约，不回退——qsdb-sync F2 修正，2026-10-12）。
 - manifest rename 即提交点；此前任何中断留下的是可清理的孤儿（`seg_*.parquet` 不被任何 manifest 引用即孤儿）。
 
 ## 5. Parquet 数据文件
