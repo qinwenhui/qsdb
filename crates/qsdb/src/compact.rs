@@ -1,8 +1,9 @@
 //! Compaction：分区级小文件在线合并（设计文档 §13）。
 //!
 //! 分区锁内：读全部小 segments → 合并写单个大 parquet → manifest 原子替换
-//! （generation 继承）→ 旧文件移 `_trash`。与读并发安全（manifest 快照语义），
-//! 与写靠同一把分区锁串行。表级多分区 rayon 并行。
+//! （generation 继承）。旧文件**留原地**由 GC 安全期后回收——与读并发安全
+//! （manifest 快照语义 + 旧段在安全期内仍可打开）。与写靠同一把分区锁串行。
+//! 表级多分区 rayon 并行。
 
 use std::fs::File;
 use std::path::Path;
@@ -14,7 +15,7 @@ use parquet::arrow::arrow_writer::ArrowWriter;
 
 use crate::catalog::TableDef;
 use crate::error::{QsdbError, Result};
-use crate::fsutil::{PartitionLock, move_to_trash, now_ms};
+use crate::fsutil::{PartitionLock, now_ms};
 use crate::index::PartitionsIndex;
 use crate::manifest::{PartitionManifest, SegmentEntry};
 use crate::scan::list_partitions;
@@ -190,10 +191,9 @@ fn compact_partition_inner(
         .replace('\\', "/");
     let _ = PartitionsIndex::upsert(store, table_dir, &rel, &manifest);
 
-    // 旧文件延迟善后
-    for f in old_files {
-        let _ = move_to_trash(store.root(), &f);
-    }
+    // 旧文件留原地（延迟回收语义）：在途扫描按旧 manifest 快照仍可打开；
+    // GC 按「替换 manifest 的年龄 > 安全期」清理（api::gc）
+    let _ = old_files;
     Ok(Some(SingleResult {
         merged,
         rows,

@@ -68,6 +68,11 @@ impl Qsdb {
 impl WriteBuffer {
     /// 追加写入（自动按分区分组累积；触发阈值时自动 flush 该表）。
     pub fn push(&self, table: &str, batches: &[RecordBatch]) -> Result<()> {
+        if self.db.read_only() {
+            return Err(QsdbError::invalid(
+                "database is opened read-only; write rejected",
+            ));
+        }
         let def = self.db.table_def(table)?;
         let mut groups: Vec<(Vec<Literal>, RecordBatch)> = Vec::new();
         for b in batches {

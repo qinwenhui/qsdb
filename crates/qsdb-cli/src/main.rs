@@ -104,6 +104,9 @@ enum Cmd {
         /// （segment/元数据 rename 前 fsync，掉电安全，写吞吐实测约 -25%）
         #[arg(long, default_value = "process-crash")]
         durability: String,
+        /// 只读模式（standby/只读副本）：写端点 503
+        #[arg(long, default_value_t = false)]
+        read_only: bool,
     },
 }
 
@@ -262,6 +265,7 @@ fn main() {
             let opts = QsdbOptions {
                 storage,
                 durability: dur,
+                read_only,
                 scan_cache_bytes: cache_mb * 1024 * 1024,
                 file_cache_bytes: file_cache_mb * 1024 * 1024,
                 staging_dir: staging_dir.clone(),

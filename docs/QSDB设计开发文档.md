@@ -668,6 +668,24 @@ M6-4 staging 写 → M6-5 HDFS → M6-6 可选租约；每阶段独立 gate。
   崩溃重开补传 exactly-once、dedup 防重复计入、staged overwrite 替换、
   配置校验）/180 默认 / clippy 双模式 0 / 默认二进制 24.38MB。
 
+### 生态契约交付 + soak 实测修复（2026-10-11）✅
+- **read_only 模式**（`QsdbOptions.read_only` + CLI `--read-only`）：写路径
+  全拒（append/overwrite/DDL/TRUNCATE/compact/gc/refresh-index；WriteBuffer
+  fail-fast；server /write 503）——standby/只读副本标准姿势。
+- **`Qsdb::partition_stats`**：每分区 (name, generation, rows, segments)，
+  idx 快路径——qsdb-sync 轮询契约；HTTP `/api/v1/tables/{t}/partitions`
+  增 `detail` 字段（generation 为增量判据）。
+- **《对接契约》**（docs/对接契约.md v1）：表格式/嵌入 API/HTTP/行为/版本
+  五层承诺——生态团队的对接基准（契约 vs 内部的边界成文）。
+- **soak 长稳 bench**（qsdb-bench soak）：混合负载（写 ~1M rows/s 量级 +
+  三类查询轮询 + 周期 compaction/gc）+ RSS/缓存/段数曲线 + 末尾总数校验。
+- **soak 抓到并修复真并发 bug**：查询按旧 manifest 快照规划 →
+  compaction/overwrite/clear **立即 move_to_trash** → 在途扫描打开旧段
+  失败。修复 = **延迟回收语义**：旧段留原地，gc 以「替换 manifest 的
+  mtime 年龄 ≥ trash_grace_ms」为安全期锚点清理孤儿（在途扫描获得完整
+  窗口）；复验 2min soak：5755 万行校验一致、2780 查询 0 错误。
+- 验收：182 默认 / 198 s3+hdfs 全绿、clippy 0。
+
 ### 耐久性专项（投产前阻塞项 2/3，2026-10-11）✅
 - **Durability 两档**（`QsdbOptions.durability`）：`ProcessCrash`（默认——
   页缓存即持久，kill -9/进程退出安全）| `PowerLoss`（segment/元数据/staging

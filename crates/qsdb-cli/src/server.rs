@@ -431,6 +431,9 @@ async fn write(
     if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
         return err_response(StatusCode::UNAUTHORIZED, "unauthorized".into());
     }
+    if s.db.read_only() {
+        return err_response(StatusCode::SERVICE_UNAVAILABLE, "database is read-only".into());
+    }
     s.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
     let t = Instant::now();
     // IPC 解码（同步 CPU 工作，直接做）
@@ -551,27 +554,26 @@ async fn partitions(
         return err_response(StatusCode::UNAUTHORIZED, "unauthorized".into());
     }
     let st = Arc::clone(&s);
-    let res = tokio::task::spawn_blocking(move || {
-        let sql = format!("SHOW PARTITIONS {table}");
-        st.db.sql(&sql)
-    })
-    .await;
+    let res = tokio::task::spawn_blocking(move || st.db.partition_stats(&table)).await;
     match res {
-        Ok(Ok(SqlResult::Query { batches, .. })) => {
-            let mut parts: Vec<String> = Vec::new();
-            for b in &batches {
-                for i in 0..b.num_rows() {
-                    if let Ok(v) =
-                        arrow::util::display::array_value_to_string(b.column(0).as_ref(), i)
-                    {
-                        parts.push(v);
-                    }
-                }
-            }
-            parts.sort();
-            Json(serde_json::json!({ "partitions": parts, "count": parts.len() })).into_response()
+        Ok(Ok(stats)) => {
+            // 契约形态：partitions = 名单（兼容旧消费方）；detail = 每分区
+            // generation/rows/segments（qsdb-sync 轮询增量判据，idx 快路径）
+            let parts: Vec<String> = stats.iter().map(|p| p.name.clone()).collect();
+            let detail: Vec<serde_json::Value> = stats
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "name": p.name,
+                        "generation": p.generation,
+                        "rows": p.rows,
+                        "segments": p.segments,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({ "partitions": parts, "count": parts.len(), "detail": detail }))
+                .into_response()
         }
-        Ok(Ok(SqlResult::Ok { message })) => err_response(StatusCode::BAD_REQUEST, message),
         Ok(Err(e)) => status_of(&e, e.to_string()),
         Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }

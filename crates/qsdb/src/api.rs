@@ -87,6 +87,10 @@ pub struct QsdbOptions {
     /// 耐久性档位（本地文件写 fsync 策略；远端 PUT 由后端保证，仅作用于
     /// staging 本地文件）。见 [`Durability`]。
     pub durability: Durability,
+    /// **只读模式**：拒绝一切写路径（append/overwrite/DDL/compact/gc/
+    /// refresh-index；server /write 返回 503）。standby/只读副本用——
+    /// 与「多写者协议」正交：只读句柄永不做写者，杜绝误连双主。
+    pub read_only: bool,
 }
 
 impl Default for QsdbOptions {
@@ -100,6 +104,7 @@ impl Default for QsdbOptions {
             file_cache_bytes: 0,
             staging_dir: None,
             durability: Durability::ProcessCrash,
+            read_only: false,
         }
     }
 }
@@ -142,6 +147,17 @@ pub struct ScanRequest {
     /// 谓词（分区/segment/row group 三级裁剪 + 行过滤）
     pub predicate: Option<Predicate>,
     pub limit: Option<u64>,
+}
+
+/// 分区统计（`Qsdb::partition_stats`；qsdb-sync 轮询契约）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionStat {
+    /// 相对表目录的分区名（`/` 分隔）
+    pub name: String,
+    /// manifest 代数（单调递增；同步增量的判据）
+    pub generation: u64,
+    pub rows: u64,
+    pub segments: usize,
 }
 
 /// 运行期可热更配置：原子量存储，新查询/新请求即时生效，**无需重启**。
@@ -200,6 +216,8 @@ pub struct Qsdb {
     file_cache: Arc<crate::filecache::FileCache>,
     /// 远端写 staging（M6-4；None = 关闭/本地后端）
     staging: Option<Arc<crate::staging::Staging>>,
+    /// 只读模式（见 QsdbOptions::read_only）
+    read_only: bool,
 }
 
 impl Qsdb {
@@ -259,6 +277,7 @@ impl Qsdb {
             root.join("_filecache"),
             opts.file_cache_bytes,
         ));
+        let read_only = opts.read_only;
         // staging（M6-4）：仅远端后端 + feature s3
         let staging = match &opts.staging_dir {
             None => None,
@@ -287,6 +306,7 @@ impl Qsdb {
             runtime,
             file_cache,
             staging,
+            read_only,
         })
     }
 
@@ -309,6 +329,21 @@ impl Qsdb {
         db.unwrap_or(DEFAULT_DB)
     }
 
+    /// 只读模式（standby/只读副本）。
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// 写路径统一闸门：只读句柄拒绝一切变更。
+    fn ensure_writable(&self) -> Result<()> {
+        if self.read_only {
+            return Err(QsdbError::invalid(
+                "database is opened read-only; write/DDL/compact/gc rejected",
+            ));
+        }
+        Ok(())
+    }
+
     fn def(&self, db: Option<&str>, table: &str) -> Result<Arc<TableDef>> {
         let db = self.db_name(db);
         let names = read_table_names(&self.store, db)?;
@@ -322,11 +357,13 @@ impl Qsdb {
 
     /// 建表。
     pub fn create_table(&self, def: TableDef) -> Result<()> {
+        self.ensure_writable()?;
         create_table(&self.store, DEFAULT_DB, &def)
     }
 
     /// 删表（目录进 trash，`gc` 后真正释放）。
     pub fn drop_table(&self, table: &str) -> Result<()> {
+        self.ensure_writable()?;
         drop_table(&self.store, DEFAULT_DB, table)
     }
 
@@ -338,6 +375,7 @@ impl Qsdb {
     /// ALTER TABLE ADD COLUMN（只加不删；列必须 nullable）。
     /// 旧 segment 读取时缺列补 NULL；宽松写接受缺尾列批。
     pub fn alter_add_column(&self, table: &str, column: crate::catalog::ColumnDef) -> Result<()> {
+        self.ensure_writable()?;
         crate::catalog::alter_add_column(&self.store, crate::catalog::DEFAULT_DB, table, column)
     }
 
@@ -350,6 +388,7 @@ impl Qsdb {
 
     /// 批量追加：自动按分区列路由（跨分区自动拆分）。
     pub fn append(&self, table: &str, batches: &[RecordBatch]) -> Result<WriteResult> {
+        self.ensure_writable()?;
         let def = self.def(None, table)?;
         let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
         let mut total = WriteResult::default();
@@ -371,6 +410,7 @@ impl Qsdb {
         values: &[(&str, Literal)],
         batches: &[RecordBatch],
     ) -> Result<WriteResult> {
+        self.ensure_writable()?;
         let def = self.def(None, table)?;
         if values.len() != def.partition_keys.len() {
             return Err(QsdbError::invalid(format!(
@@ -475,6 +515,7 @@ impl Qsdb {
     /// 命中的分区原子清空（空 manifest 替换 + 旧文件 trash）。
     /// 非分区键谓词 → 报错（行级 DELETE 是独立大特性，见设计文档 M5）。
     pub fn delete_partitions_where(&self, table: &str, selection: Option<&str>) -> Result<u64> {
+        self.ensure_writable()?;
         let def = self.def(None, table)?;
         let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
         // 无 WHERE = 清全表（等价 TRUNCATE）
@@ -577,14 +618,14 @@ impl Qsdb {
             .to_string_lossy()
             .replace('\\', "/");
         let _ = crate::index::PartitionsIndex::upsert(&self.store, tdir, &rel, &empty);
-        for f in old.segment_paths(&dir) {
-            let _ = crate::fsutil::move_to_trash(&self.root, &f);
-        }
+        // 旧文件留原地（延迟回收语义，保护在途扫描；GC 按 manifest 年龄清理）
+        let _ = old;
         Ok(rows)
     }
 
     /// 清空全表所有分区（保留表定义）。
     pub fn truncate_table(&self, table: &str) -> Result<u64> {
+        self.ensure_writable()?;
         let def = self.def(None, table)?;
         let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
         let parts = crate::scan::list_partitions(&self.store, &tdir, def.partition_keys.len());
@@ -667,6 +708,7 @@ impl Qsdb {
     /// → 未被引用且 mtime 超过安全期（`orphan_grace_ms`，覆盖在途上传与
     /// OCC 重试窗口）→ delete。安全期内的孤儿绝不删。
     pub fn gc(&self) -> Result<(u64, u64)> {
+        self.ensure_writable()?;
         #[cfg(feature = "remote")]
         if !self.store.is_local() {
             return self.gc_remote();
@@ -684,6 +726,19 @@ impl Qsdb {
                 else {
                     continue;
                 };
+                // 安全期锚点 = 替换 manifest 的提交时间（mtime）：刚提交的分区
+                // 跳过孤儿清理——按旧快照规划的在途扫描需要旧段在窗口内
+                // 仍可打开（延迟回收语义，soak 实测竞争的修复）
+                let manifest_age_ok = self
+                    .store
+                    .stat(&crate::manifest::PartitionManifest::manifest_path(&pdir))
+                    .ok()
+                    .flatten()
+                    .map(|md| crate::fsutil::now_ms().saturating_sub(md.mtime_ms) >= orphan_grace)
+                    .unwrap_or(true);
+                if !manifest_age_ok {
+                    continue;
+                }
                 let live: std::collections::HashSet<String> = manifest
                     .segments
                     .iter()
@@ -830,6 +885,7 @@ impl Qsdb {
 
     /// 表级 compaction（小文件合并；详见 `compact` 模块）。
     pub fn compact_table(&self, table: &str) -> Result<crate::compact::CompactResult> {
+        self.ensure_writable()?;
         let def = self.def(None, table)?;
         let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
         crate::compact::compact_table(
@@ -847,6 +903,7 @@ impl Qsdb {
         table: &str,
         opts: crate::compact::CompactOptions,
     ) -> Result<crate::compact::CompactResult> {
+        self.ensure_writable()?;
         let def = self.def(None, table)?;
         let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
         crate::compact::compact_table(&self.store, Some(&self.file_cache), &tdir, &def, &opts)
@@ -990,10 +1047,51 @@ impl Qsdb {
         self.cache.budget()
     }
 
+    /// 分区统计（qsdb-sync 轮询契约）：每分区 (名, generation, 行数, 段数)。
+    /// 优先读表级索引 `partitions.idx`（单文件快路径，万级分区 <50ms）；
+    /// 缺失/损坏回退 list + 逐分区 manifest。generation 单调——同步工具
+    /// 以此判断增量，见 docs/主备与qsdb-sync设计.md §3.2。
+    pub fn partition_stats(&self, table: &str) -> Result<Vec<PartitionStat>> {
+        let def = self.def(None, table)?;
+        let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
+        if let Some(idx) = crate::index::PartitionsIndex::read(&self.store, &tdir) {
+            return Ok(idx
+                .entries
+                .into_iter()
+                .map(|(name, m)| PartitionStat {
+                    name,
+                    generation: m.generation,
+                    rows: m.total_rows(),
+                    segments: m.segments.len(),
+                })
+                .collect());
+        }
+        let mut out = Vec::new();
+        for (pdir, _) in crate::scan::list_partitions(&self.store, &tdir, def.partition_keys.len())
+        {
+            let name = pdir
+                .strip_prefix(&tdir)
+                .unwrap_or(&pdir)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if let Some(m) = crate::manifest::PartitionManifest::read(&self.store, &pdir)? {
+                out.push(PartitionStat {
+                    name,
+                    generation: m.generation,
+                    rows: m.total_rows(),
+                    segments: m.segments.len(),
+                });
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
     /// 强制重建表级分区索引（`partitions.idx`）。
     ///
     /// 场景：索引损坏、跨进程写入造成 stale、或旧版本目录首次启用索引。
     pub fn refresh_index(&self, table: &str) -> Result<()> {
+        self.ensure_writable()?;
         let def = self.def(None, table)?;
         let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
         crate::index::PartitionsIndex::rebuild(&self.store, &tdir, def.partition_keys.len())?;
@@ -1211,6 +1309,55 @@ mod tests {
         // append 跨 dt=1/dt=2 两分区各 1 行；overwrite 只替换 dt=1（1 行）→ 共 2 行
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
         // tmp 残留由 GC 清（本用例只验证写读路径不因 fsync 报错）
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn read_only_rejects_writes() {
+        let root = tmp_root("ro");
+        // 先以读写模式建表写数
+        {
+            let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
+            db.create_table(events_def()).unwrap();
+            db.append(
+                "events",
+                &[batch(vec![1], vec!["a"], vec![10])],
+            )
+            .unwrap();
+        }
+        // 只读打开：读正常，写/DDL/compact/gc 全拒
+        let db = Qsdb::open(
+            &root,
+            QsdbOptions {
+                read_only: true,
+                ..QsdbOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(db.read_only());
+        let n: usize = db
+            .scan_collect(ScanRequest {
+                table: "events".into(),
+                ..Default::default()
+            })
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(n, 1);
+        assert!(db
+            .append("events", &[batch(vec![1], vec!["b"], vec![20])])
+            .is_err());
+        assert!(db.sql("INSERT INTO events VALUES (DATE '1970-01-02','c',30)").is_err());
+        assert!(db.sql("CREATE TABLE t2 (a BIGINT)").is_err());
+        assert!(db.sql("TRUNCATE TABLE events").is_err());
+        assert!(db.compact_table("events").is_err());
+        assert!(db.gc().is_err());
+        // partition_stats（读路径）可用
+        let stats = db.partition_stats("events").unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].generation, 1);
+        assert_eq!(stats[0].rows, 1);
         std::fs::remove_dir_all(&root).ok();
     }
 

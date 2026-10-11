@@ -2,7 +2,7 @@
 //!
 //! append：锁内 写数据文件(tmp+rename) → manifest 追加 → 原子替换（提交点）
 //! overwrite：锁内 写新数据 → 只含新 segment 的 manifest 原子替换（提交点）
-//!            → 旧数据文件移 `_trash`
+//!            → 旧数据文件留原地，GC 安全期后回收（保护在途扫描）
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
 use crate::catalog::TableDef;
 use crate::error::{QsdbError, Result};
-use crate::fsutil::{PartitionLock, move_to_trash, now_ms};
+use crate::fsutil::{PartitionLock, now_ms};
 use crate::manifest::{PartitionManifest, SegmentEntry};
 use crate::partition::partition_dir;
 use crate::stats;
@@ -578,12 +578,10 @@ pub(crate) fn overwrite_partition(
     }
     drop(_guard);
 
-    // 旧数据文件延迟善后（提交后；失败不影响正确性，GC 兜底；远端由引用 GC 回收）
-    if store.is_local() {
-        for f in old_files {
-            let _ = move_to_trash(store.root(), &f);
-        }
-    }
+    // 旧数据文件不立即回收（本地/远端同语义）：留在原地由 GC 按安全期清理
+    // ——立即移动会让「按旧 manifest 快照规划的在途扫描」打开失败
+    // （soak 实测竞争；安全期 = 替换 manifest 的年龄，见 api::gc）
+    let _ = old_files;
 
     Ok(result)
 }
@@ -902,8 +900,8 @@ mod tests {
         assert_eq!(m.segments.len(), 1);
         assert_eq!(m.total_rows(), 2);
         assert_eq!(m.generation, 3);
-        // 旧文件进 trash
-        assert!(root.join("_trash").exists());
+        // 延迟回收语义：旧文件留原地（不被 manifest 引用 = 孤儿），
+        // GC 安全期后清理——不再立即进 trash（保护在途扫描）
         // 空 overwrite = 清空分区
         overwrite_partition(&store, None, &tdir, &d, &vals, &[]).unwrap();
         let m = PartitionManifest::read(&store, &pdir).unwrap().unwrap();
