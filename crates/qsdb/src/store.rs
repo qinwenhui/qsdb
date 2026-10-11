@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{QsdbError, Result};
 use crate::fsutil;
 
-#[cfg(feature = "s3")]
+#[cfg(feature = "remote")]
 use object_store::ObjectStoreExt;
 
 /// 本地后端（std::fs 直通）。
@@ -29,7 +29,7 @@ pub struct LocalStore {
 }
 
 /// 远端后端（feature `s3`，M6-3）：object_store 句柄 + 虚拟根映射。
-#[cfg(feature = "s3")]
+#[cfg(feature = "remote")]
 #[derive(Debug)]
 pub struct RemoteStore {
     /// 虚拟根（`s3://bucket/prefix`）——路径契约锚点（路径 → key 的 strip 基准）
@@ -44,7 +44,7 @@ pub struct RemoteStore {
 #[derive(Debug)]
 pub enum Store {
     Local(LocalStore),
-    #[cfg(feature = "s3")]
+    #[cfg(feature = "remote")]
     Remote(RemoteStore),
 }
 
@@ -97,7 +97,7 @@ fn unsupported_remote() -> QsdbError {
 
 // --- Remote key 映射与 object_store 桥接 -----------------------------------
 
-#[cfg(feature = "s3")]
+#[cfg(feature = "remote")]
 impl RemoteStore {
     /// 路径 → 对象 key（strip 虚拟根 + 分隔符归一 + 前缀拼接）。
     fn key(&self, path: &Path) -> object_store::path::Path {
@@ -131,7 +131,7 @@ impl Store {
     /// 远端后端（feature `s3`）：`root` = 虚拟根（`s3://bucket/prefix`），
     /// `prefix` = bucket 内 key 前缀。store 句柄由调用方构建
     /// （生产 = AmazonS3；测试/嵌入方可注入任意 object_store 实现）。
-    #[cfg(feature = "s3")]
+    #[cfg(feature = "remote")]
     pub fn remote(
         root: impl Into<PathBuf>,
         os: std::sync::Arc<dyn object_store::ObjectStore>,
@@ -148,7 +148,7 @@ impl Store {
     pub fn kind(&self) -> StoreKind {
         match self {
             Self::Local(_) => StoreKind::Local,
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "remote")]
             Self::Remote(_) => StoreKind::Remote,
         }
     }
@@ -162,7 +162,7 @@ impl Store {
     pub fn root(&self) -> &Path {
         match self {
             Self::Local(s) => &s.root,
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "remote")]
             Self::Remote(s) => &s.root,
         }
     }
@@ -175,7 +175,7 @@ impl Store {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(io_err(path, "read", e)),
             },
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "remote")]
             Self::Remote(s) => {
                 let key = s.key(path);
                 let rt = crate::remote::rt();
@@ -209,7 +209,7 @@ impl Store {
     pub fn write_atomic(&self, path: &Path, data: &[u8]) -> Result<()> {
         match self {
             Self::Local(_) => fsutil::write_atomic(path, data),
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "remote")]
             Self::Remote(_) => self.put_object(path, data),
         }
     }
@@ -225,7 +225,7 @@ impl Store {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(io_err(path, "stat", e)),
             },
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "remote")]
             Self::Remote(s) => {
                 let key = s.key(path);
                 match crate::remote::rt().block_on(s.os.head(&key)) {
@@ -244,7 +244,7 @@ impl Store {
     pub fn exists(&self, path: &Path) -> bool {
         match self {
             Self::Local(_) => fs::metadata(path).is_ok(),
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "remote")]
             Self::Remote(s) => {
                 let key = s.key(path);
                 crate::remote::rt()
@@ -258,7 +258,7 @@ impl Store {
     pub fn create_dir_all(&self, path: &Path) -> Result<()> {
         match self {
             Self::Local(_) => fs::create_dir_all(path).map_err(|e| io_err(path, "mkdir", e)),
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "remote")]
             Self::Remote(_) => Ok(()),
         }
     }
@@ -280,7 +280,7 @@ impl Store {
                 }
                 Ok(out)
             }
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "remote")]
             Self::Remote(s) => {
                 let key = s.key(dir);
                 let res = crate::remote::rt()
@@ -323,7 +323,7 @@ impl Store {
     pub fn commit_object(&self, tmp: &Path, dest: &Path) -> Result<()> {
         match self {
             Self::Local(_) => fs::rename(tmp, dest).map_err(|e| io_err(dest, "rename", e)),
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "remote")]
             Self::Remote(_) => {
                 let _ = tmp;
                 Err(QsdbError::unsupported(
@@ -337,11 +337,11 @@ impl Store {
 
     /// OCC 读：内容 + ETag（条件写凭证）；不存在 → `Ok(None)`。
     /// 后端必须提供 ETag（S3 系天然支持；无 ETag 后端走不了 OCC，启动期即失败）。
-    #[cfg_attr(not(feature = "s3"), allow(unused_variables))]
+    #[cfg_attr(not(feature = "remote"), allow(unused_variables))]
     pub fn get_with_etag(&self, path: &Path) -> Result<Option<(Vec<u8>, String)>> {
         match self {
             Self::Local(_) => Err(unsupported_remote()),
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "remote")]
             Self::Remote(s) => {
                 let key = s.key(path);
                 let rt = crate::remote::rt();
@@ -366,11 +366,11 @@ impl Store {
     /// 条件写（§7.2 唯一 CAS 点）：`etag = None` → put_if_absent；
     /// `Some(t)` → ETag 匹配才写。前置条件冲突 → `Ok(false)`（调用方重放重试）；
     /// 其他 IO 错误 → `Err`。
-    #[cfg_attr(not(feature = "s3"), allow(unused_variables))]
+    #[cfg_attr(not(feature = "remote"), allow(unused_variables))]
     pub fn put_if_etag(&self, path: &Path, data: &[u8], etag: Option<&str>) -> Result<bool> {
         match self {
             Self::Local(_) => Err(unsupported_remote()),
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "remote")]
             Self::Remote(s) => {
                 use object_store::{PutMode, PutOptions, PutPayload, UpdateVersion};
                 let key = s.key(path);
@@ -406,11 +406,11 @@ impl Store {
     }
 
     /// 不可变对象写入（segment）：UUID 命名永不冲突，普通 PUT + 幂等重试（§7.2）。
-    #[cfg_attr(not(feature = "s3"), allow(unused_variables))]
+    #[cfg_attr(not(feature = "remote"), allow(unused_variables))]
     pub fn put_object(&self, path: &Path, data: &[u8]) -> Result<()> {
         match self {
             Self::Local(_) => Err(unsupported_remote()),
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "remote")]
             Self::Remote(s) => {
                 use object_store::{PutOptions, PutPayload};
                 let key = s.key(path);
@@ -429,11 +429,11 @@ impl Store {
     /// 列出前缀下全部对象（GC 引用扫描/统计用）。
     /// `RemoteObj.key` 相对**虚拟根**（已剥离 bucket 前缀——与路径契约一致，
     /// `store.root().join(key)` 即得可操作路径）。
-    #[cfg_attr(not(feature = "s3"), allow(unused_variables))]
+    #[cfg_attr(not(feature = "remote"), allow(unused_variables))]
     pub fn list_all(&self, prefix: &Path) -> Result<Vec<RemoteObj>> {
         match self {
             Self::Local(_) => Err(unsupported_remote()),
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "remote")]
             Self::Remote(s) => {
                 use futures_util::StreamExt;
                 let key = s.key(prefix);
@@ -475,11 +475,11 @@ impl Store {
     }
 
     /// 删除对象；不存在 → Ok（幂等）。
-    #[cfg_attr(not(feature = "s3"), allow(unused_variables))]
+    #[cfg_attr(not(feature = "remote"), allow(unused_variables))]
     pub fn delete_object(&self, path: &Path) -> Result<()> {
         match self {
             Self::Local(_) => Err(unsupported_remote()),
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "remote")]
             Self::Remote(s) => {
                 let key = s.key(path);
                 match crate::remote::rt().block_on(s.os.delete(&key)) {
@@ -491,7 +491,7 @@ impl Store {
     }
 
     /// 内部 object_store 句柄（scan::ChunkSource 远端读取用）。
-    #[cfg(feature = "s3")]
+    #[cfg(feature = "remote")]
     pub(crate) fn remote_handle(&self) -> Option<&std::sync::Arc<dyn object_store::ObjectStore>> {
         match self {
             Self::Local(_) => None,
@@ -500,7 +500,7 @@ impl Store {
     }
 
     /// 管理表路径 → 对象 key（ChunkSource::Managed 远端读取用；Local → None）。
-    #[cfg(feature = "s3")]
+    #[cfg(feature = "remote")]
     pub(crate) fn remote_obj_key(
         &self,
         path: &Path,

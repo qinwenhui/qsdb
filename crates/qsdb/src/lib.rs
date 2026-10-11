@@ -23,10 +23,12 @@ pub mod manifest;
 pub mod partition;
 pub mod query;
 pub mod scan;
-#[cfg(feature = "s3")]
+#[cfg(feature = "hdfs")]
+pub mod hdfs_backend;
+#[cfg(any(feature = "s3", feature = "remote"))]
 pub mod remote;
 pub mod sql;
-#[cfg_attr(not(feature = "s3"), allow(dead_code))] // 仅 s3 写路径消费
+#[cfg_attr(not(feature = "remote"), allow(dead_code))] // 仅远端写路径消费
 pub mod staging;
 pub mod stats;
 pub mod store;

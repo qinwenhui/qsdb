@@ -28,6 +28,14 @@ pub enum StorageConfig {
     /// 本地文件系统（默认）
     #[default]
     Local,
+    /// HDFS 管理表（feature `hdfs`；存储设计 §6.3/§7.3——CAS 由
+    /// 锁对象模拟，见 `hdfs_backend`）。`url` 形如 `hdfs://host:9000`
+    #[cfg(feature = "hdfs")]
+    Hdfs {
+        url: String,
+        /// HDFS 内路径前缀（建议用 /tmp/... 或专用目录）
+        prefix: String,
+    },
     /// S3 及兼容对象存储管理表（feature `s3`；存储设计 §5/§7.2）
     #[cfg(feature = "s3")]
     S3 {
@@ -182,6 +190,12 @@ impl Qsdb {
         let root = root.as_ref().to_path_buf();
         let store = match &opts.storage {
             StorageConfig::Local => Store::local(&root),
+            #[cfg(feature = "hdfs")]
+            StorageConfig::Hdfs { url, prefix } => {
+                let os = crate::hdfs_backend::build_hdfs_store(url)?;
+                let vroot = PathBuf::from(format!("{url}/{prefix}"));
+                Store::remote(vroot, os, prefix.clone())
+            }
             #[cfg(feature = "s3")]
             StorageConfig::S3 {
                 endpoint,
@@ -218,7 +232,7 @@ impl Qsdb {
         // staging（M6-4）：仅远端后端 + feature s3
         let staging = match &opts.staging_dir {
             None => None,
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "remote")]
             Some(dir) => {
                 if store.is_local() {
                     return Err(QsdbError::invalid(
@@ -227,10 +241,10 @@ impl Qsdb {
                 }
                 Some(Arc::new(crate::staging::Staging::new(dir)?))
             }
-            #[cfg(not(feature = "s3"))]
+            #[cfg(not(feature = "remote"))]
             Some(_) => {
                 return Err(QsdbError::unsupported(
-                    "staging_dir requires building with feature 's3'",
+                    "staging_dir requires building with feature 's3' or 'hdfs'",
                 ));
             }
         };
@@ -256,6 +270,7 @@ impl Qsdb {
     }
 
     /// staging 句柄（写路径内部用；None = 关闭）。
+    #[cfg_attr(not(feature = "remote"), allow(unused))]
     pub(crate) fn staging(&self) -> Option<&crate::staging::Staging> {
         self.staging.as_deref()
     }
@@ -507,10 +522,10 @@ impl Qsdb {
             &ordered,
         )?);
         if !self.store.is_local() {
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "remote")]
             return self.clear_partition_remote(&dir, def, &ordered);
-            #[cfg(not(feature = "s3"))]
-            return Err(QsdbError::unsupported("remote store requires feature 's3'"));
+            #[cfg(not(feature = "remote"))]
+            return Err(QsdbError::unsupported("remote store requires an s3/hdfs build"));
         }
         let _guard = crate::fsutil::PartitionLock::acquire(&dir.join(".lock"))?;
         let Some(old) = crate::manifest::PartitionManifest::read(&self.store, &dir)? else {
@@ -622,7 +637,7 @@ impl Qsdb {
     /// → 未被引用且 mtime 超过安全期（`orphan_grace_ms`，覆盖在途上传与
     /// OCC 重试窗口）→ delete。安全期内的孤儿绝不删。
     pub fn gc(&self) -> Result<(u64, u64)> {
-        #[cfg(feature = "s3")]
+        #[cfg(feature = "remote")]
         if !self.store.is_local() {
             return self.gc_remote();
         }
@@ -678,7 +693,7 @@ impl Qsdb {
     }
 
     /// 远端清空分区：OCC 空替换（重放继承 generation）；旧对象由引用 GC 回收。
-    #[cfg(feature = "s3")]
+    #[cfg(feature = "remote")]
     fn clear_partition_remote(
         &self,
         dir: &std::path::Path,
@@ -708,7 +723,7 @@ impl Qsdb {
 
     /// 远端引用扫描式 GC（§12）：逐表 list 全部对象 → manifest 真值比对 →
     /// 未引用且超安全期的 seg 对象删除。
-    #[cfg(feature = "s3")]
+    #[cfg(feature = "remote")]
     fn gc_remote(&self) -> Result<(u64, u64)> {
         let grace = self.opts.trash_grace_ms;
         let now = crate::fsutil::now_ms();
@@ -766,14 +781,14 @@ impl Qsdb {
             if self.store.is_local() {
                 bytes += dir_size(&tdir);
             } else {
-                #[cfg(feature = "s3")]
+                #[cfg(feature = "remote")]
                 {
                     bytes += self.store.list_all(&tdir)?.iter().map(|o| o.size).sum::<u64>();
                 }
-                #[cfg(not(feature = "s3"))]
+                #[cfg(not(feature = "remote"))]
                 {
                     let _ = tdir;
-                    return Err(QsdbError::unsupported("remote store requires feature 's3'"));
+                    return Err(QsdbError::unsupported("remote store requires an s3/hdfs build"));
                 }
             }
         }
@@ -871,11 +886,11 @@ impl Qsdb {
     /// 同名去重 + uuid7 时间序重放）→ 删除已传对。崩溃残留对在下次调用补传。
     /// 返回 (上传对数, 行数)。server 由定时器驱动；嵌入方按需调用。
     pub fn flush_staged(&self) -> Result<(u64, u64)> {
-        #[cfg(not(feature = "s3"))]
+        #[cfg(not(feature = "remote"))]
         {
             Ok((0, 0))
         }
-        #[cfg(feature = "s3")]
+        #[cfg(feature = "remote")]
         {
             let Some(st) = &self.staging else {
                 return Ok((0, 0));
@@ -923,7 +938,7 @@ impl Qsdb {
 
     /// staging 待传对数（诊断：server /stats 与运维）。
     pub fn staged_pending(&self) -> usize {
-        #[cfg(feature = "s3")]
+        #[cfg(feature = "remote")]
         if let Some(st) = &self.staging {
             return st.pending().len();
         }

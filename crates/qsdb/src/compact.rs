@@ -81,7 +81,7 @@ struct SingleResult {
 }
 
 /// 单分区 compaction（不满足条件 → Ok(None)，不动任何文件）。
-#[cfg_attr(not(feature = "s3"), allow(unused_variables))]
+#[cfg_attr(not(feature = "remote"), allow(unused_variables))]
 fn compact_partition(
     store: &Store,
     file_cache: Option<&Arc<crate::filecache::FileCache>>,
@@ -91,9 +91,9 @@ fn compact_partition(
     opts: &CompactOptions,
 ) -> Result<Option<SingleResult>> {
     if !store.is_local() {
-        #[cfg(feature = "s3")]
+        #[cfg(feature = "remote")]
         return compact_partition_remote(store, file_cache, table_dir, def, pdir, opts);
-        #[cfg(not(feature = "s3"))]
+        #[cfg(not(feature = "remote"))]
         return Err(QsdbError::unsupported("remote store requires feature 's3'"));
     }
     compact_partition_inner(store, table_dir, def, pdir, opts)
@@ -279,7 +279,7 @@ fn _opts_hint(_: &RecordBatchOptions) {}
 
 // --- 远端 compaction（feature `s3`，§11：读走段缓存 → 内存合并 → PUT → OCC） ---
 
-#[cfg(feature = "s3")]
+#[cfg(feature = "remote")]
 fn compact_partition_remote(
     store: &Store,
     file_cache: Option<&Arc<crate::filecache::FileCache>>,

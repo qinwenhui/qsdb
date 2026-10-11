@@ -254,7 +254,7 @@ fn write_segment(
 /// 缓冲 → 整体 PUT（UUID 名永不冲突，幂等）。compaction 复用。
 /// v1 内存上限 = 单次 flush 的攒批量（默认 128MB 逻辑列，压缩后远小于）；
 /// staging 落盘 M6-4。
-#[cfg(feature = "s3")]
+#[cfg(feature = "remote")]
 pub(crate) fn put_segment_remote(
     store: &Store,
     partition_dir: &Path,
@@ -415,7 +415,7 @@ pub(crate) fn append_partition(
     let dir = pdir(table_dir, def, values)?;
     store.create_dir_all(&dir)?;
     if !store.is_local() {
-        #[cfg(feature = "s3")]
+        #[cfg(feature = "remote")]
         return append_partition_remote(
             store,
             staging,
@@ -428,7 +428,7 @@ pub(crate) fn append_partition(
             &schema,
             &file_schema,
         );
-        #[cfg(not(feature = "s3"))]
+        #[cfg(not(feature = "remote"))]
         {
             let _ = staging;
             return Err(QsdbError::unsupported("remote store requires feature 's3'"));
@@ -506,12 +506,12 @@ pub(crate) fn overwrite_partition(
     let dir = pdir(table_dir, def, values)?;
     store.create_dir_all(&dir)?;
     if !store.is_local() {
-        #[cfg(feature = "s3")]
+        #[cfg(feature = "remote")]
         return overwrite_partition_remote(
             store, staging, table_dir, def.name.as_str(), def, values, &dir, batches, &schema,
             &file_schema,
         );
-        #[cfg(not(feature = "s3"))]
+        #[cfg(not(feature = "remote"))]
         {
             let _ = staging;
             return Err(QsdbError::unsupported("remote store requires feature 's3'"));
@@ -581,7 +581,7 @@ pub(crate) fn overwrite_partition(
 
 /// manifest OCC 追加（含 **file_name 去重**——staging 补传/重放幂等：
 /// 同名 segment 不重复计入，at-least-once 之上得到 exactly-once 可见状态）。
-#[cfg(feature = "s3")]
+#[cfg(feature = "remote")]
 pub(crate) fn occ_append_entry(
     store: &Store,
     dir: &Path,
@@ -617,7 +617,7 @@ pub(crate) fn occ_append_entry(
 /// append（远端）：segment PUT（不可变，无协议）→ manifest OCC 追加。
 /// 进程内分区 Mutex 串行化（§8）——跨进程/多实例由 OCC 收敛，无锁多写者。
 /// staging 启用时改为本地暂存（写盘即 ACK），网络段由 flush_staged 补。
-#[cfg(feature = "s3")]
+#[cfg(feature = "remote")]
 #[allow(clippy::too_many_arguments)]
 fn append_partition_remote(
     store: &Store,
@@ -653,7 +653,7 @@ fn append_partition_remote(
 }
 
 /// segment 序列化到本地 staging（§11：写盘即 ACK；网络段由 flush 补）。
-#[cfg(feature = "s3")]
+#[cfg(feature = "remote")]
 #[allow(clippy::too_many_arguments)]
 fn stage_segment(
     st: &crate::staging::Staging,
@@ -713,7 +713,7 @@ fn stage_segment(
 /// manifest OCC 替换提交（overwrite/compaction/clear 共用；重放只继承
 /// 最新 generation，segments 以本轮为准——旧 segment 不搬 trash，
 /// 不被引用即不可见，引用 GC 安全期后回收，§12）。
-#[cfg(feature = "s3")]
+#[cfg(feature = "remote")]
 pub(crate) fn occ_replace_entries(
     store: &Store,
     dir: &Path,
@@ -735,7 +735,7 @@ pub(crate) fn occ_replace_entries(
 
 /// overwrite（远端）：segment PUT → OCC 替换提交。
 /// staging 启用时改为本地暂存（overwrite 标记），flush_staged 补网络段。
-#[cfg(feature = "s3")]
+#[cfg(feature = "remote")]
 #[allow(clippy::too_many_arguments)]
 fn overwrite_partition_remote(
     store: &Store,

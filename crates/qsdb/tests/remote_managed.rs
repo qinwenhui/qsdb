@@ -3,7 +3,7 @@
 //! 用 object_store InMemory 作为注入后端（`Qsdb::open_with_store`）——
 //! 单对象原子 PUT / ETag 条件写（PutMode::Create/Update）/ list 语义与
 //! S3 一致，协议全链路无网络验证（存储设计 §15 故障矩阵的进程内子集）。
-#![cfg(feature = "s3")]
+#![cfg(feature = "remote")]
 
 use std::sync::Arc;
 

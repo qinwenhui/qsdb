@@ -15,10 +15,13 @@
 | `scan_cache_bytes` | usize / 256MB | 热数据缓存预算（segment 级解码后 LRU）。**0 = 关闭**。预算应能装下热工作集且不超过机器可用内存（预算过大会触发换页反噬——实测 4GB 预算在被其他进程占内存的机器上反而变慢）。 |
 | `query_timeout_ms` | Option\<u64\> / None | 默认查询超时（毫秒）。**这是运行期同名配置的初值**——open 后可经 [`Qsdb::runtime()`] 热更，见下节。 |
 | `query_memory_limit_bytes` | Option\<u64\> / None | 默认单查询内存上限（字节）。同为运行期配置的初值。 |
+| `storage`（HDFS 形态） | `StorageConfig::Hdfs { url, prefix }` | HDFS 管理表（M6-5，feature `hdfs`）：`url` 如 `hdfs://192.168.1.12:9000`；CAS 由锁对象模拟（`hdfs_backend`）；身份走 `HADOOP_USER_NAME` 环境变量。CLI：`--storage-type hdfs --storage-hdfs-url hdfs://host:9000`。 |
 | `staging_dir` | Option\<PathBuf\> / None | 远端写 staging 目录（M6-4）：Some = 启用——远端写先落本地盘（**写盘即 ACK**，写延迟与网络解耦），`flush_staged()` 批量 PUT + OCC 提交。需 S3 后端。**可见性语义**：未 flush 的数据对查询不可见（manifest 唯一真值），可见性延迟 = 上传周期；读己之写先 flush。崩溃恢复：残留对下次 flush 幂等补传（segment PUT 幂等 + manifest file_name 去重）。 |
 | `file_cache_bytes` | u64 / 0 | 远端外表（`read_parquet('s3://…')`）段文件本地磁盘缓存预算，布局 `{root}/_filecache/{url_hash}/{etag}/…`（ETag 键控，对象覆盖自动失效；预算内按 mtime LRU 驱逐）。**0 = 关闭（默认）**。仅整读（无 row group 裁剪命中）的对象入缓存；选择性查询走 range GET 不占预算。需编译 feature `s3`。 |
 
 **服务器 CLI 等价参数**（`qsdb server`）：`--cache-mb`（即 `scan_cache_bytes/1MB`）、`--file-cache-mb`（即 `file_cache_bytes/1MB`）、`--storage-type local|s3` + `--storage-endpoint/--storage-region/--storage-bucket/--storage-prefix`（即 `storage`；s3 需编译 feature）、`--staging-dir <目录>`（即 `staging_dir`，启用 M6-4 staging 写）+ `--staging-upload-secs`（后台上传周期，默认 5s；server 定时 flush_staged，启动即跑一轮=崩溃补传）。
+
+**feature `hdfs`（默认关闭，M6-5）**：`cargo build -p qsdb-cli --features hdfs`。hdfs-native（纯 Rust HDFS RPC，无 JVM/libhdfs）+ object_store 适配层（与 feature `s3` 同版 object_store 0.14，单一版本）。S3/HDFS 共享 `remote` 机件（Store::Remote + OCC + staging + 引用 GC）；HDFS 的条件写由锁对象模拟（create-no-clobber 锁 + 锁下 ETag 双检 + 覆写；残留锁 60s 过期窃取）。真实集群验证：Hadoop 3.1.3 e2e 全过。
 
 **feature `s3`（默认关闭，M6-2）**：编译开关 `cargo build -p qsdb-cli --features s3`（qsdb 核心为 `qsdb/s3`）。启用后 `read_parquet('s3://…')` 可查对象存储 parquet：URL 支持 `?endpoint=…&region=…` 查询参数（`http://` 端点自动 allow_http）与 glob 通配（`*` 段内 / `**` 跨段）；凭据走 object_store 环境变量链（`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_REGION` 等），不落配置文件明文。代价：二进制 +5.8MB（object_store/tokio/reqwest）——默认关闭时零依赖增量（`cargo tree` 验证）。
 

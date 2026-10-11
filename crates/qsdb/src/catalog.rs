@@ -224,9 +224,9 @@ fn write_table_names(store: &Store, db: &str, mut names: Vec<String>) -> Result<
 pub fn create_table(store: &Store, db: &str, def: &TableDef) -> Result<()> {
     def.validate()?;
     if !store.is_local() {
-        #[cfg(feature = "s3")]
+        #[cfg(feature = "remote")]
         return create_table_remote(store, db, def);
-        #[cfg(not(feature = "s3"))]
+        #[cfg(not(feature = "remote"))]
         return Err(QsdbError::unsupported("remote store requires feature 's3'"));
     }
     let root = store.root();
@@ -256,9 +256,9 @@ pub fn create_table(store: &Store, db: &str, def: &TableDef) -> Result<()> {
 /// 删表：目录整体移 trash，清单去名。
 pub fn drop_table(store: &Store, db: &str, table: &str) -> Result<()> {
     if !store.is_local() {
-        #[cfg(feature = "s3")]
+        #[cfg(feature = "remote")]
         return drop_table_remote(store, db, table);
-        #[cfg(not(feature = "s3"))]
+        #[cfg(not(feature = "remote"))]
         return Err(QsdbError::unsupported("remote store requires feature 's3'"));
     }
     let root = store.root();
@@ -278,9 +278,9 @@ pub fn drop_table(store: &Store, db: &str, table: &str) -> Result<()> {
 /// 分区键重名。旧 segment 读取时缺列补 NULL（scan::pad_missing_columns）。
 pub fn alter_add_column(store: &Store, db: &str, table: &str, column: ColumnDef) -> Result<()> {
     if !store.is_local() {
-        #[cfg(feature = "s3")]
+        #[cfg(feature = "remote")]
         return alter_add_column_remote(store, db, table, column);
-        #[cfg(not(feature = "s3"))]
+        #[cfg(not(feature = "remote"))]
         return Err(QsdbError::unsupported("remote store requires feature 's3'"));
     }
     let root = store.root();
@@ -395,7 +395,7 @@ pub(crate) mod serde_json_compat {
 
 /// catalog 清单 OCC 更新（postcard Vec<String>；进程内 catalog 互斥）。
 /// `mutate` 必须可重放（幂等作用于最新清单）。
-#[cfg(feature = "s3")]
+#[cfg(feature = "remote")]
 fn catalog_occ(store: &Store, db: &str, mutate: impl Fn(Vec<String>) -> Result<Vec<String>>) -> Result<()> {
     let path = catalog_file(store.root(), db);
     crate::remote::occ_update_bytes(store, &path, |cur| {
@@ -409,7 +409,7 @@ fn catalog_occ(store: &Store, db: &str, mutate: impl Fn(Vec<String>) -> Result<V
     })
 }
 
-#[cfg(feature = "s3")]
+#[cfg(feature = "remote")]
 fn create_table_remote(store: &Store, db: &str, def: &TableDef) -> Result<()> {
     let tdir = table_dir(store.root(), db, &def.name);
     if store.exists(&tdir) {
@@ -445,7 +445,7 @@ fn create_table_remote(store: &Store, db: &str, def: &TableDef) -> Result<()> {
     })
 }
 
-#[cfg(feature = "s3")]
+#[cfg(feature = "remote")]
 fn drop_table_remote(store: &Store, db: &str, table: &str) -> Result<()> {
     // 清单先去名（OCC）——此后表即「不存在」；对象随后尽力删除，
     // 中断残留由 `gc` 引用扫描回收（不被任何表引用 = 孤儿）
@@ -464,7 +464,7 @@ fn drop_table_remote(store: &Store, db: &str, table: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "s3")]
+#[cfg(feature = "remote")]
 fn alter_add_column_remote(
     store: &Store,
     db: &str,

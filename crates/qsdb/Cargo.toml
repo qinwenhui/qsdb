@@ -23,10 +23,18 @@ sqlparser = { workspace = true }
 object_store = { version = "0.14.2", default-features = false, features = ["aws", "fs"], optional = true }
 tokio = { workspace = true, optional = true }
 futures-util = { version = "0.3", default-features = false, optional = true }
+hdfs-native-object-store = { version = "0.17.0", optional = true, default-features = false }
+async-trait = { version = "0.1", optional = true }
+hdfs-native = { version = "0.14", optional = true, default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 
 [features]
-# S3 及兼容对象存储（只读外表 M6-2；object_store+tokio 仅此 feature 引入，默认关闭）
-s3 = ["dep:object_store", "dep:tokio", "dep:futures-util"]
+# 远端后端共享机件（Store::Remote + OCC + staging + GC；s3/hdfs 激活）
+remote = ["dep:object_store", "dep:tokio", "dep:futures-util"]
+# S3 及兼容对象存储（外表 read_parquet + 管理表）
+s3 = ["remote"]
+# HDFS 后端（hdfs-native 纯 Rust 客户端 + object_store 适配）
+hdfs = ["remote", "dep:hdfs-native-object-store", "dep:hdfs-native", "dep:async-trait"]
+

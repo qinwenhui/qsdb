@@ -87,6 +87,9 @@ enum Cmd {
         /// S3 bucket（storage type = s3 时必填）
         #[arg(long)]
         storage_bucket: Option<String>,
+        /// HDFS NameNode URL（storage type = hdfs 时必填，如 hdfs://host:9000）
+        #[arg(long)]
+        storage_hdfs_url: Option<String>,
         /// bucket 内 key 前缀（多租户/多库共存）
         #[arg(long, default_value = "")]
         storage_prefix: String,
@@ -189,6 +192,7 @@ fn main() {
             storage_endpoint,
             storage_region,
             storage_bucket,
+            storage_hdfs_url,
             storage_prefix,
             staging_dir,
             staging_upload_secs,
@@ -197,6 +201,25 @@ fn main() {
             // 存储后端解析（cli 层校验，错误走统一 exit 风格）
             let storage = match storage_type.as_str() {
                 "local" => qsdb::api::StorageConfig::Local,
+                "hdfs" => {
+                    #[cfg(feature = "hdfs")]
+                    {
+                        let Some(url) = storage_hdfs_url.clone() else {
+                            eprintln!("error: --storage-hdfs-url is required for --storage-type hdfs");
+                            std::process::exit(1);
+                        };
+                        qsdb::api::StorageConfig::Hdfs {
+                            url,
+                            prefix: storage_prefix,
+                        }
+                    }
+                    #[cfg(not(feature = "hdfs"))]
+                    {
+                        let _ = (storage_hdfs_url, storage_prefix);
+                        eprintln!("error: --storage-type hdfs requires building with --features hdfs");
+                        std::process::exit(1);
+                    }
+                }
                 "s3" => {
                     #[cfg(feature = "s3")]
                     {
@@ -219,7 +242,7 @@ fn main() {
                     }
                 }
                 other => {
-                    eprintln!("error: unknown --storage-type '{other}' (local|s3)");
+                    eprintln!("error: unknown --storage-type '{other}' (local|s3|hdfs)");
                     std::process::exit(1);
                 }
             };

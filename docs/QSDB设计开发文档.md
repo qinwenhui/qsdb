@@ -668,6 +668,27 @@ M6-4 staging 写 → M6-5 HDFS → M6-6 可选租约；每阶段独立 gate。
   崩溃重开补传 exactly-once、dedup 防重复计入、staged overwrite 替换、
   配置校验）/180 默认 / clippy 双模式 0 / 默认二进制 24.38MB。
 
+#### M6-5 HDFS 后端 ✅ 已完成（2026-10-11，真实集群验证）
+- 选型定案（§6.3 R2 关闭）：**hdfs-native 0.14**（纯 Rust HDFS RPC，
+  无 JVM/libhdfs/HADOOP_HOME 依赖）+ hdfs-native-object-store 0.17
+  （与本库同版 object_store 0.14——单一版本零冲突，`cargo tree` 验证）。
+- **CAS 模拟（§6.1 put_if_etag ⏳ 落地）**：`LockingStore` 包装器——
+  put_opts(Update) = 锁对象 create-no-clobber（HDFS 原生）+ 锁下 ETag
+  （适配层合成 mtime-size）双检 + 覆写；残留锁 60s 过期窃取；
+  适配层 put 不建父目录（S3 无目录概念）→ 包装器 put 前 mkdirs 补齐。
+- **remote 伞 feature 重构**：s3/hdfs 共享 Store::Remote + OCC + staging +
+  引用 GC 全机件（`remote`）；S3 专属（AmazonS3/URL/glob 外表）留 `s3`；
+  四种 feature 组合编译/测试/clippy 全绿——抽象贴合原则的枚举派发红利。
+- `StorageConfig::Hdfs { url, prefix }` + CLI `--storage-type hdfs
+  --storage-hdfs-url`；身份走 `HADOOP_USER_NAME`。
+- **真实集群 e2e**（192.168.1.12:9000，Hadoop 3.1.3，hdfs 用户）：
+  CAS 原语（冲突拒写/锁释放）/管理表全生命周期（含 overwrite/TRUNCATE/
+  引用 GC/drop）/staging 写——**3/3 全过**；无集群环境（CI）自动跳过。
+- 验收：180 默认 / 193 s3 / 197 hdfs（含 3 真实集群）/ 196 s3+hdfs
+  全绿；clippy 四组合 0；默认二进制 24.38MB。
+- 后置：`read_parquet('hdfs://…')` 外表（管理表已覆盖，外表读取待需求）；
+  HDFS 多 NameNode HA（需 HADOOP_CONF_DIR 配置链）。
+
 ---
 
 ## 十五、风险与对策

@@ -530,7 +530,7 @@ fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// 否则 range GET 惰性取字节（footer/选中 row group 才传输）。
 pub(crate) enum ChunkSource {
     File(File),
-    #[cfg(feature = "s3")]
+    #[cfg(feature = "remote")]
     Remote(crate::remote::RemoteReader),
 }
 
@@ -569,7 +569,7 @@ impl ChunkSource {
                             QsdbError::meta(format!("open {} failed: {e}", p.display()))
                         })
                     }
-                    #[cfg(feature = "s3")]
+                    #[cfg(feature = "remote")]
                     crate::store::StoreKind::Remote => {
                         let handle = store.remote_handle().expect("remote kind implies handle");
                         let key = store.remote_obj_key(p).expect("remote kind implies key");
@@ -582,9 +582,9 @@ impl ChunkSource {
                             prefer_whole,
                         )
                     }
-                    #[cfg(not(feature = "s3"))]
+                    #[cfg(not(feature = "remote"))]
                     crate::store::StoreKind::Remote => {
-                        Err(QsdbError::unsupported("remote store requires feature 's3'"))
+                        Err(QsdbError::unsupported("remote store requires an s3/hdfs build"))
                     }
                 }
             }
@@ -594,7 +594,7 @@ impl ChunkSource {
 
 /// 远端对象打开（外表 s3:// 与管理表远端共用）：段缓存命中/整读回填 → 本地
 /// File；否则 range GET 惰性 reader。
-#[cfg(feature = "s3")]
+#[cfg(feature = "remote")]
 fn open_remote_object(
     handle: Arc<dyn object_store::ObjectStore>,
     key: object_store::path::Path,
@@ -625,7 +625,7 @@ fn open_remote_object(
 pub(crate) enum ChunkRead {
     /// parquet 对 File 的 ChunkReader 实现返回 BufReader<File>
     File(std::io::BufReader<File>),
-    #[cfg(feature = "s3")]
+    #[cfg(feature = "remote")]
     Remote(crate::remote::ChunkedRangeRead),
 }
 
@@ -633,7 +633,7 @@ impl std::io::Read for ChunkRead {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::File(f) => f.read(out),
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "remote")]
             Self::Remote(r) => r.read(out),
         }
     }
@@ -643,7 +643,7 @@ impl parquet::file::reader::Length for ChunkSource {
     fn len(&self) -> u64 {
         match self {
             Self::File(f) => parquet::file::reader::Length::len(f),
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "remote")]
             Self::Remote(r) => parquet::file::reader::Length::len(r),
         }
     }
@@ -657,7 +657,7 @@ impl parquet::file::reader::ChunkReader for ChunkSource {
             Self::File(f) => {
                 ChunkRead::File(<File as ChunkReaderParquet>::get_read(f, start)?)
             }
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "remote")]
             Self::Remote(r) => ChunkRead::Remote(
                 <crate::remote::RemoteReader as ChunkReaderParquet>::get_read(r, start)?,
             ),
@@ -667,7 +667,7 @@ impl parquet::file::reader::ChunkReader for ChunkSource {
     fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<bytes::Bytes> {
         match self {
             Self::File(f) => <File as ChunkReaderParquet>::get_bytes(f, start, length),
-            #[cfg(feature = "s3")]
+            #[cfg(feature = "remote")]
             Self::Remote(r) => {
                 <crate::remote::RemoteReader as ChunkReaderParquet>::get_bytes(r, start, length)
             }

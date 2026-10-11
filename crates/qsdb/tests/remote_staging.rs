@@ -1,6 +1,6 @@
 //! M6-4 staging 写协议测试（feature `s3`）：写盘即 ACK、flush 补网络段、
 //! 崩溃补传幂等（dedup 不重复计入）、overwrite 暂存语义、配置校验。
-#![cfg(feature = "s3")]
+#![cfg(feature = "remote")]
 
 use std::sync::Arc;
 
