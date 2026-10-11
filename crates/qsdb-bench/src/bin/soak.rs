@@ -9,10 +9,9 @@
 //!   **8h 长跑必须设上限**（如 400 = 4 亿行后停写，查询/compaction/gc
 //!   继续到时长结束——稳态考察内存/句柄/缓存，不写满磁盘）。
 //!   数据落 %TEMP%/qsdb_soak，结束清理。
-#![cfg(windows)] // mem_mb 依赖 Win32；Linux 部署前用 /proc/self/status 移植
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arrow::array::{Date32Array, Float64Array, Int64Array};
@@ -27,6 +26,7 @@ static QUERIES: AtomicU64 = AtomicU64::new(0);
 static Q_NANOS: AtomicU64 = AtomicU64::new(0);
 static ERRORS: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(windows)]
 fn mem_mb() -> (f64, f64) {
     use windows_sys::Win32::System::ProcessStatus::{
         GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
@@ -82,6 +82,7 @@ fn synth(rows: usize, dt: i32, seed: u64) -> RecordBatch {
     .unwrap()
 }
 
+#[cfg(windows)] // mem_mb 依赖 Win32
 fn main() {
     let mins: u64 = std::env::args()
         .nth(1)
@@ -104,7 +105,10 @@ fn main() {
             .as_nanos()
     ));
     std::fs::create_dir_all(&root).unwrap();
-    println!("== soak: {mins}min, {writers} writers, root {} ==", root.display());
+    println!(
+        "== soak: {mins}min, {writers} writers, root {} ==",
+        root.display()
+    );
 
     let db = Arc::new(Qsdb::open(&root, QsdbOptions::default()).unwrap());
     db.sql("CREATE TABLE t (dt DATE, g1 BIGINT, a BIGINT, score DOUBLE) PARTITIONED BY (dt)")
@@ -213,7 +217,12 @@ fn main() {
                 "{:5.0}m {:7.0} {:8} {:8.1} {:7.0} {:8.0} {:8.0}  {:5.1}  (cache n={centries} hit={chits} miss={cmiss})",
                 start.elapsed().as_secs_f64() / 60.0,
                 (now_w - last_written) as f64 / dt,
-                q, q_avg, cur, peak, cbytes as f64 / 1048576.0, segs,
+                q,
+                q_avg,
+                cur,
+                peak,
+                cbytes as f64 / 1048576.0,
+                segs,
             );
             last_written = now_w;
             last_t = Instant::now();
@@ -253,7 +262,16 @@ fn main() {
         ERRORS.load(Ordering::Relaxed),
         peak
     );
-    assert_eq!(total_rows as u64, WRITTEN.load(Ordering::Relaxed), "读写并发下数据不得丢失");
+    assert_eq!(
+        total_rows as u64,
+        WRITTEN.load(Ordering::Relaxed),
+        "读写并发下数据不得丢失"
+    );
     let _ = cur;
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("soak 目前仅 Windows（mem_mb 依赖 Win32）；Linux 版待 /proc/self/status 移植");
 }

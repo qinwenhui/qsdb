@@ -403,7 +403,9 @@ fn meta_bench(parts: usize) {
         qsdb::scan::list_partitions(&store, &tdir, def.partition_keys.len())
             .iter()
             .filter_map(|(p, _)| {
-                qsdb::manifest::PartitionManifest::read(&store, p).ok().flatten()
+                qsdb::manifest::PartitionManifest::read(&store, p)
+                    .ok()
+                    .flatten()
             })
             .map(|m| m.total_rows())
             .sum()

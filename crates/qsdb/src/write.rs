@@ -232,9 +232,8 @@ fn write_segment(
 
     let durable = store.data_sync();
     let (rows, column_stats) = {
-        let mut file = File::create(&tmp_path).map_err(|e| {
-            QsdbError::meta(format!("create {} failed: {e}", tmp_path.display()))
-        })?;
+        let mut file = File::create(&tmp_path)
+            .map_err(|e| QsdbError::meta(format!("create {} failed: {e}", tmp_path.display())))?;
         let out = serialize_segment(&mut file, batches, file_schema, props, column_names)?;
         if durable {
             // 掉电安全档：段数据落盘后 rename——manifest 一旦提交，段必然可读
@@ -519,7 +518,15 @@ pub(crate) fn overwrite_partition(
     if !store.is_local() {
         #[cfg(feature = "remote")]
         return overwrite_partition_remote(
-            store, staging, table_dir, def.name.as_str(), def, values, &dir, batches, &schema,
+            store,
+            staging,
+            table_dir,
+            def.name.as_str(),
+            def,
+            values,
+            &dir,
+            batches,
+            &schema,
             &file_schema,
         );
         #[cfg(not(feature = "remote"))]
@@ -640,17 +647,29 @@ fn append_partition_remote(
     schema: &SchemaRef,
     file_schema: &SchemaRef,
 ) -> Result<WriteResult> {
-    let col_names: Vec<String> = schema
-        .fields()
-        .iter()
-        .map(|f| f.name().clone())
-        .collect();
+    let col_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
     let entry = match staging {
         Some(st) => stage_segment(
-            st, store.data_sync(), table_dir, table, def, values, dir, batches, file_schema,
-            col_names, false,
+            st,
+            store.data_sync(),
+            table_dir,
+            table,
+            def,
+            values,
+            dir,
+            batches,
+            file_schema,
+            col_names,
+            false,
         )?,
-        None => put_segment_remote(store, dir, batches, file_schema, writer_props(def)?, &col_names)?,
+        None => put_segment_remote(
+            store,
+            dir,
+            batches,
+            file_schema,
+            writer_props(def)?,
+            &col_names,
+        )?,
     };
     if staging.is_none() {
         occ_append_entry(store, dir, def, values, &entry)?;
@@ -740,8 +759,7 @@ pub(crate) fn occ_replace_entries(
     let mpath = PartitionManifest::manifest_path(dir);
     crate::remote::with_partition_mutex(dir, || {
         crate::remote::occ_commit(store, &mpath, |cur| {
-            let mut m =
-                PartitionManifest::new(named_values(def, values), def.schema_fingerprint());
+            let mut m = PartitionManifest::new(named_values(def, values), def.schema_fingerprint());
             m.generation = cur.map_or(0, |c| c.generation);
             m.segments = entries.to_vec();
             Ok(m)
@@ -765,18 +783,23 @@ fn overwrite_partition_remote(
     schema: &SchemaRef,
     file_schema: &Option<SchemaRef>,
 ) -> Result<WriteResult> {
-    let col_names: Vec<String> = schema
-        .fields()
-        .iter()
-        .map(|f| f.name().clone())
-        .collect();
+    let col_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
     let mut result = WriteResult::default();
     let mut new_segments: Vec<SegmentEntry> = Vec::new();
     if let Some(fs) = file_schema {
         let entry = match staging {
             Some(st) => stage_segment(
-                st, store.data_sync(), table_dir, table, def, values, dir, batches, fs,
-                col_names, true,
+                st,
+                store.data_sync(),
+                table_dir,
+                table,
+                def,
+                values,
+                dir,
+                batches,
+                fs,
+                col_names,
+                true,
             )?,
             None => put_segment_remote(store, dir, batches, fs, writer_props(def)?, &col_names)?,
         };
@@ -858,7 +881,15 @@ mod tests {
         let d = def();
         let tdir = root.join("t");
         let vals = [Literal::Date(1)];
-        let r = append_partition(&store, None, &tdir, &d, &vals, &[data_batch(vec![Some(10)])]).unwrap();
+        let r = append_partition(
+            &store,
+            None,
+            &tdir,
+            &d,
+            &vals,
+            &[data_batch(vec![Some(10)])],
+        )
+        .unwrap();
         assert_eq!(r.rows, 1);
         let pdir = tdir.join("dt=1970-01-02");
         let m = PartitionManifest::read(&store, &pdir).unwrap().unwrap();
@@ -875,8 +906,24 @@ mod tests {
         let d = def();
         let tdir = root.join("t");
         let vals = [Literal::Date(1)];
-        append_partition(&store, None, &tdir, &d, &vals, &[data_batch(vec![Some(10)])]).unwrap();
-        append_partition(&store, None, &tdir, &d, &vals, &[data_batch(vec![Some(20)])]).unwrap();
+        append_partition(
+            &store,
+            None,
+            &tdir,
+            &d,
+            &vals,
+            &[data_batch(vec![Some(10)])],
+        )
+        .unwrap();
+        append_partition(
+            &store,
+            None,
+            &tdir,
+            &d,
+            &vals,
+            &[data_batch(vec![Some(20)])],
+        )
+        .unwrap();
         let pdir = tdir.join("dt=1970-01-02");
         assert_eq!(
             PartitionManifest::read(&store, &pdir)

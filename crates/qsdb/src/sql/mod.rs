@@ -146,8 +146,7 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
         translate::ParsedStatement::ShowPartitions { table } => {
             let def = db.table_def(&table)?;
             let tdir = crate::catalog::table_dir(db.root(), crate::catalog::DEFAULT_DB, &table);
-            let parts =
-                crate::scan::list_partitions(db.store(), &tdir, def.partition_keys.len());
+            let parts = crate::scan::list_partitions(db.store(), &tdir, def.partition_keys.len());
             let schema = Arc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new("partition", arrow::datatypes::DataType::Utf8, true),
             ]));

@@ -20,7 +20,7 @@ use futures_util::stream::BoxStream;
 use object_store::path::Path;
 use object_store::{
     Error as OsError, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    ObjectStoreExt, PutMultipartOptions, PutMode, PutOptions, PutPayload, PutResult,
+    ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     Result as OsResult,
 };
 
@@ -228,9 +228,7 @@ pub fn build_hdfs_store(url: &str) -> crate::error::Result<Arc<dyn ObjectStore>>
     let client = hdfs_native::ClientBuilder::new()
         .with_url(url)
         .build()
-        .map_err(|e| {
-            crate::error::QsdbError::meta(format!("hdfs client for {url}: {e}"))
-        })?;
+        .map_err(|e| crate::error::QsdbError::meta(format!("hdfs client for {url}: {e}")))?;
     Ok(Arc::new(LockingStore::new(
         client.clone(),
         Arc::new(hdfs_native_object_store::HdfsObjectStore::new(client)),

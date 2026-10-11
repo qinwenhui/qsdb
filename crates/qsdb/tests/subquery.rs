@@ -214,14 +214,17 @@ fn setup_semi(tag: &str) -> (Qsdb, std::path::PathBuf) {
         (DATE '2026-01-02', 3, 102), (DATE '2026-01-02', 1, 103)",
     )
     .unwrap();
-    db.sql("CREATE TABLE u (dt DATE, g BIGINT) PARTITIONED BY (dt)").unwrap();
+    db.sql("CREATE TABLE u (dt DATE, g BIGINT) PARTITIONED BY (dt)")
+        .unwrap();
     db.sql(
         "INSERT INTO u VALUES
         (DATE '2026-01-01', 1), (DATE '2026-01-01', 1), (DATE '2026-01-02', 2)",
     )
     .unwrap();
-    db.sql("CREATE TABLE dims (g BIGINT, label STRING)").unwrap();
-    db.sql("INSERT INTO dims VALUES (1, 'one'), (3, 'three'), (5, 'five')").unwrap();
+    db.sql("CREATE TABLE dims (g BIGINT, label STRING)")
+        .unwrap();
+    db.sql("INSERT INTO dims VALUES (1, 'one'), (3, 'three'), (5, 'five')")
+        .unwrap();
     (db, root)
 }
 
@@ -230,12 +233,21 @@ fn in_subquery_basic_and_dupes() {
     let (db, root) = setup_semi("in");
     // g IN {1,3,5}：t 的 g=1×2, g=3×1 → 3 行；子查询含重复 g=1 —— semi
     // 至多发射一次（无重复）是硬语义
-    let r = q(&db, "SELECT count(*) FROM t WHERE g IN (SELECT g FROM dims)");
+    let r = q(
+        &db,
+        "SELECT count(*) FROM t WHERE g IN (SELECT g FROM dims)",
+    );
     assert_eq!(r, vec!["3"]);
-    let r = q(&db, "SELECT v FROM t WHERE g IN (SELECT g FROM dims) ORDER BY v");
+    let r = q(
+        &db,
+        "SELECT v FROM t WHERE g IN (SELECT g FROM dims) ORDER BY v",
+    );
     assert_eq!(r, vec!["100", "102", "103"]);
     // NOT IN：g=2 行
-    let r = q(&db, "SELECT v FROM t WHERE g NOT IN (SELECT g FROM dims) ORDER BY v");
+    let r = q(
+        &db,
+        "SELECT v FROM t WHERE g NOT IN (SELECT g FROM dims) ORDER BY v",
+    );
     assert_eq!(r, vec!["101"]);
     std::fs::remove_dir_all(&root).ok();
 }
@@ -244,7 +256,10 @@ fn in_subquery_basic_and_dupes() {
 fn in_subquery_with_local_filter() {
     let (db, root) = setup_semi("infilter");
     // 子查询内本地谓词：只留 g=3 → 1 行
-    let r = q(&db, "SELECT count(*) FROM t WHERE g IN (SELECT g FROM dims WHERE label = 'three')");
+    let r = q(
+        &db,
+        "SELECT count(*) FROM t WHERE g IN (SELECT g FROM dims WHERE label = 'three')",
+    );
     assert_eq!(r, vec!["1"]);
     std::fs::remove_dir_all(&root).ok();
 }
@@ -256,10 +271,16 @@ fn not_in_null_semantics() {
     // count(*) 返回 0 行（而非一行 "0"）——按现状断言，空输入聚合单行
     // 化是已记录的后置项
     db.sql("INSERT INTO dims VALUES (NULL, 'nil')").unwrap();
-    let r = q(&db, "SELECT count(*) FROM t WHERE g NOT IN (SELECT g FROM dims)");
+    let r = q(
+        &db,
+        "SELECT count(*) FROM t WHERE g NOT IN (SELECT g FROM dims)",
+    );
     assert_eq!(r, Vec::<String>::new());
     // IN 不受 build NULL 影响（NULL 键不命中）
-    let r = q(&db, "SELECT count(*) FROM t WHERE g IN (SELECT g FROM dims)");
+    let r = q(
+        &db,
+        "SELECT count(*) FROM t WHERE g IN (SELECT g FROM dims)",
+    );
     assert_eq!(r, vec!["3"]);
     std::fs::remove_dir_all(&root).ok();
 }
@@ -282,7 +303,10 @@ fn correlated_exists_equi() {
 fn correlated_exists_multi_key_precise() {
     let (db, root) = setup_semi("exists2");
     // 单键 g：u.g={1,1,2} → t.g∈{1,2,3,1} 命中 g∈{1,2} → 三行
-    let r = q(&db, "SELECT v FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.g = t.g) ORDER BY v");
+    let r = q(
+        &db,
+        "SELECT v FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.g = t.g) ORDER BY v",
+    );
     assert_eq!(r, vec!["100", "101", "103"]);
     // NOT EXISTS：g=3 一行
     let r = q(
@@ -348,14 +372,19 @@ fn semi_date_key_uses_int_fast_path() {
 fn semi_error_paths() {
     let (db, root) = setup_semi("err");
     // 非关联 EXISTS：v1 报不支持
-    assert!(db.sql("SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM dims)").is_err());
+    assert!(
+        db.sql("SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM dims)")
+            .is_err()
+    );
     // 多列子查询
-    assert!(db
-        .sql("SELECT 1 FROM t WHERE g IN (SELECT g, label FROM dims)")
-        .is_err());
+    assert!(
+        db.sql("SELECT 1 FROM t WHERE g IN (SELECT g, label FROM dims)")
+            .is_err()
+    );
     // OR 内 semi：v1 不支持（顶层 AND 合取级）
-    assert!(db
-        .sql("SELECT 1 FROM t WHERE v > 100 OR g IN (SELECT g FROM dims)")
-        .is_err());
+    assert!(
+        db.sql("SELECT 1 FROM t WHERE v > 100 OR g IN (SELECT g FROM dims)")
+            .is_err()
+    );
     std::fs::remove_dir_all(&root).ok();
 }

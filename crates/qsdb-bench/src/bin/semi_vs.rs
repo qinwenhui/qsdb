@@ -37,7 +37,8 @@ fn main() {
     .unwrap();
     db.sql("CREATE TABLE t (dt DATE, g BIGINT, a BIGINT, score DOUBLE) PARTITIONED BY (dt)")
         .unwrap();
-    db.sql("CREATE TABLE dims (g BIGINT, label STRING)").unwrap();
+    db.sql("CREATE TABLE dims (g BIGINT, label STRING)")
+        .unwrap();
 
     let mut dims_g = Vec::new();
     let mut dims_label = Vec::new();
@@ -135,10 +136,22 @@ fn main() {
 
     let queries: &[(&str, &str)] = &[
         ("基线聚合(无semi)", "SELECT count(*), sum(a) FROM t"),
-        ("基线过滤+聚合", "SELECT count(*), sum(a) FROM t WHERE g > 100"),
-        ("IN 子查询", "SELECT count(*), sum(a) FROM t WHERE g IN (SELECT g FROM dims)"),
-        ("NOT IN", "SELECT count(*) FROM t WHERE g NOT IN (SELECT g FROM dims)"),
-        ("EXISTS(关联)", "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM dims WHERE dims.g = t.g)"),
+        (
+            "基线过滤+聚合",
+            "SELECT count(*), sum(a) FROM t WHERE g > 100",
+        ),
+        (
+            "IN 子查询",
+            "SELECT count(*), sum(a) FROM t WHERE g IN (SELECT g FROM dims)",
+        ),
+        (
+            "NOT IN",
+            "SELECT count(*) FROM t WHERE g NOT IN (SELECT g FROM dims)",
+        ),
+        (
+            "EXISTS(关联)",
+            "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM dims WHERE dims.g = t.g)",
+        ),
     ];
     println!("\n（QSDB = 位图/免编码快路径；DuckDB = hash semi join；交替 2 轮）");
     for (name, sql) in queries {
@@ -178,5 +191,7 @@ fn main() {
 
 #[cfg(not(feature = "duckdb"))]
 fn main() {
-    eprintln!("需要 duckdb feature：cargo run --release -p qsdb-bench --features duckdb --bin semi_vs");
+    eprintln!(
+        "需要 duckdb feature：cargo run --release -p qsdb-bench --features duckdb --bin semi_vs"
+    );
 }

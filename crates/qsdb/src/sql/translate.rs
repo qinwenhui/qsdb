@@ -882,13 +882,13 @@ fn resolve_table_function(
             other => {
                 return Err(QsdbError::invalid(format!(
                     "read_parquet path must be a string literal, got {other:?}"
-                )))
+                )));
             }
         },
         other => {
             return Err(QsdbError::invalid(format!(
                 "read_parquet takes exactly one string literal, got {other:?} args"
-            )))
+            )));
         }
     };
     let files = crate::scan::resolve_file_locs(&path)?;
@@ -1075,9 +1075,9 @@ fn subquery_table_names(q: &sqlparser::ast::Query) -> Vec<String> {
                     names.push(last.value.to_ascii_lowercase());
                 }
             }
-            TableFactor::Derived {
-                alias: Some(a), ..
-            } => names.push(a.name.value.to_ascii_lowercase()),
+            TableFactor::Derived { alias: Some(a), .. } => {
+                names.push(a.name.value.to_ascii_lowercase())
+            }
             _ => {}
         }
     }
@@ -1234,7 +1234,10 @@ fn build_exists_semi_join(
     }
     // ③ 本地谓词 → 子计划内 Filter
     let mut sub_plan = sub_plan;
-    if let Some(pred) = local.into_iter().reduce(|a, b| PhysExpr::And(Box::new(a), Box::new(b))) {
+    if let Some(pred) = local
+        .into_iter()
+        .reduce(|a, b| PhysExpr::And(Box::new(a), Box::new(b)))
+    {
         sub_plan = LogicalPlan::Filter {
             input: Box::new(sub_plan),
             predicate: pred,
@@ -1713,8 +1716,8 @@ fn translate_select_inner(
             (None, Some(bound))
         };
         if let Some(p) = pushdown {
-            if let LogicalPlan::Scan { predicate, .. } | LogicalPlan::ExternalScan { predicate, .. } =
-                &mut plan
+            if let LogicalPlan::Scan { predicate, .. }
+            | LogicalPlan::ExternalScan { predicate, .. } = &mut plan
             {
                 *predicate = Some(p);
             }

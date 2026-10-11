@@ -67,7 +67,9 @@ pub(crate) fn writer_epoch() -> u64 {
 pub fn occ_commit(
     store: &crate::store::Store,
     manifest_path: &std::path::Path,
-    mut build: impl FnMut(Option<crate::manifest::PartitionManifest>) -> Result<crate::manifest::PartitionManifest>,
+    mut build: impl FnMut(
+        Option<crate::manifest::PartitionManifest>,
+    ) -> Result<crate::manifest::PartitionManifest>,
 ) -> Result<()> {
     const MAX_RETRIES: usize = 8;
     let mut last_conflict = 0usize;
@@ -75,8 +77,8 @@ pub fn occ_commit(
         let cur_bytes = store.get_with_etag(manifest_path)?;
         let (etag, cur) = match cur_bytes {
             Some((bytes, etag)) => {
-                let m: crate::manifest::PartitionManifest = postcard::from_bytes(&bytes)
-                    .map_err(|e| {
+                let m: crate::manifest::PartitionManifest =
+                    postcard::from_bytes(&bytes).map_err(|e| {
                         crate::error::QsdbError::meta(format!(
                             "corrupt manifest {}: {e}",
                             manifest_path.display()
@@ -174,7 +176,9 @@ fn split_url(url: &str) -> Result<SplitUrl> {
         .split_once('/')
         .ok_or_else(|| QsdbError::invalid(format!("s3 url needs bucket/key: {url}")))?;
     if bucket.is_empty() || key.is_empty() {
-        return Err(QsdbError::invalid(format!("s3 url needs bucket/key: {url}")));
+        return Err(QsdbError::invalid(format!(
+            "s3 url needs bucket/key: {url}"
+        )));
     }
     let params: Vec<(String, String)> = query
         .split('&')
@@ -220,10 +224,7 @@ fn urldecode(s: &str) -> String {
 }
 
 fn param<'a>(params: &'a [(String, String)], k: &str) -> Option<&'a str> {
-    params
-        .iter()
-        .find(|(n, _)| n == k)
-        .map(|(_, v)| v.as_str())
+    params.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
 }
 
 /// 构建 AmazonS3 句柄（QsdbOptions.storage 与 locate 共用配置规则：
@@ -243,10 +244,9 @@ pub fn build_s3_store(
     if let Some(r) = region {
         b = b.with_region(r);
     }
-    Ok(Arc::new(
-        b.build()
-            .map_err(|e| QsdbError::meta(format!("s3 client for bucket {bucket}: {e}")))?,
-    ))
+    Ok(Arc::new(b.build().map_err(|e| {
+        QsdbError::meta(format!("s3 client for bucket {bucket}: {e}"))
+    })?))
 }
 
 /// 定位单对象（构建/复用 store 句柄）。
@@ -254,7 +254,12 @@ pub(crate) fn locate(url: &str) -> Result<S3Locator> {
     let (bucket, location, params) = split_url(url)?;
     let endpoint = param(&params, "endpoint");
     let region = param(&params, "region");
-    let key = format!("{}|{}|{}", endpoint.unwrap_or(""), region.unwrap_or(""), bucket);
+    let key = format!(
+        "{}|{}|{}",
+        endpoint.unwrap_or(""),
+        region.unwrap_or(""),
+        bucket
+    );
     if let Some(store) = CTX.stores.lock().ok().and_then(|m| m.get(&key).cloned()) {
         return Ok(S3Locator { store, location });
     }
@@ -271,20 +276,14 @@ pub(crate) fn head(loc: &S3Locator) -> Result<ObjectMeta> {
 }
 
 /// HEAD（句柄 + key 直用；管理表远端读取共用）。
-pub(crate) fn head_parts(
-    store: Arc<dyn ObjectStore>,
-    location: &StorePath,
-) -> Result<ObjectMeta> {
+pub(crate) fn head_parts(store: Arc<dyn ObjectStore>, location: &StorePath) -> Result<ObjectMeta> {
     CTX.rt
         .block_on(store.head(location))
         .map_err(|e| QsdbError::meta(format!("s3 head {location}: {e}")))
 }
 
 /// 流式整读（句柄 + key 直用）。
-pub(crate) fn stream_parts(
-    store: Arc<dyn ObjectStore>,
-    location: StorePath,
-) -> Result<impl Read> {
+pub(crate) fn stream_parts(store: Arc<dyn ObjectStore>, location: StorePath) -> Result<impl Read> {
     let result = CTX
         .rt
         .block_on(store.get(&location))
@@ -308,9 +307,7 @@ impl Read for StreamRead {
         while self.buf.is_empty() && !self.done {
             match CTX.rt.block_on(self.stream.next()) {
                 Some(Ok(b)) => self.buf = b,
-                Some(Err(e)) => {
-                    return Err(std::io::Error::other(format!("object stream: {e}")))
-                }
+                Some(Err(e)) => return Err(std::io::Error::other(format!("object stream: {e}"))),
                 None => self.done = true,
             }
         }
@@ -376,11 +373,13 @@ impl ChunkReader for RemoteReader {
                 self.store
                     .get_range(&self.location, start..start + length as u64),
             )
-            .map_err(|e| ParquetError::External(Box::new(std::io::Error::other(format!(
-                "s3 range {}..{}: {e}",
-                self.location,
-                start + length as u64
-            )))))
+            .map_err(|e| {
+                ParquetError::External(Box::new(std::io::Error::other(format!(
+                    "s3 range {}..{}: {e}",
+                    self.location,
+                    start + length as u64
+                ))))
+            })
     }
 }
 
@@ -399,7 +398,10 @@ impl Read for ChunkedRangeRead {
         while self.buf.is_empty() {
             let b = CTX
                 .rt
-                .block_on(self.store.get_range(&self.location, self.pos..self.pos + READ_CHUNK))
+                .block_on(
+                    self.store
+                        .get_range(&self.location, self.pos..self.pos + READ_CHUNK),
+                )
                 .map_err(|e| std::io::Error::other(format!("s3 range read: {e}")))?;
             let n = b.len() as u64;
             self.buf = b;
@@ -424,7 +426,11 @@ pub fn expand_s3_glob(pattern: &str) -> Result<Vec<String>> {
     let region = param(&params, "region");
     // 复用 locate 的 store（key 仅用于解析，store 只按 bucket/endpoint/region 配置）
     let prefix_raw = key_pat.split('*').next().unwrap_or_default();
-    let probe_key = if prefix_raw.is_empty() { "x" } else { prefix_raw };
+    let probe_key = if prefix_raw.is_empty() {
+        "x"
+    } else {
+        prefix_raw
+    };
     let probe = format!(
         "s3://{}/{}{}",
         bucket,
@@ -460,7 +466,14 @@ pub fn expand_s3_glob(pattern: &str) -> Result<Vec<String>> {
         .into_iter()
         .map(|m| m.location)
         .filter(|k| crate::scan::glob_match(key_pat, k.as_ref()))
-        .map(|k| format!("s3://{}/{}{}", bucket, k.as_ref(), build_query(endpoint, region)))
+        .map(|k| {
+            format!(
+                "s3://{}/{}{}",
+                bucket,
+                k.as_ref(),
+                build_query(endpoint, region)
+            )
+        })
         .collect();
     urls.sort();
     if urls.is_empty() {
@@ -524,8 +537,8 @@ mod tests {
 
     #[test]
     fn url_parsing() {
-        let (b, k, p) = split_url("s3://bucket/a/b.parquet?endpoint=http://minio:9000&region=r1")
-            .unwrap();
+        let (b, k, p) =
+            split_url("s3://bucket/a/b.parquet?endpoint=http://minio:9000&region=r1").unwrap();
         assert_eq!(b, "bucket");
         assert_eq!(k.as_ref(), "a/b.parquet");
         assert_eq!(param(&p, "endpoint"), Some("http://minio:9000"));
@@ -536,8 +549,10 @@ mod tests {
 
     #[test]
     fn chunk_reader_ranges_and_parquet_roundtrip() {
-        let dir = std::env::temp_dir()
-            .join(format!("qsdb_remote_test_{}", uuid::Uuid::now_v7().simple()));
+        let dir = std::env::temp_dir().join(format!(
+            "qsdb_remote_test_{}",
+            uuid::Uuid::now_v7().simple()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let p = write_parquet(&dir, "f.parquet", &[1, 2, 3, 4, 5]);
         let r = reader_over_local(&p);
@@ -570,8 +585,10 @@ mod tests {
 
     #[test]
     fn stream_read_adapter() {
-        let dir = std::env::temp_dir()
-            .join(format!("qsdb_remote_stream_{}", uuid::Uuid::now_v7().simple()));
+        let dir = std::env::temp_dir().join(format!(
+            "qsdb_remote_stream_{}",
+            uuid::Uuid::now_v7().simple()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let p = write_parquet(&dir, "s.parquet", &[7]);
         let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::default());

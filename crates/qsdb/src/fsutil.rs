@@ -200,7 +200,6 @@ pub fn purge_trash(root: &Path, grace_ms: u64) -> Result<(u64, u64)> {
     if !trash.exists() {
         return Ok((0, 0));
     }
-    let cutoff = now_ms().saturating_sub(grace_ms);
     let mut purged = 0u64;
     let mut freed = 0u64;
     for entry in
@@ -211,7 +210,9 @@ pub fn purge_trash(root: &Path, grace_ms: u64) -> Result<(u64, u64)> {
         let Some(ts) = name.to_str().and_then(|s| s.parse::<u64>().ok()) else {
             continue;
         };
-        if ts >= cutoff {
+        // 年龄判定（而非 ts 与 cutoff 直接比较）：Linux 快 I/O 下 move 与
+        // purge 可落在同一毫秒，ts >= cutoff 会把零龄条目误判为太新
+        if now_ms().saturating_sub(ts) < grace_ms {
             continue;
         }
         freed += dir_size(&entry.path());

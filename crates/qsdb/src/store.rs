@@ -117,10 +117,16 @@ impl RemoteStore {
             format!("{}/{}", self.prefix, rel)
         };
         // key 均由受控路径派生（非空、无空段）；根路径本身（"."）无对象语义
-        object_store::path::Path::parse(full).unwrap_or_else(|_| object_store::path::Path::from("_"))
+        object_store::path::Path::parse(full)
+            .unwrap_or_else(|_| object_store::path::Path::from("_"))
     }
 
-    fn os_err(&self, what: &str, key: &object_store::path::Path, e: object_store::Error) -> QsdbError {
+    fn os_err(
+        &self,
+        what: &str,
+        key: &object_store::path::Path,
+        e: object_store::Error,
+    ) -> QsdbError {
         QsdbError::meta(format!("{what} {key}: {e}"))
     }
 }
@@ -279,9 +285,7 @@ impl Store {
             #[cfg(feature = "remote")]
             Self::Remote(s) => {
                 let key = s.key(path);
-                crate::remote::rt()
-                    .block_on(s.os.head(&key))
-                    .is_ok()
+                crate::remote::rt().block_on(s.os.head(&key)).is_ok()
             }
         }
     }
@@ -322,7 +326,12 @@ impl Store {
                     .common_prefixes
                     .into_iter()
                     .map(|p| {
-                        let name = p.as_ref().rsplit('/').next().unwrap_or_default().to_string();
+                        let name = p
+                            .as_ref()
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or_default()
+                            .to_string();
                         StoreEntry {
                             path: dir.join(&name),
                             name,
@@ -380,7 +389,7 @@ impl Store {
                 let r = match rt.block_on(s.os.get(&key)) {
                     Ok(r) => r,
                     Err(object_store::Error::NotFound { .. }) => {
-                        return Ok(None) // 不存在 = 新对象（OCC put_if_absent 路径）
+                        return Ok(None); // 不存在 = 新对象（OCC put_if_absent 路径）
                     }
                     Err(e) => return Err(s.os_err("get", &key, e)),
                 };
@@ -470,20 +479,19 @@ impl Store {
                 use futures_util::StreamExt;
                 let key = s.key(prefix);
                 let stream = s.os.list(Some(&key));
-                let metas: Vec<object_store::ObjectMeta> =
-                    crate::remote::rt().block_on(async {
-                        let mut out = Vec::new();
-                        let mut st = stream;
-                        while let Some(m) = st.next().await {
-                            match m {
-                                Ok(meta) => out.push(meta),
-                                Err(e) => {
-                                    return Err(s.os_err("list", &key, e));
-                                }
+                let metas: Vec<object_store::ObjectMeta> = crate::remote::rt().block_on(async {
+                    let mut out = Vec::new();
+                    let mut st = stream;
+                    while let Some(m) = st.next().await {
+                        match m {
+                            Ok(meta) => out.push(meta),
+                            Err(e) => {
+                                return Err(s.os_err("list", &key, e));
                             }
                         }
-                        Ok(out)
-                    })?;
+                    }
+                    Ok(out)
+                })?;
                 Ok(metas
                     .into_iter()
                     .map(|m| {
@@ -533,10 +541,7 @@ impl Store {
 
     /// 管理表路径 → 对象 key（ChunkSource::Managed 远端读取用；Local → None）。
     #[cfg(feature = "remote")]
-    pub(crate) fn remote_obj_key(
-        &self,
-        path: &Path,
-    ) -> Option<object_store::path::Path> {
+    pub(crate) fn remote_obj_key(&self, path: &Path) -> Option<object_store::path::Path> {
         match self {
             Self::Local(_) => None,
             Self::Remote(s) => Some(s.key(path)),

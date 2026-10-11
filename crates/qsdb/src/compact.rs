@@ -216,9 +216,8 @@ fn write_merged(
     let mut rows: u64 = 0;
     let durable = store.data_sync();
     {
-        let mut file = File::create(&tmp_path).map_err(|e| {
-            QsdbError::meta(format!("create {} failed: {e}", tmp_path.display()))
-        })?;
+        let mut file = File::create(&tmp_path)
+            .map_err(|e| QsdbError::meta(format!("create {} failed: {e}", tmp_path.display())))?;
         let mut writer =
             ArrowWriter::try_new(&mut file, Arc::clone(schema), Some(writer_props(def)?))
                 .map_err(|e| QsdbError::meta(format!("parquet writer init failed: {e}")))?;
@@ -303,12 +302,8 @@ fn compact_partition_remote(
     if manifest.segments.len() < opts.min_segments.max(2) {
         return Ok(None);
     }
-    let avg = manifest
-        .segments
-        .iter()
-        .map(|s| s.byte_size)
-        .sum::<u64>()
-        / manifest.segments.len() as u64;
+    let avg =
+        manifest.segments.iter().map(|s| s.byte_size).sum::<u64>() / manifest.segments.len() as u64;
     if avg >= opts.max_avg_segment_bytes {
         return Ok(None);
     }
@@ -383,10 +378,7 @@ fn compact_partition_remote(
         let new_entry = entry.clone();
         crate::remote::occ_commit(store, &mpath, |cur| {
             let mut m = cur.unwrap_or_else(|| {
-                PartitionManifest::new(
-                    manifest.partition_values.clone(),
-                    def.schema_fingerprint(),
-                )
+                PartitionManifest::new(manifest.partition_values.clone(), def.schema_fingerprint())
             });
             m.generation += 1;
             m.segments = vec![new_entry.clone()];

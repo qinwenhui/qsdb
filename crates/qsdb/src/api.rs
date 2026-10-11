@@ -246,7 +246,8 @@ impl Qsdb {
                 bucket,
                 prefix,
             } => {
-                let os = crate::remote::build_s3_store(endpoint.as_deref(), region.as_deref(), bucket)?;
+                let os =
+                    crate::remote::build_s3_store(endpoint.as_deref(), region.as_deref(), bucket)?;
                 let vroot = PathBuf::from(format!("s3://{bucket}/{prefix}"));
                 Store::remote_dur(
                     vroot,
@@ -262,7 +263,11 @@ impl Qsdb {
     /// 打开并注入自定义存储后端（测试/嵌入方；生产用 [`Qsdb::open`]）。
     /// `root` 仍为本地目录（段缓存/文件锁等本地状态），命名空间以
     /// `store.root()` 为准（Remote = 虚拟根 `s3://bucket/prefix`）。
-    pub fn open_with_store(root: impl AsRef<Path>, opts: QsdbOptions, store: Store) -> Result<Self> {
+    pub fn open_with_store(
+        root: impl AsRef<Path>,
+        opts: QsdbOptions,
+        store: Store,
+    ) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let store = Arc::new(store);
         store
@@ -396,7 +401,14 @@ impl Qsdb {
             for (values, data) in split_by_partition(batch, &def)? {
                 total = merge_write(
                     total,
-                    write::append_partition(&self.store, self.staging(), &tdir, &def, &values, &[data])?,
+                    write::append_partition(
+                        &self.store,
+                        self.staging(),
+                        &tdir,
+                        &def,
+                        &values,
+                        &[data],
+                    )?,
                 );
             }
         }
@@ -454,7 +466,14 @@ impl Qsdb {
                 data_batches.push(data);
             }
         }
-        write::overwrite_partition(&self.store, self.staging(), &tdir, &def, &ordered, &data_batches)
+        write::overwrite_partition(
+            &self.store,
+            self.staging(),
+            &tdir,
+            &def,
+            &ordered,
+            &data_batches,
+        )
     }
 
     // -- 读 ------------------------------------------------------------------
@@ -475,7 +494,11 @@ impl Qsdb {
 
     fn scan_inner(&self, req: ScanRequest, ctx: Arc<crate::query::QueryContext>) -> Result<Scan> {
         let def = self.def(req.db.as_deref(), &req.table)?;
-        let tdir = table_dir(self.store.root(), self.db_name(req.db.as_deref()), &req.table);
+        let tdir = table_dir(
+            self.store.root(),
+            self.db_name(req.db.as_deref()),
+            &req.table,
+        );
         Scan::with_cache(
             &self.store,
             &tdir,
@@ -497,7 +520,10 @@ impl Qsdb {
         predicate: Option<Predicate>,
         ctx: Arc<crate::query::QueryContext>,
     ) -> Result<Scan> {
-        let fc = self.file_cache.is_enabled().then(|| Arc::clone(&self.file_cache));
+        let fc = self
+            .file_cache
+            .is_enabled()
+            .then(|| Arc::clone(&self.file_cache));
         Scan::external(
             &self.store,
             def,
@@ -596,7 +622,9 @@ impl Qsdb {
             #[cfg(feature = "remote")]
             return self.clear_partition_remote(&dir, def, &ordered);
             #[cfg(not(feature = "remote"))]
-            return Err(QsdbError::unsupported("remote store requires an s3/hdfs build"));
+            return Err(QsdbError::unsupported(
+                "remote store requires an s3/hdfs build",
+            ));
         }
         let _guard = crate::fsutil::PartitionLock::acquire(&dir.join(".lock"))?;
         let Some(old) = crate::manifest::PartitionManifest::read(&self.store, &dir)? else {
@@ -721,7 +749,9 @@ impl Qsdb {
                 continue;
             };
             let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
-            for (pdir, _) in crate::scan::list_partitions(&self.store, &tdir, def.partition_keys.len()) {
+            for (pdir, _) in
+                crate::scan::list_partitions(&self.store, &tdir, def.partition_keys.len())
+            {
                 let Some(manifest) = crate::manifest::PartitionManifest::read(&self.store, &pdir)?
                 else {
                     continue;
@@ -763,7 +793,9 @@ impl Qsdb {
                         .stat(&entry.path)
                         .ok()
                         .flatten()
-                        .map(|md| crate::fsutil::now_ms().saturating_sub(md.mtime_ms) < orphan_grace)
+                        .map(|md| {
+                            crate::fsutil::now_ms().saturating_sub(md.mtime_ms) < orphan_grace
+                        })
                         .unwrap_or(true);
                     if fresh {
                         continue;
@@ -821,7 +853,8 @@ impl Qsdb {
             let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
             let objects = self.store.list_all(&tdir)?;
             // manifest 真值：引用集（manifest 自身与 table.json/_index 恒保留）
-            let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut referenced: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for obj in &objects {
                 let name = obj.key.rsplit('/').next().unwrap_or_default();
                 if name == crate::manifest::MANIFEST_FILE {
@@ -849,7 +882,11 @@ impl Qsdb {
                     continue;
                 }
                 let _ = def.as_ref();
-                if self.store.delete_object(&self.store.root().join(&obj.key)).is_ok() {
+                if self
+                    .store
+                    .delete_object(&self.store.root().join(&obj.key))
+                    .is_ok()
+                {
                     freed += obj.size;
                 }
             }
@@ -868,12 +905,19 @@ impl Qsdb {
             } else {
                 #[cfg(feature = "remote")]
                 {
-                    bytes += self.store.list_all(&tdir)?.iter().map(|o| o.size).sum::<u64>();
+                    bytes += self
+                        .store
+                        .list_all(&tdir)?
+                        .iter()
+                        .map(|o| o.size)
+                        .sum::<u64>();
                 }
                 #[cfg(not(feature = "remote"))]
                 {
                     let _ = tdir;
-                    return Err(QsdbError::unsupported("remote store requires an s3/hdfs build"));
+                    return Err(QsdbError::unsupported(
+                        "remote store requires an s3/hdfs build",
+                    ));
                 }
             }
         }
@@ -994,8 +1038,8 @@ impl Qsdb {
                 let bytes = std::fs::read(&parquet).map_err(|e| {
                     QsdbError::meta(format!("read staged {}: {e}", parquet.display()))
                 })?;
-                let dir = table_dir(self.store.root(), DEFAULT_DB, &rec.table)
-                    .join(&rec.partition_rel);
+                let dir =
+                    table_dir(self.store.root(), DEFAULT_DB, &rec.table).join(&rec.partition_rel);
                 self.store
                     .put_object(&dir.join(&rec.entry.file_name), &bytes)?;
                 if rec.overwrite {
@@ -1289,11 +1333,8 @@ mod tests {
         )
         .unwrap();
         db.create_table(events_def()).unwrap();
-        db.append(
-            "events",
-            &[batch(vec![1, 2], vec!["a", "b"], vec![10, 20])],
-        )
-        .unwrap();
+        db.append("events", &[batch(vec![1, 2], vec!["a", "b"], vec![10, 20])])
+            .unwrap();
         db.overwrite_partition(
             "events",
             &[("dt", Literal::Date(1))],
@@ -1319,11 +1360,8 @@ mod tests {
         {
             let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
             db.create_table(events_def()).unwrap();
-            db.append(
-                "events",
-                &[batch(vec![1], vec!["a"], vec![10])],
-            )
-            .unwrap();
+            db.append("events", &[batch(vec![1], vec!["a"], vec![10])])
+                .unwrap();
         }
         // 只读打开：读正常，写/DDL/compact/gc 全拒
         let db = Qsdb::open(
@@ -1345,10 +1383,14 @@ mod tests {
             .map(|b| b.num_rows())
             .sum();
         assert_eq!(n, 1);
-        assert!(db
-            .append("events", &[batch(vec![1], vec!["b"], vec![20])])
-            .is_err());
-        assert!(db.sql("INSERT INTO events VALUES (DATE '1970-01-02','c',30)").is_err());
+        assert!(
+            db.append("events", &[batch(vec![1], vec!["b"], vec![20])])
+                .is_err()
+        );
+        assert!(
+            db.sql("INSERT INTO events VALUES (DATE '1970-01-02','c',30)")
+                .is_err()
+        );
         assert!(db.sql("CREATE TABLE t2 (a BIGINT)").is_err());
         assert!(db.sql("TRUNCATE TABLE events").is_err());
         assert!(db.compact_table("events").is_err());

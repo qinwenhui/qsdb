@@ -33,9 +33,13 @@ fn write_parquet(path: &std::path::Path, base: i64, rows: i64) {
         Arc::clone(&schema),
         vec![
             Arc::new(StringArray::from(tenants)),
-            Arc::new(Int64Array::from((0..rows).map(|i| base + i).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(
+                (0..rows).map(|i| base + i).collect::<Vec<_>>(),
+            )),
             Arc::new(Float64Array::from(
-                (0..rows).map(|i| (base + i) as f64 / 2.0).collect::<Vec<_>>(),
+                (0..rows)
+                    .map(|i| (base + i) as f64 / 2.0)
+                    .collect::<Vec<_>>(),
             )),
         ],
     )
@@ -76,29 +80,35 @@ fn select_projection_and_where() {
     let db = db_at(&root);
 
     // 全列
-    let rows = rows_of(&db, &format!(
-        "SELECT tenant, amount FROM read_parquet('{}')",
-        dir.join("a.parquet").to_string_lossy().replace('\\', "/")
-    ));
+    let rows = rows_of(
+        &db,
+        &format!(
+            "SELECT tenant, amount FROM read_parquet('{}')",
+            dir.join("a.parquet").to_string_lossy().replace('\\', "/")
+        ),
+    );
     assert_eq!(rows.len(), 10);
     assert_eq!(rows[0][0], "t0");
     assert_eq!(rows[9][1], "9");
 
     // 谓词行过滤（走 footer 裁剪 + 行过滤）
-    let rows = rows_of(&db, &format!(
-        "SELECT amount FROM read_parquet('{}') WHERE amount >= 8",
-        dir.join("a.parquet").to_string_lossy().replace('\\', "/")
-    ));
-    assert_eq!(
-        rows,
-        vec![vec![String::from("8")], vec![String::from("9")]]
+    let rows = rows_of(
+        &db,
+        &format!(
+            "SELECT amount FROM read_parquet('{}') WHERE amount >= 8",
+            dir.join("a.parquet").to_string_lossy().replace('\\', "/")
+        ),
     );
+    assert_eq!(rows, vec![vec![String::from("8")], vec![String::from("9")]]);
 
     // 聚合
-    let rows = rows_of(&db, &format!(
-        "SELECT count(*), sum(amount), min(score), max(score) FROM read_parquet('{}')",
-        dir.join("a.parquet").to_string_lossy().replace('\\', "/")
-    ));
+    let rows = rows_of(
+        &db,
+        &format!(
+            "SELECT count(*), sum(amount), min(score), max(score) FROM read_parquet('{}')",
+            dir.join("a.parquet").to_string_lossy().replace('\\', "/")
+        ),
+    );
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], "10");
     assert_eq!(rows[0][1], "45");
@@ -118,8 +128,14 @@ fn glob_multiple_files_sorted() {
     write_parquet(&lake.join("y=2025/p3.parquet"), 200, 3);
     let db = db_at(&root);
 
-    let pat = format!("{}/y=*/*.parquet", lake.to_string_lossy().replace('\\', "/"));
-    let rows = rows_of(&db, &format!("SELECT count(*), sum(amount) FROM read_parquet('{pat}')"));
+    let pat = format!(
+        "{}/y=*/*.parquet",
+        lake.to_string_lossy().replace('\\', "/")
+    );
+    let rows = rows_of(
+        &db,
+        &format!("SELECT count(*), sum(amount) FROM read_parquet('{pat}')"),
+    );
     assert_eq!(rows[0][0], "9");
     assert_eq!(rows[0][1], "909"); // (0+1+2)+(100+101+102)+(200+201+202)
 
@@ -135,7 +151,8 @@ fn glob_multiple_files_sorted() {
 fn join_right_external() {
     let root = tmp_root("join");
     let db = db_at(&root);
-    db.sql("CREATE TABLE dim (tenant VARCHAR, label VARCHAR)").unwrap();
+    db.sql("CREATE TABLE dim (tenant VARCHAR, label VARCHAR)")
+        .unwrap();
     let schema = Arc::new(Schema::new(vec![
         Field::new("tenant", DataType::Utf8, true),
         Field::new("label", DataType::Utf8, true),
@@ -198,27 +215,30 @@ fn error_paths() {
     let root = tmp_root("err");
     let db = db_at(&root);
     // 不存在
-    assert!(db
-        .sql("SELECT * FROM read_parquet('Z:/no/such/file.parquet')")
-        .is_err());
+    assert!(
+        db.sql("SELECT * FROM read_parquet('Z:/no/such/file.parquet')")
+            .is_err()
+    );
     // 未知表函数
     assert!(db.sql("SELECT * FROM read_csv('x.csv')").is_err());
     // 非 parquet 文件（坏魔数）
     let bad = root.join("bad.parquet");
     std::fs::write(&bad, b"not a parquet file").unwrap();
-    assert!(db
-        .sql(&format!(
+    assert!(
+        db.sql(&format!(
             "SELECT * FROM read_parquet('{}')",
             bad.to_string_lossy().replace('\\', "/")
         ))
-        .is_err());
+        .is_err()
+    );
     // glob 无匹配
-    assert!(db
-        .sql(&format!(
+    assert!(
+        db.sql(&format!(
             "SELECT * FROM read_parquet('{}/*.parquet')",
             root.to_string_lossy().replace('\\', "/")
         ))
-        .is_err());
+        .is_err()
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 

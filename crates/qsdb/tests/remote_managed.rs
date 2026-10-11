@@ -46,9 +46,7 @@ fn batch(dt: i32, vals: Vec<i64>) -> RecordBatch {
 }
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
-    tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(f)
+    tokio::runtime::Runtime::new().unwrap().block_on(f)
 }
 
 fn count(db: &Qsdb, sql: &str) -> i64 {
@@ -81,9 +79,7 @@ fn occ_primitives_create_update_conflict() {
     let (bytes, etag) = store.get_with_etag(p).unwrap().unwrap();
     assert_eq!(bytes, b"v1");
     // 错 etag → false；对 etag → true
-    assert!(!store
-        .put_if_etag(p, b"v2", Some("\"wrong-etag\""))
-        .unwrap());
+    assert!(!store.put_if_etag(p, b"v2", Some("\"wrong-etag\"")).unwrap());
     assert!(store.put_if_etag(p, b"v2", Some(&etag)).unwrap());
     assert_eq!(store.read(p).unwrap().unwrap(), b"v2");
 }
@@ -143,7 +139,10 @@ fn occ_commit_replays_on_conflict_no_loss() {
     let names: Vec<&str> = back.segments.iter().map(|s| s.file_name.as_str()).collect();
     assert!(names.contains(&"seg_a.parquet"));
     assert!(names.contains(&"seg_b.parquet"));
-    assert!(names.contains(&"seg_c.parquet"), "并发写者的 segment 不得丢失");
+    assert!(
+        names.contains(&"seg_c.parquet"),
+        "并发写者的 segment 不得丢失"
+    );
     assert!(back.writer_epoch != 0, "远端提交写入 writer_epoch");
 }
 
@@ -165,8 +164,12 @@ fn managed_lifecycle_over_inmemory() {
     assert_eq!(count(&db, "SELECT count(*) FROM t WHERE v >= 4"), 3);
 
     // overwrite（远端 = OCC 替换）
-    db.overwrite_partition("t", &[("dt", qsdb::Literal::Date(19_000))], &[batch(19_000, vec![100, 200])])
-        .unwrap();
+    db.overwrite_partition(
+        "t",
+        &[("dt", qsdb::Literal::Date(19_000))],
+        &[batch(19_000, vec![100, 200])],
+    )
+    .unwrap();
     assert_eq!(count(&db, "SELECT count(*) FROM t"), 2);
 
     // compaction（远端：读 → 内存合并 → PUT → OCC）
@@ -259,14 +262,16 @@ fn two_instances_concurrent_append_no_loss() {
     });
     let h2 = std::thread::spawn(move || {
         for i in 0..8 {
-            db2.append("t", &[batch(19_000, vec![100 + i])])
-                .unwrap();
+            db2.append("t", &[batch(19_000, vec![100 + i])]).unwrap();
         }
     });
     h1.join().unwrap();
     h2.join().unwrap();
 
-    assert_eq!(count(&db_over(mem.clone(), &root), "SELECT count(*) FROM t"), 16);
+    assert_eq!(
+        count(&db_over(mem.clone(), &root), "SELECT count(*) FROM t"),
+        16
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 

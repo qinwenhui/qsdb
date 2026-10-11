@@ -107,7 +107,10 @@ fn crash_recovery_replays_exactly_once() {
         db.append("t", &[batch(19_000, vec![3])]).unwrap();
         // 模拟崩溃：staged、未 flush，进程退出（drop 句柄）
     }
-    assert!(staging.join("t/dt=2022-01-08").exists(), "staged 文件应在盘上");
+    assert!(
+        staging.join("t/dt=2022-01-08").exists(),
+        "staged 文件应在盘上"
+    );
 
     // 重启：启动后 flush（server 由定时器做；测试显式调用）
     let db2 = db_over(mem.clone(), &root, Some(&staging));
@@ -172,9 +175,7 @@ fn staged_overwrite_replaces_partition() {
         .unwrap();
     // 先直接（无 staging 句柄）写一批：用另一个同后端实例直写
     let direct = db_over(mem.clone(), &root, None);
-    direct
-        .append("t", &[batch(19_000, vec![1, 2, 3])])
-        .unwrap();
+    direct.append("t", &[batch(19_000, vec![1, 2, 3])]).unwrap();
     assert_eq!(count(&db, "SELECT count(*) FROM t"), 3);
 
     // staged overwrite → flush 后分区被替换

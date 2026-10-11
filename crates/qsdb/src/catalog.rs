@@ -396,7 +396,11 @@ pub(crate) mod serde_json_compat {
 /// catalog 清单 OCC 更新（postcard Vec<String>；进程内 catalog 互斥）。
 /// `mutate` 必须可重放（幂等作用于最新清单）。
 #[cfg(feature = "remote")]
-fn catalog_occ(store: &Store, db: &str, mutate: impl Fn(Vec<String>) -> Result<Vec<String>>) -> Result<()> {
+fn catalog_occ(
+    store: &Store,
+    db: &str,
+    mutate: impl Fn(Vec<String>) -> Result<Vec<String>>,
+) -> Result<()> {
     let path = catalog_file(store.root(), db);
     crate::remote::occ_update_bytes(store, &path, |cur| {
         let names: Vec<String> = cur
@@ -465,12 +469,7 @@ fn drop_table_remote(store: &Store, db: &str, table: &str) -> Result<()> {
 }
 
 #[cfg(feature = "remote")]
-fn alter_add_column_remote(
-    store: &Store,
-    db: &str,
-    table: &str,
-    column: ColumnDef,
-) -> Result<()> {
+fn alter_add_column_remote(store: &Store, db: &str, table: &str, column: ColumnDef) -> Result<()> {
     let names = read_table_names(store, db)?;
     if !names.iter().any(|n| n == table) {
         return Err(QsdbError::not_found(format!("table {db}.{table}")));
@@ -489,7 +488,10 @@ fn alter_add_column_remote(
             ));
         }
         if def.columns.iter().any(|c| c.name == column.name) {
-            return Err(QsdbError::already_exists(format!("column '{}'", column.name)));
+            return Err(QsdbError::already_exists(format!(
+                "column '{}'",
+                column.name
+            )));
         }
         if def.partition_keys.contains(&column.name) {
             return Err(QsdbError::invalid(format!(

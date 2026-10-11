@@ -214,7 +214,9 @@ fn main() {
                     #[cfg(feature = "hdfs")]
                     {
                         let Some(url) = storage_hdfs_url.clone() else {
-                            eprintln!("error: --storage-hdfs-url is required for --storage-type hdfs");
+                            eprintln!(
+                                "error: --storage-hdfs-url is required for --storage-type hdfs"
+                            );
                             std::process::exit(1);
                         };
                         qsdb::api::StorageConfig::Hdfs {
@@ -225,7 +227,9 @@ fn main() {
                     #[cfg(not(feature = "hdfs"))]
                     {
                         let _ = (storage_hdfs_url, storage_prefix);
-                        eprintln!("error: --storage-type hdfs requires building with --features hdfs");
+                        eprintln!(
+                            "error: --storage-type hdfs requires building with --features hdfs"
+                        );
                         std::process::exit(1);
                     }
                 }
@@ -245,7 +249,12 @@ fn main() {
                     }
                     #[cfg(not(feature = "s3"))]
                     {
-                        let _ = (storage_endpoint, storage_region, storage_bucket, storage_prefix);
+                        let _ = (
+                            storage_endpoint,
+                            storage_region,
+                            storage_bucket,
+                            storage_prefix,
+                        );
                         eprintln!("error: --storage-type s3 requires building with --features s3");
                         std::process::exit(1);
                     }

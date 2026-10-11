@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
-    Time64NanosecondArray, TimestampNanosecondArray,
+    Int8Array, Int16Array, Int32Array, Int64Array, StringArray, Time64NanosecondArray,
+    TimestampNanosecondArray,
 };
 use arrow::datatypes::{DataType, i256};
 use arrow::record_batch::RecordBatch;
@@ -294,9 +294,7 @@ fn typed_scalar_min(a: &dyn arrow::array::Array) -> Option<crate::types::Literal
     use crate::types::Literal;
     use arrow::compute::min;
     macro_rules! m {
-        ($t:ident, $lit:expr) => {{
-            min(a.as_any().downcast_ref::<$t>().unwrap()).map($lit)
-        }};
+        ($t:ident, $lit:expr) => {{ min(a.as_any().downcast_ref::<$t>().unwrap()).map($lit) }};
     }
     match a.data_type() {
         DataType::Int8 => m!(Int8Array, Literal::Int8),
@@ -315,9 +313,7 @@ fn typed_scalar_max(a: &dyn arrow::array::Array) -> Option<crate::types::Literal
     use crate::types::Literal;
     use arrow::compute::max;
     macro_rules! m {
-        ($t:ident, $lit:expr) => {{
-            max(a.as_any().downcast_ref::<$t>().unwrap()).map($lit)
-        }};
+        ($t:ident, $lit:expr) => {{ max(a.as_any().downcast_ref::<$t>().unwrap()).map($lit) }};
     }
     match a.data_type() {
         DataType::Int8 => m!(Int8Array, Literal::Int8),
@@ -480,12 +476,14 @@ impl GroupTable {
                     };
                     let ok = matches!(
                         (&self.sums[ai], a.data_type()),
-                        (SumCol::Int(_), DataType::Int8
-                            | DataType::Int16
-                            | DataType::Int32
-                            | DataType::Int64
-                            | DataType::Date32)
-                            | (SumCol::Flt(_), DataType::Float32 | DataType::Float64)
+                        (
+                            SumCol::Int(_),
+                            DataType::Int8
+                                | DataType::Int16
+                                | DataType::Int32
+                                | DataType::Int64
+                                | DataType::Date32
+                        ) | (SumCol::Flt(_), DataType::Float32 | DataType::Float64)
                             | (SumCol::Dec(_), DataType::Decimal128(_, _))
                     );
                     if !ok {
@@ -498,7 +496,13 @@ impl GroupTable {
                     };
                     let ok = matches!(
                         a.data_type(),
-                        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64 | DataType::Date32
+                        DataType::Int8
+                            | DataType::Int16
+                            | DataType::Int32
+                            | DataType::Int64
+                            | DataType::Float32
+                            | DataType::Float64
+                            | DataType::Date32
                     );
                     if !ok {
                         return Ok(false);
@@ -554,7 +558,9 @@ impl GroupTable {
                         (SumCol::Flt(acc), DataType::Float32) => {
                             let f = a.as_any().downcast_ref::<Float32Array>().unwrap();
                             kahan_slice(
-                                (0..n).filter(|&i| !f.is_null(i)).map(|i| f64::from(f.value(i))),
+                                (0..n)
+                                    .filter(|&i| !f.is_null(i))
+                                    .map(|i| f64::from(f.value(i))),
                                 &mut acc[0],
                             )
                         }
@@ -579,11 +585,7 @@ impl GroupTable {
                         typed_scalar_max(a)
                     };
                     if let Some(v) = v {
-                        *slot = crate::write::combine_lit(
-                            slot.take(),
-                            Some(v),
-                            agg.func == Min,
-                        );
+                        *slot = crate::write::combine_lit(slot.take(), Some(v), agg.func == Min);
                     }
                 }
                 Udaf => unreachable!("validated above"),
@@ -814,9 +816,9 @@ impl GroupTable {
             arrow::datatypes::DataType::Int64 => fast!(Int64Array, Literal::Int64),
             arrow::datatypes::DataType::Float64 => fast!(Float64Array, Literal::Float64),
             arrow::datatypes::DataType::Date32 => fast!(Date32Array, Literal::Date),
-            arrow::datatypes::DataType::Utf8 => fast!(StringArray, |v: &str| {
-                Literal::Utf8(v.to_string())
-            }),
+            arrow::datatypes::DataType::Utf8 => {
+                fast!(StringArray, |v: &str| { Literal::Utf8(v.to_string()) })
+            }
             arrow::datatypes::DataType::Timestamp(TimeUnit::Nanosecond, _) => {
                 fast!(TimestampNanosecondArray, |v: i64| Literal::Timestamp(v))
             }
@@ -824,7 +826,7 @@ impl GroupTable {
                 return Err(QsdbError::unsupported(format!(
                     "min/max on {:?} in fused path not supported",
                     a.data_type()
-                )))
+                )));
             }
         }
         Ok(())

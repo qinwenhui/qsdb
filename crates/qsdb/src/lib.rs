@@ -18,15 +18,15 @@ pub mod exec;
 pub mod expr;
 pub mod filecache;
 pub mod fsutil;
+#[cfg(feature = "hdfs")]
+pub mod hdfs_backend;
 pub mod index;
 pub mod manifest;
 pub mod partition;
 pub mod query;
-pub mod scan;
-#[cfg(feature = "hdfs")]
-pub mod hdfs_backend;
 #[cfg(any(feature = "s3", feature = "remote"))]
 pub mod remote;
+pub mod scan;
 pub mod sql;
 #[cfg_attr(not(feature = "remote"), allow(dead_code))] // 仅远端写路径消费
 pub mod staging;

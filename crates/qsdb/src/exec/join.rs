@@ -217,9 +217,7 @@ enum ExistsKeys {
 fn int_key_value(a: &ArrayRef, row: usize) -> Option<i64> {
     use arrow::datatypes::DataType;
     macro_rules! as_i64 {
-        ($t:ident) => {{
-            a.as_any().downcast_ref::<$t>().unwrap().value(row) as i64
-        }};
+        ($t:ident) => {{ a.as_any().downcast_ref::<$t>().unwrap().value(row) as i64 }};
     }
     Some(match a.data_type() {
         DataType::Int8 => as_i64!(Int8Array),
@@ -228,14 +226,16 @@ fn int_key_value(a: &ArrayRef, row: usize) -> Option<i64> {
         DataType::Int64 => as_i64!(Int64Array),
         // Date32/Timestamp 物理上 i32/i64 但 arrow 数组类型不同——各自 downcast
         DataType::Date32 => a.as_any().downcast_ref::<Date32Array>().unwrap().value(row) as i64,
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _) => {
-            a.as_any()
-                .downcast_ref::<TimestampNanosecondArray>()
-                .unwrap()
-                .value(row)
-        }
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _) => a
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap()
+            .value(row),
         DataType::Boolean => i64::from(
-            a.as_any().downcast_ref::<BooleanArray>().unwrap().value(row),
+            a.as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .value(row),
         ),
         _ => return None,
     })
@@ -388,7 +388,11 @@ pub fn prepare_exists_state(
 ) -> Result<Arc<ExistsState>> {
     let mut has_null = false;
     // 单整数键快路径累积（min/max 供位图判定）
-    let mut ints: Option<Vec<i64>> = if build_keys.len() == 1 { Some(Vec::new()) } else { None };
+    let mut ints: Option<Vec<i64>> = if build_keys.len() == 1 {
+        Some(Vec::new())
+    } else {
+        None
+    };
     let mut bytes: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     let mut buf: Vec<u8> = Vec::new();
     while let Some(b) = build.next() {
@@ -711,7 +715,8 @@ fn join_batch_semi(
     }
     let mut sel: Vec<u32> = Vec::with_capacity(n);
     // 单整数键快路径（与 build 侧形态一致才有效）
-    if let (ExistsKeys::I64(_) | ExistsKeys::Bitmap { .. }, [only]) = (&state.keys, key_cols.as_slice())
+    if let (ExistsKeys::I64(_) | ExistsKeys::Bitmap { .. }, [only]) =
+        (&state.keys, key_cols.as_slice())
     {
         for row in 0..n {
             if only.is_null(row) {
@@ -743,9 +748,9 @@ fn join_batch_semi(
                 continue;
             }
             match (join_type, hit) {
-                (JoinType::Semi, true)
-                | (JoinType::Anti, false)
-                | (JoinType::AntiIn, false) => sel.push(row as u32),
+                (JoinType::Semi, true) | (JoinType::Anti, false) | (JoinType::AntiIn, false) => {
+                    sel.push(row as u32)
+                }
                 _ => {}
             }
         }

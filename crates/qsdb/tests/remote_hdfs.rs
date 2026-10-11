@@ -24,15 +24,14 @@ use qsdb::store::Store;
 use qsdb::{Qsdb, QsdbOptions};
 
 fn hdfs_url() -> Option<String> {
-    std::env::var("QSDB_HDFS_URL").ok().filter(|s| !s.is_empty())
+    std::env::var("QSDB_HDFS_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 /// 每个用例独立前缀（uuid），结束清理。
 fn fresh_prefix(tag: &str) -> String {
-    format!(
-        "/tmp/qsdb-m6-5/{tag}-{}",
-        uuid::Uuid::now_v7().simple()
-    )
+    format!("/tmp/qsdb-m6-5/{tag}-{}", uuid::Uuid::now_v7().simple())
 }
 
 fn db_at(prefix: &str, local_root: &std::path::Path) -> Qsdb {
@@ -46,9 +45,7 @@ fn db_at(prefix: &str, local_root: &std::path::Path) -> Qsdb {
 fn drop_prefix(prefix: &str, db: &Qsdb) {
     // 前缀整体删除（对象层；drop_table 只清单表）
     for obj in db.store().list_all(std::path::Path::new("/")).unwrap() {
-        let _ = db
-            .store()
-            .delete_object(&db.store().root().join(obj.key));
+        let _ = db.store().delete_object(&db.store().root().join(obj.key));
     }
 }
 
@@ -109,7 +106,9 @@ fn hdfs_cas_primitives() {
     let (bytes, etag) = store.get_with_etag(&p).unwrap().unwrap();
     assert_eq!(bytes, b"v1");
     assert!(
-        !store.put_if_etag(&p, b"bad", Some("\"stale-etag\"")).unwrap(),
+        !store
+            .put_if_etag(&p, b"bad", Some("\"stale-etag\""))
+            .unwrap(),
         "错 etag 拒写"
     );
     assert!(store.put_if_etag(&p, b"v2", Some(&etag)).unwrap());
@@ -159,11 +158,7 @@ fn hdfs_managed_lifecycle() {
         let url = hdfs_url().unwrap();
         let os = qsdb::hdfs_backend::build_hdfs_store(&url).unwrap();
         let vroot = std::path::PathBuf::from(format!("{url}{prefix}"));
-        let store = Store::remote(
-            vroot,
-            os,
-            prefix.trim_start_matches('/').to_string(),
-        );
+        let store = Store::remote(vroot, os, prefix.trim_start_matches('/').to_string());
         Qsdb::open_with_store(&root, opts, store).unwrap()
     };
     let (_, freed) = db2.gc().unwrap();
@@ -188,11 +183,7 @@ fn hdfs_staging_write() {
     let url = hdfs_url().unwrap();
     let os = qsdb::hdfs_backend::build_hdfs_store(&url).unwrap();
     let vroot = std::path::PathBuf::from(format!("{url}{prefix}"));
-    let store = Store::remote(
-        vroot,
-        os,
-        prefix.trim_start_matches('/').to_string(),
-    );
+    let store = Store::remote(vroot, os, prefix.trim_start_matches('/').to_string());
     let opts = QsdbOptions {
         staging_dir: Some(staging),
         ..QsdbOptions::default()

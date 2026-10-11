@@ -564,28 +564,20 @@ impl ChunkSource {
                     return Err(QsdbError::meta("managed file loc requires the db store"));
                 };
                 match store.kind() {
-                    crate::store::StoreKind::Local => {
-                        File::open(p).map(Self::File).map_err(|e| {
-                            QsdbError::meta(format!("open {} failed: {e}", p.display()))
-                        })
-                    }
+                    crate::store::StoreKind::Local => File::open(p)
+                        .map(Self::File)
+                        .map_err(|e| QsdbError::meta(format!("open {} failed: {e}", p.display()))),
                     #[cfg(feature = "remote")]
                     crate::store::StoreKind::Remote => {
                         let handle = store.remote_handle().expect("remote kind implies handle");
                         let key = store.remote_obj_key(p).expect("remote kind implies key");
                         let disp = p.to_string_lossy().replace('\\', "/");
-                        open_remote_object(
-                            Arc::clone(handle),
-                            key,
-                            disp,
-                            file_cache,
-                            prefer_whole,
-                        )
+                        open_remote_object(Arc::clone(handle), key, disp, file_cache, prefer_whole)
                     }
                     #[cfg(not(feature = "remote"))]
-                    crate::store::StoreKind::Remote => {
-                        Err(QsdbError::unsupported("remote store requires an s3/hdfs build"))
-                    }
+                    crate::store::StoreKind::Remote => Err(QsdbError::unsupported(
+                        "remote store requires an s3/hdfs build",
+                    )),
                 }
             }
         }
@@ -605,21 +597,21 @@ fn open_remote_object(
     let meta = crate::remote::head_parts(Arc::clone(&handle), &key)?;
     if let (Some(fc), Some(etag)) = (file_cache, meta.e_tag.as_deref()) {
         if let Some(lp) = fc.get(&cache_key, etag) {
-            return File::open(lp).map(ChunkSource::File).map_err(|e| {
-                QsdbError::meta(format!("open cached {cache_key} failed: {e}"))
-            });
+            return File::open(lp)
+                .map(ChunkSource::File)
+                .map_err(|e| QsdbError::meta(format!("open cached {cache_key} failed: {e}")));
         }
         if prefer_whole {
             let mut rd = crate::remote::stream_parts(Arc::clone(&handle), key.clone())?;
             let lp = fc.insert(&cache_key, etag, &mut rd)?;
-            return File::open(lp).map(ChunkSource::File).map_err(|e| {
-                QsdbError::meta(format!("open cached {cache_key} failed: {e}"))
-            });
+            return File::open(lp)
+                .map(ChunkSource::File)
+                .map_err(|e| QsdbError::meta(format!("open cached {cache_key} failed: {e}")));
         }
     }
-    Ok(ChunkSource::Remote(crate::remote::RemoteReader::from_parts(
-        handle, key, meta.size,
-    )))
+    Ok(ChunkSource::Remote(
+        crate::remote::RemoteReader::from_parts(handle, key, meta.size),
+    ))
 }
 
 pub(crate) enum ChunkRead {
@@ -654,9 +646,7 @@ impl parquet::file::reader::ChunkReader for ChunkSource {
 
     fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
         Ok(match self {
-            Self::File(f) => {
-                ChunkRead::File(<File as ChunkReaderParquet>::get_read(f, start)?)
-            }
+            Self::File(f) => ChunkRead::File(<File as ChunkReaderParquet>::get_read(f, start)?),
             #[cfg(feature = "remote")]
             Self::Remote(r) => ChunkRead::Remote(
                 <crate::remote::RemoteReader as ChunkReaderParquet>::get_read(r, start)?,
@@ -679,8 +669,12 @@ impl parquet::file::reader::ChunkReader for ChunkSource {
 pub(crate) fn file_arrow_schema(loc: &FileLoc) -> Result<SchemaRef> {
     // 外表专用（Local/S3），无需管理表 store
     let src = ChunkSource::open(None, loc, None, false)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(src)
-        .map_err(|e| QsdbError::meta(format!("read parquet footer {}: {e}", loc.display_path().display())))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(src).map_err(|e| {
+        QsdbError::meta(format!(
+            "read parquet footer {}: {e}",
+            loc.display_path().display()
+        ))
+    })?;
     Ok(Arc::clone(builder.schema()))
 }
 

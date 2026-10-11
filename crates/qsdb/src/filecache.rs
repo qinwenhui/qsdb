@@ -65,12 +65,7 @@ impl FileCache {
 
     /// 流式填充：写入 tmp → rename 定名；超预算按目录 mtime 驱逐。
     /// 返回缓存文件本地路径。
-    pub fn insert(
-        &self,
-        url: &str,
-        etag: &str,
-        reader: &mut dyn Read,
-    ) -> Result<PathBuf> {
+    pub fn insert(&self, url: &str, etag: &str, reader: &mut dyn Read) -> Result<PathBuf> {
         if !self.is_enabled() {
             return Err(QsdbError::meta("file cache disabled (budget 0)"));
         }
@@ -230,7 +225,10 @@ mod tests {
 
     #[test]
     fn sanitize_rejects_unsafe() {
-        assert_eq!(sanitize_seg("abc-1.parquet").as_deref(), Some("abc-1.parquet"));
+        assert_eq!(
+            sanitize_seg("abc-1.parquet").as_deref(),
+            Some("abc-1.parquet")
+        );
         assert!(sanitize_seg("a/b").is_none());
         assert!(sanitize_seg("").is_none());
         assert!(sanitize_seg("他").is_none());

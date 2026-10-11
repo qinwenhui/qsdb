@@ -194,9 +194,7 @@ fn plan_scan_def(plan: &LogicalPlan) -> Option<Arc<crate::catalog::TableDef>> {
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Distinct { input } => plan_scan_def(input),
         LogicalPlan::Join {
-            left,
-            join_type,
-            ..
+            left, join_type, ..
         } if join_type.is_semi_family() => plan_scan_def(left),
         LogicalPlan::Join { .. }
         | LogicalPlan::CrossJoinFilter { .. }
@@ -574,8 +572,7 @@ fn build_aggregate(
             .map(|st| {
                 let build = build_inner(db, &st.right, None, ctx)?;
                 // semi 右键 = 右子计划局部 idx（绑定期约定）
-                let state =
-                    crate::exec::join::prepare_exists_state(build, &st.right_keys, ctx)?;
+                let state = crate::exec::join::prepare_exists_state(build, &st.right_keys, ctx)?;
                 Ok(SemiProbe {
                     left_keys: st.left_keys.clone(),
                     state,
@@ -695,9 +692,8 @@ fn run_partial_fused(
         }
         // 行选择 = semi 掩码 ∧ 过滤谓词（**每批一次求值**再逐行组合——
         // 掩码求值是整列向量化，逐行重算整列 = O(n²) 灾难）
-        let mut masks: Vec<arrow::array::BooleanArray> = Vec::with_capacity(
-            probes.len() + filters.len(),
-        );
+        let mut masks: Vec<arrow::array::BooleanArray> =
+            Vec::with_capacity(probes.len() + filters.len());
         for p in probes {
             masks.push(crate::exec::join::semi_mask(
                 &p.state,
@@ -765,14 +761,20 @@ fn finish_partitioned_merge(
         .collect::<Result<Vec<_>>>()?;
     let some_batches: Vec<RecordBatch> = batches.into_iter().flatten().collect();
     if some_batches.is_empty() {
-        return Ok(Box::new(OneShotExec { batch: None, schema }));
+        return Ok(Box::new(OneShotExec {
+            batch: None,
+            schema,
+        }));
     }
     let batch = if some_batches.len() == 1 {
         some_batches.into_iter().next().expect("len checked")
     } else {
         crate::exec::spill::concat_batches(&some_batches, &schema)?
     };
-    Ok(Box::new(OneShotExec { batch: Some(batch), schema }))
+    Ok(Box::new(OneShotExec {
+        batch: Some(batch),
+        schema,
+    }))
 }
 
 /// 分片管线中的 semi/anti 阶段（build 侧计划持引用，每分片重建 ExecNode

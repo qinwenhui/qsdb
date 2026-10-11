@@ -203,8 +203,7 @@ pub async fn serve(
                 }
             })
             .await;
-            let mut tick =
-                tokio::time::interval(std::time::Duration::from_secs(secs.max(1)));
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs.max(1)));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
@@ -432,7 +431,10 @@ async fn write(
         return err_response(StatusCode::UNAUTHORIZED, "unauthorized".into());
     }
     if s.db.read_only() {
-        return err_response(StatusCode::SERVICE_UNAVAILABLE, "database is read-only".into());
+        return err_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "database is read-only".into(),
+        );
     }
     s.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
     let t = Instant::now();

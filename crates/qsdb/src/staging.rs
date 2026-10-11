@@ -157,9 +157,7 @@ impl Staging {
 
     /// flush 互斥锁（server 定时器与手动 flush 并发防护）。
     pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.flush_lock
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        self.flush_lock.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -186,8 +184,10 @@ mod tests {
 
     #[test]
     fn stage_pending_remove_roundtrip() {
-        let dir = std::env::temp_dir()
-            .join(format!("qsdb_staging_test_{}", uuid::Uuid::now_v7().simple()));
+        let dir = std::env::temp_dir().join(format!(
+            "qsdb_staging_test_{}",
+            uuid::Uuid::now_v7().simple()
+        ));
         let st = Staging::new(&dir).unwrap();
         let r1 = rec("t", "seg_aaa.parquet", "dt=1");
         let r2 = rec("t", "seg_bbb.parquet", "dt=1");
