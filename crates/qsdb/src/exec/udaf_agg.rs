@@ -36,6 +36,9 @@ pub struct UdafAggExec {
     output: Option<RecordBatch>,
 }
 
+/// 分块分组的本地产物：(key, 块内行号, 块内首见序)。
+type ChunkGroups = Vec<(Vec<u8>, Vec<u32>, usize)>;
+
 impl UdafAggExec {
     pub fn new(
         input: Box<dyn ExecNode>,
@@ -110,9 +113,9 @@ impl UdafAggExec {
             .collect::<Result<_>>()?;
         const CHUNK: usize = 65536;
         let starts: Vec<usize> = (0..n).step_by(CHUNK).collect();
-        let locals: Vec<(usize, Vec<(Vec<u8>, Vec<u32>, usize)>)> = starts
+        let locals: Vec<(usize, ChunkGroups)> = starts
             .into_par_iter()
-            .map(|start| -> (usize, Vec<(Vec<u8>, Vec<u32>, usize)>) {
+            .map(|start| -> (usize, ChunkGroups) {
                 let end = (start + CHUNK).min(n);
                 let mut key_buf = Vec::new();
                 let mut local: HashMap<Vec<u8>, (u32, Vec<u32>)> = HashMap::new();
@@ -125,7 +128,7 @@ impl UdafAggExec {
                     });
                     e.1.push(row as u32);
                 }
-                let flat: Vec<(Vec<u8>, Vec<u32>, usize)> = order
+                let flat: ChunkGroups = order
                     .into_iter()
                     .map(|k| {
                         let (lgid, rows) = local.remove(&k).expect("key in order");
