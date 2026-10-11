@@ -651,6 +651,23 @@ M6-4 staging 写 → M6-5 HDFS → M6-6 可选租约；每阶段独立 gate。
   mem_vs smoke 无回归。真实 MinIO/AWS 的 If-Match 行为差异（R1）
   留探测套件任务；staging 写（M6-4）后置。
 
+#### M6-4 staging 写 ✅ 已完成（2026-10-11）
+- **写盘即 ACK**（§11）：远端写（append/overwrite）先序列化到本地 staging
+  目录 + postcard sidecar（表/分区/mode/entry；**sidecar 后写 = 完成标记**，
+  崩溃残留无 sidecar 的 parquet 为半成品忽略）；网络段由 `flush_staged()`
+  批量 PUT + OCC 提交后删对。
+- **崩溃补传幂等** = ① segment PUT 幂等（UUID 不可变对象）② manifest
+  追加 **file_name 去重**（`occ_append_entry`）——「已提交但删除前崩溃」
+  的残留对重放不重复计入（exactly-once 可见状态）。
+- server `--staging-dir` + `--staging-upload-secs`（默认 5s）定时器：
+  **启动即跑一轮 = 崩溃恢复补传**，之后周期 flush（错误记日志不中断）；
+  核心库保持无常驻线程（flush 由外部驱动，嵌入方按需调用）。
+- **可见性语义文档化**：未 flush 数据不可见（manifest 唯一真值），
+  可见性延迟 = 上传周期；读己之写先 flush（`staged_pending()` 诊断）。
+- 验收：193 测试全绿（s3，含 staging 五用例：ACK 不可见→flush 可见、
+  崩溃重开补传 exactly-once、dedup 防重复计入、staged overwrite 替换、
+  配置校验）/180 默认 / clippy 双模式 0 / 默认二进制 24.38MB。
+
 ---
 
 ## 十五、风险与对策

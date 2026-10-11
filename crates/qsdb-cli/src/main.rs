@@ -90,6 +90,13 @@ enum Cmd {
         /// bucket 内 key 前缀（多租户/多库共存）
         #[arg(long, default_value = "")]
         storage_prefix: String,
+        /// 远端写 staging 目录（M6-4：写盘即 ACK，后台上传；
+        /// 需 --storage-type s3。建议放本地高速盘/与库根不同盘）
+        #[arg(long)]
+        staging_dir: Option<PathBuf>,
+        /// staging 后台上传周期（秒；默认 5）
+        #[arg(long, default_value_t = 5)]
+        staging_upload_secs: u64,
     },
 }
 
@@ -183,6 +190,8 @@ fn main() {
             storage_region,
             storage_bucket,
             storage_prefix,
+            staging_dir,
+            staging_upload_secs,
             config,
         } => {
             // 存储后端解析（cli 层校验，错误走统一 exit 风格）
@@ -218,6 +227,7 @@ fn main() {
                 storage,
                 scan_cache_bytes: cache_mb * 1024 * 1024,
                 file_cache_bytes: file_cache_mb * 1024 * 1024,
+                staging_dir: staging_dir.clone(),
                 ..Default::default()
             };
             let db = match Qsdb::open(&path, opts) {
@@ -231,6 +241,11 @@ fn main() {
                 .enable_all()
                 .build()
                 .expect("init tokio runtime");
+            let staging_secs = if staging_dir.is_some() {
+                Some(staging_upload_secs)
+            } else {
+                None
+            };
             if let Err(e) = rt.block_on(crate::server::serve(
                 db,
                 &addr,
@@ -239,6 +254,7 @@ fn main() {
                 Some(max_concurrent_queries),
                 config.as_deref(),
                 flight_bind,
+                staging_secs,
             )) {
                 eprintln!("server error: {e}");
                 std::process::exit(1);

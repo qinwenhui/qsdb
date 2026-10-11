@@ -58,6 +58,10 @@ pub struct QsdbOptions {
     /// 远端外表（read_parquet s3://）段文件本地缓存预算（字节）；0 = 关闭。
     /// 布局 `{root}/_filecache/{url_hash}/{etag}/…`，ETag 键控自动失效。
     pub file_cache_bytes: u64,
+    /// 远端写 staging 目录（M6-4）：Some = 启用——远端写先落本地盘（ACK 即回），
+    /// `flush_staged()` 批量上传提交。需 S3 后端。可见性语义：未 flush 的
+    /// staged 数据对查询不可见（manifest 唯一真值）。
+    pub staging_dir: Option<PathBuf>,
 }
 
 impl Default for QsdbOptions {
@@ -69,6 +73,7 @@ impl Default for QsdbOptions {
             query_timeout_ms: None,
             query_memory_limit_bytes: None,
             file_cache_bytes: 0,
+            staging_dir: None,
         }
     }
 }
@@ -167,6 +172,8 @@ pub struct Qsdb {
     runtime: Arc<QsdbRuntime>,
     /// 远端外表段文件缓存（预算 0 = 禁用实例，API 全 no-op）
     file_cache: Arc<crate::filecache::FileCache>,
+    /// 远端写 staging（M6-4；None = 关闭/本地后端）
+    staging: Option<Arc<crate::staging::Staging>>,
 }
 
 impl Qsdb {
@@ -208,6 +215,25 @@ impl Qsdb {
             root.join("_filecache"),
             opts.file_cache_bytes,
         ));
+        // staging（M6-4）：仅远端后端 + feature s3
+        let staging = match &opts.staging_dir {
+            None => None,
+            #[cfg(feature = "s3")]
+            Some(dir) => {
+                if store.is_local() {
+                    return Err(QsdbError::invalid(
+                        "staging_dir requires a remote (s3) storage backend",
+                    ));
+                }
+                Some(Arc::new(crate::staging::Staging::new(dir)?))
+            }
+            #[cfg(not(feature = "s3"))]
+            Some(_) => {
+                return Err(QsdbError::unsupported(
+                    "staging_dir requires building with feature 's3'",
+                ));
+            }
+        };
         Ok(Self {
             root,
             store,
@@ -216,6 +242,7 @@ impl Qsdb {
             cache,
             runtime,
             file_cache,
+            staging,
         })
     }
 
@@ -226,6 +253,11 @@ impl Qsdb {
     /// 存储后端句柄（本地默认；M6-2/3 起可配置远端）。
     pub fn store(&self) -> &Arc<Store> {
         &self.store
+    }
+
+    /// staging 句柄（写路径内部用；None = 关闭）。
+    pub(crate) fn staging(&self) -> Option<&crate::staging::Staging> {
+        self.staging.as_deref()
     }
 
     fn db_name<'a>(&self, db: Option<&'a str>) -> &'a str {
@@ -280,7 +312,7 @@ impl Qsdb {
             for (values, data) in split_by_partition(batch, &def)? {
                 total = merge_write(
                     total,
-                    write::append_partition(&self.store, &tdir, &def, &values, &[data])?,
+                    write::append_partition(&self.store, self.staging(), &tdir, &def, &values, &[data])?,
                 );
             }
         }
@@ -337,7 +369,7 @@ impl Qsdb {
                 data_batches.push(data);
             }
         }
-        write::overwrite_partition(&self.store, &tdir, &def, &ordered, &data_batches)
+        write::overwrite_partition(&self.store, self.staging(), &tdir, &def, &ordered, &data_batches)
     }
 
     // -- 读 ------------------------------------------------------------------
@@ -833,6 +865,69 @@ impl Qsdb {
             total += m.total_rows();
         }
         if any { Ok(Some(total)) } else { Ok(Some(0)) }
+    }
+
+    /// 上传全部 staged 数据（M6-4）：逐对 PUT segment → OCC 提交（幂等：
+    /// 同名去重 + uuid7 时间序重放）→ 删除已传对。崩溃残留对在下次调用补传。
+    /// 返回 (上传对数, 行数)。server 由定时器驱动；嵌入方按需调用。
+    pub fn flush_staged(&self) -> Result<(u64, u64)> {
+        #[cfg(not(feature = "s3"))]
+        {
+            Ok((0, 0))
+        }
+        #[cfg(feature = "s3")]
+        {
+            let Some(st) = &self.staging else {
+                return Ok((0, 0));
+            };
+            let _guard = st.lock();
+            let mut uploaded = 0u64;
+            let mut rows = 0u64;
+            for (rec, parquet) in st.pending() {
+                // 表已删：暂存数据无主，整表清理
+                let Ok(def) = self.def(None, &rec.table) else {
+                    st.remove_table(&rec.table);
+                    continue;
+                };
+                let bytes = std::fs::read(&parquet).map_err(|e| {
+                    QsdbError::meta(format!("read staged {}: {e}", parquet.display()))
+                })?;
+                let dir = table_dir(self.store.root(), DEFAULT_DB, &rec.table)
+                    .join(&rec.partition_rel);
+                self.store
+                    .put_object(&dir.join(&rec.entry.file_name), &bytes)?;
+                if rec.overwrite {
+                    crate::write::occ_replace_entries(
+                        &self.store,
+                        &dir,
+                        &def,
+                        &rec.partition_values,
+                        std::slice::from_ref(&rec.entry),
+                    )?;
+                } else {
+                    crate::write::occ_append_entry(
+                        &self.store,
+                        &dir,
+                        &def,
+                        &rec.partition_values,
+                        &rec.entry,
+                    )?;
+                }
+                st.remove_pair(&rec, &parquet);
+                uploaded += 1;
+                rows += rec.entry.row_count;
+            }
+            Ok((uploaded, rows))
+        }
+    }
+
+    /// staging 待传对数（诊断：server /stats 与运维）。
+    pub fn staged_pending(&self) -> usize {
+        #[cfg(feature = "s3")]
+        if let Some(st) = &self.staging {
+            return st.pending().len();
+        }
+        0
     }
 
     /// 热缓存状态：(entries, bytes, hits, misses)。

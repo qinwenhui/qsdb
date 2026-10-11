@@ -149,6 +149,7 @@ pub async fn serve(
     max_concurrent_queries: Option<usize>,
     config_file: Option<&std::path::Path>,
     #[cfg_attr(not(feature = "flight"), allow(unused_variables))] flight_bind: Option<String>,
+    #[cfg_attr(not(feature = "s3"), allow(unused_variables))] staging_upload_secs: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(path) = config_file {
         let text = std::fs::read_to_string(path)?;
@@ -189,6 +190,34 @@ pub async fn serve(
         .route("/api/v1/config", get(get_config).put(put_config))
         .layer(write_layer)
         .with_state(Arc::clone(&state));
+
+    // staging 后台上传（M6-4，可选）：定时 flush_staged——启动即跑一轮
+    // （崩溃恢复补传），错误记日志不中断
+    let staging_task = staging_upload_secs.map(|secs| {
+        let db = Arc::clone(&state.db);
+        tokio::spawn(async move {
+            let d0 = Arc::clone(&db);
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Err(e) = d0.flush_staged() {
+                    eprintln!("staging recovery flush error: {e}");
+                }
+            })
+            .await;
+            let mut tick =
+                tokio::time::interval(std::time::Duration::from_secs(secs.max(1)));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let d = Arc::clone(&db);
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(e) = d.flush_staged() {
+                        eprintln!("staging flush error: {e}");
+                    }
+                })
+                .await;
+            }
+        })
+    });
 
     // 自动 compaction（可选）
     let compact_task = auto_compact_secs.map(|secs| {
@@ -237,6 +266,9 @@ pub async fn serve(
         .with_graceful_shutdown(shutdown)
         .await;
     if let Some(t) = compact_task {
+        t.abort();
+    }
+    if let Some(t) = staging_task {
         t.abort();
     }
     #[cfg(feature = "flight")]

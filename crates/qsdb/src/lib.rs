@@ -26,6 +26,8 @@ pub mod scan;
 #[cfg(feature = "s3")]
 pub mod remote;
 pub mod sql;
+#[cfg_attr(not(feature = "s3"), allow(dead_code))] // 仅 s3 写路径消费
+pub mod staging;
 pub mod stats;
 pub mod store;
 pub mod types;

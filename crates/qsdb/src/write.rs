@@ -399,6 +399,7 @@ pub(crate) fn check_constraints(def: &TableDef, batches: &[RecordBatch]) -> Resu
 /// append（单分区；输入批必须已按分区分组，含全表数据列）。
 pub(crate) fn append_partition(
     store: &Store,
+    staging: Option<&crate::staging::Staging>,
     table_dir: &Path,
     def: &TableDef,
     values: &[crate::types::Literal],
@@ -417,6 +418,9 @@ pub(crate) fn append_partition(
         #[cfg(feature = "s3")]
         return append_partition_remote(
             store,
+            staging,
+            table_dir,
+            def.name.as_str(),
             def,
             values,
             &dir,
@@ -425,7 +429,10 @@ pub(crate) fn append_partition(
             &file_schema,
         );
         #[cfg(not(feature = "s3"))]
-        return Err(QsdbError::unsupported("remote store requires feature 's3'"));
+        {
+            let _ = staging;
+            return Err(QsdbError::unsupported("remote store requires feature 's3'"));
+        }
     }
     let _guard = PartitionLock::acquire(&lock_path(&dir))?;
 
@@ -485,6 +492,7 @@ fn sync_index(store: &Store, table_dir: &Path, partition_dir: &Path, manifest: &
 /// overwrite（单分区原子替换；空输入 = 清空分区）。
 pub(crate) fn overwrite_partition(
     store: &Store,
+    staging: Option<&crate::staging::Staging>,
     table_dir: &Path,
     def: &TableDef,
     values: &[crate::types::Literal],
@@ -500,10 +508,14 @@ pub(crate) fn overwrite_partition(
     if !store.is_local() {
         #[cfg(feature = "s3")]
         return overwrite_partition_remote(
-            store, def, values, &dir, batches, &schema, &file_schema,
+            store, staging, table_dir, def.name.as_str(), def, values, &dir, batches, &schema,
+            &file_schema,
         );
         #[cfg(not(feature = "s3"))]
-        return Err(QsdbError::unsupported("remote store requires feature 's3'"));
+        {
+            let _ = staging;
+            return Err(QsdbError::unsupported("remote store requires feature 's3'"));
+        }
     }
     let _guard = PartitionLock::acquire(&lock_path(&dir))?;
 
@@ -567,30 +579,16 @@ pub(crate) fn overwrite_partition(
 
 // --- 远端写协议（feature `s3`，存储设计 §7.2 ProtocolOCC） ------------------
 
-/// append（远端）：segment PUT（不可变，无协议）→ manifest OCC 重放提交。
-/// 进程内分区 Mutex 串行化（§8）——跨进程/多实例由 OCC 收敛，无锁多写者。
+/// manifest OCC 追加（含 **file_name 去重**——staging 补传/重放幂等：
+/// 同名 segment 不重复计入，at-least-once 之上得到 exactly-once 可见状态）。
 #[cfg(feature = "s3")]
-fn append_partition_remote(
+pub(crate) fn occ_append_entry(
     store: &Store,
+    dir: &Path,
     def: &TableDef,
     values: &[crate::types::Literal],
-    dir: &Path,
-    batches: &[RecordBatch],
-    schema: &SchemaRef,
-    file_schema: &SchemaRef,
-) -> Result<WriteResult> {
-    let entry = put_segment_remote(
-        store,
-        dir,
-        batches,
-        file_schema,
-        writer_props(def)?,
-        &schema
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect::<Vec<_>>(),
-    )?;
+    entry: &SegmentEntry,
+) -> Result<()> {
     let mpath = PartitionManifest::manifest_path(dir);
     crate::remote::with_partition_mutex(dir, || {
         crate::remote::occ_commit(store, &mpath, |cur| {
@@ -606,12 +604,47 @@ fn append_partition_remote(
                 }
                 m.schema_fingerprint = def.schema_fingerprint();
             }
-            // 重放：基于最新 cur 追加（并发写者的 segment 不丢）
+            // 重放：基于最新 cur 追加（并发写者的 segment 不丢）；同名去重
             m.generation += 1;
-            m.segments.push(entry.clone());
+            if !m.segments.iter().any(|s| s.file_name == entry.file_name) {
+                m.segments.push(entry.clone());
+            }
             Ok(m)
         })
-    })?;
+    })
+}
+
+/// append（远端）：segment PUT（不可变，无协议）→ manifest OCC 追加。
+/// 进程内分区 Mutex 串行化（§8）——跨进程/多实例由 OCC 收敛，无锁多写者。
+/// staging 启用时改为本地暂存（写盘即 ACK），网络段由 flush_staged 补。
+#[cfg(feature = "s3")]
+#[allow(clippy::too_many_arguments)]
+fn append_partition_remote(
+    store: &Store,
+    staging: Option<&crate::staging::Staging>,
+    table_dir: &Path,
+    table: &str,
+    def: &TableDef,
+    values: &[crate::types::Literal],
+    dir: &Path,
+    batches: &[RecordBatch],
+    schema: &SchemaRef,
+    file_schema: &SchemaRef,
+) -> Result<WriteResult> {
+    let col_names: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let entry = match staging {
+        Some(st) => stage_segment(
+            st, table_dir, table, def, values, dir, batches, file_schema, col_names, false,
+        )?,
+        None => put_segment_remote(store, dir, batches, file_schema, writer_props(def)?, &col_names)?,
+    };
+    if staging.is_none() {
+        occ_append_entry(store, dir, def, values, &entry)?;
+    }
     Ok(WriteResult {
         rows: entry.row_count,
         bytes: entry.byte_size,
@@ -619,11 +652,96 @@ fn append_partition_remote(
     })
 }
 
-/// overwrite（远端）：segment PUT → OCC 替换提交（重放只继承 generation）。
-/// 旧 segment 不搬 trash——不被引用即不可见，引用 GC 安全期后回收（§12）。
+/// segment 序列化到本地 staging（§11：写盘即 ACK；网络段由 flush 补）。
 #[cfg(feature = "s3")]
+#[allow(clippy::too_many_arguments)]
+fn stage_segment(
+    st: &crate::staging::Staging,
+    table_dir: &Path,
+    table: &str,
+    def: &TableDef,
+    values: &[crate::types::Literal],
+    dir: &Path,
+    batches: &[RecordBatch],
+    file_schema: &SchemaRef,
+    col_names: Vec<String>,
+    overwrite: bool,
+) -> Result<SegmentEntry> {
+    let seg_name = format!("seg_{}.parquet", uuid::Uuid::now_v7().simple());
+    let rel = dir
+        .strip_prefix(table_dir)
+        .unwrap_or(dir)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let rec = crate::staging::StagedRecord {
+        version: 1,
+        table: table.to_string(),
+        partition_rel: rel,
+        partition_values: values.to_vec(),
+        overwrite,
+        entry: SegmentEntry {
+            file_name: seg_name,
+            row_count: 0,
+            byte_size: 0,
+            created_at: now_ms() as i64,
+            column_stats: vec![],
+        },
+    };
+    let props = writer_props(def)?;
+    let fs = Arc::clone(file_schema);
+    let names_for_closure = col_names;
+    let entry = st.stage(&rec, |parquet| {
+        // tmp 先行：崩溃残留 tmp 由 GC 清扫；sidecar 由 stage() 后写
+        let tmp = crate::fsutil::tmp_sibling(parquet);
+        let f = File::create(&tmp)
+            .map_err(|e| QsdbError::meta(format!("create {} failed: {e}", tmp.display())))?;
+        let (rows, stats) = serialize_segment(f, batches, &fs, props, &names_for_closure)?;
+        let bytes = std::fs::metadata(&tmp)
+            .map_err(|e| QsdbError::meta(format!("stat staged failed: {e}")))?
+            .len();
+        crate::fsutil::atomic_replace(&tmp, parquet)?;
+        Ok(SegmentEntry {
+            row_count: rows,
+            byte_size: bytes,
+            column_stats: stats,
+            ..rec.entry.clone()
+        })
+    })?;
+    Ok(entry)
+}
+
+/// manifest OCC 替换提交（overwrite/compaction/clear 共用；重放只继承
+/// 最新 generation，segments 以本轮为准——旧 segment 不搬 trash，
+/// 不被引用即不可见，引用 GC 安全期后回收，§12）。
+#[cfg(feature = "s3")]
+pub(crate) fn occ_replace_entries(
+    store: &Store,
+    dir: &Path,
+    def: &TableDef,
+    values: &[crate::types::Literal],
+    entries: &[SegmentEntry],
+) -> Result<()> {
+    let mpath = PartitionManifest::manifest_path(dir);
+    crate::remote::with_partition_mutex(dir, || {
+        crate::remote::occ_commit(store, &mpath, |cur| {
+            let mut m =
+                PartitionManifest::new(named_values(def, values), def.schema_fingerprint());
+            m.generation = cur.map_or(0, |c| c.generation);
+            m.segments = entries.to_vec();
+            Ok(m)
+        })
+    })
+}
+
+/// overwrite（远端）：segment PUT → OCC 替换提交。
+/// staging 启用时改为本地暂存（overwrite 标记），flush_staged 补网络段。
+#[cfg(feature = "s3")]
+#[allow(clippy::too_many_arguments)]
 fn overwrite_partition_remote(
     store: &Store,
+    staging: Option<&crate::staging::Staging>,
+    table_dir: &Path,
+    table: &str,
     def: &TableDef,
     values: &[crate::types::Literal],
     dir: &Path,
@@ -631,21 +749,20 @@ fn overwrite_partition_remote(
     schema: &SchemaRef,
     file_schema: &Option<SchemaRef>,
 ) -> Result<WriteResult> {
+    let col_names: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
     let mut result = WriteResult::default();
     let mut new_segments: Vec<SegmentEntry> = Vec::new();
     if let Some(fs) = file_schema {
-        let entry = put_segment_remote(
-            store,
-            dir,
-            batches,
-            fs,
-            writer_props(def)?,
-            &schema
-                .fields()
-                .iter()
-                .map(|f| f.name().clone())
-                .collect::<Vec<_>>(),
-        )?;
+        let entry = match staging {
+            Some(st) => stage_segment(
+                st, table_dir, table, def, values, dir, batches, fs, col_names, true,
+            )?,
+            None => put_segment_remote(store, dir, batches, fs, writer_props(def)?, &col_names)?,
+        };
         result = WriteResult {
             rows: entry.row_count,
             bytes: entry.byte_size,
@@ -653,16 +770,9 @@ fn overwrite_partition_remote(
         };
         new_segments.push(entry);
     }
-    let mpath = PartitionManifest::manifest_path(dir);
-    crate::remote::with_partition_mutex(dir, || {
-        crate::remote::occ_commit(store, &mpath, |cur| {
-            let mut m =
-                PartitionManifest::new(named_values(def, values), def.schema_fingerprint());
-            m.generation = cur.map_or(0, |c| c.generation);
-            m.segments = new_segments.clone();
-            Ok(m)
-        })
-    })?;
+    if staging.is_none() {
+        occ_replace_entries(store, dir, def, values, &new_segments)?;
+    }
     Ok(result)
 }
 
@@ -731,7 +841,7 @@ mod tests {
         let d = def();
         let tdir = root.join("t");
         let vals = [Literal::Date(1)];
-        let r = append_partition(&store, &tdir, &d, &vals, &[data_batch(vec![Some(10)])]).unwrap();
+        let r = append_partition(&store, None, &tdir, &d, &vals, &[data_batch(vec![Some(10)])]).unwrap();
         assert_eq!(r.rows, 1);
         let pdir = tdir.join("dt=1970-01-02");
         let m = PartitionManifest::read(&store, &pdir).unwrap().unwrap();
@@ -748,8 +858,8 @@ mod tests {
         let d = def();
         let tdir = root.join("t");
         let vals = [Literal::Date(1)];
-        append_partition(&store, &tdir, &d, &vals, &[data_batch(vec![Some(10)])]).unwrap();
-        append_partition(&store, &tdir, &d, &vals, &[data_batch(vec![Some(20)])]).unwrap();
+        append_partition(&store, None, &tdir, &d, &vals, &[data_batch(vec![Some(10)])]).unwrap();
+        append_partition(&store, None, &tdir, &d, &vals, &[data_batch(vec![Some(20)])]).unwrap();
         let pdir = tdir.join("dt=1970-01-02");
         assert_eq!(
             PartitionManifest::read(&store, &pdir)
@@ -762,6 +872,7 @@ mod tests {
         // overwrite：只剩新数据
         overwrite_partition(
             &store,
+            None,
             &tdir,
             &d,
             &vals,
@@ -775,7 +886,7 @@ mod tests {
         // 旧文件进 trash
         assert!(root.join("_trash").exists());
         // 空 overwrite = 清空分区
-        overwrite_partition(&store, &tdir, &d, &vals, &[]).unwrap();
+        overwrite_partition(&store, None, &tdir, &d, &vals, &[]).unwrap();
         let m = PartitionManifest::read(&store, &pdir).unwrap().unwrap();
         assert_eq!(m.total_rows(), 0);
         assert!(m.segments.is_empty());
@@ -788,7 +899,7 @@ mod tests {
         let d = def();
         let tdir = root.join("t");
         let vals = [Literal::Date(1)];
-        append_partition(&store, &tdir, &d, &vals, &[data_batch(vec![Some(1)])]).unwrap();
+        append_partition(&store, None, &tdir, &d, &vals, &[data_batch(vec![Some(1)])]).unwrap();
         // 错列名
         let schema = Arc::new(Schema::new(vec![Field::new(
             "wrong",
@@ -800,12 +911,12 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1]))],
         )
         .unwrap();
-        assert!(append_partition(&store, &tdir, &d, &vals, &[b]).is_err());
+        assert!(append_partition(&store, None, &tdir, &d, &vals, &[b]).is_err());
         // 错类型
         let schema2 = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, true)]));
         let b2 =
             RecordBatch::try_new(schema2, vec![Arc::new(StringArray::from(vec!["x"]))]).unwrap();
-        assert!(append_partition(&store, &tdir, &d, &vals, &[b2]).is_err());
+        assert!(append_partition(&store, None, &tdir, &d, &vals, &[b2]).is_err());
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -816,6 +927,7 @@ mod tests {
         let tdir = root.join("t");
         append_partition(
             &store,
+            None,
             &tdir,
             &d,
             &[Literal::Date(1)],
