@@ -375,8 +375,36 @@ fn new_token() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(seed.to_le_bytes())
 }
 
+/// 错误响应体（J3）：`{"error": <人读文案>, "code": <稳定机器码>}`。
+///
+/// `code` 是**契约级稳定**标识，驱动据此精确映射 SQLState；`error` 文案可能
+/// 随版本变化，消费方不应依赖其内容（驱动此前只能靠 message 前缀
+/// `"query timeout: "` 识别超时——文案一改就断）。
 fn err_response(status: StatusCode, msg: String) -> Response {
-    (status, Json(serde_json::json!({ "error": msg }))).into_response()
+    err_response_code(status, status_code_of(status), msg)
+}
+
+fn err_response_code(status: StatusCode, code: &str, msg: String) -> Response {
+    (
+        status,
+        Json(serde_json::json!({ "error": msg, "code": code })),
+    )
+        .into_response()
+}
+
+/// 无 QsdbError 上下文的通用状态码 → 机器码。
+fn status_code_of(s: StatusCode) -> &'static str {
+    match s {
+        StatusCode::UNAUTHORIZED => "UNAUTHORIZED",
+        StatusCode::FORBIDDEN => "FORBIDDEN",
+        StatusCode::BAD_REQUEST => "BAD_REQUEST",
+        StatusCode::NOT_FOUND => "NOT_FOUND",
+        StatusCode::SERVICE_UNAVAILABLE => "UNAVAILABLE",
+        StatusCode::REQUEST_TIMEOUT => "QUERY_TIMEOUT",
+        StatusCode::NOT_IMPLEMENTED => "UNSUPPORTED",
+        StatusCode::CONFLICT => "CONFLICT",
+        _ => "INTERNAL",
+    }
 }
 
 /// POST /api/v1/auth/login：Basic 认证 → 签发 Bearer token（进程内存态）。
@@ -552,7 +580,7 @@ async fn query(
         },
         Ok(Err(e)) => {
             s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-            status_of(&e, e.to_string())
+            status_of_query(&e, e.to_string())
         }
         Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -644,7 +672,7 @@ async fn write(
         }
         Ok(Err(e)) => {
             s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-            status_of(&e, e.to_string())
+            status_of_query(&e, e.to_string())
         }
         Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -865,14 +893,47 @@ async fn cancel_query(
 // 辅助
 // ---------------------------------------------------------------------------
 
+/// 错误 → 响应（**资源端点**语义：`/tables`、`/schema`、`/partitions`、`/stats`）。
+/// 这些端点上 404 是准确的「资源不存在」。
 fn status_of(e: &QsdbError, msg: String) -> Response {
-    let code = match e {
-        QsdbError::NotFound(_) => StatusCode::NOT_FOUND,
-        QsdbError::Parse(_) | QsdbError::InvalidArgument(_) => StatusCode::BAD_REQUEST,
-        QsdbError::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    err_response(code, msg)
+    let (status, code) = map_err(e, false);
+    err_response_code(status, code, msg)
+}
+
+/// 错误 → 响应（**查询/写入端点**语义）。
+///
+/// J5：`/api/v1/query` 上的 `NotFound`（表/列不存在）是 **SQL 语义错误**，
+/// 不是 HTTP 资源语义——返回 404 会让网关误判为路由错误。改 400，
+/// 并用 code `TABLE_NOT_FOUND` / `COLUMN_NOT_FOUND` 便于驱动映射 SQLState。
+fn status_of_query(e: &QsdbError, msg: String) -> Response {
+    let (status, code) = map_err(e, true);
+    err_response_code(status, code, msg)
+}
+
+/// 错误 → (HTTP 状态码, 机器码)。`query_ctx` 区分查询语义与资源语义。
+fn map_err(e: &QsdbError, query_ctx: bool) -> (StatusCode, &'static str) {
+    match e {
+        // J3：超时/取消/内存超限此前全落 500 兜底，只能靠文案前缀识别
+        QsdbError::QueryTimeout(_) => (StatusCode::REQUEST_TIMEOUT, "QUERY_TIMEOUT"),
+        QsdbError::QueryCancelled(_) => (StatusCode::BAD_REQUEST, "QUERY_CANCELLED"),
+        QsdbError::QueryMemoryLimit(_) => (StatusCode::BAD_REQUEST, "QUERY_MEMORY_LIMIT"),
+        QsdbError::NotFound(m) if query_ctx => (
+            StatusCode::BAD_REQUEST,
+            if m.contains("column") {
+                "COLUMN_NOT_FOUND"
+            } else {
+                "TABLE_NOT_FOUND"
+            },
+        ),
+        QsdbError::NotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
+        QsdbError::Parse(_) => (StatusCode::BAD_REQUEST, "PARSE_ERROR"),
+        QsdbError::InvalidArgument(_) => (StatusCode::BAD_REQUEST, "INVALID_ARGUMENT"),
+        QsdbError::Type(_) => (StatusCode::BAD_REQUEST, "TYPE_ERROR"),
+        QsdbError::AlreadyExists(_) => (StatusCode::CONFLICT, "ALREADY_EXISTS"),
+        QsdbError::Unsupported(_) => (StatusCode::NOT_IMPLEMENTED, "UNSUPPORTED"),
+        QsdbError::Meta(_) => (StatusCode::INTERNAL_SERVER_ERROR, "METADATA_ERROR"),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
+    }
 }
 
 fn batches_to_ipc(
