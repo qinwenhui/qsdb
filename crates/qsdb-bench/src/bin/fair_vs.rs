@@ -142,71 +142,8 @@ mod imp {
 
         let mut results = Results::default();
 
-        // ══ A. group by 基数扫描（核心：POC T2 打的就是这里）══
-        println!("\n=== A. group by 基数扫描（{} 行）===", parts * per);
-        println!(
-            "{:<12} {:>10} {:>10} {:>8}   说明",
-            "基数", "QSDB", "DuckDB", "比率"
-        );
-        // 每档重建分组表（g 值域 = 基数）——QSDB 不支持 GROUP BY 表达式，
-        // 只能用裸列分组；各档数据量相同、仅值域不同，可比。
-        let gcard_per = per;
-        for card in [1_000i64, 100_000, 1_000_000, 5_000_000] {
-            db.sql("DROP TABLE IF EXISTS gt").unwrap();
-            db.sql("CREATE TABLE gt (g BIGINT, v BIGINT, dp BIGINT) PARTITIONED BY (dp)")
-                .unwrap();
-            for p in 0..parts {
-                let sch = Arc::new(Schema::new(vec![
-                    Field::new("g", DataType::Int64, false),
-                    Field::new("v", DataType::Int64, false),
-                    Field::new("dp", DataType::Int64, false),
-                ]));
-                let g: Int64Array = (0..gcard_per)
-                    .map(|i| (i as i64 * 7919 + p as i64) % card)
-                    .collect();
-                let v: Int64Array = (0..gcard_per).map(|i| (i as i64) % 10_000).collect();
-                let dp: Int64Array = vec![p as i64; gcard_per].into();
-                db.append(
-                    "gt",
-                    &[
-                        RecordBatch::try_new(sch, vec![Arc::new(g), Arc::new(v), Arc::new(dp)])
-                            .unwrap(),
-                    ],
-                )
-                .unwrap();
-            }
-            let gg = tdir
-                .join("..")
-                .join("gt")
-                .join("**")
-                .join("*.parquet")
-                .to_string_lossy()
-                .replace(std::path::MAIN_SEPARATOR, "/");
-            let q = bench_pair(
-                || {
-                    db.sql_collect("SELECT g, count(*), sum(v) FROM gt GROUP BY g")
-                        .map(|b| b.iter().map(|x| x.num_rows()).sum::<usize>() as i64)
-                },
-                || {
-                    duck.query_row(
-                        &format!("SELECT count(*) FROM (SELECT g, count(*), sum(v) FROM read_parquet('{gg}') AS t GROUP BY g)"),
-                        [], |r| r.get::<_, i64>(0))
-                },
-            );
-            let (tq, td, sq, sd) = q;
-            results.push("groupby", card, tq, td);
-            println!(
-                "{:<12} {:>9.3}s {:>9.3}s {:>7.2}x  ±{:.0}/{:.0}%  {}",
-                card,
-                tq,
-                td,
-                td / tq,
-                sq * 100.0,
-                sd * 100.0,
-                verdict(td / tq)
-            );
-        }
-
+        // ★ 顺序纪律：高基数 group by 会留下分配器碎片，使**后续所有查询慢 1.7-2x**
+        //（实测：agg 0.014s → 0.025s、单列扫描 0.003s → 0.005s）。
         // ══ B. 全局聚合 ══
         println!("\n=== B. 全局聚合（{} 行）===", parts * per);
         let q = bench_pair(
@@ -340,6 +277,72 @@ mod imp {
             q.3 * 100.0,
             verdict(q.1 / q.0)
         );
+
+        // 故把它排到最后——此前它排最前，污染了 B/C/D 段全部数字。
+        // ══ A. group by 基数扫描（核心：POC T2 打的就是这里）══
+        println!("\n=== A. group by 基数扫描（{} 行）===", parts * per);
+        println!(
+            "{:<12} {:>10} {:>10} {:>8}   说明",
+            "基数", "QSDB", "DuckDB", "比率"
+        );
+        // 每档重建分组表（g 值域 = 基数）——QSDB 不支持 GROUP BY 表达式，
+        // 只能用裸列分组；各档数据量相同、仅值域不同，可比。
+        let gcard_per = per;
+        for card in [1_000i64, 100_000, 1_000_000, 5_000_000] {
+            db.sql("DROP TABLE IF EXISTS gt").unwrap();
+            db.sql("CREATE TABLE gt (g BIGINT, v BIGINT, dp BIGINT) PARTITIONED BY (dp)")
+                .unwrap();
+            for p in 0..parts {
+                let sch = Arc::new(Schema::new(vec![
+                    Field::new("g", DataType::Int64, false),
+                    Field::new("v", DataType::Int64, false),
+                    Field::new("dp", DataType::Int64, false),
+                ]));
+                let g: Int64Array = (0..gcard_per)
+                    .map(|i| (i as i64 * 7919 + p as i64) % card)
+                    .collect();
+                let v: Int64Array = (0..gcard_per).map(|i| (i as i64) % 10_000).collect();
+                let dp: Int64Array = vec![p as i64; gcard_per].into();
+                db.append(
+                    "gt",
+                    &[
+                        RecordBatch::try_new(sch, vec![Arc::new(g), Arc::new(v), Arc::new(dp)])
+                            .unwrap(),
+                    ],
+                )
+                .unwrap();
+            }
+            let gg = tdir
+                .join("..")
+                .join("gt")
+                .join("**")
+                .join("*.parquet")
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            let q = bench_pair(
+                || {
+                    db.sql_collect("SELECT g, count(*), sum(v) FROM gt GROUP BY g")
+                        .map(|b| b.iter().map(|x| x.num_rows()).sum::<usize>() as i64)
+                },
+                || {
+                    duck.query_row(
+                        &format!("SELECT count(*) FROM (SELECT g, count(*), sum(v) FROM read_parquet('{gg}') AS t GROUP BY g)"),
+                        [], |r| r.get::<_, i64>(0))
+                },
+            );
+            let (tq, td, sq, sd) = q;
+            results.push("groupby", card, tq, td);
+            println!(
+                "{:<12} {:>9.3}s {:>9.3}s {:>7.2}x  ±{:.0}/{:.0}%  {}",
+                card,
+                tq,
+                td,
+                td / tq,
+                sq * 100.0,
+                sd * 100.0,
+                verdict(td / tq)
+            );
+        }
 
         // ── 汇总：诚实统计 ──
         let (win, lose) = results.tally();
