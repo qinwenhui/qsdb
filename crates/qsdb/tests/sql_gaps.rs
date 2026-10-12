@@ -454,3 +454,27 @@ fn count_over_left_join_pushdown() {
     db.sql("INSERT INTO sr VALUES ('a'), ('a')").unwrap();
     assert!(q(&db, "SELECT count(*) FROM sl LEFT JOIN sr ON sl.s = sr.s") == vec!["4"]);
 }
+
+// ── F18：无分区表 TRUNCATE（qsdb-sync 反馈实锤）────────────────────────
+
+#[test]
+fn f18_truncate_unpartitioned() {
+    let (db, _r) = db("f18_trunc");
+    // 无分区表：list_partitions(depth=0) 返回空 → 原实现空循环后 Ok(0) 却不清数据
+    db.sql("CREATE TABLE nop (k BIGINT, v BIGINT)").unwrap();
+    db.sql("INSERT INTO nop VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+    assert!(q(&db, "SELECT count(*) FROM nop") == vec!["3"]);
+    db.sql("TRUNCATE TABLE nop").unwrap();
+    assert!(q(&db, "SELECT count(*) FROM nop") == vec!["0"], "无分区表 TRUNCATE 必须清空");
+    // 清空后仍可写
+    db.sql("INSERT INTO nop VALUES (4, 40)").unwrap();
+    assert!(q(&db, "SELECT count(*) FROM nop") == vec!["1"]);
+    // 分区表对照
+    db.sql("CREATE TABLE p (k BIGINT, dp BIGINT) PARTITIONED BY (dp)").unwrap();
+    db.sql("INSERT INTO p VALUES (1, 1), (2, 2)").unwrap();
+    db.sql("TRUNCATE TABLE p").unwrap();
+    assert!(q(&db, "SELECT count(*) FROM p") == vec!["0"]);
+    // 空表 TRUNCATE 幂等
+    db.sql("TRUNCATE TABLE nop").unwrap();
+    assert!(q(&db, "SELECT count(*) FROM nop") == vec!["0"]);
+}

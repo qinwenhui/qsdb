@@ -676,6 +676,12 @@ impl Qsdb {
         self.ensure_writable()?;
         let def = self.def(None, table)?;
         let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
+        // F18 修复：无分区表没有 manifest 与分区目录，list_partitions(depth=0)
+        // 返回空 → 原实现空循环后返回 Ok(0) 却不清数据（静默无效）。
+        // 无分区表的 segment 直接位于表目录下，走专门清空路径。
+        if def.partition_keys.is_empty() {
+            return self.clear_unpartitioned(&tdir);
+        }
         let parts = crate::scan::list_partitions(&self.store, &tdir, def.partition_keys.len());
         let mut cleared = 0u64;
         for (pdir, _) in parts {
@@ -688,6 +694,35 @@ impl Qsdb {
             }
         }
         Ok(cleared)
+    }
+
+    /// 清空**无分区表**：无 manifest/分区目录，segment 直接位于表目录下。
+    /// 表目录锁内逐个移入 trash（延迟回收语义与分区路径一致）。
+    fn clear_unpartitioned(&self, tdir: &std::path::Path) -> Result<u64> {
+        if !self.store.is_local() {
+            #[cfg(feature = "remote")]
+            {
+                return Err(QsdbError::unsupported(
+                    "TRUNCATE on unpartitioned remote table not supported yet",
+                ));
+            }
+            #[cfg(not(feature = "remote"))]
+            {
+                return Err(QsdbError::unsupported(
+                    "remote store requires an s3/hdfs build",
+                ));
+            }
+        }
+        let _guard = crate::fsutil::PartitionLock::acquire(&tdir.join(".lock"))?;
+        let mut rows = 0u64;
+        for entry in self.store.read_dir(tdir).unwrap_or_default() {
+            if !entry.name.ends_with(".parquet") {
+                continue;
+            }
+            rows += crate::scan::parquet_row_count(&entry.path).unwrap_or(0);
+            crate::fsutil::move_to_trash(self.store.root(), &entry.path)?;
+        }
+        Ok(rows)
     }
 
     // -- SQL（M2：SQL-0/1）----------------------------------------------------

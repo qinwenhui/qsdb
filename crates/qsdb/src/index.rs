@@ -33,6 +33,12 @@ pub struct PartitionsIndex {
 
 impl PartitionsIndex {
     /// 读取索引；不存在 → None；损坏 → None（读侧乐观回退）。
+    ///
+    /// **F19 相关**：写者提交顺序「commit manifest（建分区目录）→ upsert idx」
+    /// 之间有毫秒窗口，此时 idx 落后目录真值，读者信任 idx 会漏新分区。
+    /// 曾尝试用「表目录 mtime > idx mtime」判 stale——**不可行**：upsert 自身
+    /// 会创建 `_index.lock`（更新目录 mtime）导致立刻误判。改为在调用侧
+    /// 用 list 补 idx 缺失项（见 `plan_scan` / `partition_stats`）。
     pub fn read(store: &Store, table_dir: &Path) -> Option<Self> {
         let bytes = store.read(&table_dir.join(INDEX_FILE)).ok().flatten()?;
         let idx: Self = postcard::from_bytes(&bytes).ok()?;
