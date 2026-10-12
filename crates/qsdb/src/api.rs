@@ -71,7 +71,14 @@ pub struct QsdbOptions {
     /// （远端模式 = 孤儿对象安全期：不被 manifest 引用且早于该期限才可删）
     pub trash_grace_ms: u64,
     /// 热数据缓存预算（字节）：segment 级**解码后**的 Arrow 批 LRU 缓存。
-    /// `0` = 关闭；默认 256MB。
+    /// `0` = 关闭；默认 **1GB**。
+    ///
+    /// **默认值依据（2026-10-12 实测）**：收集器的单条累积上界是
+    /// `budget / 8`（8 分片并行时的防爆内存系数），而 10M 行 × 4 列的
+    /// 单分片片段约 32~64MB。原默认 256MB → 上界 32MB **恰好卡在边缘**：
+    /// 16 个分片只进 11 个 → 付了缓存成本却几乎不命中（比关缓存还慢）。
+    /// 提到 1GB（上界 128MB）后全命中，宽投影查询快 **16x**。
+    /// 预算只是**上限**（按需分配，不预占）。
     ///
     /// **性能口径警告**：本缓存让同一 segment 的重复查询免解码，收益显著——
     /// 但它不是与"每次现解码"的引擎（如 DuckDB `read_parquet`）可直接比较的
@@ -104,7 +111,7 @@ impl Default for QsdbOptions {
         Self {
             storage: StorageConfig::Local,
             trash_grace_ms: 10 * 60 * 1000,
-            scan_cache_bytes: 256 * 1024 * 1024,
+            scan_cache_bytes: 1024 * 1024 * 1024,
             query_timeout_ms: None,
             query_memory_limit_bytes: None,
             file_cache_bytes: 0,

@@ -14,7 +14,7 @@
 | `read_only` | bool / false | **只读模式**：拒绝一切写路径（append/overwrite/DDL/compact/gc/refresh-index；server /write 返回 503）。standby/只读副本标准姿势——只读句柄永不做写者，杜绝误连双主。CLI：`--read-only`。 |
 | `durability` | Durability / ProcessCrash | 耐久性档位（M6 后追加）：`ProcessCrash`（默认，页缓存即持久——kill -9 安全，掉电可能丢最近段）/ `PowerLoss`（segment/元数据/staging 文件 rename 前 fsync + POSIX 目录 sync，掉电安全）。**损耗实测：写吞吐约 -25%**（本机 NVMe，31MB/段每段 fsync ≈190ms；首轮脏页积压时更多）——按性能优先定案默认关；带电容/掉电保护的企业级 SSD 上 fsync 代价远低；WriteBuffer 攒大段可摊薄每字节 fsync 次数。CLI：`--durability process-crash\|power-loss`。 |
 | `trash_grace_ms` | u64 / 10 分钟 | `_trash` 静默期：被换出的旧数据文件至少保留这么久才可被 `gc()` 清理。调小可加速空间回收，但会牺牲正在进行的旧扫描（跨进程长查询）。 |
-| `scan_cache_bytes` | usize / 256MB | 热数据缓存预算（segment 级解码后 LRU）。**0 = 关闭**。预算应能装下热工作集且不超过机器可用内存（预算过大会触发换页反噬——实测 4GB 预算在被其他进程占内存的机器上反而变慢）。 |
+| `scan_cache_bytes` | usize / **1GB** | 热数据缓存预算（segment 级**解码后** LRU）。**0 = 关闭**。预算应能装下热工作集且不超过机器可用内存（预算过大会触发换页反噬——实测 4GB 预算在被其他进程占内存的机器上反而变慢）。**默认值依据（2026-10-12 实测）**：单条累积上界是 `budget/8`（8 分片防爆内存系数），而 10M×4 列的单个分片片段约 32~64MB——原默认 256MB（上界 32MB）**恰好卡在边缘**：16 分片只进 11 个，付了缓存成本却几乎不命中（比关缓存还慢）；提到 1GB（上界 128MB）后全命中，宽投影快 **19.5x**。预算只是上限、按需分配。 |
 | `query_timeout_ms` | Option\<u64\> / None | 默认查询超时（毫秒）。**这是运行期同名配置的初值**——open 后可经 [`Qsdb::runtime()`] 热更，见下节。 |
 | `query_memory_limit_bytes` | Option\<u64\> / None | 默认单查询内存上限（字节）。同为运行期配置的初值。 |
 | `storage`（HDFS 形态） | `StorageConfig::Hdfs { url, prefix }` | HDFS 管理表（M6-5，feature `hdfs`）：`url` 如 `hdfs://192.168.1.12:9000`；CAS 由锁对象模拟（`hdfs_backend`）；身份走 `HADOOP_USER_NAME` 环境变量。CLI：`--storage-type hdfs --storage-hdfs-url hdfs://host:9000`。 |
@@ -60,7 +60,7 @@
 | 数据目录 | `--path`（必填） | ❌ | 库根目录 |
 | 监听地址 | `--addr` / 0.0.0.0:9430 | ❌ | 重启生效 |
 | 鉴权 token | `--token` / 无 | ❌ | Bearer token；不设则开放（建议生产必设） |
-| 热缓存预算 | `--cache-mb` / 256 | ❌（open 期定死） | 0 = 关闭 |
+| 热缓存预算 | `--cache-mb` / 1024 | ❌（open 期定死） | 0 = 关闭 |
 | 自动 compaction 周期 | `--auto-compact-secs` / 关 | ❌ | 周期遍历全表 compact |
 | 并发查询上限 | `--max-concurrent-queries` / 0（不限） | ❌（当前版） | 超限返回 503 |
 | 写缓冲阈值 | WriteBufferOptions（代码默认 64 批/128MB） | ❌ | 攒批自动 flush |

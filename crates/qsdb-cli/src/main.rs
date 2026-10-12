@@ -61,8 +61,10 @@ enum Cmd {
         /// 自动 compaction 周期（秒）
         #[arg(long)]
         auto_compact_secs: Option<u64>,
-        /// 热数据缓存预算（MB；0 = 关闭，默认 256）
-        #[arg(long, default_value_t = 256)]
+        /// 热数据缓存预算（MB；0 = 关闭，默认 1024）。
+        /// 默认值依据见 `QsdbOptions::scan_cache_bytes` 文档——256MB 时宽投影
+        /// 的缓存上界（budget/8）卡在片段大小边缘，几乎不命中。
+        #[arg(long, default_value_t = 1024)]
         cache_mb: usize,
         /// 并发查询上限（0 = 不限）
         #[arg(long, default_value_t = 0)]
