@@ -472,11 +472,29 @@ fn build_inner(
             input,
             exprs,
             names,
-        } => Ok(Box::new(ProjectExec::new(
-            build_inner(db, input, scan_proj.clone(), ctx)?,
-            exprs.clone(),
-            names.clone(),
-        ))),
+        } => {
+            // 投影下推到 Join 两侧：物化 join 是冷读口径下最大差距项
+            // （5 列表比 2 列表慢 1.8x，实测）。仅两侧均为无谓词 Scan 时启用。
+            if let LogicalPlan::Join {
+                left,
+                right,
+                left_keys,
+                right_keys,
+                join_type,
+            } = input.as_ref()
+            {
+                if let Some(node) = try_project_join(
+                    db, left, right, left_keys, right_keys, *join_type, exprs, names, ctx,
+                )? {
+                    return Ok(node);
+                }
+            }
+            Ok(Box::new(ProjectExec::new(
+                build_inner(db, input, scan_proj.clone(), ctx)?,
+                exprs.clone(),
+                names.clone(),
+            )))
+        }
         LogicalPlan::Aggregate { input, group, aggs } => {
             build_aggregate(db, input, group, aggs, &scan_proj, ctx)
         }
@@ -603,6 +621,220 @@ fn build_inner(
             )))
         }
     }
+}
+
+/// Join 输出（左 ++ 右）的 idx → 投影后序（左投影 ++ 右投影）。
+/// `lw` = 原左宽，`nl` = 新左宽（左投影列数）。
+fn remap_join_expr(
+    e: &PhysExpr,
+    lw: usize,
+    nl: usize,
+    lmap: &[Option<usize>],
+    rmap: &[Option<usize>],
+) -> PhysExpr {
+    match e {
+        PhysExpr::Column { idx, name, ty } => {
+            let new_idx = if *idx < lw {
+                lmap.get(*idx).copied().flatten().unwrap_or(*idx)
+            } else {
+                let r = *idx - lw;
+                nl + rmap.get(r).copied().flatten().unwrap_or(r)
+            };
+            PhysExpr::Column {
+                idx: new_idx,
+                name: name.clone(),
+                ty: ty.clone(),
+            }
+        }
+        PhysExpr::Lit(l) => PhysExpr::Lit(l.clone()),
+        PhysExpr::Arith { op, l, r, ty } => PhysExpr::Arith {
+            op: *op,
+            l: Box::new(remap_join_expr(l, lw, nl, lmap, rmap)),
+            r: Box::new(remap_join_expr(r, lw, nl, lmap, rmap)),
+            ty: ty.clone(),
+        },
+        PhysExpr::Cmp { op, l, r } => PhysExpr::Cmp {
+            op: *op,
+            l: Box::new(remap_join_expr(l, lw, nl, lmap, rmap)),
+            r: Box::new(remap_join_expr(r, lw, nl, lmap, rmap)),
+        },
+        PhysExpr::And(a, b) => PhysExpr::And(
+            Box::new(remap_join_expr(a, lw, nl, lmap, rmap)),
+            Box::new(remap_join_expr(b, lw, nl, lmap, rmap)),
+        ),
+        PhysExpr::Or(a, b) => PhysExpr::Or(
+            Box::new(remap_join_expr(a, lw, nl, lmap, rmap)),
+            Box::new(remap_join_expr(b, lw, nl, lmap, rmap)),
+        ),
+        PhysExpr::Not(a) => PhysExpr::Not(Box::new(remap_join_expr(a, lw, nl, lmap, rmap))),
+        PhysExpr::IsNull(a, n) => {
+            PhysExpr::IsNull(Box::new(remap_join_expr(a, lw, nl, lmap, rmap)), *n)
+        }
+        PhysExpr::Cast { e, ty } => PhysExpr::Cast {
+            e: Box::new(remap_join_expr(e, lw, nl, lmap, rmap)),
+            ty: ty.clone(),
+        },
+        PhysExpr::Fn { name, args, ty } => PhysExpr::Fn {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| remap_join_expr(a, lw, nl, lmap, rmap))
+                .collect(),
+            ty: ty.clone(),
+        },
+        PhysExpr::Case {
+            conds,
+            else_expr,
+            ty,
+        } => PhysExpr::Case {
+            conds: conds
+                .iter()
+                .map(|(c, r)| {
+                    (
+                        remap_join_expr(c, lw, nl, lmap, rmap),
+                        remap_join_expr(r, lw, nl, lmap, rmap),
+                    )
+                })
+                .collect(),
+            else_expr: Box::new(remap_join_expr(else_expr, lw, nl, lmap, rmap)),
+            ty: ty.clone(),
+        },
+        PhysExpr::Coalesce(es, ty) => PhysExpr::Coalesce(
+            es.iter()
+                .map(|e| remap_join_expr(e, lw, nl, lmap, rmap))
+                .collect(),
+            ty.clone(),
+        ),
+        PhysExpr::Concat(l, r) => PhysExpr::Concat(
+            Box::new(remap_join_expr(l, lw, nl, lmap, rmap)),
+            Box::new(remap_join_expr(r, lw, nl, lmap, rmap)),
+        ),
+        PhysExpr::Like {
+            e,
+            pattern,
+            negated,
+            ci,
+        } => PhysExpr::Like {
+            e: Box::new(remap_join_expr(e, lw, nl, lmap, rmap)),
+            pattern: pattern.clone(),
+            negated: *negated,
+            ci: *ci,
+        },
+    }
+}
+
+/// Join 两侧列裁剪下推。**两个已知坑**（首次尝试均踩中）：
+/// ① 投影列必须按**表定义序**排列——`Scan` 的 read_columns 会按 def.columns
+///    重排，而 build_mapping 按给定序索引，序不一致则 idx 错位（越界/结果空）。
+/// ② 给 HashJoinExec 的右键必须是 **build 侧局部序**（其内部按 build 表求值），
+///    只有 Join 之上的 Project exprs 才带 `nl`（新左宽）偏移。
+#[allow(clippy::too_many_arguments)]
+fn try_project_join(
+    db: &Qsdb,
+    left: &LogicalPlan,
+    right: &LogicalPlan,
+    left_keys: &[PhysExpr],
+    right_keys: &[PhysExpr],
+    join_type: crate::exec::join::JoinType,
+    exprs: &[PhysExpr],
+    names: &[String],
+    ctx: &Arc<crate::query::QueryContext>,
+) -> Result<Option<Box<dyn ExecNode>>> {
+    let (
+        LogicalPlan::Scan {
+            def: ldef,
+            predicate: None,
+        },
+        LogicalPlan::Scan {
+            def: rdef,
+            predicate: None,
+        },
+    ) = (left, right)
+    else {
+        return Ok(None);
+    };
+    let lall: Vec<String> = ldef.columns.iter().map(|c| c.name.clone()).collect();
+    let rall: Vec<String> = rdef.columns.iter().map(|c| c.name.clone()).collect();
+    let lw = lall.len();
+
+    let mut used: Vec<usize> = Vec::new();
+    for e in exprs {
+        e.collect_columns(&mut used);
+    }
+    for k in left_keys.iter().chain(right_keys.iter()) {
+        k.collect_columns(&mut used);
+    }
+    let mut lproj: Vec<String> = Vec::new();
+    let mut rproj: Vec<String> = Vec::new();
+    for &i in &used {
+        if i < lw {
+            let n = &lall[i];
+            if !lproj.contains(n) {
+                lproj.push(n.clone());
+            }
+        } else {
+            let n = &rall[i - lw];
+            if !rproj.contains(n) {
+                rproj.push(n.clone());
+            }
+        }
+    }
+    for pk in &ldef.partition_keys {
+        if !lproj.iter().any(|c| c.eq_ignore_ascii_case(pk)) {
+            lproj.push(pk.clone());
+        }
+    }
+    for pk in &rdef.partition_keys {
+        if !rproj.iter().any(|c| c.eq_ignore_ascii_case(pk)) {
+            rproj.push(pk.clone());
+        }
+    }
+    if lproj.len() >= lall.len() && rproj.len() >= rall.len() {
+        return Ok(None); // 无收益
+    }
+    // ★ 坑 ①：按表定义序排序（与 Scan 的 read_columns 对齐）
+    lproj.sort_by_key(|n| lall.iter().position(|c| c == n).unwrap_or(usize::MAX));
+    rproj.sort_by_key(|n| rall.iter().position(|c| c == n).unwrap_or(usize::MAX));
+    let lmap = build_mapping(&lall, &lproj);
+    let rmap = build_mapping(&rall, &rproj);
+    let lp = rewrite_plan(left, &lmap, &lall);
+    let rp = rewrite_plan(right, &rmap, &rall);
+    let probe = build_inner(db, &lp, Some(lproj), ctx)?;
+    let build = build_inner(db, &rp, Some(rproj), ctx)?;
+    let nl = probe.schema().fields().len();
+
+    let lk: Vec<PhysExpr> = left_keys
+        .iter()
+        .map(|k| rewrite_expr(k, &lmap, &lall))
+        .collect();
+    // ★ 坑 ②：右键 → 右表局部序（减 lw）再映射到右投影序，**不带 nl**
+    let rk: Vec<PhysExpr> = right_keys
+        .iter()
+        .map(|k| match k {
+            PhysExpr::Column { idx, name, ty } => rewrite_expr(
+                &PhysExpr::Column {
+                    idx: idx.saturating_sub(lw),
+                    name: name.clone(),
+                    ty: ty.clone(),
+                },
+                &rmap,
+                &rall,
+            ),
+            other => other.clone(),
+        })
+        .collect();
+    let join =
+        crate::exec::join::HashJoinExec::new(probe, build, lk, rk, join_type, Arc::clone(ctx));
+    // exprs 在 Join 之上 → 带 nl 偏移（输出 = 左投影 ++ 右投影）
+    let new_exprs: Vec<PhysExpr> = exprs
+        .iter()
+        .map(|e| remap_join_expr(e, lw, nl, &lmap, &rmap))
+        .collect();
+    Ok(Some(Box::new(ProjectExec::new(
+        Box::new(join),
+        new_exprs,
+        names.to_vec(),
+    ))))
 }
 
 /// 聚合构建：含 UDAF → 串行物化路径；可分片源 → 并行 partial/merge；否则串行。
