@@ -940,6 +940,17 @@ fn schema_fields(schema: &arrow::datatypes::SchemaRef) -> Vec<serde_json::Value>
         .collect()
 }
 
+/// 每行每列按 **Arrow 列类型**分派输出（J1+J2，2026-10-12）。
+///
+/// 原实现忽略列类型，统一走「display 串 → parse::<i64> → parse::<f64> →
+/// true/false」的数字启发，造成两类正确性问题：
+/// - **字符串列的数值内容被改写为 number**（`"123"` → `123`），消费方无法
+///   区分「字符串 123」与「整数 123」；Decimal 走 f64 丢精度（F20）
+/// - **BINARY 列彻底不可逆**：display 给出 hex 串 `"6465616462656566"`，
+///   启发按**十进制**解析成 6465616462656566 —— 字节内容已换血
+///
+/// 现按类型分派：数值输出 number、精确类型（Decimal）输出字符串、
+/// 二进制输出小写 hex 字符串、其余按各自规范形态。
 fn batches_to_json(
     _schema: &arrow::datatypes::SchemaRef,
     batches: &[RecordBatch],
@@ -953,26 +964,161 @@ fn batches_to_json(
                 if arr.is_null(i) {
                     row.push(serde_json::Value::Null);
                 } else {
-                    let s = arrow::util::display::array_value_to_string(arr.as_ref(), i)
-                        .map_err(|e| QsdbError::invalid(format!("display: {e}")))?;
-                    // 数值类型尽量输出数字
-                    row.push(if let Ok(n) = s.parse::<i64>() {
-                        serde_json::json!(n)
-                    } else if let Ok(f) = s.parse::<f64>() {
-                        serde_json::json!(f)
-                    } else if s == "true" {
-                        serde_json::json!(true)
-                    } else if s == "false" {
-                        serde_json::json!(false)
-                    } else {
-                        serde_json::json!(s)
-                    });
+                    row.push(json_value_typed(arr.as_ref(), i)?);
                 }
             }
             rows.push(row);
         }
     }
     Ok(rows)
+}
+
+/// 单值按 Arrow 类型 → JSON（见 `batches_to_json` 的类型分派说明）。
+fn json_value_typed(
+    arr: &dyn arrow::array::Array,
+    i: usize,
+) -> Result<serde_json::Value, QsdbError> {
+    use arrow::array::{
+        BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+        Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
+        StringArray, Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray,
+    };
+    use arrow::datatypes::DataType as D;
+    let disp = || {
+        arrow::util::display::array_value_to_string(arr, i)
+            .map_err(|e| QsdbError::invalid(format!("display: {e}")))
+    };
+    Ok(match arr.data_type() {
+        // 整数：i64 内恒精确 → number
+        D::Int8 => serde_json::json!(arr.as_any().downcast_ref::<Int8Array>().unwrap().value(i)),
+        D::Int16 => serde_json::json!(arr.as_any().downcast_ref::<Int16Array>().unwrap().value(i)),
+        D::Int32 => serde_json::json!(arr.as_any().downcast_ref::<Int32Array>().unwrap().value(i)),
+        D::Int64 => serde_json::json!(arr.as_any().downcast_ref::<Int64Array>().unwrap().value(i)),
+        // 浮点：非有限值固定拼写（J7：生态惯用 Infinity，非 Rust 的 inf）
+        D::Float32 => {
+            let v = arr
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(i) as f64;
+            finite_or_string(v)
+        }
+        D::Float64 => {
+            let v = arr
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(i);
+            finite_or_string(v)
+        }
+        // 精确小数：字符串输出（彻底解决 F20 的 f64 中转精度边界，零成本）。
+        // 必须用 display 串——它按列 scale 插入小数点；`.value(i)` 是 unscaled
+        // 原始整数（1.5 会输出 "15"）。
+        D::Decimal128(..) => {
+            let _ = arr.as_any().downcast_ref::<Decimal128Array>();
+            serde_json::json!(disp()?)
+        }
+        // 字符串：**恒 string**（不因内容是数字而改写形态）
+        D::Utf8 => serde_json::json!(arr.as_any().downcast_ref::<StringArray>().unwrap().value(i)),
+        D::LargeUtf8 => serde_json::json!(
+            arr.as_any()
+                .downcast_ref::<LargeStringArray>()
+                .unwrap()
+                .value(i)
+        ),
+        D::Boolean => serde_json::json!(
+            arr.as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .value(i)
+        ),
+        // 二进制：恒小写 hex 字符串（display 即 hex；J2 修复点）
+        D::Binary => serde_json::json!(hex_lower(
+            arr.as_any().downcast_ref::<BinaryArray>().unwrap().value(i)
+        )),
+        D::LargeBinary => serde_json::json!(hex_lower(
+            arr.as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .unwrap()
+                .value(i)
+        )),
+        // 时间族：规范形态字符串
+        D::Date32 => {
+            let d = arr.as_any().downcast_ref::<Date32Array>().unwrap().value(i);
+            serde_json::json!(qsdb::types::temporal::format_date(d))
+        }
+        D::Time64(_) => serde_json::json!(qsdb::types::temporal::format_time_ns(
+            arr.as_any()
+                .downcast_ref::<Time64NanosecondArray>()
+                .unwrap()
+                .value(i)
+        )),
+        D::Timestamp(unit, tz) => {
+            let ns = match unit {
+                arrow::datatypes::TimeUnit::Second => {
+                    arr.as_any()
+                        .downcast_ref::<TimestampSecondArray>()
+                        .unwrap()
+                        .value(i)
+                        * 1_000_000_000
+                }
+                arrow::datatypes::TimeUnit::Millisecond => {
+                    arr.as_any()
+                        .downcast_ref::<TimestampMillisecondArray>()
+                        .unwrap()
+                        .value(i)
+                        * 1_000_000
+                }
+                arrow::datatypes::TimeUnit::Microsecond => {
+                    arr.as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()
+                        .unwrap()
+                        .value(i)
+                        * 1_000
+                }
+                arrow::datatypes::TimeUnit::Nanosecond => arr
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap()
+                    .value(i),
+            };
+            let s = qsdb::types::temporal::format_timestamp_ns(ns);
+            // 带时区：RFC3339（T 分隔 + Z）；naive：空格分隔（JDBC 惯用）
+            serde_json::json!(if tz.is_some() {
+                format!("{}Z", s.replacen(' ', "T", 1))
+            } else {
+                s.replacen(' ', "T", 1)
+            })
+        }
+        // 其余（含嵌套/未列类型）：display 兜底为字符串
+        other => {
+            let _ = other;
+            serde_json::json!(disp()?)
+        }
+    })
+}
+
+/// 有限浮点 → number；NaN/±Inf → 固定拼写字符串（J7）。
+fn finite_or_string(v: f64) -> serde_json::Value {
+    if v.is_nan() {
+        serde_json::json!("NaN")
+    } else if v.is_infinite() {
+        serde_json::json!(if v > 0.0 { "Infinity" } else { "-Infinity" })
+    } else {
+        serde_json::json!(v)
+    }
+}
+
+/// 字节 → 小写 hex（BINARY 的 JSON 表示，J2）。
+fn hex_lower(b: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        s.push(HEX[(x >> 4) as usize] as char);
+        s.push(HEX[(x & 0x0f) as usize] as char);
+    }
+    s
 }
 
 // Body 引用占位（保持 import；axum 0.8 body 直接用 Bytes）
