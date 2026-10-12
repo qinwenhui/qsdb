@@ -45,6 +45,25 @@ impl PartitionsIndex {
         (idx.version == 1).then_some(idx)
     }
 
+    /// **F19b 防护**：读取索引并校验分区数与目录真值一致，否则返回 None。
+    /// 写者顺序「commit manifest（建分区目录）→ 索引锁内 upsert idx」之间有
+    /// 毫秒窗口，读者落入窗口会拿到陈旧分区集（e2e 实测 count 首调陈旧、
+    /// 次调正确）。用 readdir 校验（文件系统真值）→ 不一致则调用方回退
+    /// 逐分区读。代价仅一次 readdir，且回退路径本就需要 readdir。
+    ///
+    /// 三条发现路径（plan_scan / partition_stats / scan_metadata_count）
+    /// **必须共用本函数**，否则又会出现「一条新一条旧」的分裂。
+    pub fn read_fresh(store: &Store, table_dir: &Path, depth: usize) -> Option<Self> {
+        let idx = Self::read(store, table_dir)?;
+        // 无分区表（depth == 0）：list_partitions 恒返回空（无分区目录可列），
+        // 校验无意义且会恒失败 → 直接信任 idx。
+        if depth == 0 {
+            return Some(idx);
+        }
+        let live = crate::scan::list_partitions(store, table_dir, depth).len();
+        (live == idx.entries.len()).then_some(idx)
+    }
+
     /// 锁内 upsert 一个分区条目（commit 后调用）。
     pub fn upsert(
         store: &Store,

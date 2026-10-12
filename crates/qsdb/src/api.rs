@@ -1054,7 +1054,15 @@ impl Qsdb {
         // ★ idx 快路径：partitions.idx 已含全分区 manifest 快照（index.rs 模块
         // 注释即为此动机——逐分区 open+read 在 Windows ~0.2ms/文件 → 万分区 2s+）。
         // 单文件读替代 N 次文件读：实测 16 分区 25ms → 1ms 量级。
-        if let Some(idx) = crate::index::PartitionsIndex::read(&self.store, &tdir) {
+        // ★ F19b：idx 是「最终一致」的——写者顺序是 commit manifest（建分区目录）
+        // → 索引锁内 upsert idx，两步间有毫秒窗口。读者若恰在此窗口读 idx 会
+        // 拿到陈旧分区集（实测 e2e 中 count 首调陈旧、紧接的次调正确）。
+        // 防护：先用 readdir 校验分区数（文件系统真值），一致才信 idx；
+        // 不一致则落到下方慢路径逐分区读。代价仅一次 readdir，且慢路径本就要
+        // readdir，故最坏情况不比原实现差。
+        if let Some(idx) =
+            crate::index::PartitionsIndex::read_fresh(&self.store, &tdir, def.partition_keys.len())
+        {
             let mut total = 0u64;
             let mut any = false;
             for (_dir, m) in &idx.entries {
@@ -1207,7 +1215,9 @@ impl Qsdb {
     pub fn partition_stats(&self, table: &str) -> Result<Vec<PartitionStat>> {
         let def = self.def(None, table)?;
         let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
-        if let Some(idx) = crate::index::PartitionsIndex::read(&self.store, &tdir) {
+        if let Some(idx) =
+            crate::index::PartitionsIndex::read_fresh(&self.store, &tdir, def.partition_keys.len())
+        {
             return Ok(idx
                 .entries
                 .into_iter()

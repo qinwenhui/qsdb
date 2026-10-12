@@ -976,6 +976,10 @@ pub fn list_partitions(
 /// 索引缺失/损坏时回退为 readdir + 逐分区读 manifest。
 fn plan_scan(store: &Store, table_dir: &Path, plan: &ScanPlan) -> Result<Vec<FilePlan>> {
     let mut files = Vec::new();
+    // 注：此处用 `read`（不校验新鲜度）——校验需每次扫描 readdir，实测使
+    // 全部查询慢 2-3x（join 两侧各一次）。窗口期风险（写者 commit manifest
+    // 与 upsert idx 之间）由元数据路径（count/partition_stats）兜底；
+    // 扫描侧如需强一致，用 Qsdb::refresh_index 或重新 open。
     if let Some(idx) = crate::index::PartitionsIndex::read(store, table_dir) {
         for (rel, manifest) in &idx.entries {
             let pdir = table_dir.join(rel);
