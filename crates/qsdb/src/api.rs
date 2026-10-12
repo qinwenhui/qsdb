@@ -70,8 +70,14 @@ pub struct QsdbOptions {
     /// trash 静默期（毫秒）；`gc()` 只清理更早的条目
     /// （远端模式 = 孤儿对象安全期：不被 manifest 引用且早于该期限才可删）
     pub trash_grace_ms: u64,
-    /// 热数据缓存预算（字节）：segment 级解码后 LRU 缓存。
+    /// 热数据缓存预算（字节）：segment 级**解码后**的 Arrow 批 LRU 缓存。
     /// `0` = 关闭；默认 256MB。
+    ///
+    /// **性能口径警告**：本缓存让同一 segment 的重复查询免解码，收益显著——
+    /// 但它不是与"每次现解码"的引擎（如 DuckDB `read_parquet`）可直接比较的
+    /// 口径。对外性能声明必须显式标注是否启用（`crates/qsdb-bench/src/bin/
+    /// fair_vs.rs` 的权威口径为 `scan_cache_bytes = 0` 冷读 + 分进程独立测量；
+    /// 详见 `docs/QSDB设计开发文档.md` 性能口径一节）。
     pub scan_cache_bytes: usize,
     /// 默认查询超时（毫秒）；None/0 = 不超时
     pub query_timeout_ms: Option<u64>,
