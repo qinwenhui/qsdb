@@ -31,6 +31,10 @@ mod imp {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 
+        // FAIR_SOLO=qsdb|duck：只测一方（分进程独立测量）。
+        // 同进程交替会让双方争 CPU/内存（实测 agg 独立 0.011s vs 同进程 0.048s），
+        // 使比率失真；SOLO 用于交叉验证真实差距。
+        let solo = std::env::var("FAIR_SOLO").unwrap_or_default();
         let threads = rayon::current_num_threads().min(16).max(1);
         let mem_mb: usize = std::env::var("FAIR_MEM_MB")
             .ok()
@@ -385,6 +389,30 @@ mod imp {
         F: FnMut() -> qsdb::error::Result<i64>,
         G: FnMut() -> Result<i64, duckdb::Error>,
     {
+        let solo = std::env::var("FAIR_SOLO").unwrap_or_default();
+        // SOLO 模式：对方一侧跳过（返回 0 占位，比率无意义——用绝对时间比较）
+        if solo == "qsdb" {
+            let mut best = f64::INFINITY;
+            for _ in 0..6 {
+                let t = Instant::now();
+                if f().is_err() {
+                    return (f64::NAN, f64::NAN, f64::NAN, f64::NAN);
+                }
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            return (best, 0.0, 0.0, 0.0);
+        }
+        if solo == "duck" {
+            let mut best = f64::INFINITY;
+            for _ in 0..6 {
+                let t = Instant::now();
+                if g().is_err() {
+                    return (f64::NAN, f64::NAN, f64::NAN, f64::NAN);
+                }
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            return (0.0, best, 0.0, 0.0);
+        }
         const ROUNDS: usize = 5;
         let mut qs: Vec<f64> = Vec::with_capacity(ROUNDS);
         let mut ds: Vec<f64> = Vec::with_capacity(ROUNDS);

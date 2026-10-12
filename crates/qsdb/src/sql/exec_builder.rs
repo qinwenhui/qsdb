@@ -1080,7 +1080,10 @@ fn try_shard_source(
                         Arc::clone(ctx),
                     )
                     .ok()?;
-                let threads = rayon::current_num_threads().clamp(1, 16);
+                // 分片数上限 8：每分片建独立组表，merge 成本 = 组数 × 分片数。
+                // 实测倒 U 型——高基数（89 万组）16 分片比 8 慢 1.6x、比 4 慢 2.3x；
+                // 低基数 8 分片最优。8 是两个场景的稳健折中（后续可做采样自适应）。
+                let threads = rayon::current_num_threads().clamp(1, 8);
                 let shards = scan.shard(threads, false)?;
                 return Some((shards, semis, filters));
             }
@@ -1098,7 +1101,10 @@ fn try_shard_source(
                         Arc::clone(ctx),
                     )
                     .ok()?;
-                let threads = rayon::current_num_threads().clamp(1, 16);
+                // 分片数上限 8：每分片建独立组表，merge 成本 = 组数 × 分片数。
+                // 实测倒 U 型——高基数（89 万组）16 分片比 8 慢 1.6x、比 4 慢 2.3x；
+                // 低基数 8 分片最优。8 是两个场景的稳健折中（后续可做采样自适应）。
+                let threads = rayon::current_num_threads().clamp(1, 8);
                 let shards = scan.shard(threads, false)?;
                 return Some((shards, semis, filters));
             }

@@ -343,10 +343,14 @@ enum SumCol {
 #[derive(Default)]
 
 pub struct GroupTable {
-    by_hash: HashMap<u64, Vec<u32>>,
+    by_hash: HashMap<u64, Vec<u32>, crate::exec::join::BuildI64Hasher>,
     pending_arity: Option<usize>,
     /// Int64 fast path 的持久化开放寻址索引（(hash, gid)；跨批存活）
     fast_slots: Vec<(u64, u32)>,
+    /// 单 Int64 分组列专用：槽内直存键值 (key, gid)——免 key_arena 二次
+    /// 随机访问（高基数下每次命中省一次 cache miss）与每行 key_bytes 构造。
+    /// 与 fast_slots 互斥（按列数选用），merge 后一并清空。
+    fast_slots_inline: Vec<(i64, u32)>,
     // —— 组数据（SoA）——
     /// 全部组 key 的单一 arena（fast 格式定长内联 / 慢路径 tag+bytes 变长）
     key_arena: Vec<u8>,
@@ -383,15 +387,17 @@ impl GroupTable {
     }
 
     /// 追加一个新组（key 入 arena，键 literal 与各聚合列状态按 gid 对齐扩展）。
-    fn push_group(&mut self, key: &[u8], lits: Vec<Literal>) -> u32 {
+    /// 新建组。`lits` 按引用传入——调用方用栈数组（避免每组一次 Vec 堆分配：
+    /// 高基数 89 万组时实测是主要开销）。
+    fn push_group(&mut self, key: &[u8], lits: &[Literal]) -> u32 {
         if self.key_off.is_empty() {
             self.key_off.push(0); // 首组前压起点哨兵
         }
         let gid = self.len() as u32;
         self.key_off.push((self.key_arena.len() + key.len()) as u32);
         self.key_arena.extend_from_slice(key);
-        for (c, l) in self.group_lits.iter_mut().zip(lits) {
-            c.push(l);
+        for (c, l) in self.group_lits.iter_mut().zip(lits.iter()) {
+            c.push(l.clone());
         }
         for c in &mut self.counts {
             c.push(0);
@@ -513,7 +519,7 @@ impl GroupTable {
         }
         // 应用（全局唯一组 gid 0；首批建空键组）
         if self.is_empty() {
-            self.push_group(&[], Vec::new());
+            self.push_group(&[], &[]);
         }
         for (ai, agg) in aggs.iter().enumerate() {
             let arr = arrays[ai].as_deref();
@@ -902,11 +908,82 @@ impl GroupTable {
         Ok(())
     }
 
+    /// 单 Int64 键内联槽探测：槽 = (key, gid)，命中判定只比槽内键，
+    /// 无 key_arena 访问、无每行字节缓冲构造。
+    fn assign_groups_fast_inline(&mut self, col: &Int64Array, out: &mut Vec<u32>) {
+        const EMPTY: u32 = u32::MAX;
+        let n = col.len();
+        if self.fast_slots_inline.is_empty() {
+            let mut cap: usize = 16;
+            while cap < (self.len() + n + 1) * 2 {
+                cap <<= 1;
+            }
+            self.fast_slots_inline = vec![(0, EMPTY); cap];
+            // 已有组回填（merge 后继续 ingest 的组键完整性——M4-1 教训）
+            for gid in 0..self.len() {
+                let k = match self.group_lits.first().and_then(|c| c.get(gid)) {
+                    Some(crate::types::Literal::Int64(v)) => *v,
+                    _ => continue,
+                };
+                let h = crate::exec::agg::fxhash_bytes(&k.to_le_bytes()) | 1;
+                Self::insert_slot_inline(&mut self.fast_slots_inline, h, k, gid as u32);
+            }
+        }
+        for row in 0..n {
+            let k = col.value(row);
+            let h = crate::exec::agg::fxhash_bytes(&k.to_le_bytes()) | 1;
+            let mask = self.fast_slots_inline.len() - 1;
+            let mut idx = (h as usize) & mask;
+            loop {
+                let (sk, sg) = self.fast_slots_inline[idx];
+                if sg == EMPTY {
+                    let gid = self.push_group(&k.to_le_bytes(), &[crate::types::Literal::Int64(k)]);
+                    self.fast_slots_inline[idx] = (k, gid);
+                    if self.len() * 2 >= self.fast_slots_inline.len() {
+                        let mut cap = self.fast_slots_inline.len() * 2;
+                        while cap < (self.len() + 1) * 2 {
+                            cap <<= 1;
+                        }
+                        let old = std::mem::take(&mut self.fast_slots_inline);
+                        self.fast_slots_inline = vec![(0, EMPTY); cap];
+                        for (ok, og) in old {
+                            if og != EMPTY {
+                                let oh = crate::exec::agg::fxhash_bytes(&ok.to_le_bytes()) | 1;
+                                Self::insert_slot_inline(&mut self.fast_slots_inline, oh, ok, og);
+                            }
+                        }
+                    }
+                    out.push(gid);
+                    break;
+                }
+                if sk == k {
+                    out.push(sg);
+                    break;
+                }
+                idx = (idx + 1) & mask;
+            }
+        }
+    }
+
+    fn insert_slot_inline(slots: &mut [(i64, u32)], h: u64, k: i64, gid: u32) {
+        let mask = slots.len() - 1;
+        let mut idx = (h as usize) & mask;
+        while slots[idx].1 != u32::MAX {
+            idx = (idx + 1) & mask;
+        }
+        slots[idx] = (k, gid);
+    }
+
     /// Int64 分组列特化：key = 列值序列直接内联，开放寻址探测。
     ///
     /// 探测表（fast_slots）是 GroupTable 的持久化字段——跨批存活，
     /// 否则每批重建会丢失已建组索引导致组键分裂（M4-1 bug）。
     fn assign_groups_fast(&mut self, cols: &[&Int64Array], out: &mut Vec<u32>) {
+        // 单列 → 内联槽快路径（高基数 group by 的主形态）
+        if cols.len() == 1 {
+            self.assign_groups_fast_inline(cols[0], out);
+            return;
+        }
         const EMPTY: u32 = u32::MAX;
         let n = cols.first().map(|c| c.len()).unwrap_or(0);
         if self.fast_slots.is_empty() {
@@ -937,7 +1014,7 @@ impl GroupTable {
                 if slot.1 == EMPTY {
                     let lits: Vec<Literal> =
                         cols.iter().map(|c| Literal::Int64(c.value(row))).collect();
-                    gid = self.push_group(&key_bytes, lits);
+                    gid = self.push_group(&key_bytes, &lits);
                     self.fast_slots[idx] = (h, gid);
                     // 负载因子 >= 50% 扩容重排
                     if self.len() * 2 >= self.fast_slots.len() {
@@ -989,7 +1066,7 @@ impl GroupTable {
             .iter()
             .map(|a| array_value_to_literal(a, row))
             .collect();
-        let gid = self.push_group(key, lits);
+        let gid = self.push_group(key, &lits);
         self.by_hash.entry(h).or_default().push(gid);
         gid
     }
@@ -1001,6 +1078,7 @@ impl GroupTable {
         if self.is_empty() {
             *self = other;
             self.fast_slots.clear();
+            self.fast_slots_inline.clear();
             return;
         }
         let other_len = other.len();
@@ -1011,14 +1089,21 @@ impl GroupTable {
     /// shard 组分桶，各桶独立合并）。
     pub fn merge_subset(&mut self, other: &GroupTable, ogs: Vec<usize>, agg_count: usize) {
         self.fast_slots.clear();
+        self.fast_slots_inline.clear();
+        // 高基数下本循环是热点（组数 × 分片数）：key/lits 全部缓冲复用，
+        // 免每次跨表合并的两次堆分配（原实现 14M 次 malloc 是主要开销）
+        let mut key_buf: Vec<u8> = Vec::with_capacity(64);
+        let mut lits_buf: Vec<Literal> = Vec::new();
         for og in ogs {
-            let key: Vec<u8> = other.key_of(og).to_vec();
-            let h = fxhash_bytes(&key);
+            key_buf.clear();
+            key_buf.extend_from_slice(other.key_of(og));
+            let key: &[u8] = &key_buf;
+            let h = fxhash_bytes(key);
             let gid = match self.by_hash.get(&h).and_then(|cands| {
                 cands
                     .iter()
                     .copied()
-                    .find(|&g| self.key_of(g as usize) == key.as_slice())
+                    .find(|&g| self.key_of(g as usize) == key)
             }) {
                 Some(g) => g,
                 None => {
@@ -1041,9 +1126,9 @@ impl GroupTable {
                             self.minmax.push(Vec::new());
                         }
                     }
-                    let lits: Vec<Literal> =
-                        other.group_lits.iter().map(|c| c[og].clone()).collect();
-                    let gid = self.push_group(&key, lits);
+                    lits_buf.clear();
+                    lits_buf.extend(other.group_lits.iter().map(|c| c[og].clone()));
+                    let gid = self.push_group(key, &lits_buf);
                     self.by_hash.entry(h).or_default().push(gid);
                     gid
                 }
