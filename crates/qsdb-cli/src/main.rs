@@ -193,12 +193,15 @@ fn main() {
                         std::process::exit(1);
                     }
                 },
-                AdminCmd::UserAdd { name, role, password } => {
-                    let r = qsdb::users::Role::from_name(&role)
-                        .unwrap_or_else(|e| {
-                            eprintln!("error: {e}");
-                            std::process::exit(1);
-                        });
+                AdminCmd::UserAdd {
+                    name,
+                    role,
+                    password,
+                } => {
+                    let r = qsdb::users::Role::from_name(&role).unwrap_or_else(|e| {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    });
                     let pw = match password {
                         Some(p) => p,
                         None => {
@@ -254,18 +257,16 @@ fn main() {
                         }
                     }
                 }
-                AdminCmd::UserExport => {
-                    match qsdb::users::UserStore::export_json(db.store()) {
-                        Ok(json) => {
-                            println!("{json}");
-                            return;
-                        }
-                        Err(e) => {
-                            eprintln!("error: {e}");
-                            std::process::exit(1);
-                        }
+                AdminCmd::UserExport => match qsdb::users::UserStore::export_json(db.store()) {
+                    Ok(json) => {
+                        println!("{json}");
+                        return;
                     }
-                }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                },
                 AdminCmd::UserImport { file, overwrite } => {
                     let json = match file {
                         Some(p) => std::fs::read_to_string(&p).unwrap_or_else(|e| {
@@ -281,8 +282,10 @@ fn main() {
                     };
                     match qsdb::users::UserStore::import_json(db.store(), &json, overwrite) {
                         Ok(n) => {
-                            println!("imported {n} users ({})",
-                                if overwrite { "overwrite" } else { "merge" });
+                            println!(
+                                "imported {n} users ({})",
+                                if overwrite { "overwrite" } else { "merge" }
+                            );
                             return;
                         }
                         Err(e) => {
@@ -291,24 +294,22 @@ fn main() {
                         }
                     }
                 }
-                AdminCmd::UserList => {
-                    match qsdb::users::UserStore::list(db.store()) {
-                        Ok(users) => {
-                            if users.is_empty() {
-                                println!("(no users)");
-                            } else {
-                                for (n, r) in users {
-                                    println!("{n:<20} {}", r.name());
-                                }
+                AdminCmd::UserList => match qsdb::users::UserStore::list(db.store()) {
+                    Ok(users) => {
+                        if users.is_empty() {
+                            println!("(no users)");
+                        } else {
+                            for (n, r) in users {
+                                println!("{n:<20} {}", r.name());
                             }
-                            return;
                         }
-                        Err(e) => {
-                            eprintln!("error: {e}");
-                            std::process::exit(1);
-                        }
+                        return;
                     }
-                }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                },
                 AdminCmd::Gc => match db.gc() {
                     Ok((purged, freed)) => {
                         println!("gc: {purged} entries, {} bytes freed", freed);

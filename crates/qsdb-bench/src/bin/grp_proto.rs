@@ -53,7 +53,7 @@ fn baseline(keys: &[i64], card: usize) -> f64 {
 }
 
 /// 方案 A：按 hash 高比特分桶（计数 → 前缀和 → 散列 → 每桶独立探测）。
-fn partitioned(keys: &[i64], card: usize, p_bits: u32) -> (f64, f64) {
+fn partitioned(keys: &[i64], _card: usize, p_bits: u32) -> (f64, f64) {
     let p = 1usize << p_bits;
     let t0 = Instant::now();
     // ① 计数
@@ -93,8 +93,8 @@ fn partitioned(keys: &[i64], card: usize, p_bits: u32) -> (f64, f64) {
             continue;
         }
         let mask = per_cap - 1;
-        for i in 0..per_cap {
-            slots[i].1 = EMPTY;
+        for s in slots.iter_mut() {
+            s.1 = EMPTY;
         }
         for &k in &buf[lo..hi] {
             let h = fib_hash(k);
@@ -142,8 +142,14 @@ fn main() {
         ref_acc = std::hint::black_box(ref_acc.wrapping_add(t as u64));
         best = best.min(t);
     }
-    println!("基线（单表开放寻址）      {best:.3}s  ({:.1} ns/行)", per_row(best));
-    println!("  表大小 ≈ {} MB（2M 槽 × 16B）\n", card * 2 * 16 / 1_048_576);
+    println!(
+        "基线（单表开放寻址）      {best:.3}s  ({:.1} ns/行)",
+        per_row(best)
+    );
+    println!(
+        "  表大小 ≈ {} MB（2M 槽 × 16B）\n",
+        card * 2 * 16 / 1_048_576
+    );
 
     for p_bits in [1u32, 2, 3, 4, 5] {
         let mut best_s = f64::INFINITY;
@@ -176,7 +182,10 @@ fn main() {
     }
     println!("--- 取值方式对照（同一算法，只换取数方式）---");
     println!("连续 Vec 迭代（原型）     {:.1} ns/行", per_row(best));
-    println!("arrow col.value(row)     {:.1} ns/行   ← 真实路径用法", per_row(b_arrow));
+    println!(
+        "arrow col.value(row)     {:.1} ns/行   ← 真实路径用法",
+        per_row(b_arrow)
+    );
     println!("arrow values() 切片       {:.1} ns/行", per_row(b_slice));
     println!();
 

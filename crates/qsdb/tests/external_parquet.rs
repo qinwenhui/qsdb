@@ -342,9 +342,7 @@ fn f12_hive_directory_semantics() {
     // 不匹配分区 → 0 行（裁剪生效）
     let rows = rows_of(
         &db,
-        &format!(
-            "SELECT count(*) FROM read_parquet('{pat}') WHERE dt = DATE '2025-01-01'"
-        ),
+        &format!("SELECT count(*) FROM read_parquet('{pat}') WHERE dt = DATE '2025-01-01'"),
     );
     // 0 行可能返回空（引擎空输入 count 语义）或 "0"
     assert!(rows.is_empty() || rows[0][0] == "0");

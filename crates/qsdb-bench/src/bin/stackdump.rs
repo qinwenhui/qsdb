@@ -3,18 +3,18 @@
 #[cfg(windows)]
 mod imp {
     use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Diagnostics::Debug::GetThreadContext;
     use windows_sys::Win32::System::Diagnostics::Debug::{
-        StackWalk64, SymFromAddr, SymCleanup, SymInitialize, CONTEXT, STACKFRAME64, SYMBOL_INFO,
+        CONTEXT, STACKFRAME64, SYMBOL_INFO, StackWalk64, SymCleanup, SymFromAddr, SymInitialize,
     };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
     };
     use windows_sys::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_AMD64;
     use windows_sys::Win32::System::Threading::{
         GetCurrentThreadId, OpenProcess, OpenThread, ResumeThread, SuspendThread,
         THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
     };
-    use windows_sys::Win32::System::Diagnostics::Debug::GetThreadContext;
 
     pub fn dump(pid: u32) {
         unsafe {
@@ -82,7 +82,10 @@ mod imp {
                     }
                 }
                 ResumeThread(h);
-                eprintln!("--- thread {tid} {} ---", if tid == cur { "(MAIN)" } else { "" });
+                eprintln!(
+                    "--- thread {tid} {} ---",
+                    if tid == cur { "(MAIN)" } else { "" }
+                );
                 let mut buf = vec![0u8; 4096];
                 for (i, addr) in frames.iter().enumerate() {
                     if *addr == 0 {

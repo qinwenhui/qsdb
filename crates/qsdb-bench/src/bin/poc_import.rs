@@ -39,7 +39,17 @@ fn main() {
             total += b.num_rows();
             db.append(&table, &[b]).expect("append");
         }
-        eprintln!("[poc_import] {} 累计 {} 行 {:?}", f.display(), total, t0.elapsed());
+        eprintln!(
+            "[poc_import] {} 累计 {} 行 {:?}",
+            f.display(),
+            total,
+            t0.elapsed()
+        );
     }
-    println!("[poc_import] 完成：{} ← {} 行（{:?}）", table, total, t0.elapsed());
+    println!(
+        "[poc_import] 完成：{} ← {} 行（{:?}）",
+        table,
+        total,
+        t0.elapsed()
+    );
 }

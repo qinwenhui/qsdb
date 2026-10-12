@@ -316,7 +316,10 @@ fn auth_role(state: &AppState, headers: &HeaderMap) -> Option<qsdb::users::Role>
     // 超级 token（向后兼容：Admin 等效）
     match (&state.token, &auth_header) {
         (Some(expect), Some(h)) => {
-            if h.strip_prefix("Bearer ").map(|t| t == expect.as_str()).unwrap_or(false) {
+            if h.strip_prefix("Bearer ")
+                .map(|t| t == expect.as_str())
+                .unwrap_or(false)
+            {
                 return Some(qsdb::users::Role::Admin);
             }
             None
@@ -338,9 +341,7 @@ fn auth_role(state: &AppState, headers: &HeaderMap) -> Option<qsdb::users::Role>
 
 fn auth_basic(state: &AppState, b64: &str) -> Option<qsdb::users::Role> {
     use base64::Engine;
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .ok()?;
+    let decoded = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
     let text = String::from_utf8(decoded).ok()?;
     let (user, pass) = text.split_once(':')?;
     qsdb::users::UserStore::verify(state.db.store(), user, pass)
@@ -357,8 +358,8 @@ fn auth(state: &AppState, headers: &HeaderMap) -> StatusCode {
 /// 生成随机 token（hex 32 字节）。
 fn new_token() -> String {
     // base64(时间戳 ns + 计数器 + 进程启动随机盐)——足够随机且无新依赖
-    use std::time::Instant;
     use std::sync::atomic::AtomicU64;
+    use std::time::Instant;
     static CTR: AtomicU64 = AtomicU64::new(0);
     static BOOT: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
     let boot = *BOOT.get_or_init(|| {
@@ -371,8 +372,7 @@ fn new_token() -> String {
     let now = Instant::now().elapsed().as_nanos();
     let seed = boot ^ (now << 64) ^ ((c as u128) << 32);
     use base64::Engine;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(seed.to_le_bytes())
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(seed.to_le_bytes())
 }
 
 fn err_response(status: StatusCode, msg: String) -> Response {
@@ -380,10 +380,7 @@ fn err_response(status: StatusCode, msg: String) -> Response {
 }
 
 /// POST /api/v1/auth/login：Basic 认证 → 签发 Bearer token（进程内存态）。
-async fn auth_login(
-    State(s): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+async fn auth_login(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let Some(role) = auth_role(&s, &headers) else {
         return err_response(StatusCode::UNAUTHORIZED, "invalid credentials".into());
     };
@@ -416,10 +413,7 @@ async fn download_file(
         return err_response(StatusCode::UNAUTHORIZED, "unauthorized".into());
     };
     if !role.is_admin() {
-        return err_response(
-            StatusCode::FORBIDDEN,
-            "file download requires admin".into(),
-        );
+        return err_response(StatusCode::FORBIDDEN, "file download requires admin".into());
     }
     // 路径安全检查
     let rel = p.path.replace('\\', "/");
@@ -427,7 +421,10 @@ async fn download_file(
         return err_response(StatusCode::BAD_REQUEST, "invalid path".into());
     }
     if rel.starts_with("_trash/") || rel.starts_with("_filecache/") {
-        return err_response(StatusCode::FORBIDDEN, "internal paths not downloadable".into());
+        return err_response(
+            StatusCode::FORBIDDEN,
+            "internal paths not downloadable".into(),
+        );
     }
     let full = s.db.root().join(&rel);
     let result = tokio::task::spawn_blocking(move || std::fs::read(&full)).await;
@@ -444,14 +441,8 @@ async fn download_file(
             )
                 .into_response()
         }
-        Ok(Err(e)) => err_response(
-            StatusCode::NOT_FOUND,
-            format!("file not found: {e}"),
-        ),
-        Err(e) => err_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("io task: {e}"),
-        ),
+        Ok(Err(e)) => err_response(StatusCode::NOT_FOUND, format!("file not found: {e}")),
+        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, format!("io task: {e}")),
     }
 }
 
@@ -512,9 +503,9 @@ async fn query(
     let sql = body.sql;
     let fmt = body.format.unwrap_or_else(|| "json".into());
     let ctx_exec = Arc::clone(&ctx);
-    let result = tokio::task::spawn_blocking(move || {
-        st.db.sql_with_role_and_context(&sql, role, &ctx_exec)
-    }).await;
+    let result =
+        tokio::task::spawn_blocking(move || st.db.sql_with_role_and_context(&sql, role, &ctx_exec))
+            .await;
     reg.unregister_query(&query_id);
     let elapsed = t.elapsed().as_nanos() as u64;
     s.metrics.observe_query(elapsed);

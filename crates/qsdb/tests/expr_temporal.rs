@@ -1,7 +1,6 @@
 //! M7-B2 日期算术 e2e：DATE±INTEGER / DATE−DATE / date_diff / extract，
 //! 含 F16（temporal × 字符串字面量比较的绑定期提升）。
 
-use arrow::record_batch::RecordBatch;
 use qsdb::{Qsdb, QsdbOptions};
 
 fn db(tag: &str) -> (Qsdb, std::path::PathBuf) {

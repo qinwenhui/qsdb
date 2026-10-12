@@ -81,11 +81,10 @@ fn like_general_and_escape() {
     // 反斜杠无默认转义（Postgres 语义）：'z\\z' 无此行
     assert!(q(&db, "SELECT b FROM t WHERE a LIKE 'z%'") == vec!["4"]);
     // 显式 ESCAPE：字面 % 匹配
-    assert!(
-        db.sql_collect("SELECT b FROM t WHERE a LIKE 'zz!-abc' ESCAPE '!'")
-            .is_err() // 该模式无 % 通配转义发生——应能解析执行
-            == false
-    );
+    // 无通配转义发生——应能正常执行（ESCAPE 语法被正确解析）
+    assert!(db
+        .sql_collect("SELECT b FROM t WHERE a LIKE 'zz!-abc' ESCAPE '!'")
+        .is_ok());
     // 非 ILIKE 大小写敏感
     assert!(q(&db, "SELECT b FROM t WHERE a LIKE 'AX%'") == Vec::<String>::new());
 }
@@ -192,7 +191,7 @@ fn select_without_from() {
     assert!(q(&db, "SELECT CASE WHEN 1 < 2 THEN 'yes' ELSE 'no' END") == vec!["yes"]);
     // current_date = 今天（UTC；2026-10 测试环境下必然 >= 2026-10-12）
     let d = q(&db, "SELECT CURRENT_DATE")[0].clone();
-    assert!(d >= "2026-10-12".to_string(), "got {d}");
+    assert!(d.as_str() >= "2026-10-12", "got {d}");
     // now() 可比较
     assert!(q(&db, "SELECT now() > TIMESTAMP '2020-01-01 00:00:00'") == vec!["true"]);
 }
@@ -462,15 +461,20 @@ fn f18_truncate_unpartitioned() {
     let (db, _r) = db("f18_trunc");
     // 无分区表：list_partitions(depth=0) 返回空 → 原实现空循环后 Ok(0) 却不清数据
     db.sql("CREATE TABLE nop (k BIGINT, v BIGINT)").unwrap();
-    db.sql("INSERT INTO nop VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+    db.sql("INSERT INTO nop VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
     assert!(q(&db, "SELECT count(*) FROM nop") == vec!["3"]);
     db.sql("TRUNCATE TABLE nop").unwrap();
-    assert!(q(&db, "SELECT count(*) FROM nop") == vec!["0"], "无分区表 TRUNCATE 必须清空");
+    assert!(
+        q(&db, "SELECT count(*) FROM nop") == vec!["0"],
+        "无分区表 TRUNCATE 必须清空"
+    );
     // 清空后仍可写
     db.sql("INSERT INTO nop VALUES (4, 40)").unwrap();
     assert!(q(&db, "SELECT count(*) FROM nop") == vec!["1"]);
     // 分区表对照
-    db.sql("CREATE TABLE p (k BIGINT, dp BIGINT) PARTITIONED BY (dp)").unwrap();
+    db.sql("CREATE TABLE p (k BIGINT, dp BIGINT) PARTITIONED BY (dp)")
+        .unwrap();
     db.sql("INSERT INTO p VALUES (1, 1), (2, 2)").unwrap();
     db.sql("TRUNCATE TABLE p").unwrap();
     assert!(q(&db, "SELECT count(*) FROM p") == vec!["0"]);

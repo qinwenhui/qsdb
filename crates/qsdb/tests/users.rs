@@ -23,8 +23,10 @@ fn sql_user_management() {
     db.sql("INSERT INTO t VALUES (1), (2)").unwrap();
 
     // CREATE USER
-    db.sql("CREATE USER alice WITH PASSWORD 'pass123' ROLE admin").unwrap();
-    db.sql("CREATE USER bob WITH PASSWORD 'pass456' ROLE reader").unwrap();
+    db.sql("CREATE USER alice WITH PASSWORD 'pass123' ROLE admin")
+        .unwrap();
+    db.sql("CREATE USER bob WITH PASSWORD 'pass456' ROLE reader")
+        .unwrap();
     db.sql("CREATE USER carol WITH PASSWORD 'pass789'").unwrap(); // 默认 writer
 
     // 重复拒绝
@@ -36,10 +38,10 @@ fn sql_user_management() {
         .iter()
         .flat_map(|b| {
             (0..b.num_rows()).map(|i| {
-                let n = arrow::util::display::array_value_to_string(b.column(0).as_ref(), i)
-                    .unwrap();
-                let r = arrow::util::display::array_value_to_string(b.column(1).as_ref(), i)
-                    .unwrap();
+                let n =
+                    arrow::util::display::array_value_to_string(b.column(0).as_ref(), i).unwrap();
+                let r =
+                    arrow::util::display::array_value_to_string(b.column(1).as_ref(), i).unwrap();
                 format!("{n}|{r}")
             })
         })
@@ -65,9 +67,15 @@ fn sql_user_management() {
     // ALTER USER SET PASSWORD / SET ROLE
     db.sql("ALTER USER bob SET PASSWORD 'new789'").unwrap();
     assert_eq!(UserStore::verify(db.store(), "bob", "pass456"), None);
-    assert_eq!(UserStore::verify(db.store(), "bob", "new789"), Some(Role::Reader));
+    assert_eq!(
+        UserStore::verify(db.store(), "bob", "new789"),
+        Some(Role::Reader)
+    );
     db.sql("ALTER USER bob SET ROLE writer").unwrap();
-    assert_eq!(UserStore::verify(db.store(), "bob", "new789"), Some(Role::Writer));
+    assert_eq!(
+        UserStore::verify(db.store(), "bob", "new789"),
+        Some(Role::Writer)
+    );
 
     // DROP USER
     db.sql("DROP USER carol").unwrap();
@@ -86,24 +94,55 @@ fn role_matrix_gates() {
     UserStore::add(db.store(), "a", "pass3", Role::Admin).unwrap();
 
     // Reader：SELECT/SHOW ✓；INSERT/DDL ✗
-    assert!(db.sql_with_role("SELECT count(*) FROM t", Role::Reader).is_ok());
+    assert!(
+        db.sql_with_role("SELECT count(*) FROM t", Role::Reader)
+            .is_ok()
+    );
     assert!(db.sql_with_role("SHOW USERS", Role::Reader).is_ok());
-    assert!(db.sql_with_role("INSERT INTO t VALUES (1)", Role::Reader).is_err());
-    assert!(db.sql_with_role("CREATE TABLE x (v BIGINT)", Role::Reader).is_err());
+    assert!(
+        db.sql_with_role("INSERT INTO t VALUES (1)", Role::Reader)
+            .is_err()
+    );
+    assert!(
+        db.sql_with_role("CREATE TABLE x (v BIGINT)", Role::Reader)
+            .is_err()
+    );
     assert!(db.sql_with_role("DROP TABLE t", Role::Reader).is_err());
 
     // Writer：SELECT/INSERT ✓；DDL ✗
-    assert!(db.sql_with_role("SELECT count(*) FROM t", Role::Writer).is_ok());
-    assert!(db.sql_with_role("INSERT INTO t VALUES (1)", Role::Writer).is_ok());
-    assert!(db.sql_with_role("CREATE TABLE x (v BIGINT)", Role::Writer).is_err());
-    assert!(db.sql_with_role("CREATE USER u1 WITH PASSWORD 'p1234'", Role::Writer).is_err());
+    assert!(
+        db.sql_with_role("SELECT count(*) FROM t", Role::Writer)
+            .is_ok()
+    );
+    assert!(
+        db.sql_with_role("INSERT INTO t VALUES (1)", Role::Writer)
+            .is_ok()
+    );
+    assert!(
+        db.sql_with_role("CREATE TABLE x (v BIGINT)", Role::Writer)
+            .is_err()
+    );
+    assert!(
+        db.sql_with_role("CREATE USER u1 WITH PASSWORD 'p1234'", Role::Writer)
+            .is_err()
+    );
 
     // Admin：全 ✓
-    assert!(db.sql_with_role("SELECT count(*) FROM t", Role::Admin).is_ok());
-    assert!(db.sql_with_role("INSERT INTO t VALUES (1)", Role::Admin).is_ok());
-    assert!(db.sql_with_role("CREATE TABLE x (v BIGINT)", Role::Admin).is_ok());
     assert!(
-        db.sql_with_role("CREATE USER u1 WITH PASSWORD 'p1234'", Role::Admin).is_ok()
+        db.sql_with_role("SELECT count(*) FROM t", Role::Admin)
+            .is_ok()
+    );
+    assert!(
+        db.sql_with_role("INSERT INTO t VALUES (1)", Role::Admin)
+            .is_ok()
+    );
+    assert!(
+        db.sql_with_role("CREATE TABLE x (v BIGINT)", Role::Admin)
+            .is_ok()
+    );
+    assert!(
+        db.sql_with_role("CREATE USER u1 WITH PASSWORD 'p1234'", Role::Admin)
+            .is_ok()
     );
     std::fs::remove_dir_all(&root).ok();
 }
@@ -124,7 +163,10 @@ fn password_security_basics() {
     // 密码大小写敏感
     UserStore::add(db.store(), "case", "PassWord", Role::Reader).unwrap();
     assert_eq!(UserStore::verify(db.store(), "case", "password"), None);
-    assert_eq!(UserStore::verify(db.store(), "case", "PassWord"), Some(Role::Reader));
+    assert_eq!(
+        UserStore::verify(db.store(), "case", "PassWord"),
+        Some(Role::Reader)
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
