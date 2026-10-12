@@ -141,7 +141,11 @@ fn collect_plan_columns(plan: &LogicalPlan, out: &mut Vec<String>) {
         LogicalPlan::Join { .. } | LogicalPlan::CrossJoinFilter { .. } => {
             // INNER/LEFT 多表计划不走列裁剪下推（build 的 count_scans guard 兜底）
         }
-        LogicalPlan::Values { .. } | LogicalPlan::Window { .. } => {} // 内存/窗口源无需裁剪
+        LogicalPlan::Values { .. } | LogicalPlan::Window { .. } | LogicalPlan::OneRow => {} // 内存/窗口源无需裁剪
+        LogicalPlan::SetOp { left, right, .. } => {
+            collect_plan_columns(left, out);
+            collect_plan_columns(right, out);
+        }
     }
 }
 
@@ -164,6 +168,21 @@ fn collect_expr_columns(e: &PhysExpr, out: &mut Vec<String>) {
         PhysExpr::Not(a) | PhysExpr::IsNull(a, _) => collect_expr_columns(a, out),
         PhysExpr::Cast { e, .. } => collect_expr_columns(e, out),
         PhysExpr::Fn { args, .. } => args.iter().for_each(|a| collect_expr_columns(a, out)),
+        PhysExpr::Case {
+            conds, else_expr, ..
+        } => {
+            for (c, r) in conds {
+                collect_expr_columns(c, out);
+                collect_expr_columns(r, out);
+            }
+            collect_expr_columns(else_expr, out);
+        }
+        PhysExpr::Coalesce(exprs, _) => exprs.iter().for_each(|e| collect_expr_columns(e, out)),
+        PhysExpr::Concat(l, r) => {
+            collect_expr_columns(l, out);
+            collect_expr_columns(r, out);
+        }
+        PhysExpr::Like { e, .. } => collect_expr_columns(e, out),
     }
 }
 
@@ -198,7 +217,9 @@ fn plan_scan_def(plan: &LogicalPlan) -> Option<Arc<crate::catalog::TableDef>> {
         } if join_type.is_semi_family() => plan_scan_def(left),
         LogicalPlan::Join { .. }
         | LogicalPlan::CrossJoinFilter { .. }
-        | LogicalPlan::Values { .. } => None,
+        | LogicalPlan::Values { .. }
+        | LogicalPlan::OneRow
+        | LogicalPlan::SetOp { .. } => None,
         LogicalPlan::Window { input, .. } => plan_scan_def(input),
     }
 }
@@ -296,7 +317,19 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
         },
         LogicalPlan::Join { .. }
         | LogicalPlan::CrossJoinFilter { .. }
-        | LogicalPlan::Values { .. } => plan.clone(),
+        | LogicalPlan::Values { .. }
+        | LogicalPlan::OneRow => plan.clone(),
+        LogicalPlan::SetOp {
+            left,
+            right,
+            op,
+            all: all_flag,
+        } => LogicalPlan::SetOp {
+            left: Box::new(rewrite_plan(left, mapping, all)),
+            right: Box::new(rewrite_plan(right, mapping, all)),
+            op: *op,
+            all: *all_flag,
+        },
         LogicalPlan::Window {
             input,
             partition_by,
@@ -362,6 +395,40 @@ fn rewrite_expr(e: &PhysExpr, mapping: &[Option<usize>], all: &[String]) -> Phys
             name: name.clone(),
             args: args.iter().map(|a| rewrite_expr(a, mapping, all)).collect(),
             ty: ty.clone(),
+        },
+        PhysExpr::Case {
+            conds,
+            else_expr,
+            ty,
+        } => PhysExpr::Case {
+            conds: conds
+                .iter()
+                .map(|(c, r)| (rewrite_expr(c, mapping, all), rewrite_expr(r, mapping, all)))
+                .collect(),
+            else_expr: Box::new(rewrite_expr(else_expr, mapping, all)),
+            ty: ty.clone(),
+        },
+        PhysExpr::Coalesce(exprs, ty) => PhysExpr::Coalesce(
+            exprs
+                .iter()
+                .map(|e| rewrite_expr(e, mapping, all))
+                .collect(),
+            ty.clone(),
+        ),
+        PhysExpr::Concat(l, r) => PhysExpr::Concat(
+            Box::new(rewrite_expr(l, mapping, all)),
+            Box::new(rewrite_expr(r, mapping, all)),
+        ),
+        PhysExpr::Like {
+            e,
+            pattern,
+            negated,
+            ci,
+        } => PhysExpr::Like {
+            e: Box::new(rewrite_expr(e, mapping, all)),
+            pattern: pattern.clone(),
+            negated: *negated,
+            ci: *ci,
         },
     }
 }
@@ -453,6 +520,25 @@ fn build_inner(
                 .unwrap_or_default();
             Ok(Box::new(crate::exec::ValuesExec::new(schema, batches)))
         }
+        LogicalPlan::OneRow => Ok(Box::new(crate::exec::OneRowExec::new())),
+        LogicalPlan::SetOp {
+            left,
+            right,
+            op,
+            all,
+        } => {
+            // 集合操作内含多 Scan：不走列裁剪（build 侧 scan_proj=None 传全列）
+            let l = build_inner(db, left, None, ctx)?;
+            let r = build_inner(db, right, None, ctx)?;
+            let exec = crate::exec::SetOpExec::new(l, r, *op, ctx);
+            match (*op, *all) {
+                // UNION distinct → DistinctExec 包装去重
+                (crate::exec::SetOpKind::Union, false) => {
+                    Ok(Box::new(crate::exec::DistinctExec::new(Box::new(exec))))
+                }
+                _ => Ok(Box::new(exec)),
+            }
+        }
         LogicalPlan::CrossJoinFilter {
             left,
             right,
@@ -528,6 +614,123 @@ fn build_aggregate(
     scan_proj: &Option<Vec<String>>,
     ctx: &Arc<crate::query::QueryContext>,
 ) -> Result<Box<dyn ExecNode>> {
+    // ── count(*) over INNER 等值 JOIN：计数下推（T3 优化）──
+    // 低基数键下 JOIN 输出行数 = Σ左键匹配数，物化代价 n²/keys。
+    // 恒等变换为「右键计数 + 左键累加」→ O(n)、build 侧只物化键列。
+    if group.is_empty()
+        && aggs.len() == 1
+        && matches!(aggs[0].func, crate::expr::AggFunc::Count)
+        && aggs[0].arg.is_none()
+    {
+        if std::env::var("QSDB_JOIN_PROF").is_ok() {
+            eprintln!(
+                "[join-prof] count(*) agg, input = {}",
+                match input {
+                    LogicalPlan::Join { .. } => "Join",
+                    LogicalPlan::Project { .. } => "Project",
+                    LogicalPlan::Filter { .. } => "Filter",
+                    LogicalPlan::Values { .. } => "Values",
+                    LogicalPlan::Scan { .. } => "Scan",
+                    _ => "other",
+                }
+            );
+        }
+        if let LogicalPlan::Join {
+            left,
+            right,
+            left_keys,
+            right_keys,
+            join_type,
+        } = input
+        {
+            // INNER：Σ匹配数；LEFT：Σ max(匹配数, 1)（未匹配行补 NULL 仍计 1）
+            let left_outer = matches!(join_type, crate::exec::join::JoinType::LeftOuter);
+            if !left_outer && !matches!(join_type, crate::exec::join::JoinType::Inner) {
+                // semi/anti 族等不适用（输出语义不同）——交给常规路径
+            } else {
+                // 键列投影：join 只需键列（扫描量 5 列 → 1 列）。
+                // idx 两层转换：① right_keys 全局序 → 右表序（减左表**全**宽）
+                // ② 两侧全表序 → 投影序（rewrite_expr，仅纯 Scan 无谓词时生效）。
+                // 左表**原始**输出宽度（不限 Scan——CTE/派生表/Join 左侧同样适用）
+                let l_full = crate::sql::translate::plan_output_columns(left)?.len();
+                let r_local: Vec<PhysExpr> = right_keys
+                    .iter()
+                    .map(|k| match k {
+                        PhysExpr::Column { idx, name, ty } => PhysExpr::Column {
+                            idx: idx.saturating_sub(l_full),
+                            name: name.clone(),
+                            ty: ty.clone(),
+                        },
+                        other => other.clone(),
+                    })
+                    .collect();
+                // 纯 Scan 无谓词 → 键列投影（否则回退全列）
+                let project =
+                    |pl: &LogicalPlan,
+                     keys: &[PhysExpr]|
+                     -> (LogicalPlan, Vec<PhysExpr>, Option<Vec<String>>) {
+                        let LogicalPlan::Scan {
+                            def,
+                            predicate: None,
+                        } = pl
+                        else {
+                            return (pl.clone(), keys.to_vec(), None);
+                        };
+                        let all: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
+                        let mut cols: Vec<String> = Vec::new();
+                        for k in keys {
+                            let mut raw: Vec<String> = Vec::new();
+                            collect_expr_columns(k, &mut raw);
+                            for n in raw {
+                                // 去表限定（`rr.k` → `k`）：def.columns 存非限定名
+                                let unq = n.rsplit('.').next().unwrap_or(&n).to_string();
+                                if !cols.iter().any(|c| c.eq_ignore_ascii_case(&unq)) {
+                                    cols.push(unq);
+                                }
+                            }
+                        }
+                        // 分区列必须保留（Scan 从目录重建）
+                        for pk in &def.partition_keys {
+                            if !cols.iter().any(|c| c.eq_ignore_ascii_case(pk)) {
+                                cols.push(pk.clone());
+                            }
+                        }
+                        if std::env::var("QSDB_JOIN_PROF").is_ok() {
+                            eprintln!(
+                                "[join-prof] scan all={} keycols={:?} project={}",
+                                all.len(),
+                                cols,
+                                cols.len() < all.len()
+                            );
+                        }
+                        if cols.len() >= all.len() {
+                            return (pl.clone(), keys.to_vec(), None);
+                        }
+                        let mapping = build_mapping(&all, &cols);
+                        let lp = rewrite_plan(pl, &mapping, &all);
+                        let k2: Vec<PhysExpr> = keys
+                            .iter()
+                            .map(|k| rewrite_expr(k, &mapping, &all))
+                            .collect();
+                        (lp, k2, Some(cols))
+                    };
+                let (lp, lkeys2, lproj) = project(left, left_keys);
+                let (rp, rkeys2, rproj) = project(right, &r_local);
+                let probe = build_inner(db, &lp, lproj, ctx)?;
+                let build = build_inner(db, &rp, rproj, ctx)?;
+                let left_width = probe.schema().fields().len();
+                let _ = left_width; // 投影已含 idx 转换，此处不再减宽
+                return Ok(Box::new(crate::exec::join::JoinCountExec::new(
+                    probe,
+                    build,
+                    lkeys2,
+                    rkeys2,
+                    left_outer,
+                    Arc::clone(ctx),
+                )));
+            }
+        }
+    }
     if aggs
         .iter()
         .any(|a| matches!(a.func, crate::expr::AggFunc::Udaf))

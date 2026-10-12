@@ -5,7 +5,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Decimal128Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, StringArray,
 };
 use arrow::compute::kernels::cmp;
 use arrow::compute::kernels::numeric;
@@ -63,19 +64,96 @@ pub fn eval_mask(expr: &PhysExpr, batch: &RecordBatch) -> Result<BooleanArray> {
             expr.data_type()
         )));
     }
-    let v = eval_val(expr, batch)?;
-    let arr = match v {
-        EvalVal::Arr(a) => a,
-        EvalVal::Const(one) => {
-            let indices: Vec<(usize, usize)> = vec![(0, 0); batch.num_rows()];
-            arrow::compute::interleave(&[one.as_ref()], &indices)
-                .map_err(|e| QsdbError::invalid(format!("broadcast const failed: {e}")))?
-        }
-    };
+    let arr = eval_to_n(expr, batch, batch.num_rows())?;
     arr.as_any()
         .downcast_ref::<BooleanArray>()
         .cloned()
         .ok_or_else(|| QsdbError::type_err("expression did not evaluate to boolean"))
+}
+
+/// CASE 向量化求值：布尔掩码从后往前覆盖（首个真条件的值存活——
+/// 后覆盖者只会落在先前为 false/NULL 的行上，语义 = 按序短路）。
+fn eval_case(
+    conds: &[(PhysExpr, PhysExpr)],
+    else_expr: &PhysExpr,
+    batch: &RecordBatch,
+) -> Result<ArrayRef> {
+    let n = batch.num_rows();
+    let mut current = eval_to_n(else_expr, batch, n)?;
+    for (cond, result) in conds.iter().rev() {
+        let mask = eval_mask(cond, batch)?;
+        let result_arr = eval_to_n(result, batch, n)?;
+        current = select_arrays(&mask, &result_arr, &current)?;
+    }
+    Ok(current)
+}
+
+fn broadcast_const(one: &ArrayRef, n: usize) -> Result<ArrayRef> {
+    let indices: Vec<(usize, usize)> = vec![(0, 0); n];
+    arrow::compute::interleave(&[one.as_ref()], &indices)
+        .map_err(|e| QsdbError::invalid(format!("broadcast const failed: {e}")))
+}
+
+/// 求值并对齐到 n 行（Const / 常量折叠后的 1 行 Arr → 广播；
+/// 其余长度不符报错——防静默错位）。
+fn eval_to_n(expr: &PhysExpr, batch: &RecordBatch, n: usize) -> Result<ArrayRef> {
+    match eval_val(expr, batch)? {
+        EvalVal::Const(one) => broadcast_const(&one, n),
+        EvalVal::Arr(a) if a.len() == n => Ok(a),
+        EvalVal::Arr(a) if a.len() == 1 => broadcast_const(&a, n),
+        EvalVal::Arr(a) => Err(QsdbError::invalid(format!(
+            "expression length {} != batch rows {n}",
+            a.len()
+        ))),
+    }
+}
+
+/// 布尔掩码选择：mask=true 取 a，false/NULL 取 b（arrow zip kernel 向量化）。
+fn select_arrays(mask: &BooleanArray, a: &ArrayRef, b: &ArrayRef) -> Result<ArrayRef> {
+    arrow::compute::kernels::zip::zip(mask, a, b)
+        .map_err(|e| QsdbError::invalid(format!("select failed: {e}")))
+}
+
+/// COALESCE 向量化：按序从后往前覆盖非 NULL 位置。
+fn eval_coalesce(exprs: &[PhysExpr], batch: &RecordBatch) -> Result<ArrayRef> {
+    let n = batch.num_rows();
+    let mut current = arrow::array::new_null_array(&exprs[0].data_type().arrow_type(), n);
+    for e in exprs.iter().rev() {
+        let arr = eval_to_n(e, batch, n)?;
+        let non_null = arrow::compute::is_not_null(&arr)
+            .map_err(|er| QsdbError::invalid(format!("is_not_null failed: {er}")))?;
+        current = select_arrays(&non_null, &arr, &current)?;
+    }
+    Ok(current)
+}
+
+/// 字符串拼接 ||：NULL || x = NULL（SQL 语义）。
+/// StringBuilder 单缓冲复用——无每行堆分配。
+fn eval_concat(l: &PhysExpr, r: &PhysExpr, batch: &RecordBatch) -> Result<ArrayRef> {
+    let n = batch.num_rows();
+    let la = eval_to_n(l, batch, n)?;
+    let ra = eval_to_n(r, batch, n)?;
+    let ls = la
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| QsdbError::type_err("|| left not Utf8"))?;
+    let rs = ra
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| QsdbError::type_err("|| right not Utf8"))?;
+    let mut b = arrow::array::StringBuilder::new();
+    use std::fmt::Write as _;
+    for i in 0..ls.len() {
+        if ls.is_null(i) || rs.is_null(i) {
+            b.append_null();
+        } else {
+            // 两段直写 builder 缓冲（fmt::Write 追加不收值），append_value("") 收值
+            b.write_str(ls.value(i)).ok();
+            b.write_str(rs.value(i)).ok();
+            b.append_value("");
+        }
+    }
+    Ok(Arc::new(b.finish()))
 }
 
 fn eval_val(expr: &PhysExpr, batch: &RecordBatch) -> Result<EvalVal> {
@@ -87,6 +165,10 @@ fn eval_val(expr: &PhysExpr, batch: &RecordBatch) -> Result<EvalVal> {
             let rv = eval_val(r, batch)?;
             if matches!(ty, LogicalType::Decimal(_)) {
                 decimal_arith(*op, &lv, &rv, ty)
+            } else if matches!(l.data_type(), LogicalType::Date)
+                || matches!(r.data_type(), LogicalType::Date)
+            {
+                date_arith(*op, &lv, &rv)
             } else {
                 let arr = arith_arrow(*op, &lv, &rv)?;
                 // 两标量入 → 单行结果保持 Const 语义（避免上层按非标量定长比较）
@@ -143,6 +225,14 @@ fn eval_val(expr: &PhysExpr, batch: &RecordBatch) -> Result<EvalVal> {
             let target = ty.arrow_type();
             match v {
                 EvalVal::Const(one) => {
+                    // NULL 字面量兜底类型是 Boolean，arrow 无 Boolean→数值 cast；
+                    // 全 NULL 短路（NULL cast 恒 NULL，语义等价）
+                    if one.null_count() == one.len() {
+                        return Ok(EvalVal::Const(arrow::array::new_null_array(
+                            &target,
+                            one.len(),
+                        )));
+                    }
                     // 常量转换后仍是常量（1 行）
                     let casted = cast_with_options(one.as_ref(), &target, &CastOptions::default())
                         .map_err(|err| {
@@ -153,7 +243,9 @@ fn eval_val(expr: &PhysExpr, batch: &RecordBatch) -> Result<EvalVal> {
                         })?;
                     Ok(EvalVal::Const(casted))
                 }
-                EvalVal::Arr(a) => Ok(EvalVal::Arr(
+                EvalVal::Arr(a) => Ok(EvalVal::Arr(if a.null_count() == a.len() {
+                    arrow::array::new_null_array(&target, a.len())
+                } else {
                     cast_with_options(a.as_ref(), &target, &CastOptions::default()).map_err(
                         |err| {
                             QsdbError::type_err(format!(
@@ -161,9 +253,37 @@ fn eval_val(expr: &PhysExpr, batch: &RecordBatch) -> Result<EvalVal> {
                                 e.display()
                             ))
                         },
-                    )?,
-                )),
+                    )?
+                })),
             }
+        }
+        PhysExpr::Case {
+            conds, else_expr, ..
+        } => Ok(EvalVal::Arr(eval_case(conds, else_expr, batch)?)),
+        PhysExpr::Coalesce(exprs, _) => Ok(EvalVal::Arr(eval_coalesce(exprs, batch)?)),
+        PhysExpr::Concat(l, r) => Ok(EvalVal::Arr(eval_concat(l, r, batch)?)),
+        PhysExpr::Like {
+            e,
+            pattern,
+            negated,
+            ci,
+        } => {
+            // NULL LIKE x → NULL（三值；Filter 掩码 null 按 false 处理）
+            let arr = eval_to_n(e, batch, batch.num_rows())?;
+            let s = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QsdbError::type_err("LIKE requires string operand"))?;
+            let mut b = arrow::array::BooleanBuilder::with_capacity(s.len());
+            for i in 0..s.len() {
+                if s.is_null(i) {
+                    b.append_null();
+                } else {
+                    let m = pattern.matches(s.value(i), *ci);
+                    b.append_value(if *negated { !m } else { m });
+                }
+            }
+            Ok(EvalVal::Arr(Arc::new(b.finish())))
         }
         PhysExpr::Fn { name, args, .. } => {
             let def = super::scalar::lookup(name)?;
@@ -311,7 +431,10 @@ fn decimal_arith(op: ArithOp, l: &EvalVal, r: &EvalVal, ty: &LogicalType) -> Res
                 let q = scaled / b; // b != 0 已检查
                 q
             }
-            ArithOp::Mod => return Err(QsdbError::unsupported("decimal % operator")),
+            ArithOp::Mod => {
+                // 余数符号随被除数；两侧对齐到结果 scale 后取模
+                align_scale(a, lsa, rs)? % align_scale(b, lsb, rs)?
+            }
         };
         let _ = lpa;
         let Some(i128v) = v.to_i128() else {
@@ -397,6 +520,177 @@ fn rescale_i256(v: I256, from: i32, to: i32) -> Result<I256> {
             q
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// 日期算术：DATE ± INTEGER（天）/ DATE - DATE（天数）
+// ---------------------------------------------------------------------------
+
+/// 日期算术（binder 保证一侧 DATE、int 侧 Int64）：i64 中间量防 i32 溢出。
+fn date_arith(op: ArithOp, l: &EvalVal, r: &EvalVal) -> Result<EvalVal> {
+    let n = l.len_hint().max(r.len_hint());
+    let la = match l {
+        EvalVal::Arr(a) => Arc::clone(a),
+        EvalVal::Const(one) => materialize_const(one, n)?,
+    };
+    let ra = match r {
+        EvalVal::Arr(a) => Arc::clone(a),
+        EvalVal::Const(one) => materialize_const(one, n)?,
+    };
+    let ld = la.as_any().downcast_ref::<Date32Array>();
+    let rd = ra.as_any().downcast_ref::<Date32Array>();
+
+    // DATE − DATE → 天数（Int64）
+    if let (Some(l), Some(r)) = (ld, rd) {
+        if !matches!(op, ArithOp::Sub) {
+            return Err(QsdbError::type_err("DATE + DATE is not defined"));
+        }
+        let mut out: Vec<Option<i64>> = Vec::with_capacity(n);
+        for i in 0..n {
+            if l.is_null(i) || r.is_null(i) {
+                out.push(None);
+            } else {
+                out.push(Some(i64::from(l.value(i)) - i64::from(r.value(i))));
+            }
+        }
+        return Ok(EvalVal::Arr(Arc::new(Int64Array::from(out))));
+    }
+
+    // DATE ± INTEGER → DATE（Add 双侧可换；Sub 仅 Date−Int）
+    let bad = || QsdbError::type_err("date arithmetic expects DATE and INTEGER operands");
+    let (da, ia, int_first) = match (ld, rd) {
+        (Some(d), None) => (
+            d,
+            ra.as_any().downcast_ref::<Int64Array>().ok_or_else(bad)?,
+            false,
+        ),
+        (None, Some(d)) => (
+            d,
+            la.as_any().downcast_ref::<Int64Array>().ok_or_else(bad)?,
+            true,
+        ),
+        _ => return Err(bad()),
+    };
+    if int_first && matches!(op, ArithOp::Sub) {
+        return Err(QsdbError::type_err("INTEGER - DATE is not defined"));
+    }
+    let mut out: Vec<Option<i32>> = Vec::with_capacity(n);
+    for i in 0..n {
+        if da.is_null(i) || ia.is_null(i) {
+            out.push(None);
+            continue;
+        }
+        let d = i64::from(da.value(i));
+        let k = ia.value(i);
+        let v = match op {
+            ArithOp::Add => d + k,
+            _ => d - k, // Sub（其余运算 binder 已拒）
+        };
+        let Some(v32) = i32::try_from(v).ok() else {
+            return Err(QsdbError::type_err("date arithmetic overflow"));
+        };
+        out.push(Some(v32));
+    }
+    Ok(EvalVal::Arr(Arc::new(Date32Array::from(out))))
+}
+
+// ---------------------------------------------------------------------------
+// DECIMAL 标量数值函数（abs / round / floor / ceil）
+// ---------------------------------------------------------------------------
+
+/// 取整方向（round=HALF_UP 远离零；floor/ceil=向 ±∞）。
+#[derive(Clone, Copy)]
+pub(crate) enum RoundDir {
+    HalfUp,
+    Floor,
+    Ceil,
+}
+
+/// decimal abs：scale 不变（i128 原生；i128::MIN 溢出即报错——
+/// 其绝对值超出 38 位精度，DECIMAL 域内不可表示）。
+pub(crate) fn decimal_abs(arr: &ArrayRef) -> Result<ArrayRef> {
+    let d = arr
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .ok_or_else(|| QsdbError::type_err("abs: arg is not decimal"))?;
+    let (s, p) = decimal_meta_of(d.data_type());
+    let meta = crate::types::DecimalMeta::new(p, s);
+    let mut out: Vec<Option<i128>> = Vec::with_capacity(d.len());
+    for i in 0..d.len() {
+        match d.is_null(i) {
+            true => out.push(None),
+            false => {
+                let v = d
+                    .value(i)
+                    .checked_abs()
+                    .filter(|v| meta.fits(*v))
+                    .ok_or_else(|| QsdbError::type_err(format!("abs overflows {meta}")))?;
+                out.push(Some(v));
+            }
+        }
+    }
+    Ok(Arc::new(
+        Decimal128Array::from(out).with_data_type(DataType::Decimal128(p, s)),
+    ))
+}
+
+/// decimal 定点取整：在 digit 位取整后放大回原 scale（类型不变）。
+/// digits >= scale 时零拷贝返回原数组。i128 原生除法
+///（10^38 ≤ i128 域；|q·pw| ≤ |v| + pw，checked 兜底极端值）。
+pub(crate) fn decimal_round_dir(arr: &ArrayRef, digits: i64, dir: RoundDir) -> Result<ArrayRef> {
+    let d = arr
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .ok_or_else(|| QsdbError::type_err("round: arg is not decimal"))?;
+    let (s, p) = decimal_meta_of(d.data_type());
+    if digits >= i64::from(s) {
+        return Ok(Arc::clone(arr)); // 已在该精度内，无需取整
+    }
+    let di = digits.clamp(-38, 38) as i32; // |digits|>38 时结果恒 0，钳制不失语义
+    let k = (i32::from(s) - di).clamp(0, 38) as u32; // 缩小位数（≤ 38：pow10 表界）
+    let pw = decimal::pow10(k); // 10^38 < i128::MAX
+    let half = (pw + 1) / 2; // HALF_UP 阈值（无溢出形式：2|rem| >= pw ⟺ |rem| >= half）
+    let mut out: Vec<Option<i128>> = Vec::with_capacity(d.len());
+    for i in 0..d.len() {
+        if d.is_null(i) {
+            out.push(None);
+            continue;
+        }
+        let v = d.value(i);
+        let q = v / pw; // Rust 除法向零截断
+        let rem = v % pw;
+        // 方向修正：HALF_UP 远离零 / floor 向 -∞ / ceil 向 +∞
+        let q = match dir {
+            RoundDir::HalfUp => {
+                if rem.abs() >= half && rem != 0 {
+                    if v >= 0 { q + 1 } else { q - 1 }
+                } else {
+                    q
+                }
+            }
+            RoundDir::Floor => {
+                if v < 0 && rem != 0 {
+                    q - 1
+                } else {
+                    q
+                }
+            }
+            RoundDir::Ceil => {
+                if v > 0 && rem != 0 {
+                    q + 1
+                } else {
+                    q
+                }
+            }
+        };
+        let Some(r) = q.checked_mul(pw) else {
+            return Err(QsdbError::type_err("decimal round overflow"));
+        };
+        out.push(Some(r));
+    }
+    Ok(Arc::new(
+        Decimal128Array::from(out).with_data_type(DataType::Decimal128(p, s)),
+    ))
 }
 
 // ---------------------------------------------------------------------------

@@ -176,6 +176,333 @@ impl ExecNode for ValuesExec {
     }
 }
 
+/// 单行零列源（无 FROM SELECT：`SELECT 1+1` / `SELECT CURRENT_DATE`）。
+pub struct OneRowExec {
+    schema: SchemaRef,
+    done: bool,
+}
+
+impl OneRowExec {
+    pub fn new() -> Self {
+        Self {
+            schema: Arc::new(arrow::datatypes::Schema::empty()),
+            done: false,
+        }
+    }
+}
+
+impl Default for OneRowExec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExecNode for OneRowExec {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+    fn next(&mut self) -> Option<Result<RecordBatch>> {
+        if self.done {
+            return None;
+        }
+        self.done = true;
+        let opts = arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(1));
+        Some(
+            RecordBatch::try_new_with_options(Arc::clone(&self.schema), vec![], &opts)
+                .map_err(|e| QsdbError::invalid(format!("one-row batch: {e}"))),
+        )
+    }
+}
+
+/// 集合操作类型（LogicalPlan::SetOp 携带）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SetOpKind {
+    Union,
+    Intersect,
+    Except,
+}
+
+/// 右表行键集合：单整数域列（Int/Date/Boolean/Timestamp 等）免编码
+/// i64 快路径（semi-join 同款偏门），其余走字节编码。
+enum SetKeys {
+    I64 {
+        set: std::collections::HashSet<i64>,
+        has_null: bool,
+    },
+    Bytes(std::collections::HashSet<Vec<u8>>),
+}
+
+/// 单列 → i64（null → None）。非整数域列返回 None（走 Bytes 路径）。
+fn single_col_i64(batch: &RecordBatch) -> Option<Box<dyn Fn(usize) -> Option<i64> + '_>> {
+    if batch.num_columns() != 1 {
+        return None;
+    }
+    let col = batch.column(0);
+    macro_rules! prim {
+        ($ty:ty, $f:ident) => {{
+            let arr = col.as_any().downcast_ref::<$ty>()?;
+            let f = move |i: usize| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i) as i64)
+                }
+            };
+            Some(Box::new(f) as Box<dyn Fn(usize) -> Option<i64> + '_>)
+        }};
+    }
+    use arrow::datatypes::DataType as D;
+    match col.data_type() {
+        D::Int8 => prim!(arrow::array::Int8Array, v8),
+        D::Int16 => prim!(arrow::array::Int16Array, v16),
+        D::Int32 | D::Date32 => prim!(arrow::array::Int32Array, v32),
+        D::Int64 | D::Timestamp(_, _) | D::Time64(_) => prim!(arrow::array::Int64Array, v64),
+        D::Boolean => {
+            let arr = col.as_any().downcast_ref::<arrow::array::BooleanArray>()?;
+            let f = move |i: usize| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i) as i64)
+                }
+            };
+            Some(Box::new(f))
+        }
+        _ => None,
+    }
+}
+
+/// 集合操作执行：UNION 左右直连（去重由上层 DistinctExec 包装）；
+/// INTERSECT/EXCEPT = 右表行键存在集探测左表 + 内联去重（DISTINCT 语义；
+/// NULL 在集合操作中视为相等）。单整数列走 i64 免编码快路径。
+pub struct SetOpExec {
+    left: Box<dyn ExecNode>,
+    right: Box<dyn ExecNode>,
+    op: SetOpKind,
+    schema: SchemaRef,
+    /// None = 右表集合未构建（首条前完成）
+    right_set: Option<SetKeys>,
+    emitted: std::collections::HashSet<Vec<u8>>,
+    emitted_i64: std::collections::HashSet<i64>,
+    emitted_null: bool,
+    buf: Vec<u8>,
+    ctx: std::sync::Arc<crate::query::QueryContext>,
+}
+
+impl SetOpExec {
+    pub fn new(
+        left: Box<dyn ExecNode>,
+        right: Box<dyn ExecNode>,
+        op: SetOpKind,
+        ctx: &std::sync::Arc<crate::query::QueryContext>,
+    ) -> Self {
+        let schema = left.schema();
+        Self {
+            left,
+            right,
+            op,
+            schema,
+            right_set: None,
+            emitted: std::collections::HashSet::new(),
+            emitted_i64: std::collections::HashSet::new(),
+            emitted_null: false,
+            buf: Vec::new(),
+            ctx: Arc::clone(ctx),
+        }
+    }
+
+    fn row_key(batch: &RecordBatch, row: usize, buf: &mut Vec<u8>) -> Vec<u8> {
+        buf.clear();
+        join::encode_join_key(batch.columns(), row, buf);
+        buf.clone()
+    }
+
+    /// 右表全量构建行键集合（首个 next 前调用）。
+    fn build_right_set(&mut self) -> Result<()> {
+        // schema 判定 i64/Bytes 路径（两侧已归一，批间形态一致）
+        let use_i64 = {
+            // 借右表 schema 判定（schema 与批同构）
+            let rs = self.right.schema();
+            let fields = rs.fields();
+            fields.len() == 1 && {
+                use arrow::datatypes::DataType as D;
+                matches!(
+                    fields[0].data_type(),
+                    D::Int8
+                        | D::Int16
+                        | D::Int32
+                        | D::Int64
+                        | D::Date32
+                        | D::Boolean
+                        | D::Timestamp(_, _)
+                        | D::Time64(_)
+                )
+            }
+        };
+        if use_i64 {
+            let mut set = std::collections::HashSet::new();
+            let mut has_null = false;
+            let mut feed = |b: RecordBatch| -> Result<()> {
+                self.ctx.check()?;
+                let col = b.column(0);
+                let mut visit = |v: Option<i64>| match v {
+                    Some(v) => {
+                        set.insert(v);
+                    }
+                    None => has_null = true,
+                };
+                macro_rules! prim {
+                    ($ty:ty) => {{
+                        let arr = col
+                            .as_any()
+                            .downcast_ref::<$ty>()
+                            .ok_or_else(|| QsdbError::type_err("set op: bad i64 column"))?;
+                        for i in 0..arr.len() {
+                            visit(if arr.is_null(i) {
+                                None
+                            } else {
+                                Some(arr.value(i) as i64)
+                            });
+                        }
+                    }};
+                }
+                use arrow::datatypes::DataType as D;
+                match col.data_type() {
+                    D::Int8 => prim!(arrow::array::Int8Array),
+                    D::Int16 => prim!(arrow::array::Int16Array),
+                    D::Int32 | D::Date32 => prim!(arrow::array::Int32Array),
+                    D::Int64 | D::Timestamp(_, _) | D::Time64(_) => prim!(arrow::array::Int64Array),
+                    D::Boolean => {
+                        let arr = col
+                            .as_any()
+                            .downcast_ref::<arrow::array::BooleanArray>()
+                            .ok_or_else(|| QsdbError::type_err("set op: bad boolean"))?;
+                        for i in 0..arr.len() {
+                            visit(if arr.is_null(i) {
+                                None
+                            } else {
+                                Some(arr.value(i) as i64)
+                            });
+                        }
+                    }
+                    _ => return Err(QsdbError::type_err("set op: unsupported i64 column")),
+                }
+                Ok(())
+            };
+            while let Some(nb) = self.right.next() {
+                feed(nb?)?;
+            }
+            self.right_set = Some(SetKeys::I64 { set, has_null });
+            return Ok(());
+        }
+        let mut set = std::collections::HashSet::new();
+        let mut feed = |b: &RecordBatch, buf: &mut Vec<u8>| -> Result<()> {
+            self.ctx.check()?;
+            for row in 0..b.num_rows() {
+                buf.clear();
+                join::encode_join_key(b.columns(), row, buf);
+                set.insert(buf.clone());
+            }
+            Ok(())
+        };
+        while let Some(nb) = self.right.next() {
+            let b = nb?;
+            feed(&b, &mut self.buf)?;
+        }
+        self.right_set = Some(SetKeys::Bytes(set));
+        Ok(())
+    }
+}
+
+impl ExecNode for SetOpExec {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+    fn next(&mut self) -> Option<Result<RecordBatch>> {
+        if self.op == SetOpKind::Union {
+            // 左流尽接右（拉式：每次先取左，None 后转右）
+            if let Some(b) = self.left.next() {
+                return Some(b);
+            }
+            return self.right.next();
+        }
+        // INTERSECT / EXCEPT：首轮构建右表行键集合
+        if self.right_set.is_none() {
+            if let Err(e) = self.build_right_set() {
+                return Some(Err(e));
+            }
+        }
+        // 流式探测左表。INTERSECT 的去重与存在集合一：命中即移除
+        //（set.remove 一个哈希操作替代 contains+去重 insert 两个，天然 emit-once）；
+        // EXCEPT 保留独立 emitted 集。
+        while let Some(b) = self.left.next() {
+            let batch = match b {
+                Ok(x) => x,
+                Err(e) => return Some(Err(e)),
+            };
+            if let Err(e) = self.ctx.check() {
+                return Some(Err(e));
+            }
+            let mut mask = arrow::array::BooleanBuilder::with_capacity(batch.num_rows());
+            let mut all_true = true;
+            match self.right_set.as_mut().unwrap() {
+                // i64 快路径：单整数列免编码探测
+                SetKeys::I64 { set, has_null } => {
+                    if let Some(val) = single_col_i64(&batch) {
+                        for row in 0..batch.num_rows() {
+                            let keep = match val(row) {
+                                Some(v) => match self.op {
+                                    // 命中即移除：去重与探测合一
+                                    SetOpKind::Intersect => set.remove(&v),
+                                    _ => !set.contains(&v) && self.emitted_i64.insert(v),
+                                },
+                                None => match self.op {
+                                    SetOpKind::Intersect => std::mem::replace(has_null, false),
+                                    _ => {
+                                        !*has_null
+                                            && !std::mem::replace(&mut self.emitted_null, true)
+                                    }
+                                },
+                            };
+                            mask.append_value(keep);
+                            all_true &= keep;
+                        }
+                    } else {
+                        return Some(Err(QsdbError::type_err(
+                            "set op: left/right column shape mismatch",
+                        )));
+                    }
+                }
+                SetKeys::Bytes(set) => {
+                    for row in 0..batch.num_rows() {
+                        let key = Self::row_key(&batch, row, &mut self.buf);
+                        let keep = match self.op {
+                            SetOpKind::Intersect => set.remove(&key),
+                            _ => !set.contains(&key) && self.emitted.insert(key),
+                        };
+                        mask.append_value(keep);
+                        all_true &= keep;
+                    }
+                }
+            }
+            if all_true {
+                // 全真：零拷贝直通
+                return Some(Ok(batch));
+            }
+            let mask = mask.finish();
+            if mask.false_count() == batch.num_rows() {
+                continue; // 全假：跳批
+            }
+            let out = match filter_record_batch(&batch, &mask) {
+                Ok(o) => o,
+                Err(e) => return Some(Err(QsdbError::invalid(format!("set op filter: {e}")))),
+            };
+            return Some(Ok(out));
+        }
+        None
+    }
+}
+
 /// LIMIT。
 pub struct LimitExec {
     pub input: Box<dyn ExecNode>,

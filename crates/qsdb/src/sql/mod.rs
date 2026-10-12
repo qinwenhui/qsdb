@@ -64,17 +64,34 @@ pub fn check_role_permission(
     };
     match stmt {
         // 只读：任意角色
-        PS::Select(_) | PS::Describe { .. } | PS::ShowTables | PS::ShowPartitions { .. }
+        PS::Select(_)
+        | PS::Describe { .. }
+        | PS::ShowTables
+        | PS::ShowPartitions { .. }
         | PS::ShowUsers => Ok(()),
         // 写：Writer 及以上
         PS::Insert { .. } | PS::Delete { .. } => {
-            if role.can_write() { Ok(()) } else { deny("write operations") }
+            if role.can_write() {
+                Ok(())
+            } else {
+                deny("write operations")
+            }
         }
         // DDL + 运维 + 用户管理：Admin
-        PS::CreateTable { .. } | PS::DropTable { .. } | PS::AlterAddColumn { .. }
-        | PS::Truncate { .. } | PS::CreateUser { .. } | PS::DropUser { .. }
+        PS::CreateTable { .. }
+        | PS::DropTable { .. }
+        | PS::AlterAddColumn { .. }
+        | PS::CreateView { .. }
+        | PS::DropView { .. }
+        | PS::Truncate { .. }
+        | PS::CreateUser { .. }
+        | PS::DropUser { .. }
         | PS::AlterUser { .. } => {
-            if role.is_admin() { Ok(()) } else { deny("DDL/admin operations") }
+            if role.is_admin() {
+                Ok(())
+            } else {
+                deny("DDL/admin operations")
+            }
         }
     }
 }
@@ -214,23 +231,37 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
                         users.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
                     )),
                     Arc::new(StringArray::from(
-                        users.iter().map(|(_, r)| r.name().to_string()).collect::<Vec<_>>(),
+                        users
+                            .iter()
+                            .map(|(_, r)| r.name().to_string())
+                            .collect::<Vec<_>>(),
                     )),
                 ],
             )
             .map_err(|e| QsdbError::invalid(format!("show users output: {e}")))?;
-            Ok(SqlResult::Query { schema, batches: vec![batch] })
+            Ok(SqlResult::Query {
+                schema,
+                batches: vec![batch],
+            })
         }
-        translate::ParsedStatement::CreateUser { name, password, role } => {
+        translate::ParsedStatement::CreateUser {
+            name,
+            password,
+            role,
+        } => {
             crate::users::UserStore::add(db.store(), &name, &password, role)?;
-            Ok(SqlResult::Ok { message: format!("user '{name}' created ({})", role.name()) })
+            Ok(SqlResult::Ok {
+                message: format!("user '{name}' created ({})", role.name()),
+            })
         }
         translate::ParsedStatement::DropUser { name, if_exists } => {
             match crate::users::UserStore::drop_user(db.store(), &name) {
-                Ok(()) => Ok(SqlResult::Ok { message: format!("user '{name}' dropped") }),
-                Err(e) if if_exists && matches!(e, QsdbError::NotFound(_)) => {
-                    Ok(SqlResult::Ok { message: format!("user '{name}' dropped") })
-                }
+                Ok(()) => Ok(SqlResult::Ok {
+                    message: format!("user '{name}' dropped"),
+                }),
+                Err(e) if if_exists && matches!(e, QsdbError::NotFound(_)) => Ok(SqlResult::Ok {
+                    message: format!("user '{name}' dropped"),
+                }),
                 Err(e) => Err(e),
             }
         }
@@ -239,11 +270,15 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
             match action {
                 UserAlterAction::SetPassword(pw) => {
                     crate::users::UserStore::set_password(db.store(), &name, &pw)?;
-                    Ok(SqlResult::Ok { message: format!("password updated for '{name}'") })
+                    Ok(SqlResult::Ok {
+                        message: format!("password updated for '{name}'"),
+                    })
                 }
                 UserAlterAction::SetRole(r) => {
                     crate::users::UserStore::set_role(db.store(), &name, r)?;
-                    Ok(SqlResult::Ok { message: format!("role updated to {} for '{name}'", r.name()) })
+                    Ok(SqlResult::Ok {
+                        message: format!("role updated to {} for '{name}'", r.name()),
+                    })
                 }
             }
         }
@@ -347,6 +382,31 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
                 message: format!("{rows} rows deleted"),
             })
         }
+        translate::ParsedStatement::CreateView {
+            name,
+            sql,
+            or_replace,
+        } => {
+            // 定义期校验：必须可解析为单条 SELECT（防存入垃圾 SQL）
+            match translate::parse_statements(&sql)?.into_iter().next() {
+                Some(translate::ParsedStatement::Select(_)) => {}
+                _ => {
+                    return Err(QsdbError::invalid(
+                        "view definition must be a single SELECT statement",
+                    ));
+                }
+            }
+            crate::views::ViewStore::create(db.store(), &name, &sql, or_replace)?;
+            Ok(SqlResult::Ok {
+                message: format!("view '{name}' created"),
+            })
+        }
+        translate::ParsedStatement::DropView { name, if_exists } => {
+            crate::views::ViewStore::drop_view(db.store(), &name, if_exists)?;
+            Ok(SqlResult::Ok {
+                message: format!("view '{name}' dropped"),
+            })
+        }
         translate::ParsedStatement::Truncate { table } => {
             let rows = db.truncate_table(&table)?;
             Ok(SqlResult::Ok {
@@ -356,6 +416,7 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
         translate::ParsedStatement::Select(q) => {
             let resolver = translate::TableResolver {
                 resolve: Box::new(|name: &str| db.table_def(name)),
+                views: crate::views::ViewStore::read_all(db.store())?,
             };
             let (plan, cte_defs) = translate::translate_select_full_with_ctes(*q, &resolver)?;
             // CTE 物化：按定义序执行每个 CTE 子计划 → 批缓存（cte_id → Vec<RecordBatch>）。
@@ -434,8 +495,13 @@ fn metadata_shortcut_count(
     let LogicalPlan::Scan { def, predicate } = input else {
         return Ok(None);
     };
+    // 无分区表：无谓词 → footer 元数据（parquet num_rows，零解码，DuckDB 同款）；
+    // 有谓词需数据 → 交给常规扫描。
     if def.partition_keys.is_empty() {
-        return Ok(None);
+        if predicate.is_some() {
+            return Ok(None);
+        }
+        return db.scan_metadata_count(&def.name, None);
     }
     if let Some(pred) = predicate {
         let mut cols = std::collections::HashSet::new();

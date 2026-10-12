@@ -398,9 +398,7 @@ impl FileLoc {
 /// F12：从外表文件位置提取 hive 分区（路径含 `k=v` 段 → 列名 → 值列表）。
 /// 返回 None = 无 hive 目录（普通外表）。类型由首个值推断（parse 分区值
 /// 的类型推导链：先试 Date/Int64/Bool，失败回退 Utf8）。
-pub(crate) fn extract_hive_partitions(
-    files: &[FileLoc],
-) -> Option<HashMap<String, Vec<Literal>>> {
+pub(crate) fn extract_hive_partitions(files: &[FileLoc]) -> Option<HashMap<String, Vec<Literal>>> {
     let mut hive: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new(); // (name, [(value, base)])
     for loc in files {
         let p = match loc {
@@ -1157,6 +1155,10 @@ fn footer_bound(
 ) -> Option<Literal> {
     use parquet::file::statistics::Statistics as S;
     match (stats, target) {
+        // F17 顺带：Boolean footer 统计 → 裁剪真正生效（原先 None 保守放行）
+        (S::Boolean(s), LogicalType::Boolean) => {
+            opt_bound(s.min_opt(), s.max_opt(), is_min).map(|v| Literal::Boolean(*v))
+        }
         (S::Int32(s), LogicalType::Int32) => {
             opt_bound(s.min_opt(), s.max_opt(), is_min).map(|v| Literal::Int32(*v))
         }
@@ -1323,6 +1325,15 @@ fn cmp_mask(
     }
     .map_err(|e| QsdbError::type_err(format!("compare '{column}' failed: {e}")))?;
     Ok(mask)
+}
+
+/// parquet footer 行数（只读尾部元数据，不解码数据页）。
+pub fn parquet_row_count(path: &Path) -> Result<u64> {
+    let f = File::open(path)
+        .map_err(|e| QsdbError::meta(format!("open {} failed: {e}", path.display())))?;
+    let r = ParquetRecordBatchReaderBuilder::try_new(f)
+        .map_err(|e| QsdbError::meta(format!("read footer {}: {e}", path.display())))?;
+    Ok(r.metadata().file_metadata().num_rows() as u64)
 }
 
 /// 外表列类型归一的准入判定（F3）：只放行无损/语义等价的归一。
@@ -1875,11 +1886,18 @@ impl Iterator for Scan {
                     if let Some(c) = &mut self.pending_collector {
                         c.push(clone_batch(&batch));
                     }
-                    return match self.finish_batch(batch, &pvals) {
-                        Ok(Some(b)) => Some(Ok(b)),
-                        Ok(None) => None,
-                        Err(e) => Some(Err(e)),
-                    };
+                    // Ok(None) 两义：过滤后空批（continue 下一批）vs limit 耗尽
+                    //（files 已清 → 迭代器自然终止）。原先空批也终止 = 静默丢数据。
+                    match self.finish_batch(batch, &pvals) {
+                        Ok(Some(b)) => return Some(Ok(b)),
+                        Ok(None) => {
+                            if self.files.is_empty() && self.current.is_none() {
+                                return None; // limit 提前终止
+                            }
+                            continue; // 空批：跳过继续
+                        }
+                        Err(e) => return Some(Err(e)),
+                    }
                 }
                 None => {
                     if self.current.is_some() {

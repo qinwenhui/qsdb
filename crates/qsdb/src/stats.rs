@@ -177,11 +177,25 @@ fn bool_stats(array: &dyn Array, stats: &mut ColumnStats) {
             has_false = true;
         }
     }
-    if has_false {
-        stats.min = Some(Literal::Boolean(false));
-    }
-    if has_true {
-        stats.max = Some(Literal::Boolean(true));
+    // F17 修复：min/max 必须成对——单侧标志分开设置会让全 true/全 false 段
+    // 出现 (None, Some) 形态，segment 裁剪把"缺失"误判为全 NULL 列 → 整段错裁
+    match (has_false, has_true) {
+        (true, true) => {
+            stats.min = Some(Literal::Boolean(false));
+            stats.max = Some(Literal::Boolean(true));
+        }
+        // 全 true（非空部分）：[true, true]
+        (false, true) => {
+            stats.min = Some(Literal::Boolean(true));
+            stats.max = Some(Literal::Boolean(true));
+        }
+        // 全 false（非空部分）：[false, false]
+        (true, false) => {
+            stats.min = Some(Literal::Boolean(false));
+            stats.max = Some(Literal::Boolean(false));
+        }
+        // 全 NULL：不设（等值裁剪"无匹配"语义正确）
+        (false, false) => {}
     }
 }
 

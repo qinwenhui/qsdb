@@ -18,13 +18,13 @@ parquet = { workspace = true }
 rayon = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
+windows-sys = { version = "0.60", features = ["Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_SystemInformation", "Win32_System_Kernel"] }
 
 [features]
 # DuckDB 进程内对比（bundled 编译 C++，首次编译数分钟）
 duckdb = ["dep:duckdb"]
 
 [dependencies.duckdb]
-version = "1.1"
+version = "1.4.5"
 optional = true
 features = ["bundled"]

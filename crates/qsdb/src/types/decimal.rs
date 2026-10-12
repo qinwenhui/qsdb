@@ -114,11 +114,26 @@ impl DecimalMeta {
         Self::try_new(a.precision + b.precision, a.scale + b.scale)
     }
 
-    /// `x / y`：p1+s2+max(s1+s2, 4), max(s1+s2, 4)
+    /// `x / y`：p1+s2+max(s1+s2, 4), max(s1+s2, 4)；超 38 时截 scale 保整数位
+    ///（精度损失退化为 HALF_UP 取整，而非绑定期报错）。
     pub fn div_result(a: Self, b: Self) -> Result<Self> {
-        let s = (a.scale + b.scale).max(4);
-        let p = i32::from(a.precision) + i32::from(b.scale) + i32::from(s);
-        Self::try_new(p as u8, s)
+        let s = i32::from((a.scale + b.scale).max(4));
+        let p = i32::from(a.precision) + i32::from(b.scale) + s;
+        if p <= 38 {
+            Self::try_new(p as u8, s as i8)
+        } else {
+            let int_digits = (i32::from(a.precision) - i32::from(a.scale)).max(1);
+            let s = s.min(38 - int_digits).max(0);
+            Self::try_new((int_digits + s) as u8, s as i8)
+        }
+    }
+
+    /// `x % y`：|余数| < min(|x|,|y|)——整数位取两侧大者，scale 取两侧大者。
+    pub fn mod_result(a: Self, b: Self) -> Result<Self> {
+        let s = a.scale.max(b.scale);
+        let ip = (i16::from(a.precision) - i16::from(a.scale))
+            .max(i16::from(b.precision) - i16::from(b.scale));
+        Self::try_new((ip + i16::from(s)).clamp(1, 38) as u8, s)
     }
 
     /// `sum(x)`：min(p+10, 38), s
@@ -323,6 +338,15 @@ mod tests {
             m(30, 8)
         );
         assert_eq!(DecimalMeta::div_result(m(5, 0), m(2, 0)).unwrap(), m(9, 4));
+        // 宽 decimal 除法：超 38 截 scale 保整数位（不再绑定期报错）
+        assert_eq!(
+            DecimalMeta::div_result(m(38, 20), m(38, 20)).unwrap(),
+            m(38, 20)
+        );
+        assert_eq!(
+            DecimalMeta::div_result(m(38, 0), m(38, 0)).unwrap(),
+            m(38, 0)
+        );
         // 聚合
         assert_eq!(DecimalMeta::sum_result(m(28, 6)), m(38, 6));
         assert_eq!(DecimalMeta::sum_result(m(30, 0)), m(38, 0));

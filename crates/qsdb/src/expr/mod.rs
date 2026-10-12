@@ -95,6 +95,179 @@ pub enum PhysExpr {
         args: Vec<PhysExpr>,
         ty: LogicalType,
     },
+    /// CASE WHEN（M7-B）：conds 按序评估（短路），else 兜底。向量化：
+    /// 布尔掩码从后往前覆盖（首个真条件的值存活）
+    Case {
+        conds: Vec<(PhysExpr, PhysExpr)>,
+        else_expr: Box<PhysExpr>,
+        ty: LogicalType,
+    },
+    /// COALESCE（M7-B）：按序取首个非 NULL。
+    Coalesce(Vec<PhysExpr>, LogicalType),
+    /// 字符串拼接 `||`（M7-B）：两侧已 cast 为 Utf8
+    Concat(Box<PhysExpr>, Box<PhysExpr>),
+    /// LIKE/ILIKE（M7-B4）：模式绑定期预编译；ci=大小写不敏感。
+    Like {
+        e: Box<PhysExpr>,
+        pattern: LikePattern,
+        negated: bool,
+        ci: bool,
+    },
+}
+
+/// LIKE 模式词元（`%` 任意序列 / `_` 单字符；字面字符按 char）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LikeTok {
+    Lit(char),
+    One,
+    Any,
+}
+
+/// 预编译 LIKE 模式：常见形态走零回溯快路径，其余通用回溯匹配。
+#[derive(Debug, Clone, PartialEq)]
+pub enum LikePattern {
+    /// 无通配符
+    Exact(String),
+    /// `abc%`
+    Prefix(String),
+    /// `%abc`
+    Suffix(String),
+    /// `%abc%`
+    Contains(String),
+    /// 通用（连续 % 已折叠）
+    General(Vec<LikeTok>),
+}
+
+impl LikePattern {
+    /// 编译模式。escape=None 时 `\` 为普通字符（Postgres 默认，无隐式转义）。
+    /// ci 时字面段预小写（行值匹配时同步小写）。
+    pub fn compile(pat: &str, escape: Option<char>, ci: bool) -> crate::error::Result<Self> {
+        let mut toks: Vec<LikeTok> = Vec::new();
+        let mut lit = String::new();
+        let mut chars = pat.chars().peekable();
+        while let Some(raw) = chars.next() {
+            let (c, escaped) = if Some(raw) == escape {
+                // 转义：下一字符取字面（含通配符本身）
+                match chars.next() {
+                    Some(n) => (n, true),
+                    None => {
+                        return Err(crate::error::QsdbError::parse_err(
+                            "LIKE pattern ends with escape character",
+                        ));
+                    }
+                }
+            } else {
+                (raw, false)
+            };
+            match c {
+                '%' if !escaped => {
+                    // 连续 % 折叠：仅当中间无未 flush 的字面量（lit 空）且末尾已是 Any
+                    if !(lit.is_empty() && matches!(toks.last(), Some(LikeTok::Any))) {
+                        flush_lit(&mut lit, &mut toks);
+                        toks.push(LikeTok::Any);
+                    }
+                }
+                '_' if !escaped => {
+                    flush_lit(&mut lit, &mut toks);
+                    toks.push(LikeTok::One);
+                }
+                c => {
+                    if ci {
+                        // 多字符小写展开（如 ß→ss）完整保留
+                        for lc in c.to_lowercase() {
+                            lit.push(lc);
+                        }
+                    } else {
+                        lit.push(c);
+                    }
+                }
+            }
+        }
+        flush_lit(&mut lit, &mut toks);
+        // 快路径归类
+        let is_lit = |t: &LikeTok| matches!(t, LikeTok::Lit(_));
+        let all_lit = |ts: &[LikeTok]| ts.iter().all(is_lit);
+        let lit_join = |ts: &[LikeTok]| {
+            ts.iter()
+                .map(|t| match t {
+                    LikeTok::Lit(c) => *c,
+                    _ => unreachable!(),
+                })
+                .collect::<String>()
+        };
+        Ok(match toks.as_slice() {
+            [] => LikePattern::Exact(String::new()),
+            t if all_lit(t) => LikePattern::Exact(lit_join(t)),
+            [t @ .., LikeTok::Any] if all_lit(t) => LikePattern::Prefix(lit_join(t)),
+            [LikeTok::Any, t @ ..] if all_lit(t) => LikePattern::Suffix(lit_join(t)),
+            [LikeTok::Any, t @ .., LikeTok::Any] if all_lit(t) => {
+                LikePattern::Contains(lit_join(t))
+            }
+            _ => LikePattern::General(toks),
+        })
+    }
+
+    /// 行值匹配（ci 时行值小写后比较——与编译期小写规则一致）。
+    pub fn matches(&self, s: &str, ci: bool) -> bool {
+        let lowered;
+        let s = if ci {
+            lowered = s.to_lowercase();
+            lowered.as_str()
+        } else {
+            s
+        };
+        match self {
+            LikePattern::Exact(x) => s == x,
+            LikePattern::Prefix(x) => s.starts_with(x),
+            LikePattern::Suffix(x) => s.ends_with(x),
+            LikePattern::Contains(x) => s.contains(x),
+            LikePattern::General(toks) => like_match(&s.chars().collect::<Vec<_>>(), toks),
+        }
+    }
+}
+
+fn flush_lit(lit: &mut String, toks: &mut Vec<LikeTok>) {
+    for c in lit.drain(..) {
+        toks.push(LikeTok::Lit(c));
+    }
+}
+
+impl LikePattern {
+    /// 模式回显（display/EXPLAIN 用；快路径即原样语义）。
+    pub fn display(&self) -> String {
+        match self {
+            LikePattern::Exact(s) => format!("'{s}'"),
+            LikePattern::Prefix(s) => format!("'{s}%'"),
+            LikePattern::Suffix(s) => format!("'%{s}'"),
+            LikePattern::Contains(s) => format!("'%{s}%'"),
+            LikePattern::General(toks) => {
+                let mut s = String::new();
+                for t in toks {
+                    match t {
+                        LikeTok::Lit(c) => s.push(*c),
+                        LikeTok::One => s.push('_'),
+                        LikeTok::Any => s.push('%'),
+                    }
+                }
+                format!("'{s}'")
+            }
+        }
+    }
+}
+
+/// 通用回溯匹配（模式短，回溯量级可控）。
+fn like_match(s: &[char], toks: &[LikeTok]) -> bool {
+    match toks.split_first() {
+        None => s.is_empty(),
+        Some((LikeTok::Any, rest)) => {
+            if rest.is_empty() {
+                return true;
+            }
+            (0..=s.len()).rev().any(|k| like_match(&s[k..], rest))
+        }
+        Some((LikeTok::One, rest)) => !s.is_empty() && like_match(&s[1..], rest),
+        Some((LikeTok::Lit(c), rest)) => !s.is_empty() && s[0] == *c && like_match(&s[1..], rest),
+    }
 }
 
 impl PhysExpr {
@@ -109,9 +282,14 @@ impl PhysExpr {
             Self::Column { ty, .. } => ty.clone(),
             Self::Lit(l) => l.logical_type().unwrap_or(LogicalType::Boolean),
             Self::Arith { ty, .. } | Self::Cast { ty, .. } | Self::Fn { ty, .. } => ty.clone(),
-            Self::Cmp { .. } | Self::And(..) | Self::Or(..) | Self::Not(_) | Self::IsNull(..) => {
-                LogicalType::Boolean
-            }
+            Self::Case { ty, .. } | Self::Coalesce(_, ty) => ty.clone(),
+            Self::Concat(..) => LogicalType::Varchar { max_chars: None },
+            Self::Cmp { .. }
+            | Self::And(..)
+            | Self::Or(..)
+            | Self::Not(_)
+            | Self::IsNull(..)
+            | Self::Like { .. } => LogicalType::Boolean,
         }
     }
 
@@ -140,6 +318,21 @@ impl PhysExpr {
             Self::Not(a) | Self::IsNull(a, _) => a.collect_columns(out),
             Self::Cast { e, .. } => e.collect_columns(out),
             Self::Fn { args, .. } => args.iter().for_each(|a| a.collect_columns(out)),
+            Self::Case {
+                conds, else_expr, ..
+            } => {
+                for (c, r) in conds {
+                    c.collect_columns(out);
+                    r.collect_columns(out);
+                }
+                else_expr.collect_columns(out);
+            }
+            Self::Coalesce(exprs, _) => exprs.iter().for_each(|e| e.collect_columns(out)),
+            Self::Concat(l, r) => {
+                l.collect_columns(out);
+                r.collect_columns(out);
+            }
+            Self::Like { e, .. } => e.collect_columns(out),
         }
     }
 
@@ -162,6 +355,36 @@ impl PhysExpr {
                 let inner: Vec<String> = args.iter().map(|a| a.display()).collect();
                 format!("{name}({})", inner.join(", "))
             }
+            Self::Case {
+                conds, else_expr, ..
+            } => {
+                let mut s = String::from("CASE");
+                for (c, r) in conds {
+                    s.push_str(&format!(" WHEN {} THEN {}", c.display(), r.display()));
+                }
+                if !matches!(**else_expr, Self::Lit(Literal::Null)) {
+                    s.push_str(&format!(" ELSE {}", else_expr.display()));
+                }
+                s.push_str(" END");
+                s
+            }
+            Self::Coalesce(exprs, _) => {
+                let inner: Vec<String> = exprs.iter().map(|e| e.display()).collect();
+                format!("coalesce({})", inner.join(", "))
+            }
+            Self::Concat(l, r) => format!("({} || {})", l.display(), r.display()),
+            Self::Like {
+                e,
+                pattern,
+                negated,
+                ci,
+            } => format!(
+                "({} {}{} {})",
+                e.display(),
+                if *negated { "NOT " } else { "" },
+                if *ci { "ILIKE" } else { "LIKE" },
+                pattern.display()
+            ),
         }
     }
 }
@@ -283,5 +506,52 @@ impl AggExpr {
             None => format!("{}(*)", self.func.name()),
             Some(a) => format!("{}({})", self.func.name(), a.display()),
         }
+    }
+}
+
+#[cfg(test)]
+mod like_tests {
+    use super::*;
+
+    #[test]
+    fn compile_fast_paths() {
+        assert!(matches!(
+            LikePattern::compile("abc", None, false).unwrap(),
+            LikePattern::Exact(s) if s == "abc"
+        ));
+        assert!(matches!(
+            LikePattern::compile("abc%", None, false).unwrap(),
+            LikePattern::Prefix(s) if s == "abc"
+        ));
+        assert!(matches!(
+            LikePattern::compile("%abc", None, false).unwrap(),
+            LikePattern::Suffix(s) if s == "abc"
+        ));
+        assert!(matches!(
+            LikePattern::compile("%a%", None, false).unwrap(),
+            LikePattern::Contains(s) if s == "a"
+        ));
+        assert!(matches!(
+            LikePattern::compile("%z-a%", None, false).unwrap(),
+            LikePattern::Contains(s) if s == "z-a"
+        ));
+    }
+
+    #[test]
+    fn match_semantics() {
+        let c = LikePattern::compile("%z-a%", None, false).unwrap();
+        assert!(c.matches("zz-abc", false));
+        let g = LikePattern::compile("z%-a__", None, false).unwrap();
+        assert!(g.matches("zz-abc", false));
+        let one = LikePattern::compile("_x", None, false).unwrap();
+        assert!(one.matches("ax", false));
+        assert!(!one.matches("abx", false));
+        // 转义：ESCAPE '!' 时 !% 为字面 %
+        let e = LikePattern::compile("50!%", Some('!'), false).unwrap();
+        assert!(e.matches("50%", false));
+        assert!(!e.matches("50x", false));
+        // 连续 % 折叠
+        let f = LikePattern::compile("a%%b", None, false).unwrap();
+        assert!(f.matches("axxb", false));
     }
 }

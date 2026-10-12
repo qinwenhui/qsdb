@@ -34,6 +34,7 @@ pub mod stats;
 pub mod store;
 pub mod types;
 pub mod users;
+pub mod views;
 pub mod write;
 pub mod write_buffer;
 

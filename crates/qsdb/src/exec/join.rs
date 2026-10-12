@@ -14,7 +14,7 @@ use arrow::array::{
     UInt32Array,
 };
 use arrow::compute::{concat, take};
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
 use crate::error::{QsdbError, Result};
@@ -190,8 +190,29 @@ pub struct HashJoinExec {
 struct BuildState {
     /// 右表物化批（单批 concat 后）
     table: RecordBatch,
-    /// key bytes → 行号列表
-    index: HashMap<Vec<u8>, Vec<u32>>,
+    /// 键索引：单整数键走 i64 免编码（probe 每行省一次字节编码 + 字节哈希）
+    index: HashIndex,
+}
+
+/// 键 → build 行号列表。单整数键（Int/Date/Boolean/Timestamp）用 i64 直查。
+enum HashIndex {
+    I64(I64Map<Vec<u32>>),
+    Bytes(HashMap<Vec<u8>, Vec<u32>>),
+}
+
+impl HashIndex {
+    /// 单整数键判定（与 semi-join 快路径同款）。
+    fn int_ok(keys: &[PhysExpr]) -> bool {
+        keys.len() == 1
+            && matches!(
+                keys[0].data_type(),
+                crate::types::LogicalType::Int8
+                    | crate::types::LogicalType::Int16
+                    | crate::types::LogicalType::Int32
+                    | crate::types::LogicalType::Int64
+                    | crate::types::LogicalType::Date
+            )
+    }
 }
 
 /// semi/anti 族 build 产物：存在性三形态（按键形状自动选优——「别人不做
@@ -206,8 +227,8 @@ pub struct ExistsState {
 enum ExistsKeys {
     /// 通用：多键/字符串/浮点 → 键字节编码存在集
     Bytes(std::collections::HashSet<Vec<u8>>),
-    /// 单整数键（Int8..64/Date32/Boolean）→ 免编码 i64 存在集
-    I64(std::collections::HashSet<i64>),
+    /// 单整数键（Int8..64/Date32/Boolean）→ 免编码 i64 存在集（快哈希）
+    I64(std::collections::HashSet<i64, BuildI64Hasher>),
     /// 单整数键且域稠密（max−min ≤ 16M 位 = 2MB）→ 位图探测：
     /// probe = 单 bit 测试（无哈希/无分配/缓存友好；分区键 IN 的标准形态）
     Bitmap { min: i64, bits: Vec<u64> },
@@ -327,15 +348,22 @@ impl HashJoinExec {
         for k in &self.build_keys {
             key_cols.push(eval::eval(k, &table)?);
         }
-        let mut index: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
-        let mut buf: Vec<u8> = Vec::new();
-        for row in 0..table.num_rows() {
-            encode_join_key(&key_cols, row, &mut buf);
-            if buf.first() == Some(&0) {
-                continue; // 任一键 NULL → 不入索引（SQL 语义）
+        let index: HashIndex = if HashIndex::int_ok(&self.build_keys) {
+            let mut m: I64Map<Vec<u32>> = I64Map::default();
+            if let Some(vals) = int_key_column(&key_cols[0]) {
+                let nrows = table.num_rows();
+                for row in 0..nrows {
+                    if let Some(v) = vals(row) {
+                        m.entry(v).or_default().push(row as u32);
+                    }
+                }
+                HashIndex::I64(m)
+            } else {
+                HashIndex::Bytes(build_bytes_index(&key_cols, table.num_rows()))
             }
-            index.entry(buf.clone()).or_default().push(row as u32);
-        }
+        } else {
+            HashIndex::Bytes(build_bytes_index(&key_cols, table.num_rows()))
+        };
         self.build_state = Some(BuildState { table, index });
         Ok(())
     }
@@ -393,7 +421,7 @@ pub fn prepare_exists_state(
     } else {
         None
     };
-    let mut bytes: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut bytes: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::default();
     let mut buf: Vec<u8> = Vec::new();
     while let Some(b) = build.next() {
         ctx.check()?;
@@ -600,6 +628,20 @@ impl ExecNode for HashJoinExec {
     }
 }
 
+/// 字节键索引构建（多键/字符串/浮点路径）。
+fn build_bytes_index(key_cols: &[ArrayRef], nrows: usize) -> HashMap<Vec<u8>, Vec<u32>> {
+    let mut index: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
+    let mut buf: Vec<u8> = Vec::new();
+    for row in 0..nrows {
+        encode_join_key(key_cols, row, &mut buf);
+        if buf.first() == Some(&0) {
+            continue; // 任一键 NULL → 不入索引（SQL 语义）
+        }
+        index.entry(buf.clone()).or_default().push(row as u32);
+    }
+    index
+}
+
 /// 单个 probe 批的连接。
 fn join_batch(
     probe_batch: &RecordBatch,
@@ -618,21 +660,41 @@ fn join_batch(
     let mut probe_idx: Vec<u32> = Vec::new();
     let mut build_idx: Vec<u32> = Vec::new();
     let mut unmatched: Vec<u32> = Vec::new();
-    let mut buf: Vec<u8> = Vec::new();
-    for row in 0..n {
-        encode_join_key(&key_cols, row, &mut buf);
-        if buf.first() == Some(&0) {
-            unmatched.push(row as u32);
-            continue;
-        }
-        match state.index.get(buf.as_slice()) {
-            Some(rows) => {
-                for &b in rows {
-                    probe_idx.push(row as u32);
-                    build_idx.push(b);
+    match &state.index {
+        // i64 快路径：免编码免字节哈希
+        HashIndex::I64(map) => {
+            let vals = int_key_column(&key_cols[0]);
+            for row in 0..n {
+                let hit = vals.as_ref().and_then(|f| f(row));
+                match hit.and_then(|v| map.get(&v)) {
+                    Some(rows) => {
+                        for &b in rows {
+                            probe_idx.push(row as u32);
+                            build_idx.push(b);
+                        }
+                    }
+                    None => unmatched.push(row as u32),
                 }
             }
-            None => unmatched.push(row as u32),
+        }
+        HashIndex::Bytes(map) => {
+            let mut buf: Vec<u8> = Vec::new();
+            for row in 0..n {
+                encode_join_key(&key_cols, row, &mut buf);
+                if buf.first() == Some(&0) {
+                    unmatched.push(row as u32);
+                    continue;
+                }
+                match map.get(buf.as_slice()) {
+                    Some(rows) => {
+                        for &b in rows {
+                            probe_idx.push(row as u32);
+                            build_idx.push(b);
+                        }
+                    }
+                    None => unmatched.push(row as u32),
+                }
+            }
         }
     }
     // LEFT：未匹配行补 NULL build 侧
@@ -802,7 +864,7 @@ fn new_null_like(arr: &dyn Array, n: usize) -> ArrayRef {
 }
 
 /// 连接键编码：与 agg 的 encode_key_row 同构（null 前缀 tag + 类型化值）。
-fn encode_join_key(arrays: &[ArrayRef], row: usize, buf: &mut Vec<u8>) {
+pub fn encode_join_key(arrays: &[ArrayRef], row: usize, buf: &mut Vec<u8>) {
     buf.clear();
     for a in arrays {
         if a.is_null(row) {
@@ -892,5 +954,307 @@ fn encode_value(a: &dyn Array, i: usize, buf: &mut Vec<u8>) {
             let s = format!("{other:?}");
             buf.extend_from_slice(s.as_bytes());
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// i64 键快速哈希（Fibonacci hashing）：std 默认 SipHash 对整数键是浪费
+//（实测 join probe 57ns/行，哈希占大头）。乘法哈希 ~2ns 且分布良好。
+// ---------------------------------------------------------------------------
+#[derive(Default, Clone, Copy)]
+pub struct I64Hasher(u64);
+
+impl std::hash::Hasher for I64Hasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = self.0.rotate_left(5) ^ u64::from(*b);
+        }
+    }
+    #[inline]
+    fn write_i64(&mut self, i: i64) {
+        self.0 = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct BuildI64Hasher;
+
+impl std::hash::BuildHasher for BuildI64Hasher {
+    type Hasher = I64Hasher;
+    #[inline]
+    fn build_hasher(&self) -> I64Hasher {
+        I64Hasher(0)
+    }
+}
+
+/// i64 键 map（快哈希）。
+pub type I64Map<V> = std::collections::HashMap<i64, V, BuildI64Hasher>;
+
+// ---------------------------------------------------------------------------
+// count(*) 下推（T3 优化）：JOIN 输出的行数 = Σ(左键匹配的右键行数)，
+// 恒等变换为「右键计数 + 左键累加」——不物化 JOIN 输出。
+// 低基数键下物化输出是 n²/keys 行（POC T3：10M×10M/1e4 键 → 10^7 倍放大），
+// 本路径将其压回 O(n)。仅 INNER 等值 JOIN + 单一 count(*) + 无 GROUP BY。
+// ---------------------------------------------------------------------------
+pub struct JoinCountExec {
+    probe: Box<dyn ExecNode>,
+    build: Box<dyn ExecNode>,
+    probe_keys: Vec<PhysExpr>,
+    build_keys: Vec<PhysExpr>,
+    /// LEFT：未匹配行也计入 1（Σ max(匹配数, 1)）——INNER 为 false
+    left_outer: bool,
+    ctx: Arc<QueryContext>,
+    /// 键 → 右表匹配行数（单整数键走 i64 快路径）
+    counts: Option<CountMap>,
+    emitted: bool,
+    schema: SchemaRef,
+}
+
+enum CountMap {
+    /// 稠密整数键域 → 直接索引计数数组（免哈希、顺序访问 cache 友好）。
+    /// 稀疏域退回哈希路径（跨度 > 16M 或非整数键）。
+    Direct {
+        min: i64,
+        counts: Vec<u32>,
+        miss: u64,
+    },
+    I64(I64Map<u64>),
+    Bytes(std::collections::HashMap<Vec<u8>, u64>),
+}
+
+impl JoinCountExec {
+    pub fn new(
+        probe: Box<dyn ExecNode>,
+        build: Box<dyn ExecNode>,
+        probe_keys: Vec<PhysExpr>,
+        build_keys: Vec<PhysExpr>,
+        left_outer: bool,
+        ctx: Arc<QueryContext>,
+    ) -> Self {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("count(*)", DataType::Int64, false),
+        ]));
+        Self {
+            probe,
+            build,
+            probe_keys,
+            build_keys,
+            left_outer,
+            ctx,
+            counts: None,
+            emitted: false,
+            schema,
+        }
+    }
+
+    /// 单整数键快路径判定（与 semi-join 同款：免键编码）。
+    fn int_key_ok(keys: &[PhysExpr]) -> bool {
+        keys.len() == 1
+            && matches!(
+                keys[0].data_type(),
+                crate::types::LogicalType::Int8
+                    | crate::types::LogicalType::Int16
+                    | crate::types::LogicalType::Int32
+                    | crate::types::LogicalType::Int64
+            )
+    }
+
+    fn build_counts(&mut self) -> Result<()> {
+        let t_prof = std::env::var("QSDB_JOIN_PROF").is_ok();
+        let t0 = std::time::Instant::now();
+        let use_i64 = Self::int_key_ok(&self.build_keys);
+        let mut i64_map: I64Map<u64> = I64Map::default();
+        let mut bytes_map: std::collections::HashMap<Vec<u8>, u64> =
+            std::collections::HashMap::new();
+        // 稠密直索引候选：单整数键时先收集键值（build 侧通常远小于 probe）
+        let mut dense_keys: Vec<i64> = Vec::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut rows: u64 = 0;
+        while let Some(b) = self.build.next() {
+            self.ctx.check()?;
+            let batch = b?;
+            rows += batch.num_rows() as u64;
+            let mut key_cols: Vec<ArrayRef> = Vec::with_capacity(self.build_keys.len());
+            for k in &self.build_keys {
+                key_cols.push(eval::eval(k, &batch)?);
+            }
+            if use_i64 {
+                if let Some(vals) = int_key_column(&key_cols[0]) {
+                    for row in 0..batch.num_rows() {
+                        if let Some(v) = vals(row) {
+                            dense_keys.push(v);
+                        }
+                    }
+                    continue;
+                }
+            }
+            for row in 0..batch.num_rows() {
+                encode_join_key(&key_cols, row, &mut buf);
+                if buf.first() == Some(&0) {
+                    continue; // NULL 键不匹配（SQL 语义）
+                }
+                *bytes_map.entry(buf.clone()).or_insert(0) += 1;
+            }
+        }
+        // 稠密判定：span ≤ 16M 用直索引（16M × 4B = 64MB 上界）
+        if use_i64 {
+            if let (Some(&mn), Some(&mx)) = (dense_keys.iter().min(), dense_keys.iter().max()) {
+                let span = (mx as i128 - mn as i128 + 1) as u128;
+                if span <= 16_000_000 {
+                    let mut counts = vec![0u32; span as usize];
+                    for k in &dense_keys {
+                        counts[(*k - mn) as usize] += 1;
+                    }
+                    self.counts = Some(CountMap::Direct {
+                        min: mn,
+                        counts,
+                        miss: 0,
+                    });
+                    return Ok(());
+                }
+            }
+            for k in dense_keys {
+                *i64_map.entry(k).or_insert(0) += 1;
+            }
+        }
+        // 右表为空 → 结果 0（用空 i64 map 表示）
+        self.counts = Some(if use_i64 && bytes_map.is_empty() {
+            CountMap::I64(i64_map)
+        } else {
+            CountMap::Bytes(bytes_map)
+        });
+        if t_prof {
+            eprintln!(
+                "[join-prof] build: {:.3}s rows={rows} i64={use_i64}",
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        let _ = rows;
+        Ok(())
+    }
+}
+
+/// 单整数列 → i64 取值闭包（NULL → None；非整数返回 None 走通用路径）。
+fn int_key_column(col: &ArrayRef) -> Option<Box<dyn Fn(usize) -> Option<i64> + '_>> {
+    macro_rules! prim {
+        ($ty:ty) => {{
+            let arr = col.as_any().downcast_ref::<$ty>()?;
+            Some(Box::new(move |i: usize| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i) as i64)
+                }
+            }) as Box<dyn Fn(usize) -> Option<i64> + '_>)
+        }};
+    }
+    match col.data_type() {
+        DataType::Int8 => prim!(arrow::array::Int8Array),
+        DataType::Int16 => prim!(arrow::array::Int16Array),
+        DataType::Int32 => prim!(arrow::array::Int32Array),
+        DataType::Int64 => prim!(arrow::array::Int64Array),
+        _ => None,
+    }
+}
+
+impl ExecNode for JoinCountExec {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+    fn next(&mut self) -> Option<Result<RecordBatch>> {
+        if self.emitted {
+            return None;
+        }
+        if self.counts.is_none() {
+            if let Err(e) = self.build_counts() {
+                return Some(Err(e));
+            }
+        }
+        let t_prof = std::env::var("QSDB_JOIN_PROF").is_ok();
+        let t1 = std::time::Instant::now();
+        let counts = self.counts.as_ref().unwrap();
+        let use_i64 = matches!(counts, CountMap::I64(_) | CountMap::Direct { .. });
+        let mut total: u64 = 0;
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            if let Err(e) = self.ctx.check() {
+                return Some(Err(e));
+            }
+            let Some(b) = self.probe.next() else { break };
+            let batch = match b {
+                Ok(x) => x,
+                Err(e) => return Some(Err(e)),
+            };
+            let mut key_cols: Vec<ArrayRef> = Vec::with_capacity(self.probe_keys.len());
+            for k in &self.probe_keys {
+                match eval::eval(k, &batch) {
+                    Ok(a) => key_cols.push(a),
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+            let miss = if self.left_outer { 1u64 } else { 0 };
+            if let CountMap::Direct {
+                min,
+                counts: dc,
+                miss: dm,
+            } = counts
+            {
+                let _ = dm;
+                if let Some(vals) = int_key_column(&key_cols[0]) {
+                    for row in 0..batch.num_rows() {
+                        if let Some(v) = vals(row) {
+                            let i = v - *min;
+                            if i >= 0 && (i as usize) < dc.len() {
+                                total += u64::from(dc[i as usize]);
+                                continue;
+                            }
+                        }
+                        total += miss;
+                    }
+                    continue;
+                }
+            }
+            if use_i64 {
+                if let Some(vals) = int_key_column(&key_cols[0]) {
+                    if let CountMap::I64(m) = counts {
+                        for row in 0..batch.num_rows() {
+                            let hit = vals(row).and_then(|v| m.get(&v).copied());
+                            total += hit.unwrap_or(miss);
+                        }
+                    }
+                    continue;
+                }
+            }
+            if let CountMap::Bytes(m) = counts {
+                for row in 0..batch.num_rows() {
+                    encode_join_key(&key_cols, row, &mut buf);
+                    let hit = if buf.first() == Some(&0) {
+                        None
+                    } else {
+                        m.get(&buf).copied()
+                    };
+                    total += hit.unwrap_or(miss);
+                }
+            }
+        }
+        if t_prof {
+            eprintln!(
+                "[join-prof] probe: {:.3}s total={total}",
+                t1.elapsed().as_secs_f64()
+            );
+        }
+        self.emitted = true;
+        let arr = arrow::array::Int64Array::from(vec![total as i64]);
+        let out = RecordBatch::try_new(Arc::clone(&self.schema), vec![Arc::new(arr)]);
+        Some(out.map_err(|e| QsdbError::invalid(format!("join count output: {e}"))))
     }
 }

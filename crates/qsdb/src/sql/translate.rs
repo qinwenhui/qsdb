@@ -83,6 +83,17 @@ pub enum LogicalPlan {
         right_keys: Vec<PhysExpr>,
         join_type: crate::exec::join::JoinType,
     },
+    /// 单行零列源（无 FROM SELECT）
+    OneRow,
+    /// 集合操作（M7-B4）：UNION [ALL] / INTERSECT / EXCEPT（DISTINCT 语义）。
+    /// 两侧 schema 已归一（公共超类型 cast）；输出列名取左。
+    SetOp {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        op: crate::exec::SetOpKind,
+        /// UNION ALL = 不去重直连；其余形态内部去重
+        all: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +118,15 @@ pub enum ParsedStatement {
     },
     Describe {
         table: String,
+    },
+    CreateView {
+        name: String,
+        sql: String,
+        or_replace: bool,
+    },
+    DropView {
+        name: String,
+        if_exists: bool,
     },
     ShowTables,
     ShowPartitions {
@@ -391,12 +411,32 @@ fn translate_statement(stmt: SqlStatement, raw: &str) -> Result<ParsedStatement>
             };
             Ok(ParsedStatement::AlterAddColumn { table, column })
         }
+        SqlStatement::CreateView(v) => {
+            if v.materialized {
+                return Err(QsdbError::unsupported("MATERIALIZED VIEW"));
+            }
+            let vname = object_name_single(v.name.clone())?;
+            Ok(ParsedStatement::CreateView {
+                name: vname,
+                sql: v.query.to_string(),
+                or_replace: v.or_replace,
+            })
+        }
         SqlStatement::Drop {
             object_type,
             if_exists,
             names,
             ..
         } => {
+            if matches!(object_type, sqlparser::ast::ObjectType::View) {
+                let name = names
+                    .first()
+                    .ok_or_else(|| QsdbError::invalid("DROP VIEW needs a name"))?;
+                return Ok(ParsedStatement::DropView {
+                    name: object_name_single(name.clone())?,
+                    if_exists,
+                });
+            }
             if !matches!(object_type, sqlparser::ast::ObjectType::Table) {
                 return Err(QsdbError::unsupported(format!(
                     "DROP {object_type:?} not supported"
@@ -901,6 +941,8 @@ pub fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<(String, LogicalTyp
             .map(|(n, e)| (n.clone(), e.data_type()))
             .collect(),
         LogicalPlan::Values { columns, .. } => columns.clone(),
+        LogicalPlan::OneRow => Vec::new(),
+        LogicalPlan::SetOp { left, .. } => plan_output_columns(left)?,
         LogicalPlan::Aggregate { group, aggs, .. } => {
             let mut cols: Vec<(String, LogicalType)> =
                 group.iter().map(|g| (g.display(), g.data_type())).collect();
@@ -932,6 +974,8 @@ pub fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<(String, LogicalTyp
 
 pub struct TableResolver<'a> {
     pub resolve: TableResolverFn<'a>,
+    /// 视图（name → SQL；SELECT 期重解析展开）
+    pub views: std::collections::HashMap<String, String>,
 }
 
 /// CTE 物化定义（执行层按 id 填充批数据）。
@@ -976,6 +1020,10 @@ fn resolve_table_source(
             SchemaCtx { cols: cols.clone() },
         ));
     }
+    // 视图：重解析展开为子计划（递归深度护栏防循环引用）
+    if let Some(vsql) = resolver.views.get(name) {
+        return resolve_view(vsql, resolver);
+    }
     let def = (resolver.resolve)(name)?;
     Ok((
         LogicalPlan::Scan {
@@ -984,6 +1032,40 @@ fn resolve_table_source(
         },
         SchemaCtx::from_table(&def),
     ))
+}
+
+/// 视图展开：SQL 重解析 → 单条 SELECT → 子计划（祖先 CTE 透传）。
+/// 深度护栏：视图链过深/循环引用报错。
+fn resolve_view(vsql: &str, resolver: &TableResolver) -> Result<(LogicalPlan, SchemaCtx)> {
+    use std::cell::Cell;
+    thread_local! {
+        static VIEW_DEPTH: Cell<u32> = const { Cell::new(0) };
+    }
+    if VIEW_DEPTH.with(|d| d.get()) >= 8 {
+        return Err(QsdbError::invalid(
+            "view expansion too deep (circular view reference?)",
+        ));
+    }
+    let stmts = crate::sql::translate::parse_statements(vsql)?;
+    let q = match stmts.into_iter().next() {
+        Some(ParsedStatement::Select(q)) => q,
+        _ => {
+            return Err(QsdbError::invalid(
+                "view definition must be a single SELECT statement",
+            ));
+        }
+    };
+    VIEW_DEPTH.with(|d| d.set(d.get() + 1));
+    let r = translate_select_inner(*q, resolver, &VisibleCtes::default());
+    VIEW_DEPTH.with(|d| d.set(d.get() - 1));
+    let (plan, cte_defs) = r?;
+    if !cte_defs.is_empty() {
+        return Err(QsdbError::invalid(
+            "CTE inside view not supported (inline the subquery)",
+        ));
+    }
+    let cols = plan_output_columns(&plan)?;
+    Ok((plan, SchemaCtx { cols }))
 }
 
 /// 表函数（FROM 子句）：当前仅 `read_parquet('<路径/glob>')`。
@@ -1046,7 +1128,9 @@ fn resolve_table_function(
             if let Some(lit) = vals.first() {
                 all_columns.push(crate::catalog::ColumnDef {
                     name: k.clone(),
-                    logical_type: lit.logical_type().unwrap_or(LogicalType::Varchar { max_chars: None }),
+                    logical_type: lit
+                        .logical_type()
+                        .unwrap_or(LogicalType::Varchar { max_chars: None }),
                     nullable: true,
                     check: None,
                     default: None,
@@ -1575,11 +1659,12 @@ fn filter_reachable_ctes(defs: Vec<CteDef>, main: &LogicalPlan) -> Vec<CteDef> {
             | LogicalPlan::Distinct { input }
             | LogicalPlan::Window { input, .. } => collect_refs(input, out),
             LogicalPlan::Join { left, right, .. }
-            | LogicalPlan::CrossJoinFilter { left, right, .. } => {
+            | LogicalPlan::CrossJoinFilter { left, right, .. }
+            | LogicalPlan::SetOp { left, right, .. } => {
                 collect_refs(left, out);
                 collect_refs(right, out);
             }
-            LogicalPlan::Scan { .. } | LogicalPlan::ExternalScan { .. } => {}
+            LogicalPlan::Scan { .. } | LogicalPlan::ExternalScan { .. } | LogicalPlan::OneRow => {}
         }
     }
     let mut keep = std::collections::HashSet::new();
@@ -1597,31 +1682,16 @@ fn filter_reachable_ctes(defs: Vec<CteDef>, main: &LogicalPlan) -> Vec<CteDef> {
         .collect()
 }
 
-fn translate_select_inner(
-    q: sqlparser::ast::Query,
+/// WITH 子句绑定（普通 SELECT 与集合操作两路共用）：
+/// CTE 内联展开为子计划，祖先可见（后定义可引用先定义，链式）。
+fn bind_with_ctes(
+    with: Option<&sqlparser::ast::With>,
     resolver: &TableResolver,
     ancestors: &VisibleCtes,
-) -> Result<(LogicalPlan, Vec<CteDef>)> {
-    use sqlparser::ast::*;
-
-    let select = match *q.body {
-        SetExpr::Select(s) => s,
-        other => {
-            return Err(QsdbError::unsupported(format!(
-                "query body {other:?} not supported (plain SELECT only)"
-            )));
-        }
-    };
-    if select.from.len() != 1 {
-        return Err(QsdbError::unsupported(
-            "multi-FROM (comma join) not supported",
-        ));
-    }
-    // CTE（非递归）：WITH name AS (...) 内联展开为子计划。
-    // 定义期即分配 cte_id；祖先 CTE 可见（后定义可引用先定义，链式）。
+) -> Result<(VisibleCtes, Vec<CteDef>)> {
     let mut visible: VisibleCtes = ancestors.clone();
     let mut cte_defs: Vec<CteDef> = Vec::new();
-    if let Some(with) = &q.with {
+    if let Some(with) = with {
         if with.recursive {
             return Err(QsdbError::unsupported("recursive CTE"));
         }
@@ -1644,36 +1714,269 @@ fn translate_select_inner(
             visible.insert(name, (id, cols));
         }
     }
+    Ok((visible, cte_defs))
+}
 
-    // FROM 主表：实表 / 表函数（read_parquet）/ CTE（本级 → 祖先）/ 派生表
-    let (mut plan, mut ctx): (LogicalPlan, SchemaCtx) = match &select.from[0].relation {
-        TableFactor::Table {
-            name,
-            args: Some(tf_args),
-            ..
-        } => resolve_table_function(&object_name_single(name.clone())?, &tf_args.args)?,
-        TableFactor::Function { name, args, .. } => {
-            resolve_table_function(&object_name_single(name.clone())?, args)?
+/// 集合操作绑定（M7-B4）：UNION [ALL] / INTERSECT / EXCEPT。
+/// 两侧递归翻译（外层 WITH 对两侧可见）；列数相等、类型按公共超类型
+/// 双侧 cast 归一（列名取左）；INTERSECT/EXCEPT 的 ALL 多重集形态拒绝。
+fn translate_set_operation(
+    op: sqlparser::ast::SetOperator,
+    left: Box<sqlparser::ast::SetExpr>,
+    right: Box<sqlparser::ast::SetExpr>,
+    quantifier: Option<sqlparser::ast::SetQuantifier>,
+    q: &sqlparser::ast::Query,
+    resolver: &TableResolver,
+    ancestors: &VisibleCtes,
+) -> Result<(LogicalPlan, Vec<CteDef>)> {
+    use crate::exec::SetOpKind;
+    let (visible, mut cte_defs) = bind_with_ctes(q.with.as_ref(), resolver, ancestors)?;
+    let body_query = |body: Box<sqlparser::ast::SetExpr>| sqlparser::ast::Query {
+        with: None,
+        body,
+        order_by: None,
+        limit_clause: None,
+        fetch: None,
+        locks: vec![],
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators: vec![],
+    };
+    let (mut lp, mut dl) = translate_select_inner(body_query(left), resolver, &visible)?;
+    let (mut rp, mut dr) = translate_select_inner(body_query(right), resolver, &visible)?;
+    cte_defs.append(&mut dl);
+    cte_defs.append(&mut dr);
+
+    // schema 归一：列数相等；类型公共超类型双侧 cast（列名取左）
+    let lc = plan_output_columns(&lp)?;
+    let rc = plan_output_columns(&rp)?;
+    if lc.len() != rc.len() {
+        return Err(QsdbError::invalid(format!(
+            "set operation sides have different column counts ({} vs {})",
+            lc.len(),
+            rc.len()
+        )));
+    }
+    let common: Vec<LogicalType> = lc
+        .iter()
+        .zip(&rc)
+        .map(|((_, a), (_, b))| {
+            if a == b {
+                a.clone()
+            } else {
+                common_supertype(a, b)
+            }
+        })
+        .collect();
+    let needs_cast =
+        |cols: &[(String, LogicalType)]| cols.iter().zip(&common).any(|((_, t), c)| t != c);
+    if needs_cast(&rc) {
+        rp = cast_setop_side(rp, &common, &lc);
+    }
+    if needs_cast(&lc) {
+        lp = cast_setop_side(lp, &common, &lc);
+    }
+
+    let is_all = matches!(quantifier, Some(sqlparser::ast::SetQuantifier::All));
+    let (kind, all) = match op {
+        sqlparser::ast::SetOperator::Union => (SetOpKind::Union, is_all),
+        sqlparser::ast::SetOperator::Intersect => {
+            if is_all {
+                return Err(QsdbError::unsupported(
+                    "INTERSECT ALL (multiset) not supported",
+                ));
+            }
+            (SetOpKind::Intersect, false)
         }
-        TableFactor::Table { name, .. } => {
-            resolve_table_source(&object_name_single(name.clone())?, &visible, resolver)?
-        }
-        TableFactor::Derived { subquery, .. } => {
-            let (sub, child_defs) =
-                translate_select_inner((**subquery).clone(), resolver, &visible)?;
-            cte_defs.extend(child_defs);
-            let cols = plan_output_columns(&sub)?;
-            (sub, SchemaCtx { cols })
+        sqlparser::ast::SetOperator::Except => {
+            if is_all {
+                return Err(QsdbError::unsupported(
+                    "EXCEPT ALL (multiset) not supported",
+                ));
+            }
+            (SetOpKind::Except, false)
         }
         other => {
             return Err(QsdbError::unsupported(format!(
-                "FROM {other:?} not supported"
+                "set operation {other:?} not supported"
             )));
         }
     };
+    let mut plan = LogicalPlan::SetOp {
+        left: Box::new(lp),
+        right: Box::new(rp),
+        op: kind,
+        all,
+    };
+
+    // 外层 ORDER BY：输出列名 / 序号（1-based）
+    if let Some(order_by) = &q.order_by {
+        let exprs = match &order_by.kind {
+            sqlparser::ast::OrderByKind::Expressions(es) => es.clone(),
+            _ => return Err(QsdbError::unsupported("ORDER BY ALL")),
+        };
+        let mut keys = Vec::with_capacity(exprs.len());
+        for ob in &exprs {
+            let desc = matches!(&ob.options.sort, Some(sqlparser::ast::OrderBySort::Desc));
+            let idx = match &ob.expr {
+                sqlparser::ast::Expr::Identifier(id) => lc
+                    .iter()
+                    .position(|(n, _)| n.eq_ignore_ascii_case(&id.value)),
+                sqlparser::ast::Expr::Value(v) => match &v.value {
+                    sqlparser::ast::Value::Number(n, _) => n
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|i| i.checked_sub(1))
+                        .filter(|i| *i < lc.len()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(i) = idx else {
+                return Err(QsdbError::invalid(
+                    "ORDER BY over set operations must reference output column name or ordinal",
+                ));
+            };
+            keys.push(crate::exec::SortKey {
+                expr: PhysExpr::Column {
+                    idx: i,
+                    name: lc[i].0.clone(),
+                    ty: lc[i].1.clone(),
+                },
+                descending: desc,
+            });
+        }
+        plan = LogicalPlan::Sort {
+            input: Box::new(plan),
+            keys,
+        };
+    }
+    // LIMIT（沿用普通路径的常量要求）
+    if let Some(limit_clause) = &q.limit_clause {
+        let limit_expr: Option<&sqlparser::ast::Expr> = match limit_clause {
+            sqlparser::ast::LimitClause::LimitOffset { limit: Some(l), .. } => Some(l),
+            sqlparser::ast::LimitClause::OffsetCommaLimit { limit, .. } => Some(limit),
+            _ => None,
+        };
+        if let Some(e) = limit_expr {
+            let n = match bind_expr(e, &SchemaCtx { cols: vec![] })? {
+                PhysExpr::Lit(Literal::Int64(n)) if n >= 0 => n as usize,
+                _ => return Err(QsdbError::invalid("LIMIT requires a non-negative integer")),
+            };
+            plan = LogicalPlan::Limit {
+                input: Box::new(plan),
+                n,
+            };
+        }
+    }
+    Ok((plan, cte_defs))
+}
+
+/// 集合操作一侧 cast 到公共类型（包 Project；列名沿用）。
+fn cast_setop_side(
+    plan: LogicalPlan,
+    common: &[LogicalType],
+    names: &[(String, LogicalType)],
+) -> LogicalPlan {
+    let exprs: Vec<PhysExpr> = (0..common.len())
+        .map(|i| {
+            let c = PhysExpr::Column {
+                idx: i,
+                name: names[i].0.clone(),
+                ty: names[i].1.clone(),
+            };
+            c.cast_to_pub(common[i].clone())
+        })
+        .collect();
+    LogicalPlan::Project {
+        input: Box::new(plan),
+        exprs,
+        names: names.iter().map(|(n, _)| n.clone()).collect(),
+    }
+}
+
+fn translate_select_inner(
+    q: sqlparser::ast::Query,
+    resolver: &TableResolver,
+    ancestors: &VisibleCtes,
+) -> Result<(LogicalPlan, Vec<CteDef>)> {
+    use sqlparser::ast::*;
+
+    // 集合操作分支（借用判别，避免 body 部分移动）
+    if let SetExpr::SetOperation {
+        op,
+        left,
+        right,
+        set_quantifier,
+    } = q.body.as_ref()
+    {
+        return translate_set_operation(
+            *op,
+            left.clone(),
+            right.clone(),
+            Some(*set_quantifier),
+            &q,
+            resolver,
+            ancestors,
+        );
+    }
+    let select = match *q.body {
+        SetExpr::Select(s) => s,
+        other => {
+            return Err(QsdbError::unsupported(format!(
+                "query body {other:?} not supported (plain SELECT only)"
+            )));
+        }
+    };
+    if select.from.len() > 1 {
+        return Err(QsdbError::unsupported(
+            "multi-FROM (comma join) not supported",
+        ));
+    }
+    // CTE（非递归）：WITH name AS (...) 内联展开为子计划。
+    // 定义期即分配 cte_id；祖先 CTE 可见（后定义可引用先定义，链式）。
+    let (visible, mut cte_defs) = bind_with_ctes(q.with.as_ref(), resolver, ancestors)?;
+
+    // FROM 主表：实表 / 表函数（read_parquet）/ CTE（本级 → 祖先）/ 派生表；
+    // 无 FROM → 单行零列源（SELECT 1+1 / SELECT CURRENT_DATE）
+    let (mut plan, mut ctx): (LogicalPlan, SchemaCtx) = match select.from.first() {
+        None => (LogicalPlan::OneRow, SchemaCtx { cols: Vec::new() }),
+        Some(tw) => match &tw.relation {
+            TableFactor::Table {
+                name,
+                args: Some(tf_args),
+                ..
+            } => resolve_table_function(&object_name_single(name.clone())?, &tf_args.args)?,
+            TableFactor::Function { name, args, .. } => {
+                resolve_table_function(&object_name_single(name.clone())?, args)?
+            }
+            TableFactor::Table { name, .. } => {
+                resolve_table_source(&object_name_single(name.clone())?, &visible, resolver)?
+            }
+            TableFactor::Derived { subquery, .. } => {
+                let (sub, child_defs) =
+                    translate_select_inner((**subquery).clone(), resolver, &visible)?;
+                cte_defs.extend(child_defs);
+                let cols = plan_output_columns(&sub)?;
+                (sub, SchemaCtx { cols })
+            }
+            other => {
+                return Err(QsdbError::unsupported(format!(
+                    "FROM {other:?} not supported"
+                )));
+            }
+        },
+    };
 
     // JOIN 链（SQL-2：等值 INNER/LEFT）
-    for join in &select.from[0].joins {
+    let no_joins: Vec<sqlparser::ast::Join> = Vec::new();
+    let joins = select
+        .from
+        .first()
+        .map(|t| t.joins.as_slice())
+        .unwrap_or_else(|| no_joins.as_slice());
+    for join in joins {
         let (jt, constraint) = match &join.join_operator {
             sqlparser::ast::JoinOperator::Inner(c) | sqlparser::ast::JoinOperator::Join(c) => {
                 (crate::exec::join::JoinType::Inner, c)
@@ -1937,6 +2240,13 @@ fn translate_select_inner(
     // HAVING（SQL-2）：对聚合输出过滤
     let mut having_pred: Option<PhysExpr> = None;
     if let Some(h) = &select.having {
+        // 别名置换后的 HAVING 独有聚合（不在 SELECT 里）也进聚合面（隐藏聚合列）
+        let pairs: Vec<(Expr, String)> = items
+            .iter()
+            .map(|it| (it.sql.clone(), it.name.clone()))
+            .collect();
+        let substituted = substitute_aliases(h, &pairs);
+        collect_aggs(&substituted, &ctx, &mut aggs)?;
         if group_exprs.is_empty() && aggs.is_empty() {
             return Err(QsdbError::invalid("HAVING requires aggregation"));
         }
@@ -1949,11 +2259,6 @@ fn translate_select_inner(
         }
 
         let agg_ctx = SchemaCtx { cols: hctx };
-        let pairs: Vec<(Expr, String)> = items
-            .iter()
-            .map(|it| (it.sql.clone(), it.name.clone()))
-            .collect();
-        let substituted = substitute_aliases(h, &pairs);
         having_pred = Some(rebind_over_agg(
             &substituted,
             &ctx,
@@ -2097,9 +2402,17 @@ fn translate_select_inner(
                 let desc = matches!(&ob.options.sort, Some(sqlparser::ast::OrderBySort::Desc));
                 (&ob.expr, desc)
             };
-            // 别名/输出名优先：Identifier 查输出名；其他表达式按 display 匹配投影
+            // 别名/输出名优先：Identifier 查输出名；纯数字字面量 = 输出序号
+            //（1-based，SQL 标准）；其他表达式按 display 匹配投影
             let by_output = match key_expr {
                 Expr::Identifier(id) => out_ctx.index_of(&id.value),
+                Expr::Value(v) => match &v.value {
+                    sqlparser::ast::Value::Number(n, _) => n
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|i| i.checked_sub(1).filter(|i| *i < proj_names.len())),
+                    _ => None,
+                },
                 other => {
                     let d = expr_display(other);
                     proj_names.iter().position(|n| n.eq_ignore_ascii_case(&d))
@@ -2633,6 +2946,154 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
             };
             Ok(PhysExpr::Lit(lit).cast_to(ty))
         }
+        // ── M7-B 表达式补全（向量化 CASE / coalesce / nullif / ||）────────
+        E::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            // 简单形态：CASE x WHEN v1 THEN r1 ... → 转搜索形态 x = v1
+            let conds: Vec<(PhysExpr, PhysExpr)> = match operand {
+                Some(op_expr) => {
+                    let subject = bind_expr(op_expr, ctx)?;
+                    let mut out = Vec::with_capacity(conditions.len());
+                    for cw in conditions {
+                        let cond = bind_cmp_phys(
+                            CmpOp::Eq,
+                            subject.clone(),
+                            bind_expr(&cw.condition, ctx)?,
+                        )?;
+                        out.push((cond, bind_expr(&cw.result, ctx)?));
+                    }
+                    out
+                }
+                None => {
+                    let mut out = Vec::with_capacity(conditions.len());
+                    for cw in conditions {
+                        let cond = bind_expr(&cw.condition, ctx)?;
+                        if !cond.is_boolean() {
+                            return Err(QsdbError::type_err("CASE WHEN condition must be boolean"));
+                        }
+                        out.push((cond, bind_expr(&cw.result, ctx)?));
+                    }
+                    out
+                }
+            };
+            let else_expr = match else_result {
+                Some(e) => bind_expr(e, ctx)?,
+                None => PhysExpr::Lit(Literal::Null),
+            };
+            finish_case(conds, else_expr)
+        }
+        E::Function(f)
+            if f.name.to_string().eq_ignore_ascii_case("coalesce") && f.over.is_none() =>
+        {
+            let args = arg_exprs(f)?;
+            if args.len() < 2 {
+                return Err(QsdbError::invalid("coalesce requires >= 2 arguments"));
+            }
+            let bound: Vec<PhysExpr> = args
+                .iter()
+                .map(|a| bind_expr(a, ctx))
+                .collect::<Result<_>>()?;
+            // 类型：非 NULL 参数的公共超类型
+            let mut ty: Option<LogicalType> = None;
+            for b in &bound {
+                if matches!(b, PhysExpr::Lit(Literal::Null)) {
+                    continue;
+                }
+                ty = Some(match ty {
+                    None => b.data_type(),
+                    Some(acc) => common_supertype(&acc, &b.data_type()),
+                });
+            }
+            let ty = ty.unwrap_or(LogicalType::Int64);
+            let casted: Vec<PhysExpr> = bound.into_iter().map(|b| b.cast_to(ty.clone())).collect();
+            Ok(PhysExpr::Coalesce(casted, ty))
+        }
+        E::Function(f) if f.name.to_string().eq_ignore_ascii_case("nullif") && f.over.is_none() => {
+            let args = arg_exprs(f)?;
+            if args.len() != 2 {
+                return Err(QsdbError::invalid(
+                    "nullif(a, b) requires exactly 2 arguments",
+                ));
+            }
+            let a = bind_expr(args[0], ctx)?;
+            let b = bind_expr(args[1], ctx)?;
+            let ty = a.data_type();
+            // nullif(a, b) → CASE WHEN a = b THEN NULL ELSE a
+            let cond = bind_cmp_phys(CmpOp::Eq, a.clone(), b)?;
+            Ok(PhysExpr::Case {
+                conds: vec![(cond, PhysExpr::Lit(Literal::Null).cast_to(ty.clone()))],
+                else_expr: Box::new(a.cast_to(ty.clone())),
+                ty,
+            })
+        }
+        // date_diff(unit, a, b)（DuckDB 签名）：unit 字面量 + 字符串日期提升 + Date/Ts 归一
+        E::Function(f)
+            if f.name.to_string().eq_ignore_ascii_case("date_diff") && f.over.is_none() =>
+        {
+            let args = arg_exprs(f)?;
+            if args.len() != 3 {
+                return Err(QsdbError::invalid(
+                    "date_diff(unit, a, b) requires exactly 3 arguments",
+                ));
+            }
+            let unit = match bind_expr(args[0], ctx)? {
+                PhysExpr::Lit(Literal::Utf8(s)) => s,
+                _ => {
+                    return Err(QsdbError::invalid(
+                        "date_diff unit must be a string literal (year/quarter/month/week/day/hour/minute/second)",
+                    ));
+                }
+            };
+            let mut a = bind_expr(args[1], ctx)?;
+            let mut b = bind_expr(args[2], ctx)?;
+            // 字符串字面量 → 对侧 temporal 类型提升（F16 同款白名单）
+            if !matches!(
+                a.data_type(),
+                LogicalType::Date | LogicalType::Timestamp { .. } | LogicalType::Time
+            ) && matches!(
+                b.data_type(),
+                LogicalType::Date | LogicalType::Timestamp { .. }
+            ) {
+                if let PhysExpr::Lit(Literal::Utf8(s)) = &a {
+                    let lit = parse_temporal_literal(s, &b.data_type())?;
+                    a = PhysExpr::Lit(lit);
+                }
+            }
+            if !matches!(
+                b.data_type(),
+                LogicalType::Date | LogicalType::Timestamp { .. } | LogicalType::Time
+            ) && matches!(
+                a.data_type(),
+                LogicalType::Date | LogicalType::Timestamp { .. }
+            ) {
+                if let PhysExpr::Lit(Literal::Utf8(s)) = &b {
+                    let lit = parse_temporal_literal(s, &a.data_type())?;
+                    b = PhysExpr::Lit(lit);
+                }
+            }
+            // a/b 类型归一（Date ↔ Timestamp → Timestamp）
+            let (ta, tb) = (a.data_type(), b.data_type());
+            if ta != tb {
+                let common = cmp_common_type(&ta, &tb)?;
+                a = a.cast_to(common.clone());
+                b = b.cast_to(common);
+            }
+            let def = scalar::lookup("date_diff")?;
+            let ty = (def.ret_ty)(&[
+                LogicalType::Varchar { max_chars: None },
+                a.data_type(),
+                b.data_type(),
+            ])?;
+            Ok(PhysExpr::Fn {
+                name: "date_diff".into(),
+                args: vec![PhysExpr::Lit(Literal::Utf8(unit)), a, b],
+                ty,
+            })
+        }
         E::Nested(inner) => bind_expr(inner, ctx),
         E::UnaryOp { op, expr } => match op {
             sqlparser::ast::UnaryOperator::Not => {
@@ -2670,6 +3131,12 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
                 }
                 B::Modulo => {
                     bind_binary_arith(ArithOp::Mod, bind_expr(left, ctx)?, bind_expr(right, ctx)?)
+                }
+                B::StringConcat => {
+                    let l = bind_expr(left, ctx)?.cast_to(LogicalType::Varchar { max_chars: None });
+                    let r =
+                        bind_expr(right, ctx)?.cast_to(LogicalType::Varchar { max_chars: None });
+                    Ok(PhysExpr::Concat(Box::new(l), Box::new(r)))
                 }
                 B::Eq => bind_cmp(CmpOp::Eq, left, right, ctx),
                 B::NotEq => bind_cmp(CmpOp::NotEq, left, right, ctx),
@@ -2747,8 +3214,124 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
         }
         E::Floor { expr, .. } => bind_floor_ceil(expr, ctx, "floor"),
         E::Ceil { expr, .. } => bind_floor_ceil(expr, ctx, "ceil"),
+        // EXTRACT(field FROM x) / EXTRACT(field, x) → extract('<field>', x)
+        E::Extract { field, expr, .. } => {
+            let inner = bind_expr(expr, ctx)?;
+            let ty = inner.data_type();
+            if !matches!(
+                ty,
+                LogicalType::Date | LogicalType::Timestamp { .. } | LogicalType::Time
+            ) {
+                return Err(QsdbError::type_err(format!(
+                    "extract on {ty} not supported (DATE/TIMESTAMP/TIME)"
+                )));
+            }
+            Ok(PhysExpr::Fn {
+                name: "extract".into(),
+                args: vec![
+                    PhysExpr::Lit(Literal::Utf8(datetime_field_str(field)?)),
+                    inner,
+                ],
+                ty: LogicalType::Int64,
+            })
+        }
         E::IsNull(inner) => Ok(PhysExpr::IsNull(Box::new(bind_expr(inner, ctx)?), false)),
         E::IsNotNull(inner) => Ok(PhysExpr::IsNull(Box::new(bind_expr(inner, ctx)?), true)),
+        // IS TRUE/FALSE 族：NULL 归 false/true（Coalesce+Not 组合，无新节点）
+        // IS TRUE = coalesce(x, false)；IS NOT TRUE = coalesce(NOT x, true)…
+        E::IsTrue(inner) => {
+            let x = bind_expr(inner, ctx)?;
+            require_boolean(&x, "IS TRUE")?;
+            Ok(PhysExpr::Coalesce(
+                vec![x, PhysExpr::Lit(Literal::Boolean(false))],
+                LogicalType::Boolean,
+            ))
+        }
+        E::IsNotTrue(inner) => {
+            let x = bind_expr(inner, ctx)?;
+            require_boolean(&x, "IS NOT TRUE")?;
+            Ok(PhysExpr::Coalesce(
+                vec![
+                    PhysExpr::Not(Box::new(x)),
+                    PhysExpr::Lit(Literal::Boolean(true)),
+                ],
+                LogicalType::Boolean,
+            ))
+        }
+        E::IsFalse(inner) => {
+            let x = bind_expr(inner, ctx)?;
+            require_boolean(&x, "IS FALSE")?;
+            Ok(PhysExpr::Coalesce(
+                vec![
+                    PhysExpr::Not(Box::new(x)),
+                    PhysExpr::Lit(Literal::Boolean(false)),
+                ],
+                LogicalType::Boolean,
+            ))
+        }
+        E::IsNotFalse(inner) => {
+            let x = bind_expr(inner, ctx)?;
+            require_boolean(&x, "IS NOT FALSE")?;
+            Ok(PhysExpr::Coalesce(
+                vec![x, PhysExpr::Lit(Literal::Boolean(true))],
+                LogicalType::Boolean,
+            ))
+        }
+        // IS [NOT] DISTINCT FROM：NULL 安全等值/不等（三值 → 二值）
+        // IS NOT DISTINCT FROM ≡ (x = y) OR (x IS NULL AND y IS NULL)
+        // IS DISTINCT FROM ≡ NOT 上式
+        E::IsNotDistinctFrom(l, r) => {
+            let lb = bind_expr(l, ctx)?;
+            let rb = bind_expr(r, ctx)?;
+            bind_is_not_distinct(lb, rb, false)
+        }
+        E::IsDistinctFrom(l, r) => {
+            let lb = bind_expr(l, ctx)?;
+            let rb = bind_expr(r, ctx)?;
+            bind_is_not_distinct(lb, rb, true)
+        }
+        // LIKE / ILIKE（模式须字符串字面量——绑定期预编译；ESCAPE 显式指定）
+        E::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } if !any => {
+            let inner = bind_expr(expr, ctx)?;
+            let pat = bind_expr(pattern, ctx)?;
+            let esc = escape_char_literal(escape_char.as_deref(), ctx)?;
+            like_from_phys(inner, pat, esc, *negated, false)
+        }
+        E::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } if !any => {
+            let inner = bind_expr(expr, ctx)?;
+            let pat = bind_expr(pattern, ctx)?;
+            let esc = escape_char_literal(escape_char.as_deref(), ctx)?;
+            like_from_phys(inner, pat, esc, *negated, true)
+        }
+        // x BETWEEN lo AND hi ≡ x >= lo AND x <= hi（NOT 取反；Kleene 三值）
+        E::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let x = bind_expr(expr, ctx)?;
+            let ge = bind_cmp_phys(CmpOp::GtEq, x.clone(), bind_expr(low, ctx)?)?;
+            let le = bind_cmp_phys(CmpOp::LtEq, x, bind_expr(high, ctx)?)?;
+            let both = PhysExpr::And(Box::new(ge), Box::new(le));
+            Ok(if *negated {
+                PhysExpr::Not(Box::new(both))
+            } else {
+                both
+            })
+        }
         E::Cast {
             expr,
             data_type,
@@ -2798,6 +3381,30 @@ fn bind_floor_ceil(e: &sqlparser::ast::Expr, ctx: &SchemaCtx, fname: &str) -> Re
     })
 }
 
+/// EXTRACT 字段 → 规范名（extract eval 层的 unit 词表）。
+fn datetime_field_str(f: &sqlparser::ast::DateTimeField) -> Result<String> {
+    use sqlparser::ast::DateTimeField as F;
+    Ok(match f {
+        F::Year | F::Years => "year",
+        F::Quarter => "quarter",
+        F::Month | F::Months => "month",
+        F::Day | F::Days | F::Date => "day",
+        F::DayOfWeek | F::Dow => "dow",
+        F::DayOfYear | F::Doy => "doy",
+        F::Hour | F::Hours => "hour",
+        F::Minute | F::Minutes => "minute",
+        F::Second | F::Seconds => "second",
+        // 逗号/引号形态（extract('year', x)）→ 词表由 eval 层校验
+        F::Custom(id) => return Ok(id.value.to_ascii_lowercase()),
+        other => {
+            return Err(QsdbError::unsupported(format!(
+                "extract field {other:?} not supported"
+            )));
+        }
+    }
+    .to_string())
+}
+
 fn zero_of(ty: &LogicalType) -> Result<Literal> {
     Ok(match ty {
         LogicalType::Int8 => Literal::Int8(0),
@@ -2831,9 +3438,223 @@ impl PhysExpr {
 
 // -- 算术绑定 --------------------------------------------------------------
 
+/// CASE 尾段：分支公共超类型统一 + cast（普通/聚合上两路共用）。
+fn finish_case(conds: Vec<(PhysExpr, PhysExpr)>, else_expr: PhysExpr) -> Result<PhysExpr> {
+    // 类型统一：分支求公共超类型（数值塔向宽处靠 / 字符串收编）
+    let mut ty: Option<LogicalType> = None;
+    for b in conds
+        .iter()
+        .map(|(_, r)| r)
+        .chain(std::iter::once(&else_expr))
+    {
+        if matches!(b, PhysExpr::Lit(Literal::Null)) {
+            continue; // 无类型 NULL 分支跳过
+        }
+        ty = Some(match ty {
+            None => b.data_type(),
+            Some(acc) => common_supertype(&acc, &b.data_type()),
+        });
+    }
+    let ty = ty.unwrap_or(LogicalType::Int64); // 全 NULL 分支
+    let conds: Vec<(PhysExpr, PhysExpr)> = conds
+        .into_iter()
+        .map(|(c, r)| (c, r.cast_to(ty.clone())))
+        .collect();
+    let else_expr = else_expr.cast_to(ty.clone());
+    Ok(PhysExpr::Case {
+        conds,
+        else_expr: Box::new(else_expr),
+        ty,
+    })
+}
+
+/// 布尔操作数闸门（IS TRUE 族用）。
+fn require_boolean(e: &PhysExpr, what: &str) -> Result<()> {
+    if !e.is_boolean() {
+        return Err(QsdbError::type_err(format!(
+            "{what} requires boolean operand, got {}",
+            e.data_type()
+        )));
+    }
+    Ok(())
+}
+
+/// IS [NOT] DISTINCT FROM（null-safe 等值/不等；negate=true 为 DISTINCT 形态）。
+/// NOT DISTINCT ≡ (x = y) OR (x IS NULL AND y IS NULL)。
+/// DISTINCT 不能用 NOT 包裹（Kleene 三值：NOT UNKNOWN = UNKNOWN ≠ TRUE）——
+/// 显式展开为 (单侧 NULL) OR (x != y)。
+fn bind_is_not_distinct(l: PhysExpr, r: PhysExpr, negate: bool) -> Result<PhysExpr> {
+    let is_null = |e: PhysExpr, neg: bool| PhysExpr::IsNull(Box::new(e), neg);
+    if !negate {
+        let eq = bind_cmp_phys(CmpOp::Eq, l.clone(), r.clone())?;
+        let both_null = PhysExpr::And(Box::new(is_null(l, false)), Box::new(is_null(r, false)));
+        return Ok(PhysExpr::Or(Box::new(eq), Box::new(both_null)));
+    }
+    // DISTINCT：(x 空且 y 非空) OR (x 非空且 y 空) OR (x != y)
+    let t1 = PhysExpr::And(
+        Box::new(is_null(l.clone(), false)),
+        Box::new(is_null(r.clone(), true)),
+    );
+    let t2 = PhysExpr::And(
+        Box::new(is_null(l.clone(), true)),
+        Box::new(is_null(r.clone(), false)),
+    );
+    let neq = bind_cmp_phys(CmpOp::NotEq, l, r)?;
+    Ok(PhysExpr::Or(
+        Box::new(PhysExpr::Or(Box::new(t1), Box::new(t2))),
+        Box::new(neq),
+    ))
+}
+
+/// ESCAPE 子句 → 单字符（None = 无转义，`\` 为普通字符——Postgres 默认）。
+fn escape_char_literal(e: Option<&sqlparser::ast::Expr>, ctx: &SchemaCtx) -> Result<Option<char>> {
+    match e {
+        None => Ok(None),
+        Some(ee) => match bind_expr(ee, ctx)? {
+            PhysExpr::Lit(Literal::Utf8(s)) => {
+                let mut cs = s.chars();
+                let c = cs
+                    .next()
+                    .ok_or_else(|| QsdbError::invalid("ESCAPE must be a single character"))?;
+                if cs.next().is_some() {
+                    return Err(QsdbError::invalid("ESCAPE must be a single character"));
+                }
+                Ok(Some(c))
+            }
+            _ => Err(QsdbError::invalid("ESCAPE must be a character literal")),
+        },
+    }
+}
+
+/// 已绑定操作数 + 模式字面量 → LIKE 表达式（普通/聚合上两路共用）。
+fn like_from_phys(
+    inner: PhysExpr,
+    pat: PhysExpr,
+    esc: Option<char>,
+    negated: bool,
+    ci: bool,
+) -> Result<PhysExpr> {
+    if !inner.data_type().is_string() {
+        return Err(QsdbError::type_err(format!(
+            "LIKE requires string operand, got {}",
+            inner.data_type()
+        )));
+    }
+    let pat_s = match pat {
+        PhysExpr::Lit(Literal::Utf8(s)) => s,
+        _ => return Err(QsdbError::invalid("LIKE pattern must be a string literal")),
+    };
+    Ok(PhysExpr::Like {
+        e: Box::new(inner),
+        pattern: crate::expr::LikePattern::compile(&pat_s, esc, ci)?,
+        negated,
+        ci,
+    })
+}
+
+/// 已绑定表达式的比较（CASE 简单形态 / nullif 用）：对齐逻辑同 bind_cmp。
+fn bind_cmp_phys(op: CmpOp, lb: PhysExpr, rb: PhysExpr) -> Result<PhysExpr> {
+    // NULL 比较短路（x = NULL 恒 UNKNOWN → 条件不取）
+    if matches!(lb, PhysExpr::Lit(Literal::Null)) || matches!(rb, PhysExpr::Lit(Literal::Null)) {
+        return Ok(PhysExpr::Lit(Literal::Null));
+    }
+    let (lb, rb) = promote_temporal_lit(lb, rb)?;
+    let lt = lb.data_type();
+    let rt = rb.data_type();
+    let common = cmp_common_type(&lt, &rt)?;
+    let lb = if lt == common {
+        lb
+    } else {
+        lb.cast_to(common.clone())
+    };
+    let rb = if rt == common {
+        rb
+    } else {
+        rb.cast_to(common.clone())
+    };
+    Ok(PhysExpr::Cmp {
+        op,
+        l: Box::new(lb),
+        r: Box::new(rb),
+    })
+}
+
+/// CASE/COALESCE 分支公共超类型：数值塔向宽处靠、字符串收编标量、
+/// 其余不可合并时取左值（cast 层裁决是否可行）。
+fn common_supertype(a: &LogicalType, b: &LogicalType) -> LogicalType {
+    use LogicalType as Lt;
+    if a == b {
+        return a.clone();
+    }
+    if a.is_string() || b.is_string() {
+        return Lt::Varchar { max_chars: None };
+    }
+    if a.is_numeric() && b.is_numeric() {
+        if matches!(a, Lt::Float64) || matches!(b, Lt::Float64) {
+            return Lt::Float64;
+        }
+        if matches!(a, Lt::Float32) || matches!(b, Lt::Float32) {
+            return Lt::Float64;
+        }
+        match (a, b) {
+            // 双 decimal：取 scale 大者（精度不丢）
+            (Lt::Decimal(x), Lt::Decimal(y)) => {
+                Lt::Decimal(if y.scale > x.scale { *y } else { *x })
+            }
+            // decimal 与整数：decimal 承接
+            (Lt::Decimal(d), x) | (x, Lt::Decimal(d)) if x.is_integer() => Lt::Decimal(*d),
+            _ => wider_int(a, b),
+        }
+    } else {
+        a.clone()
+    }
+}
+
 fn bind_binary_arith(op: ArithOp, l: PhysExpr, r: PhysExpr) -> Result<PhysExpr> {
     let lt = l.data_type();
     let rt = r.data_type();
+    // ── 日期算术：DATE ± INTEGER（天）/ DATE − DATE（天数）──
+    if matches!(lt, Lt::Date) || matches!(rt, Lt::Date) {
+        match (op, &lt, &rt) {
+            (ArithOp::Sub, Lt::Date, Lt::Date) => {
+                return Ok(PhysExpr::Arith {
+                    op,
+                    l: Box::new(l),
+                    r: Box::new(r),
+                    ty: Lt::Int64,
+                });
+            }
+            // Add 双侧可换；Sub 仅 Date−Int（int−Date 无日历语义）
+            (ArithOp::Add, Lt::Date, x)
+            | (ArithOp::Add, x, Lt::Date)
+            | (ArithOp::Sub, Lt::Date, x)
+                if x.is_integer() =>
+            {
+                // int 侧归一 Int64，Date 侧原样（保谓词下推）
+                let lc = if matches!(lt, Lt::Date) {
+                    l
+                } else {
+                    l.cast_to(Lt::Int64)
+                };
+                let rc = if matches!(rt, Lt::Date) {
+                    r
+                } else {
+                    r.cast_to(Lt::Int64)
+                };
+                return Ok(PhysExpr::Arith {
+                    op,
+                    l: Box::new(lc),
+                    r: Box::new(rc),
+                    ty: Lt::Date,
+                });
+            }
+            _ => {
+                return Err(QsdbError::type_err(format!(
+                    "date arithmetic on {lt} and {rt} not supported (DATE ± INTEGER 天 / DATE - DATE 天数)"
+                )));
+            }
+        }
+    }
     if !lt.is_numeric() || !rt.is_numeric() {
         return Err(QsdbError::type_err(format!(
             "arithmetic on {} and {} not supported",
@@ -2868,7 +3689,7 @@ fn bind_binary_arith(op: ArithOp, l: PhysExpr, r: PhysExpr) -> Result<PhysExpr> 
                 ArithOp::Add | ArithOp::Sub => DecimalMeta::add_result(*a, *b),
                 ArithOp::Mul => DecimalMeta::mul_result(*a, *b),
                 ArithOp::Div => DecimalMeta::div_result(*a, *b),
-                ArithOp::Mod => return Err(QsdbError::unsupported("decimal % operator")),
+                ArithOp::Mod => DecimalMeta::mod_result(*a, *b),
             }?;
             (Lt::Decimal(m), l, r) // decimal 路径 eval 内部对齐 scale
         }
@@ -2878,7 +3699,7 @@ fn bind_binary_arith(op: ArithOp, l: PhysExpr, r: PhysExpr) -> Result<PhysExpr> 
                 ArithOp::Add | ArithOp::Sub => DecimalMeta::add_result(*a, b),
                 ArithOp::Mul => DecimalMeta::mul_result(*a, b),
                 ArithOp::Div => DecimalMeta::div_result(*a, b),
-                ArithOp::Mod => return Err(QsdbError::unsupported("decimal % operator")),
+                ArithOp::Mod => DecimalMeta::mod_result(*a, b),
             }?;
             let lc = l.cast_to(Lt::Decimal(m));
             let rc = r.cast_to(Lt::Decimal(m));
@@ -2930,6 +3751,9 @@ fn bind_cmp(
     if matches!(lb, PhysExpr::Lit(Literal::Null)) || matches!(rb, PhysExpr::Lit(Literal::Null)) {
         return Ok(PhysExpr::Lit(Literal::Null));
     }
+    // F16：temporal 列 × 字符串字面量 → 绑定期字面量提升（白名单隐式转换）。
+    // 谓词保持 typed → min/max 裁剪与谓词下推不受影响；解析失败给出字面量指引。
+    let (lb, rb) = promote_temporal_lit(lb, rb)?;
     let lt = lb.data_type();
     let rt = rb.data_type();
     let common = cmp_common_type(&lt, &rt)?;
@@ -2957,6 +3781,46 @@ fn bind_cmp(
 
 fn is_lit(e: &PhysExpr) -> bool {
     matches!(e, PhysExpr::Lit(_))
+}
+
+/// 一侧 temporal、另一侧字符串**字面量** → 按目标类型解析提升
+///（字符串列 × temporal 仍显式报错——诚实语义，仅白名单字面量）。
+fn promote_temporal_lit(lb: PhysExpr, rb: PhysExpr) -> Result<(PhysExpr, PhysExpr)> {
+    let temporal = |t: &LogicalType| {
+        matches!(
+            t,
+            LogicalType::Date | LogicalType::Timestamp { .. } | LogicalType::Time
+        )
+    };
+    match (&lb, &rb) {
+        (a, PhysExpr::Lit(Literal::Utf8(s))) if temporal(&a.data_type()) => {
+            let lit = parse_temporal_literal(s, &a.data_type())?;
+            Ok((lb, PhysExpr::Lit(lit)))
+        }
+        (PhysExpr::Lit(Literal::Utf8(s)), b) if temporal(&b.data_type()) => {
+            let lit = parse_temporal_literal(s, &b.data_type())?;
+            Ok((PhysExpr::Lit(lit), rb))
+        }
+        _ => Ok((lb, rb)),
+    }
+}
+
+/// 字符串字面量 → temporal 字面量（失败给 `DATE '...'` 形态指引）。
+fn parse_temporal_literal(s: &str, ty: &LogicalType) -> Result<Literal> {
+    use crate::types::temporal;
+    let hint = |kind: &str| {
+        QsdbError::parse_err(format!(
+            "cannot parse '{s}' as {kind} (use {kind} '{s}' literal)"
+        ))
+    };
+    Ok(match ty {
+        LogicalType::Date => Literal::Date(temporal::parse_date(s).map_err(|_| hint("DATE"))?),
+        LogicalType::Timestamp { .. } => {
+            Literal::Timestamp(temporal::parse_timestamp_ns(s).map_err(|_| hint("TIMESTAMP"))?)
+        }
+        LogicalType::Time => Literal::Time(temporal::parse_time_ns(s).map_err(|_| hint("TIME"))?),
+        _ => unreachable!("caller 已过滤 temporal"),
+    })
 }
 
 fn cast_lit_expr(e: PhysExpr, ty: &LogicalType) -> Result<PhysExpr> {
@@ -3037,6 +3901,17 @@ fn fn_args(f: &sqlparser::ast::Function) -> &[sqlparser::ast::FunctionArg] {
         sqlparser::ast::FunctionArguments::List(list) => &list.args,
         _ => &[],
     }
+}
+
+/// 函数参数解包为表达式（命名参数/通配符不参与普通函数求值）。
+fn arg_exprs(f: &sqlparser::ast::Function) -> Result<Vec<&sqlparser::ast::Expr>> {
+    fn_args(f)
+        .iter()
+        .map(|a| match a {
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => Ok(e),
+            _ => Err(QsdbError::invalid("unsupported function argument form")),
+        })
+        .collect()
 }
 
 fn fn_name(f: &sqlparser::ast::Function) -> String {
@@ -3158,6 +4033,33 @@ fn collect_aggs(e: &sqlparser::ast::Expr, ctx: &SchemaCtx, aggs: &mut Vec<AggExp
         E::Cast { expr, .. } => collect_aggs(expr, ctx, aggs),
         E::UnaryOp { expr, .. } => collect_aggs(expr, ctx, aggs),
         E::IsNull(inner) | E::IsNotNull(inner) => collect_aggs(inner, ctx, aggs),
+        E::Floor { expr, .. } | E::Ceil { expr, .. } => collect_aggs(expr, ctx, aggs),
+        E::Between {
+            expr, low, high, ..
+        } => {
+            collect_aggs(expr, ctx, aggs)?;
+            collect_aggs(low, ctx, aggs)?;
+            collect_aggs(high, ctx, aggs)
+        }
+        E::Extract { expr, .. } => collect_aggs(expr, ctx, aggs),
+        E::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                collect_aggs(op, ctx, aggs)?;
+            }
+            for cw in conditions {
+                collect_aggs(&cw.condition, ctx, aggs)?;
+                collect_aggs(&cw.result, ctx, aggs)?;
+            }
+            if let Some(e) = else_result {
+                collect_aggs(e, ctx, aggs)?;
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -3262,6 +4164,109 @@ fn rebind_over_agg(
                     }
                 }
                 E::Nested(inner) => rebind_over_agg(inner, ctx, group, aggs, agg_ctx),
+                E::Case {
+                    operand,
+                    conditions,
+                    else_result,
+                    ..
+                } => {
+                    // 简单形态 CASE x WHEN v → x = v；与 bind_expr 臂同构
+                    let subject = match operand {
+                        Some(op) => Some(rebind_over_agg(op, ctx, group, aggs, agg_ctx)?),
+                        None => None,
+                    };
+                    let mut out = Vec::with_capacity(conditions.len());
+                    for cw in conditions {
+                        let cond = match &subject {
+                            Some(s) => bind_cmp_phys(
+                                CmpOp::Eq,
+                                s.clone(),
+                                rebind_over_agg(&cw.condition, ctx, group, aggs, agg_ctx)?,
+                            )?,
+                            None => {
+                                let c = rebind_over_agg(&cw.condition, ctx, group, aggs, agg_ctx)?;
+                                if !c.is_boolean() {
+                                    return Err(QsdbError::type_err(
+                                        "CASE WHEN condition must be boolean",
+                                    ));
+                                }
+                                c
+                            }
+                        };
+                        out.push((
+                            cond,
+                            rebind_over_agg(&cw.result, ctx, group, aggs, agg_ctx)?,
+                        ));
+                    }
+                    let else_expr = match else_result {
+                        Some(e) => rebind_over_agg(e, ctx, group, aggs, agg_ctx)?,
+                        None => PhysExpr::Lit(Literal::Null),
+                    };
+                    finish_case(out, else_expr)
+                }
+                E::Like {
+                    negated,
+                    any,
+                    expr,
+                    pattern,
+                    escape_char,
+                } if !any => {
+                    let inner = rebind_over_agg(expr, ctx, group, aggs, agg_ctx)?;
+                    let pat = rebind_over_agg(pattern, ctx, group, aggs, agg_ctx)?;
+                    let esc = escape_char_literal(escape_char.as_deref(), ctx)?;
+                    like_from_phys(inner, pat, esc, *negated, false)
+                }
+                E::ILike {
+                    negated,
+                    any,
+                    expr,
+                    pattern,
+                    escape_char,
+                } if !any => {
+                    let inner = rebind_over_agg(expr, ctx, group, aggs, agg_ctx)?;
+                    let pat = rebind_over_agg(pattern, ctx, group, aggs, agg_ctx)?;
+                    let esc = escape_char_literal(escape_char.as_deref(), ctx)?;
+                    like_from_phys(inner, pat, esc, *negated, true)
+                }
+                E::Floor { expr, .. } | E::Ceil { expr, .. } => {
+                    let fname = match other {
+                        E::Floor { .. } => "floor",
+                        _ => "ceil",
+                    };
+                    let inner = rebind_over_agg(expr, ctx, group, aggs, agg_ctx)?;
+                    let def = scalar::lookup(fname)?;
+                    let ty = (def.ret_ty)(&[inner.data_type()])?;
+                    Ok(PhysExpr::Fn {
+                        name: fname.to_string(),
+                        args: vec![inner],
+                        ty,
+                    })
+                }
+                E::Between {
+                    expr,
+                    negated,
+                    low,
+                    high,
+                } => {
+                    // 与 bind_expr 的 Between 臂同构（x >= lo AND x <= hi）
+                    let x = rebind_over_agg(expr, ctx, group, aggs, agg_ctx)?;
+                    let ge = bind_cmp_phys(
+                        CmpOp::GtEq,
+                        x.clone(),
+                        rebind_over_agg(low, ctx, group, aggs, agg_ctx)?,
+                    )?;
+                    let le = bind_cmp_phys(
+                        CmpOp::LtEq,
+                        x,
+                        rebind_over_agg(high, ctx, group, aggs, agg_ctx)?,
+                    )?;
+                    let both = PhysExpr::And(Box::new(ge), Box::new(le));
+                    Ok(if *negated {
+                        PhysExpr::Not(Box::new(both))
+                    } else {
+                        both
+                    })
+                }
                 E::Cast {
                     expr, data_type, ..
                 } => {
@@ -3282,7 +4287,6 @@ fn rebind_over_agg(
 
 fn bind_scalar_fn(f: &sqlparser::ast::Function, ctx: &SchemaCtx) -> Result<PhysExpr> {
     let name = fn_name(f);
-    let def = scalar::lookup(&name)?;
     let fargs = fn_args(f);
     let mut args = Vec::with_capacity(fargs.len());
     for a in fargs {
@@ -3297,15 +4301,19 @@ fn bind_scalar_fn(f: &sqlparser::ast::Function, ctx: &SchemaCtx) -> Result<PhysE
             }
         }
     }
+    finish_scalar_fn(name, args)
+}
+
+/// 标量函数绑定尾段：ret_ty 校验 + 隐式 cast（int→Int64 / float→Float64）
+/// + Fn 构造。普通路径与聚合上路（bind_scalar_fn_over）共用。
+fn finish_scalar_fn(name: String, args: Vec<PhysExpr>) -> Result<PhysExpr> {
+    let def = scalar::lookup(&name)?;
     let arg_tys: Vec<LogicalType> = args.iter().map(|a| a.data_type()).collect();
     let ty = (def.ret_ty)(&arg_tys)?;
-    // 参数隐式 cast（int→Int64 / float→Float64）
     let args = args
         .into_iter()
         .enumerate()
         .map(|(i, a)| {
-            let want = arg_tys.get(i).cloned().unwrap_or(LogicalType::Int64);
-            let _ = want;
             let target = match &arg_tys[i] {
                 LogicalType::Int8
                 | LogicalType::Int16
@@ -3314,23 +4322,38 @@ fn bind_scalar_fn(f: &sqlparser::ast::Function, ctx: &SchemaCtx) -> Result<PhysE
                 LogicalType::Float32 | LogicalType::Float64 => LogicalType::Float64,
                 t => t.clone(),
             };
-            Ok(a.cast_to(target))
+            a.cast_to(target)
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Vec<_>>();
     Ok(PhysExpr::Fn { name, args, ty })
 }
 
+/// 聚合输出上的标量函数（round(sum(x)) / upper(tenant) 聚合查询形态）：
+/// 参数递归走 rebind_over_agg（聚合调用→agg 列引用），尾段与普通路径共用。
 fn bind_scalar_fn_over(
     _e: &sqlparser::ast::Expr,
-    _f: &sqlparser::ast::Function,
-    _ctx: &SchemaCtx,
-    _group: &[PhysExpr],
+    f: &sqlparser::ast::Function,
+    ctx: &SchemaCtx,
+    group: &[PhysExpr],
     _aggs: &[AggExpr],
-    _agg_ctx: &SchemaCtx,
+    agg_ctx: &SchemaCtx,
 ) -> Result<PhysExpr> {
-    Err(QsdbError::unsupported(
-        "scalar functions over aggregates (e.g. upper(sum(x))) land in M4",
-    ))
+    let name = fn_name(f);
+    let fargs = fn_args(f);
+    let mut args = Vec::with_capacity(fargs.len());
+    for a in fargs {
+        match a {
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => {
+                args.push(rebind_over_agg(e, ctx, group, _aggs, agg_ctx)?)
+            }
+            other => {
+                return Err(QsdbError::unsupported(format!(
+                    "function arg {other:?} not supported"
+                )));
+            }
+        }
+    }
+    finish_scalar_fn(name, args)
 }
 
 // ---------------------------------------------------------------------------
