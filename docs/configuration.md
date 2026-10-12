@@ -17,6 +17,7 @@
 | `scan_cache_bytes` | usize / **256MB** | 热数据缓存预算（segment 级**解码后** LRU）。**0 = 关闭**。预算应能装下热工作集且不超过机器可用内存（预算过大会触发换页反噬——实测 4GB 预算在被其他进程占内存的机器上反而变慢）。**默认取保守值守「极致低占用」定位**；宽投影要快的部署显式调大（CLI `--cache-mb`）。**权衡实测（2026-10-12，10M×4 列）**：单条累积上界是 `budget/8`（8 分片防爆内存系数），而单个分片片段约 32~64MB——**256MB（上界 32MB）恰好卡在片段大小边缘**：16 分片只进 11 个，付了缓存成本却几乎不命中（**0.182s，比关缓存 0.136s 还慢**）；**1GB（上界 128MB）** 全命中 → **0.011s（约 16x）**，代价是查询期 RSS 到 **1.2GB**。**根治方向是缓存粒度**（按批/RG 分块，使小预算也能部分命中），不是放大预算。**注意**：这是**缓存记账上限**，不是进程内存硬上限（在途 `Arc` 不计入，见内存模型一节）。 |
 | `query_timeout_ms` | Option\<u64\> / None | 默认查询超时（毫秒）。**这是运行期同名配置的初值**——open 后可经 [`Qsdb::runtime()`] 热更，见下节。 |
 | `query_memory_limit_bytes` | Option\<u64\> / None | 默认单查询内存上限（字节）；**None/0 = 不限**（库默认不限——嵌入方自控内存策略）。同为运行期配置的初值。**`qsdb server` 兜底 4GB**（`--query-memory-limit-mb`）：server 是唯一会叠加多查询的部署面，不给默认即「N 个查询各自无界」。只约束**物化算子**记账（join build / sort spill / window / udaf），流式扫描/聚合不记账——见内存模型一节。 |
+| `memory_budget_bytes` | Option\<u64\> / None | **全局内存预算**（字节）：本句柄内**所有**查询共享的执行内存 + 解码缓存总上界；**None/0 = 不限**（库默认不限，嵌入方自控）。与上一行的分工：那个是「单查询配额」（400 `QUERY_MEMORY_LIMIT`），这个是「整个句柄的天花板」（超了是 503 `MEMORY_PRESSURE`，可退避重试）。压力下**先挤兑缓存**再拒查询。**只约束记账到的内存**（物化算子 + 解码缓存；流式在途批的残留上界见设计文档 §七）。`qsdb server` 兜底 4GB（`--memory-budget-mb`）。 |
 | `storage`（HDFS 形态） | `StorageConfig::Hdfs { url, prefix }` | HDFS 管理表（M6-5，feature `hdfs`）：`url` 如 `hdfs://192.168.1.12:9000`；CAS 由锁对象模拟（`hdfs_backend`）；身份走 `HADOOP_USER_NAME` 环境变量。CLI：`--storage-type hdfs --storage-hdfs-url hdfs://host:9000`。 |
 | `staging_dir` | Option\<PathBuf\> / None | 远端写 staging 目录（M6-4）：Some = 启用——远端写先落本地盘（**写盘即 ACK**，写延迟与网络解耦），`flush_staged()` 批量 PUT + OCC 提交。需 S3 后端。**可见性语义**：未 flush 的数据对查询不可见（manifest 唯一真值），可见性延迟 = 上传周期；读己之写先 flush。崩溃恢复：残留对下次 flush 幂等补传（segment PUT 幂等 + manifest file_name 去重）。 |
 | `file_cache_bytes` | u64 / 0 | 远端外表（`read_parquet('s3://…')`）段文件本地磁盘缓存预算，布局 `{root}/_filecache/{url_hash}/{etag}/…`（ETag 键控，对象覆盖自动失效；预算内按 mtime LRU 驱逐）。**0 = 关闭（默认）**。仅整读（无 row group 裁剪命中）的对象入缓存；选择性查询走 range GET 不占预算。需编译 feature `s3`。 |
@@ -63,7 +64,9 @@
 | 热缓存预算 | `--cache-mb` / 256 | ❌（open 期定死） | 0 = 关闭；守恒低占用，宽投影可显式调大 |
 | 单查询内存上限 | `--query-memory-limit-mb` / 4096 | ✅（`PUT /api/v1/config`） | 0 = 不限；超限该查询被终止（**防 OOM 双闸之二**） |
 | 自动 compaction 周期 | `--auto-compact-secs` / 关 | ❌ | 周期遍历全表 compact |
-| 并发查询上限 | `--max-concurrent-queries` / **16（过渡值，待重定）** | ❌（当前版） | 0 = 不限；超限**直接 503 + `TOO_MANY_QUERIES`**（不排队，**可退避重试**）。**这是过渡默认**：16 ≈ 机器内存 ÷ 单查询上限，是当前唯一的系统级内存上界，但它数的是**条数**、分不清 µs 级轻查询与吃 4GB 的重查询 → 对轻查询并发有副作用。**最终取定随「全局内存预算 + 溢出」准入设计一并做**（见内存模型一节）。要立刻按机器容量调整就显式传参 |
+| 全局内存预算 | `--memory-budget-mb` / **4096** | ❌（open 期定死） | 全库执行内存 + 缓存总上界；0 = 不限。超预算 → 503 `MEMORY_PRESSURE`（**可退避重试**）。**这是「进程内存上界」的承诺落点** |
+| 单查询内存上限 | `--query-memory-limit-mb` / **4096** | ✅（`PUT /api/v1/config`） | 单查询自己的配额；0 = 不限。超限 → 400 `QUERY_MEMORY_LIMIT`（改查询才有用） |
+| 并发查询上限 | `--max-concurrent-queries` / **0（不限）** | ❌（当前版） | 0 = 不限；超限直接 503 `TOO_MANY_QUERIES`（不排队，可退避重试）。**只管条数、不承担内存职责**（内存归预算管）——先前默认 16 是因为"它是唯一的系统级内存上界"，预算落地后该理由不成立，且按条数限流会误伤轻查询 |
 | 写缓冲阈值 | WriteBufferOptions（代码默认 64 批/128MB） | ❌ | 攒批自动 flush |
 | compaction 触发 | CompactOptions（代码默认 ≥4 段且均值 <64MB） | ❌ | 见 `qsdb admin compact` |
 | Flight 监听口 | `--flight-bind` / 关 | ❌ | Arrow Flight 数据面（h2c，独立于 HTTP）；需 `--features flight` 编译（默认关闭守二进制红线）。鉴权复用 `--token`（Bearer metadata）。do_get ticket=SQL；do_put 首帧 descriptor cmd=`table:<名>` |
@@ -106,28 +109,40 @@ drift 时显式报错转人工 ALTER（最小权限原则）。此矩阵不改�
 
 **密码哈希**：SHA-256(password ‖ 16B salt) 迭代 10,000 次（内网部署口径）。
 
-## 六、内存模型（三个池 + 两道闸）
+## 六、内存模型（一个账本，三类租户）
 
-QSDB 的内存**不是一个池、也不由一个旋钮统管**——三个池各管各的，调一个不影响另一个：
+设计见 [`内存预算与溢出设计.md`](内存预算与溢出设计.md)；**P0（账本合一）已落地 2026-10-13**。
 
-| 池 | 谁用 | 上限由谁管 |
-|---|------|-----------|
-| ① 解码缓存 | `SegmentCache`（**实例级共享**：`Arc<Mutex<Inner>>` + LRU，多查询共用、互相命中） | `scan_cache_bytes`（默认 256MB；`put` 时 LRU 驱逐，保证**记账** `used ≤ budget`） |
-| ② 查询执行内存 | **显式物化**算子：HashJoin build / Sort spill / Window / UdafAgg | 每查询独立 `QueryContext` 计数，闸门 = `query_memory_limit_bytes` |
-| ③ 写缓冲 | `WriteBuffer` | 攒批阈值（代码默认 64 批 / 128MB） |
+**一个账本**：`MemoryPool`（每个 `Qsdb` 句柄一份，`Arc` 共享）持有
+`budget` 与两个计数（`exec` 执行侧 / `cache` 缓存侧）。**准入只有一个入口**
+`QueryContext::try_reserve` → RAII 的 `Reservation`（`Drop` 即归还，
+「忘还」在类型上不可能）。
 
-**流式路径不占池 ②**：扫描 / 过滤 / 聚合是拉式迭代（一批 8192 行用完即弃），既不记账也不驻留——故空闲进程 RSS 只有几 MB。只有「必须物化」的算子才吃池 ②。
+| 租户 | 谁 | 记账 | 压力下的行为 |
+|---|---|---|---|
+| **执行内存** | 显式物化算子：HashJoin build / CrossJoin / Sort / Window / HashAgg / Distinct / SetOp / JoinCount / semi-anti 存在集 / CTE 物化 | 按**分配点的实际保留量**增量预留（聚合按组表**每分片**实记——分片放大是真占用） | 有溢出能力（Sort）→ 落盘完成；否则 → `MEMORY_PRESSURE`（503 **可退避重试**） |
+| **解码缓存** | `SegmentCache`（实例级共享 LRU） | 由缓存自己同步 `used` | **先被挤兑**（纯缓存，丢了大不了重算；只挤到够用，不一挤到底） |
+| **写缓冲** | `WriteBuffer` | **不纳入预算**（自带上界 64 批 / 128MB） | 攒批阈值触发 flush |
 
-### 两道防 OOM 闸（仅 server；嵌入模式由宿主自控）
+**流式路径不记账**：扫描/过滤/聚合是拉式迭代（一批 8192 行用完即弃），不驻留——
+故空闲进程 RSS 只有几 MB。只有「必须物化」的算子才吃账本。
+
+### 三道闸（仅 server；嵌入模式由宿主自控）
 
 | 闸 | 默认 | 超限行为 |
 |---|------|---------|
-| `--max-concurrent-queries` | **16**（0 = 不限；**过渡值**） | 第 17 个请求**直接 503 + `TOO_MANY_QUERIES`**（**不排队**——闸门的职责是拒绝，不是缓冲）。该码**可退避重试**（与"只读库拒绝写"的 503 是**两个不同的码**，见码表）。**已知局限**：数条数、不分轻重，轻查询并发也会被挡；取定待「全局内存预算 + 溢出」准入设计 |
-| `--query-memory-limit-mb` | **4096**（4GB；0 = 不限） | 该查询被终止（`QUERY_MEMORY_LIMIT`），不 OOM 全库 |
+| `--memory-budget-mb` | **4096**（4GB；0 = 不限） | **全库**执行内存 + 缓存的总上界。要不到额度 → 503 **`MEMORY_PRESSURE`**（**可退避重试**——多为他人占用）。这才是「进程内存上界」的落点 |
+| `--query-memory-limit-mb` | **4096**（4GB；0 = 不限） | 单查询**自己的配额**超限 → 400 `QUERY_MEMORY_LIMIT`（**改查询才有用**，重试无用） |
+| `--max-concurrent-queries` | **0**（不限） | 并发**条数**上限 → 503 `TOO_MANY_QUERIES`（可退避重试）。**它不再承担内存职责**（内存归预算管）；真需要过载保护/公平性时才显式给 |
 
-**两闸相互独立，不构成一个内存上界**：最坏占用 ≈ `limit × 并发数`（4GB × 16 = 64GB）。要真实的进程上界，请按机器容量自己收紧两者。生效优先级：**CLI 显式值 > `--config` 文件 > 兜底默认**。
+**"内存不够"的两种码别混**（客户端动作相反）：`QUERY_MEMORY_LIMIT`（你的查询太大 →
+改查询）/ `MEMORY_PRESSURE`（全库此刻吃紧 → 退避重试）。**三种 503 也别按状态码一刀切**。
+生效优先级：**CLI 显式值 > `--config` 文件 > 兜底默认**。
 
 > 错误码的含义、可重试性与 SQLState 映射见 [`error-codes.md`](error-codes.md)（权威码表）。
+> 运行期观测：`GET /api/v1/config` 的 `memory` 节（budget/exec/cache/挤兑量）、
+> `/metrics` 的 `qsdb_memory_used_bytes{pool=exec|cache}` 与
+> `qsdb_queries_rejected_total{reason=concurrency|memory}`。
 
 ### 三条容易踩的认知（2026-10-12 实测）
 

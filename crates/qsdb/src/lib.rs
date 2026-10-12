@@ -22,6 +22,7 @@ pub mod fsutil;
 pub mod hdfs_backend;
 pub mod index;
 pub mod manifest;
+pub mod memory;
 pub mod partition;
 pub mod query;
 #[cfg(any(feature = "s3", feature = "remote"))]
@@ -44,6 +45,7 @@ pub use error::{NotFoundKind, QsdbError, Result};
 pub use expr::udaf;
 pub use expr::udf;
 pub use manifest::{ColumnStats, PartitionManifest, SegmentEntry};
+pub use memory::{MemoryPool, Reservation};
 // format-spec 原语（F13：生态工具实现合规布局的契约级稳定面）
 pub use partition::{
     encode_partition_value, parse_partition_dir, parse_partition_value, partition_dir,

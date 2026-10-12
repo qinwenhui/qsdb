@@ -380,6 +380,60 @@ impl GroupTable {
         self.key_off.len().saturating_sub(1)
     }
 
+    /// 组表**内存占用的量级估算**（字节）——供内存预算记账。
+    ///
+    /// 口径是「分配的容器容量」而非「元素个数」：账要覆盖**已保留的内存**，
+    /// 而不是逻辑数据量。不追求逐字节精确（HashMap 桶开销、分配器对齐、
+    /// 容量翻倍余量都是估的），但**不系统性低估**——高基数下组表是内存大头，
+    /// 估错一个量级就等于预算失效。
+    ///
+    /// 用它的地方：`HashAggExec` 按本值增量预留（见 `exec/mod.rs`），
+    /// 从而把「每分片各建一份完整组表」的**分片放大**如实记进全局预算。
+    pub fn estimated_bytes(&self) -> u64 {
+        let mut b: u64 = 0;
+        b += self.key_arena.capacity() as u64;
+        b += self.key_off.capacity() as u64 * 4;
+        b += self.fast_slots.capacity() as u64 * 16; // (u64, u32) + padding
+        b += self.fast_slots_inline.capacity() as u64 * 16; // (i64, u32) + padding
+        // HashMap<u64, Vec<u32>>：桶 + 每组一个 Vec 头
+        let vec_hdr = std::mem::size_of::<Vec<u32>>() as u64;
+        b += self.by_hash.capacity() as u64 * (std::mem::size_of::<(u64, Vec<u32>)>() as u64 + 1);
+        b += self
+            .by_hash
+            .values()
+            .map(|v| v.capacity() as u64 * 4 + vec_hdr)
+            .sum::<u64>();
+        let lit = std::mem::size_of::<Literal>() as u64;
+        b += self.group_lits.capacity() as u64 * vec_hdr;
+        b += self
+            .group_lits
+            .iter()
+            .map(|v| v.capacity() as u64 * lit)
+            .sum::<u64>();
+        b += self.counts.capacity() as u64 * vec_hdr;
+        b += self
+            .counts
+            .iter()
+            .map(|v| v.capacity() as u64 * 8)
+            .sum::<u64>();
+        for s in &self.sums {
+            let per = match s {
+                SumCol::None => 0,
+                SumCol::Int(v) => v.capacity() as u64 * 16,
+                SumCol::Flt(v) => v.capacity() as u64 * 16,
+                SumCol::Dec(v) => v.capacity() as u64 * 32,
+            };
+            b += per;
+        }
+        b += self.minmax.capacity() as u64 * vec_hdr;
+        b += self
+            .minmax
+            .iter()
+            .map(|v| v.capacity() as u64 * (lit + 8))
+            .sum::<u64>();
+        b
+    }
+
     /// 组 g 的 key 字节。
     #[inline]
     fn key_of(&self, g: usize) -> &[u8] {

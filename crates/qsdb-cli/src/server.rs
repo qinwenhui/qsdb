@@ -122,6 +122,14 @@ pub struct Metrics {
     pub write_nanos: AtomicU64,
     pub write_count: AtomicU64,
     pub errors_total: AtomicU64,
+    /// 内存池观测快照（每次渲染前由 handler 刷新）
+    pub mem_budget: AtomicU64,
+    pub mem_exec: AtomicU64,
+    pub mem_cache: AtomicU64,
+    /// 被并发闸拒绝（`TOO_MANY_QUERIES`）次数
+    pub rejected_concurrency: AtomicU64,
+    /// 被全局内存预算拒绝（`MEMORY_PRESSURE`）次数
+    pub rejected_memory: AtomicU64,
 }
 
 impl Metrics {
@@ -145,7 +153,10 @@ impl Metrics {
              # HELP qsdb_write_rows_total rows written\n# TYPE qsdb_write_rows_total counter\nqsdb_write_rows_total {}\n\
              # HELP qsdb_write_seconds_avg avg write latency\n# TYPE qsdb_write_seconds_avg gauge\nqsdb_write_seconds_avg {}\n\
              # HELP qsdb_tables tables\n# TYPE qsdb_tables gauge\nqsdb_tables {}\n\
-             # HELP qsdb_store_bytes total store bytes\n# TYPE qsdb_store_bytes gauge\nqsdb_store_bytes {}\n",
+             # HELP qsdb_store_bytes total store bytes\n# TYPE qsdb_store_bytes gauge\nqsdb_store_bytes {}\n\
+             # HELP qsdb_memory_used_bytes memory in use (exec = materializing operators, cache = decoded LRU)\n# TYPE qsdb_memory_used_bytes gauge\nqsdb_memory_used_bytes{{pool=\"exec\"}} {}\nqsdb_memory_used_bytes{{pool=\"cache\"}} {}\n\
+             # HELP qsdb_memory_budget_bytes global memory budget (0 = unlimited)\n# TYPE qsdb_memory_budget_bytes gauge\nqsdb_memory_budget_bytes {}\n\
+             # HELP qsdb_queries_rejected_total queries rejected by admission control\n# TYPE qsdb_queries_rejected_total counter\nqsdb_queries_rejected_total{{reason=\"concurrency\"}} {}\nqsdb_queries_rejected_total{{reason=\"memory\"}} {}\n",
             self.requests_total.load(Ordering::Relaxed),
             self.errors_total.load(Ordering::Relaxed),
             if qc > 0 {
@@ -162,6 +173,11 @@ impl Metrics {
             },
             tables,
             bytes,
+            self.mem_exec.load(Ordering::Relaxed),
+            self.mem_cache.load(Ordering::Relaxed),
+            self.mem_budget.load(Ordering::Relaxed),
+            self.rejected_concurrency.load(Ordering::Relaxed),
+            self.rejected_memory.load(Ordering::Relaxed),
         )
     }
 }
@@ -557,6 +573,18 @@ async fn download_file(
     }
 }
 
+/// 把内存池的实时占用刷进指标原子（渲染前调一次；池本身在 `Qsdb` 上）。
+fn refresh_mem_gauges(s: &AppState) {
+    let pool = s.db.memory_pool();
+    s.metrics.mem_budget.store(pool.budget(), Ordering::Relaxed);
+    s.metrics
+        .mem_exec
+        .store(pool.exec_used(), Ordering::Relaxed);
+    s.metrics
+        .mem_cache
+        .store(pool.cache_used(), Ordering::Relaxed);
+}
+
 /// GET /api/v1/error-codes：错误码目录（机器可读，由 [`ErrorCode`] 直接产出）。
 ///
 /// 目录是**静态**的（不含实例信息、不含凭证），故与 `/health`、`/metrics` 同口径
@@ -578,6 +606,7 @@ async fn health(State(_s): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn metrics(State(s): State<Arc<AppState>>) -> Response {
+    refresh_mem_gauges(&s);
     let (tables, bytes) = match tokio::task::spawn_blocking({
         let db = Arc::clone(&s.db);
         move || db.stats()
@@ -660,6 +689,9 @@ async fn query(
             s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
             // 专属 code：同为 503 还有"只读库拒绝写"（UNAVAILABLE），驱动必须能
             // 区分「并发满 → 可退避重试」与「只读 → 永不重试」。
+            s.metrics
+                .rejected_concurrency
+                .fetch_add(1, Ordering::Relaxed);
             return ErrorCode::TooManyQueries.response(msg);
         }
     };
@@ -724,6 +756,7 @@ async fn query(
         },
         Ok(Err(e)) => {
             s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+            note_memory_rejection(&s, &e);
             status_of_query(&e, e.to_string())
         }
         Err(e) => ErrorCode::Internal.response(e.to_string()),
@@ -998,6 +1031,14 @@ async fn get_config(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Respo
             "scanCacheBytes": opts.scan_cache_bytes,
             "trashGraceMs": opts.trash_grace_ms,
         },
+        // 全局内存账本（实时）
+        "memory": {
+            "budgetBytes": s.db.memory_pool().budget(),
+            "execUsedBytes": s.db.memory_pool().exec_used(),
+            "cacheUsedBytes": s.db.memory_pool().cache_used(),
+            "cacheEvictedBytes": s.db.cache_evicted_bytes(),
+            "note": "budget=0 表示不限；压力下先挤兑 cache（纯缓存），再拒查询（503 MEMORY_PRESSURE）",
+        },
         // 服务器级
         "server": {
             "maxConcurrentQueries": s.max_concurrent_queries,
@@ -1106,6 +1147,13 @@ fn status_of(e: &QsdbError, msg: String) -> Response {
 /// 并用 code `TABLE_NOT_FOUND` / `COLUMN_NOT_FOUND` 便于驱动映射 SQLState。
 fn status_of_query(e: &QsdbError, msg: String) -> Response {
     ErrorCode::from_qsdb(e, true).response(msg)
+}
+
+/// 计一次「被内存预算拒绝」（供 `qsdb_queries_rejected_total{reason="memory"}`）。
+fn note_memory_rejection(s: &AppState, e: &QsdbError) {
+    if matches!(e, QsdbError::MemoryPressure(_)) {
+        s.metrics.rejected_memory.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 // 错误 → 响应/状态码的映射**只有一处**：`error_code::ErrorCode::from_qsdb`

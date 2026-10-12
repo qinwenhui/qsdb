@@ -67,15 +67,25 @@ enum Cmd {
         /// `QsdbOptions::scan_cache_bytes` 文档的内存-性能权衡）。
         #[arg(long, default_value_t = 256)]
         cache_mb: usize,
-        /// 并发查询上限（0 = 不限；默认 16）。**防 OOM 双闸之一**：
-        /// 超限请求直接 503（不排队——闸门的职责是拒绝，不是缓冲）。
-        /// **16 是过渡默认**：它 ≈ 机器内存 ÷ 单查询上限，是当前唯一的系统级
-        /// 内存上界；但闸门数的是**条数**，分不清 µs 级轻查询与吃 4GB 的重查询，
-        /// 故对轻查询并发有副作用。最终取定随「全局内存预算 + 溢出」准入设计
-        /// 一并做（见 docs/configuration.md 内存模型一节）——在那之前，按机器
-        /// 容量显式传参即可。
-        #[arg(long, default_value_t = 16)]
+        /// 并发查询上限（0 = 不限；**默认 0**）。超限请求直接 503
+        /// `TOO_MANY_QUERIES`（不排队——闸门的职责是拒绝，不是缓冲）。
+        ///
+        /// **它只管「条数」，不承担内存职责**：内存由 `--memory-budget-mb`
+        /// 的全局预算管（超预算 → 503 `MEMORY_PRESSURE`，可退避重试）。
+        /// 原先默认 16 是因为"它是唯一的系统级内存上界"，预算落地后这个理由
+        /// 不成立了；且按条数限流会误伤 µs 级轻查询。真需要限流（过载保护/
+        /// 公平性）时按机器容量显式给。
+        #[arg(long, default_value_t = 0)]
         max_concurrent_queries: usize,
+        /// **全局内存预算**（MB；0 = 不限；默认 4096 = 4GB）。
+        ///
+        /// 本进程内**所有**查询共享的执行内存上界 + 解码缓存的总上界
+        /// （压力下先挤兑缓存——纯缓存丢了大不了重算）。超预算的查询 →
+        /// 503 `MEMORY_PRESSURE`（可退避重试），**不是 OOM**。
+        /// 与 `--query-memory-limit-mb` 的分工：那个是「单个查询的配额」
+        /// （超了是 400 `QUERY_MEMORY_LIMIT`，改查询才有用）。
+        #[arg(long, default_value_t = 4096)]
+        memory_budget_mb: u64,
         /// 单查询执行内存上限（MB；**0 = 不限**；不给则默认 4096 = 4GB）。
         /// **防 OOM 双闸之二**，只约束显式物化算子的记账（join build /
         /// sort spill / window / udaf；流式扫描/聚合不驻留故不记账）。
@@ -352,6 +362,7 @@ fn main() {
             auto_compact_secs,
             cache_mb,
             max_concurrent_queries,
+            memory_budget_mb,
             query_memory_limit_mb,
             flight_bind,
             file_cache_mb,
@@ -436,6 +447,9 @@ fn main() {
                 storage,
                 durability: dur,
                 read_only,
+                // MB → 字节；0 = 不限（嵌入方/部署方自控）
+                memory_budget_bytes: (memory_budget_mb > 0)
+                    .then(|| memory_budget_mb.saturating_mul(1024 * 1024)),
                 scan_cache_bytes: cache_mb * 1024 * 1024,
                 file_cache_bytes: file_cache_mb * 1024 * 1024,
                 staging_dir: staging_dir.clone(),

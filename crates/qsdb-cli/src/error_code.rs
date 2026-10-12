@@ -42,6 +42,7 @@ pub enum ErrorCode {
     Forbidden,
     // ---- capacity ----
     TooManyQueries,
+    MemoryPressure,
     ReadOnly,
     // ---- storage ----
     MetadataError,
@@ -52,7 +53,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// 全量清单（目录端点与漂移测试的唯一来源）。
-    pub const ALL: [ErrorCode; 20] = [
+    pub const ALL: [ErrorCode; 21] = [
         Self::QueryTimeout,
         Self::QueryCancelled,
         Self::QueryMemoryLimit,
@@ -69,6 +70,7 @@ impl ErrorCode {
         Self::Unauthorized,
         Self::Forbidden,
         Self::TooManyQueries,
+        Self::MemoryPressure,
         Self::ReadOnly,
         Self::MetadataError,
         Self::IoError,
@@ -94,6 +96,7 @@ impl ErrorCode {
             Self::Unauthorized => "UNAUTHORIZED",
             Self::Forbidden => "FORBIDDEN",
             Self::TooManyQueries => "TOO_MANY_QUERIES",
+            Self::MemoryPressure => "MEMORY_PRESSURE",
             Self::ReadOnly => "READ_ONLY",
             Self::MetadataError => "METADATA_ERROR",
             Self::IoError => "IO_ERROR",
@@ -121,7 +124,9 @@ impl ErrorCode {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
-            Self::TooManyQueries | Self::ReadOnly => StatusCode::SERVICE_UNAVAILABLE,
+            Self::TooManyQueries | Self::MemoryPressure | Self::ReadOnly => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
         }
     }
 
@@ -130,7 +135,10 @@ impl ErrorCode {
     /// **同为 503 的两个码在这里分道扬镳**：并发满是"等一会儿再来"，
     /// 只读库是"这台永远不行"。
     pub fn retryable(self) -> bool {
-        matches!(self, Self::TooManyQueries | Self::IoError)
+        matches!(
+            self,
+            Self::TooManyQueries | Self::MemoryPressure | Self::IoError
+        )
     }
 
     /// 归组（给人看的分类，不参与映射）。
@@ -148,7 +156,7 @@ impl ErrorCode {
             Self::AlreadyExists | Self::NotFound => "resource",
             Self::InvalidArgument | Self::InvalidIpc => "request",
             Self::Unauthorized | Self::Forbidden => "auth",
-            Self::TooManyQueries | Self::ReadOnly => "capacity",
+            Self::TooManyQueries | Self::MemoryPressure | Self::ReadOnly => "capacity",
             Self::MetadataError | Self::IoError => "storage",
             Self::Internal => "internal",
         }
@@ -172,6 +180,7 @@ impl ErrorCode {
             Self::Unauthorized => "28000",
             Self::Forbidden => "42501",
             Self::TooManyQueries => "53300",
+            Self::MemoryPressure => "53000",
             Self::ReadOnly => "25006",
             Self::IoError => "58030",
         }
@@ -199,6 +208,8 @@ impl ErrorCode {
             QsdbError::Meta(_) => Self::MetadataError,
             // 只读库拒绝变更：对客户端是"这台不行"，不是"请求写错了"
             QsdbError::ReadOnly(_) => Self::ReadOnly,
+            // 全库预算此刻耗尽（多为**他人占用**）→ 503 + 可退避重试
+            QsdbError::MemoryPressure(_) => Self::MemoryPressure,
             QsdbError::NotFound { .. } => match (query_ctx, e.not_found_kind()) {
                 // 查询端点：表/列各有专属码（驱动可映射 42P01/42703）；
                 // 其余对象（文件/视图/函数……）在 SQL 面一律归"参数指向了不存在的东西"
@@ -245,7 +256,7 @@ impl ErrorCode {
         match self {
             Self::QueryTimeout => Code::DeadlineExceeded,
             Self::QueryCancelled => Code::Cancelled,
-            Self::TooManyQueries => Code::ResourceExhausted,
+            Self::TooManyQueries | Self::MemoryPressure => Code::ResourceExhausted,
             Self::ReadOnly => Code::FailedPrecondition,
             Self::Unauthorized => Code::Unauthenticated,
             Self::Forbidden => Code::PermissionDenied,
@@ -396,17 +407,35 @@ mod tests {
 
     /// 两个 503 必须能区分（并发满可重试 / 只读永不重试）。
     #[test]
-    fn two_flavors_of_503() {
-        assert_eq!(
-            ErrorCode::TooManyQueries.status(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-        assert_eq!(
-            ErrorCode::ReadOnly.status(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
+    fn three_flavors_of_503() {
+        for c in [
+            ErrorCode::TooManyQueries,
+            ErrorCode::MemoryPressure,
+            ErrorCode::ReadOnly,
+        ] {
+            assert_eq!(c.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
         assert!(ErrorCode::TooManyQueries.retryable());
+        assert!(ErrorCode::MemoryPressure.retryable());
         assert!(!ErrorCode::ReadOnly.retryable());
+    }
+
+    /// 「内存不够」的两种：配额错（改查询）vs 全局压力（退避重试）——动作相反。
+    #[test]
+    fn two_flavors_of_out_of_memory() {
+        assert_eq!(
+            ErrorCode::from_qsdb(&QsdbError::QueryMemoryLimit("x".into()), true),
+            ErrorCode::QueryMemoryLimit
+        );
+        assert_eq!(
+            ErrorCode::from_qsdb(&QsdbError::MemoryPressure("x".into()), true),
+            ErrorCode::MemoryPressure
+        );
+        assert_eq!(
+            ErrorCode::QueryMemoryLimit.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(!ErrorCode::QueryMemoryLimit.retryable());
     }
 
     /// NotFound 的类别决定查询端点的码——不再嗅探文案。

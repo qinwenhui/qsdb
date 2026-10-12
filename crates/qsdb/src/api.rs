@@ -107,6 +107,20 @@ pub struct QsdbOptions {
     /// 一个内存上界，最坏占用 ≈ `limit × 并发数`，需按机器容量各自收紧。
     /// 详见 `docs/configuration.md` 内存模型一节。
     pub query_memory_limit_bytes: Option<u64>,
+    /// **全局内存预算**（字节；0/None = 不限）：本句柄内**所有**查询共享的
+    /// 执行内存上界 + 解码缓存的总上界（缓存可被执行内存**挤兑**）。
+    ///
+    /// 与 [`Self::query_memory_limit_bytes`] 的分工：那个是「单个查询的配额」，
+    /// 这个是「整个句柄的天花板」。三者（本预算 / 每查询配额 / 并发闸）叠加后
+    /// 才是真实上界：
+    /// - 单查询要不到额度（多为**他人占用**）→ `MemoryPressure`（503，**可退避重试**）
+    /// - 单查询超**自己**配额 → `QueryMemoryLimit`（400，改查询才有用）
+    /// - 压力下**先挤兑缓存**（纯缓存，丢了大不了重算）——故缓存不会挤掉查询
+    ///
+    /// **库默认不限**（嵌入方自控）；`qsdb server` 兜底 **4GB**
+    /// （`--memory-budget-mb`）。只约束**记账到的**内存：物化算子 + 解码缓存；
+    /// 流式在途批的残留上界见 `docs/内存预算与溢出设计.md` §七。
+    pub memory_budget_bytes: Option<u64>,
     /// 远端外表（read_parquet s3://）段文件本地缓存预算（字节）；0 = 关闭。
     /// 布局 `{root}/_filecache/{url_hash}/{etag}/…`，ETag 键控自动失效。
     pub file_cache_bytes: u64,
@@ -131,6 +145,7 @@ impl Default for QsdbOptions {
             scan_cache_bytes: 256 * 1024 * 1024,
             query_timeout_ms: None,
             query_memory_limit_bytes: None,
+            memory_budget_bytes: None,
             file_cache_bytes: 0,
             staging_dir: None,
             durability: Durability::ProcessCrash,
@@ -241,6 +256,8 @@ pub struct Qsdb {
     opts: QsdbOptions,
     defs: TableDefCache,
     cache: Arc<crate::cache::SegmentCache>,
+    /// 全局内存账本（一键共享：执行内存 + 可挤兑的缓存）
+    pool: Arc<crate::memory::MemoryPool>,
     runtime: Arc<QsdbRuntime>,
     /// 远端外表段文件缓存（预算 0 = 禁用实例，API 全 no-op）
     file_cache: Arc<crate::filecache::FileCache>,
@@ -306,7 +323,17 @@ impl Qsdb {
         store
             .create_dir_all(&db_dir(store.root(), DEFAULT_DB))
             .map_err(|e| QsdbError::meta(format!("init default db failed: {e}")))?;
-        let cache = Arc::new(crate::cache::SegmentCache::new(opts.scan_cache_bytes));
+        let mut cache = crate::cache::SegmentCache::new(opts.scan_cache_bytes);
+        // 全局内存账本：缓存挂成**可挤兑**租户（压力下先丢缓存，见 memory.rs）。
+        // 预算 0/None = 不限（嵌入方自控；server 兜 4GB）。
+        let pool = Arc::new(crate::memory::MemoryPool::new(
+            opts.memory_budget_bytes.unwrap_or(0),
+        ));
+        if cache.is_enabled() {
+            cache.attach_pool(Arc::clone(&pool));
+            pool.register_yielder(crate::memory::Yielder::SegmentCache(cache.clone()));
+        }
+        let cache = Arc::new(cache);
         let runtime = Arc::new(QsdbRuntime::from_opts(&opts));
         let file_cache = Arc::new(crate::filecache::FileCache::new(
             root.join("_filecache"),
@@ -338,6 +365,7 @@ impl Qsdb {
             opts,
             defs: TableDefCache::default(),
             cache,
+            pool,
             runtime,
             file_cache,
             staging,
@@ -771,11 +799,18 @@ impl Qsdb {
         query_id: Option<String>,
         timeout_ms: Option<u64>,
     ) -> Arc<crate::query::QueryContext> {
-        crate::query::QueryContext::new(
+        // 每查询配额（本查询自己的上限）+ 全局预算（本句柄所有查询共享）
+        crate::query::QueryContext::new_with_pool(
             query_id.unwrap_or_else(|| format!("q{}", uuid::Uuid::now_v7().simple())),
             timeout_ms.or_else(|| self.runtime.query_timeout_ms()),
             self.runtime.query_memory_limit_bytes(),
+            Some(Arc::clone(&self.pool)),
         )
+    }
+
+    /// 全局内存账本（观测/运维：`exec_used` / `cache_used` / `budget`）。
+    pub fn memory_pool(&self) -> Arc<crate::memory::MemoryPool> {
+        Arc::clone(&self.pool)
     }
 
     /// 运行期配置（热更）：`Arc` 引用可直接调 setter。
@@ -1237,6 +1272,11 @@ impl Qsdb {
     /// 热缓存状态：(entries, bytes, hits, misses)。
     pub fn cache_stats(&self) -> (usize, usize, u64, u64) {
         self.cache.stats()
+    }
+
+    /// 热缓存累计被挤兑/驱逐的字节（观测：内存压力是否在拿缓存换执行内存）。
+    pub fn cache_evicted_bytes(&self) -> u64 {
+        self.cache.evicted_bytes()
     }
 
     /// 清空热缓存。

@@ -1,0 +1,227 @@
+//! 全局内存账本：**一个预算，三类租户**。
+//!
+//! 设计（`docs/内存预算与溢出设计.md`）：
+//!
+//! ```text
+//! ① 每查询配额  超 → QueryMemoryLimit   (400)  「你的查询太大」
+//! ② 挤兑缓存    令 cache 让位（可到 0）
+//! ③ 全局不足    → 算子溢出；无溢出能力 → MemoryPressure (503, 可退避重试)
+//! ```
+//!
+//! 两条不变量：
+//! - **C1**：`exec`（物化算子保留字节）≤ `budget`——恒成立，因为准入与释放同源；
+//! - **C2**：缓存是**可挤兑**的纯缓存（丢了大不了重算），压力下先丢它。
+//!
+//! 与被删掉的 `charge_memory` / `release_memory` 手工配对相比，这里只有**一个入口**
+//! [`QueryContext::try_reserve`]，归还由 [`Reservation`] 的 `Drop` 负责——「忘还」
+//! 在类型上不可能（这也是审计出的真实缺陷：6 处手工配对里 `HashAggExec` 就只记不还）。
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use crate::cache::SegmentCache;
+use crate::error::{QsdbError, Result};
+use crate::query::QueryContext;
+
+/// 可被挤兑的内存持有者（enum 派发，零虚调用——贴合项目惯例）。
+pub enum Yielder {
+    /// 解码后批的 LRU 缓存（`scan_cache_bytes`）。
+    SegmentCache(SegmentCache),
+}
+
+impl Yielder {
+    /// 请求释放至多 `want` 字节，返回**实际可释放**的字节数。
+    ///
+    /// 「可释放」= 索引侧摘除量：已被查询持有（在途 `Arc`）的批摘了也不还内存，
+    /// 故与 `cache` 记账口径一致（记账记的也是索引侧持有量）。
+    pub fn yield_bytes(&self, want: u64) -> u64 {
+        match self {
+            Yielder::SegmentCache(c) => c.evict_bytes(want as usize) as u64,
+        }
+    }
+
+    /// 当前持有量（观测用）。
+    pub fn used_bytes(&self) -> u64 {
+        match self {
+            Yielder::SegmentCache(c) => c.stats().1 as u64,
+        }
+    }
+}
+
+/// 进程内（严格说：一个 `Qsdb` 句柄内）共享的内存预算。
+pub struct MemoryPool {
+    /// 0 = 不限（嵌入方自控；server 会给兜底默认值）。
+    budget: u64,
+    /// 执行侧已保留字节（物化算子）。
+    exec: AtomicU64,
+    /// 缓存侧已用字节（可被挤兑；由 [`SegmentCache`] 自分片同步过来）。
+    cache: AtomicU64,
+    /// 可挤兑者（只在**慢路径**加锁——快路径只读两个原子）。
+    yielders: Mutex<Vec<Yielder>>,
+}
+
+impl MemoryPool {
+    /// `budget_bytes = 0` = 不限。
+    pub fn new(budget_bytes: u64) -> Self {
+        Self {
+            budget: budget_bytes,
+            exec: AtomicU64::new(0),
+            cache: AtomicU64::new(0),
+            yielders: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn budget(&self) -> u64 {
+        self.budget
+    }
+
+    pub fn exec_used(&self) -> u64 {
+        self.exec.load(Ordering::Relaxed)
+    }
+
+    pub fn cache_used(&self) -> u64 {
+        self.cache.load(Ordering::Relaxed)
+    }
+
+    /// 注册可挤兑者（`Qsdb::open` 时挂上解码缓存）。
+    pub fn register_yielder(&self, y: Yielder) {
+        if let Ok(mut v) = self.yielders.lock() {
+            v.push(y);
+        }
+    }
+
+    /// 缓存侧记账同步（由 `SegmentCache` 在自己的增删后调用；非热路径）。
+    pub fn set_cache_used(&self, bytes: u64) {
+        self.cache.store(bytes, Ordering::Relaxed);
+    }
+
+    /// 准入：保留 `bytes`；不足则先挤兑缓存，仍不足 → [`QsdbError::MemoryPressure`]。
+    ///
+    /// 调用方在**拿不到额度时**有两个选择：有溢出能力就溢出（如 `SortExec`），
+    /// 没有就把它当终止错误上抛（如 `WindowExec`）。
+    pub fn acquire(&self, bytes: u64) -> Result<()> {
+        if self.budget == 0 {
+            return Ok(()); // 不限
+        }
+        if self.try_add(bytes) {
+            return Ok(());
+        }
+        // 慢路径：压力下先丢缓存（纯缓存，丢了大不了重算），再试一次
+        let want = self
+            .exec
+            .load(Ordering::Relaxed)
+            .saturating_add(bytes)
+            .saturating_add(self.cache.load(Ordering::Relaxed))
+            .saturating_sub(self.budget);
+        self.evict(want);
+        if self.try_add(bytes) {
+            return Ok(());
+        }
+        Err(QsdbError::MemoryPressure(format!(
+            "memory budget {}MB exhausted: {}MB in use, {}MB requested (retry later)",
+            self.budget / 1_048_576,
+            self.exec.load(Ordering::Relaxed) / 1_048_576,
+            bytes / 1_048_576
+        )))
+    }
+
+    /// 无条件尝试入账（CAS 循环，防并发超额）。
+    fn try_add(&self, bytes: u64) -> bool {
+        let mut cur = self.exec.load(Ordering::Relaxed);
+        loop {
+            let total = cur
+                .saturating_add(bytes)
+                .saturating_add(self.cache.load(Ordering::Relaxed));
+            if total > self.budget {
+                return false;
+            }
+            match self.exec.compare_exchange_weak(
+                cur,
+                cur.saturating_add(bytes),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// 请所有可挤兑者让位（最多 `want` 字节）。
+    fn evict(&self, want: u64) {
+        if want == 0 {
+            return;
+        }
+        let Ok(v) = self.yielders.lock() else { return };
+        let mut remaining = want;
+        for y in v.iter() {
+            if remaining == 0 {
+                break;
+            }
+            remaining -= remaining.min(y.yield_bytes(remaining));
+        }
+    }
+
+    /// 归还（只由 [`Reservation::drop`] 调用）。
+    pub(crate) fn release_bytes(&self, bytes: u64) {
+        let _ = self
+            .exec
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(bytes))
+            });
+    }
+}
+
+/// 内存预留（RAII）：`Drop` 即归还。算子把它作为字段持有，
+/// 结构消失（查询结束 / panic 展开）时额度自动回到账上。
+#[must_use = "预留必须被持有，否则立即归还（等于没预留）"]
+pub struct Reservation {
+    ctx: Arc<QueryContext>,
+    bytes: u64,
+}
+
+impl std::fmt::Debug for Reservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 不打印 ctx（它会牵出 query_id 与整条链路）
+        f.debug_struct("Reservation")
+            .field("query_id", &self.ctx.query_id)
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+impl Reservation {
+    /// 由 [`QueryContext::try_reserve`] 构造（账已入，此处只移交所有权）。
+    pub(crate) fn from_parts(ctx: Arc<QueryContext>, bytes: u64) -> Self {
+        Self { ctx, bytes }
+    }
+
+    /// 已预留字节。
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// 追加预留（用于**单调增长**的状态，如聚合组表）。
+    ///
+    /// 失败时**不改动本预留**——调用方据此决定溢出还是终止。
+    pub fn grow(&mut self, more: u64) -> Result<()> {
+        if more == 0 {
+            return Ok(());
+        }
+        self.bytes += self.ctx.reserve_plain(more)?;
+        Ok(())
+    }
+
+    /// 部分归还（用于**可收缩**的场景，如排序 chunk 落盘后）。
+    pub fn shrink(&mut self, less: u64) {
+        let less = less.min(self.bytes);
+        self.ctx.release_plain(less);
+        self.bytes -= less;
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.ctx.release_plain(self.bytes);
+    }
+}

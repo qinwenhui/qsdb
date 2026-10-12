@@ -76,6 +76,13 @@ pub enum QsdbError {
     #[error("query memory limit exceeded: {0}")]
     QueryMemoryLimit(String),
 
+    /// 全库内存预算此刻耗尽（**多为他人占用**——别的查询跑完就好）。
+    ///
+    /// 与 [`Self::QueryMemoryLimit`] 分开：那个是「你的查询太大」（400，改查询），
+    /// 这个是「服务器此刻吃紧」（503，**退避重试有意义**）——客户端动作完全不同。
+    #[error("memory pressure: {0}")]
+    MemoryPressure(String),
+
     /// 查询内部 panic（已被隔离边界捕获，进程无恙）
     #[error("query panicked (isolated, process unaffected): {0}")]
     QueryPanic(String),

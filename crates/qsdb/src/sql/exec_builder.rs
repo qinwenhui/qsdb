@@ -14,24 +14,65 @@ use crate::expr::{AggExpr, PhysExpr};
 use super::translate::LogicalPlan;
 
 // CTE 批缓存（execute_sql 物化后注入；build 期间读取）。
-// thread_local：查询独立，无跨查询泄漏。
+//
+// **生命周期由 `CteScope` 管**（RAII）：查询开始 `set_cte_batches` 重置、
+// 结束（含提前 return / panic 展开）`CteScope::drop` 清空。此前只在"下一个
+// WITH 查询开始时"才被替换，物化批会**跨查询驻留**在这条线程上
+// ——与注释自称的"无跨查询泄漏"不符，是实打实的滞留。
 thread_local! {
-    static CTE_BATCHES: std::cell::RefCell<std::collections::HashMap<u32, Vec<RecordBatch>>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    static CTE_BATCHES: std::cell::RefCell<CteStore> = std::cell::RefCell::new(CteStore::default());
+}
+
+/// CTE 批存储 + 它们的内存预留（批被清掉，预留也一起归还）。
+#[derive(Default)]
+pub struct CteStore {
+    map: std::collections::HashMap<u32, Vec<RecordBatch>>,
+    reserved: Vec<crate::memory::Reservation>,
+}
+
+/// 查询级作用域：drop 即清空 CTE 批 + 归还内存预留。
+#[derive(Default)]
+pub struct CteScope;
+
+impl CteScope {
+    /// 开始一个新查询的 CTE 作用域（清掉上一条查询可能残留的物化批）。
+    pub fn new() -> Self {
+        set_cte_batches(std::collections::HashMap::new());
+        Self
+    }
+}
+
+impl Drop for CteScope {
+    fn drop(&mut self) {
+        set_cte_batches(std::collections::HashMap::new());
+    }
 }
 
 /// 注入 CTE 批缓存（execute_sql 调用；build 前设置）。
 pub fn set_cte_batches(map: std::collections::HashMap<u32, Vec<RecordBatch>>) {
     CTE_BATCHES.with(|c| {
-        *c.borrow_mut() = map;
+        let mut s = c.borrow_mut();
+        s.map = map;
+        s.reserved.clear(); // 旧的批已丢弃 → 预留一并归还
     });
 }
 
-/// 增量写入单个 CTE 批（链式 CTE：后物化者读取先物化者的缓存）。
-pub fn add_cte_batches(cte_id: u32, batches: Vec<RecordBatch>) {
+/// 增量写入单个 CTE 批（链式 CTE：后物化者读取先物化者的缓存），
+/// 并把该批的内存预留挂进存储（存活到作用域结束）。
+pub fn add_cte_batches(cte_id: u32, batches: Vec<RecordBatch>, res: crate::memory::Reservation) {
     CTE_BATCHES.with(|c| {
-        c.borrow_mut().insert(cte_id, batches);
+        let mut s = c.borrow_mut();
+        s.map.insert(cte_id, batches);
+        s.reserved.push(res);
     });
+}
+
+/// 当前 CTE 批占用的内存（估算：批的 Arrow buffer 字节）。
+pub fn cte_bytes(map: &std::collections::HashMap<u32, Vec<RecordBatch>>) -> u64 {
+    map.values()
+        .flatten()
+        .map(|b| b.get_array_memory_size() as u64)
+        .sum()
 }
 
 /// 一次性批执行节点（并行聚合结果）。
@@ -510,7 +551,8 @@ fn build_inner(
         })),
         LogicalPlan::Distinct { input } => Ok(Box::new(crate::exec::DistinctExec::new(
             build_inner(db, input, scan_proj.clone(), ctx)?,
-        ))),
+            Arc::clone(ctx),
+        )?)),
         LogicalPlan::Window {
             input,
             partition_by,
@@ -534,7 +576,7 @@ fn build_inner(
                     .collect::<Vec<_>>(),
             ));
             let batches = CTE_BATCHES
-                .with(|c| c.borrow().get(cte_id).cloned())
+                .with(|c| c.borrow().map.get(cte_id).cloned())
                 .unwrap_or_default();
             Ok(Box::new(crate::exec::ValuesExec::new(schema, batches)))
         }
@@ -548,12 +590,12 @@ fn build_inner(
             // 集合操作内含多 Scan：不走列裁剪（build 侧 scan_proj=None 传全列）
             let l = build_inner(db, left, None, ctx)?;
             let r = build_inner(db, right, None, ctx)?;
-            let exec = crate::exec::SetOpExec::new(l, r, *op, ctx);
+            let exec = crate::exec::SetOpExec::new(l, r, *op, ctx)?;
             match (*op, *all) {
                 // UNION distinct → DistinctExec 包装去重
-                (crate::exec::SetOpKind::Union, false) => {
-                    Ok(Box::new(crate::exec::DistinctExec::new(Box::new(exec))))
-                }
+                (crate::exec::SetOpKind::Union, false) => Ok(Box::new(
+                    crate::exec::DistinctExec::new(Box::new(exec), Arc::clone(ctx))?,
+                )),
                 _ => Ok(Box::new(exec)),
             }
         }
@@ -959,7 +1001,7 @@ fn build_aggregate(
                     rkeys2,
                     left_outer,
                     Arc::clone(ctx),
-                )));
+                )?));
             }
         }
     }
@@ -1015,18 +1057,22 @@ fn build_aggregate(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let tables: Vec<GroupTable> = shards
+        let partials: Vec<(GroupTable, crate::memory::Reservation)> = shards
             .into_par_iter()
             .map(|s| run_partial_fused(s, &probes, &filters, &group, &aggs, ctx))
             .collect::<Result<Vec<_>>>()?;
-        return finish_partitioned_merge(tables, group, aggs, schema);
+        let (tables, hold): (Vec<_>, Vec<_>) = partials.into_iter().unzip();
+        // 分片表的内存预留活到 merge 结束（merge 期间 N 张表同时在内存 = 峰值）
+        return finish_partitioned_merge(tables, group, aggs, schema, hold);
     }
 
     use rayon::prelude::*;
-    let tables: Vec<GroupTable> = shards
+    let partials: Vec<(GroupTable, crate::memory::Reservation)> = shards
         .into_par_iter()
         .map(|s| run_partial(db, s, &semis, &filters, &group, &aggs, ctx))
         .collect::<Result<Vec<_>>>()?;
+    // 分片表的内存预留活到 merge 结束（峰值 = N 张分片表 + 合并中的分区）
+    let (tables, _hold): (Vec<_>, Vec<_>) = partials.into_iter().unzip();
 
     // merge：按组 key hash 分区并行（每分区独立合并全部 shard 的对应组——
     // 分区表小缓存友好；原本单线程串行 merge 是高组数下的瓶颈），
@@ -1111,7 +1157,7 @@ fn run_partial_fused(
     group: &[PhysExpr],
     aggs: &[AggExpr],
     ctx: &Arc<crate::query::QueryContext>,
-) -> Result<GroupTable> {
+) -> Result<(GroupTable, crate::memory::Reservation)> {
     use crate::exec::ExecNode;
     use arrow::array::Array;
     // 分片任务内串行拉取（ScanExec）——不用 ParScanExec：嵌套并行会与
@@ -1119,6 +1165,8 @@ fn run_partial_fused(
     // 时间全耗在嵌套并行等待）
     let mut node: Box<dyn ExecNode> = Box::new(crate::exec::ScanExec::new(scan));
     let mut table = GroupTable::default();
+    // 融合路径与 HashAggExec 同口径记账（组表随摄入增长 → 增量预留）
+    let mut res = ctx.try_reserve(0)?;
     while let Some(b) = node.next() {
         ctx.check()?;
         let batch = b?;
@@ -1156,8 +1204,13 @@ fn run_partial_fused(
             sel.push(row as u32);
         }
         table.ingest_with_sel(group, aggs, &batch, &sel)?;
+        // 组表增长 → 增量预留（同 HashAggExec 口径：按容器容量增量）
+        let est = table.estimated_bytes();
+        if est > res.bytes() {
+            res.grow(est - res.bytes())?;
+        }
     }
-    Ok(table)
+    Ok((table, res))
 }
 
 /// 分片合并 + 分区并行 finalize（融合路径）：与主路径 merge 块同款。
@@ -1166,6 +1219,7 @@ fn finish_partitioned_merge(
     group: Vec<PhysExpr>,
     aggs: Vec<AggExpr>,
     schema: Arc<arrow::datatypes::Schema>,
+    _hold: Vec<crate::memory::Reservation>,
 ) -> Result<Box<dyn ExecNode>> {
     use rayon::prelude::*;
     let p = rayon::current_num_threads().clamp(1, 32);
@@ -1230,7 +1284,7 @@ fn run_partial(
     group: &[PhysExpr],
     aggs: &[AggExpr],
     ctx: &Arc<crate::query::QueryContext>,
-) -> Result<GroupTable> {
+) -> Result<(GroupTable, crate::memory::Reservation)> {
     let mut node: Box<dyn ExecNode> = Box::new(ScanExec::new(scan));
     // semi 阶段按「自底向上」应用（try_shard_source 剥离序为自顶向下）
     for st in semis.iter().rev() {
@@ -1264,7 +1318,9 @@ fn run_partial(
     while let Some(b) = exec.next() {
         b?; // 取消/超时/内存超限在此冒泡
     }
-    Ok(std::mem::take(&mut exec.state))
+    // 预留随组表一起交回：分片表在 merge 期间仍然活着（N 张表同时在内存
+    // 正是峰值），账不能在这里提前放掉
+    Ok(exec.into_state())
 }
 
 /// 源分片：`(Scan | Filter)+` 链且 scan 可切多片 → Some((分片, 逆序 filters))。

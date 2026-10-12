@@ -423,18 +423,27 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
             let (plan, cte_defs) = translate::translate_select_full_with_ctes(*q, &resolver)?;
             // CTE 物化：按定义序执行每个 CTE 子计划 → 批缓存（cte_id → Vec<RecordBatch>）。
             // 增量装入：链式 CTE（引用先定义者）物化时缓存已可读。
-            exec_builder::set_cte_batches(std::collections::HashMap::new());
+            //
+            // 两处硬伤（2026-10-13 修）：
+            // ① 子计划此前用 `QueryContext::benign()` 执行——**内存闸/超时/取消
+            //    三条隔离全绕过**；现用外层真 ctx。
+            // ② 物化批此前只在"下一条 WITH 查询开始时"才被替换 → **跨查询驻留**
+            //    在这条线程上（注释自称"无跨查询泄漏"并不成立）。现由 `CteScope`
+            //    在查询结束（含提前 return / panic 展开）时清空并归还预留。
+            let _cte_scope = exec_builder::CteScope::new();
             for cte in &cte_defs {
                 if cte.cte_id == u32::MAX {
                     continue; // 防御：translate 已过滤 dead CTE
                 }
-                let ctx = crate::query::QueryContext::benign();
-                let mut exec = exec_builder::build(db, &cte.plan, &ctx)?;
+                let mut exec = exec_builder::build(db, &cte.plan, ctx)?;
                 let mut batches = Vec::new();
+                let mut res = ctx.try_reserve(0)?;
                 while let Some(b) = exec.next() {
-                    batches.push(b?);
+                    let b = b?;
+                    res.grow(b.get_array_memory_size() as u64)?;
+                    batches.push(b);
                 }
-                exec_builder::add_cte_batches(cte.cte_id, batches);
+                exec_builder::add_cte_batches(cte.cte_id, batches, res);
             }
             ctx.check()?;
             // M4-4 元数据短路：count(*) + 纯分区列谓词 → manifest O(1) 应答

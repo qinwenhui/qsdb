@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::error::{QsdbError, Result};
+use crate::memory::{MemoryPool, Reservation};
 
 /// 单查询上下文。
 pub struct QueryContext {
@@ -21,6 +22,8 @@ pub struct QueryContext {
     memory_used: AtomicU64,
     /// `None` = 不限
     pub memory_limit: Option<u64>,
+    /// 全局预算（`None` = 无池：仅每查询配额生效，嵌入方自控场景）。
+    pool: Option<Arc<MemoryPool>>,
 }
 
 impl QueryContext {
@@ -29,6 +32,16 @@ impl QueryContext {
         query_id: impl Into<String>,
         timeout_ms: Option<u64>,
         memory_limit: Option<u64>,
+    ) -> Arc<Self> {
+        Self::new_with_pool(query_id, timeout_ms, memory_limit, None)
+    }
+
+    /// 同 [`Self::new`]，但挂到全局内存池上（准入 + 挤兑缓存）。
+    pub fn new_with_pool(
+        query_id: impl Into<String>,
+        timeout_ms: Option<u64>,
+        memory_limit: Option<u64>,
+        pool: Option<Arc<MemoryPool>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             query_id: query_id.into(),
@@ -39,6 +52,7 @@ impl QueryContext {
             cancelled: AtomicBool::new(false),
             memory_used: AtomicU64::new(0),
             memory_limit,
+            pool,
         })
     }
 
@@ -74,23 +88,51 @@ impl QueryContext {
         self.cancelled.load(Ordering::Relaxed)
     }
 
-    /// 记账并检查上限；超限 → Err（而非 OOM 全库）。
-    pub fn charge_memory(&self, bytes: u64) -> Result<()> {
-        let used = self.memory_used.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    /// **内存准入**：保留 `bytes`，返回 RAII 预留（`Drop` 即归还）。
+    ///
+    /// 顺序（见 `docs/内存预算与溢出设计.md` §3.2）：
+    /// ① 每查询配额（报错最精确，且不动全局账）→ ② 挤兑缓存 → ③ 全局不足则拒。
+    ///
+    /// 失败**不入账**（旧实现「先加后比、失败不回滚」会把超限额永久留在
+    /// `memory_used` 里，而它正是 `GET /api/v1/queries` 对外回显的字段）。
+    pub fn try_reserve(self: &Arc<Self>, bytes: u64) -> Result<Reservation> {
+        let n = self.reserve_plain(bytes)?;
+        Ok(Reservation::from_parts(Arc::clone(self), n))
+    }
+
+    /// 准入但不构造预留（[`Reservation::grow`] 用）：返回实际保留字节。
+    pub(crate) fn reserve_plain(&self, bytes: u64) -> Result<u64> {
+        if bytes == 0 {
+            return Ok(0);
+        }
+        // ① 每查询配额
         if let Some(limit) = self.memory_limit {
-            if used > limit {
+            let used = self.memory_used.load(Ordering::Relaxed);
+            if used.saturating_add(bytes) > limit {
                 return Err(QsdbError::QueryMemoryLimit(format!(
-                    "query {} at {}MB exceeds {}MB limit",
+                    "query {} at {}MB would exceed its {}MB limit",
                     self.query_id,
-                    used / 1_048_576,
+                    used.saturating_add(bytes) / 1_048_576,
                     limit / 1_048_576
                 )));
             }
         }
-        Ok(())
+        // ②③ 全局预算（内含缓存挤兑）
+        if let Some(pool) = &self.pool {
+            pool.acquire(bytes)?;
+        }
+        self.memory_used.fetch_add(bytes, Ordering::Relaxed);
+        Ok(bytes)
     }
 
-    pub fn release_memory(&self, bytes: u64) {
+    /// 归还（[`Reservation`] 私有）。
+    pub(crate) fn release_plain(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        if let Some(pool) = &self.pool {
+            pool.release_bytes(bytes);
+        }
         let _ = self
             .memory_used
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
@@ -160,16 +202,57 @@ mod tests {
     }
 
     #[test]
-    fn memory_charge_and_limit() {
+    fn memory_reserve_and_limit() {
         let ctx = QueryContext::new("q3", None, Some(1000));
-        assert!(ctx.charge_memory(600).is_ok());
+        let a = ctx.try_reserve(600).unwrap();
         assert_eq!(ctx.memory_used(), 600);
+        // 超配额：Err，且**不上账**（旧实现先加后比会把超限额留在账上）
         assert!(matches!(
-            ctx.charge_memory(600).unwrap_err(),
+            ctx.try_reserve(600).unwrap_err(),
             QsdbError::QueryMemoryLimit(_)
         ));
-        ctx.release_memory(600);
-        assert!(ctx.charge_memory(400).is_ok());
+        assert_eq!(ctx.memory_used(), 600, "失败的预留不得入账");
+        // RAII：Drop 即归还
+        drop(a);
+        assert_eq!(ctx.memory_used(), 0);
+        let _b = ctx.try_reserve(400).unwrap();
+    }
+
+    #[test]
+    fn reservation_grow_shrink_and_drop() {
+        let ctx = QueryContext::new("q4", None, Some(1000));
+        let mut r = ctx.try_reserve(100).unwrap();
+        r.grow(300).unwrap();
+        assert_eq!(ctx.memory_used(), 400);
+        assert_eq!(r.bytes(), 400);
+        // 增长失败不改动本预留
+        assert!(r.grow(10_000).is_err());
+        assert_eq!(r.bytes(), 400);
+        r.shrink(150);
+        assert_eq!(ctx.memory_used(), 250);
+        r.shrink(10_000); // 过度归还 saturating，不为负
+        assert_eq!(ctx.memory_used(), 0);
+    }
+
+    #[test]
+    fn global_pool_rejects_over_budget() {
+        use crate::memory::MemoryPool;
+        let pool = Arc::new(MemoryPool::new(1000));
+        let ctx = QueryContext::new_with_pool("q5", None, None, Some(Arc::clone(&pool)));
+        let _a = ctx.try_reserve(800).unwrap();
+        assert_eq!(pool.exec_used(), 800);
+        // 全局不够（无缓存可挤兑）→ MemoryPressure（503 可重试），而非配额错
+        let other = QueryContext::new_with_pool("q6", None, None, Some(Arc::clone(&pool)));
+        assert!(matches!(
+            other.try_reserve(400).unwrap_err(),
+            QsdbError::MemoryPressure(_)
+        ));
+        assert_eq!(pool.exec_used(), 800, "被拒的预留不入账");
+        // 释放后立刻可再用（闸门不是熔断）
+        drop(_a);
+        assert_eq!(pool.exec_used(), 0);
+        let _c = other.try_reserve(400).unwrap();
+        assert_eq!(pool.exec_used(), 400);
     }
 
     #[test]

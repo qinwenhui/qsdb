@@ -68,6 +68,7 @@ retry, category, sqlState}` 全表——驱动冷启动即可自配置映射，�
 | `UNAUTHORIZED` | 401 | no | auth | 缺凭证 / 凭证无效 / token 过期 | 重新登录换 token | `28000` |
 | `FORBIDDEN` | 403 | no | auth | 凭证有效但角色不足（reader 写、非 admin 改配置） | 换角色或申请授权 | `42501` |
 | `TOO_MANY_QUERIES` | 503 | yes | capacity | 并发查询超上限（`--max-concurrent-queries`） | **退避重试**（此时段并发已满） | `53300` |
+| `MEMORY_PRESSURE` | 503 | yes | capacity | **全库内存预算**此刻耗尽（`--memory-budget-mb`；多为**他人占用**） | **退避重试**（别的查询跑完就好）；持续则调大预算 | `53000` |
 | `READ_ONLY` | 503 | no | capacity | 只读库（`--read-only`）拒绝写 | **永不重试**；换可写实例 | `25006` |
 | `METADATA_ERROR` | 500 | no | storage | manifest / 表格式元数据损坏或不一致 | 上报；可能需要 `refresh-index` 或人工介入 | `XX000` |
 | `IO_ERROR` | 500 | yes | storage | 磁盘 / 远端对象存储 I/O 失败（瞬时居多） | **退避重试**；持续失败则上报 | `58030` |
@@ -76,8 +77,12 @@ retry, category, sqlState}` 全表——驱动冷启动即可自配置映射，�
 
 ## 四、几个容易混的语义
 
-- **503 有两种**：`TOO_MANY_QUERIES`（并发满，**可退避重试**）与 `READ_ONLY`
-  （只读库，**永不重试**）。别按状态码一刀切。
+- **503 有三种，别按状态码一刀切**：`TOO_MANY_QUERIES`（并发条数满，**可退避重试**）、
+  `MEMORY_PRESSURE`（全库内存预算被他人占用，**可退避重试**）、`READ_ONLY`
+  （只读库，**永不重试**——换实例才对）。
+- **"内存不够"有两种**：`QUERY_MEMORY_LIMIT`（400，**你的查询超了自己的配额**——
+  改查询或调 `--query-memory-limit-mb`）与 `MEMORY_PRESSURE`（503 可重试，
+  **全库预算此刻被占用**——退避重试即可）。混成一个码会让驱动错误地重试/不重试。
 - **400 与 404 的分工**：**查询端点**的 SQL 语义错误（表/列不存在）→ **400**
   （`TABLE_NOT_FOUND`/`COLUMN_NOT_FOUND`），避免网关把 SQL 错判成路由错；
   **资源端点**的对象不存在 → **404**（`NOT_FOUND`），保住 HTTP 语义。

@@ -157,22 +157,21 @@ impl WindowExec {
 
     fn execute_all(&mut self) -> Result<RecordBatch> {
         // 物化输入
+        // 物化输入：预留随函数内数据存活（RAII），函数返回即归还
+        let mut res = self.ctx.try_reserve(0)?;
         let mut batches = Vec::new();
-        let mut charged = 0u64;
         while let Some(b) = self.input.next() {
             self.ctx.check()?;
             let x = b?;
-            let bytes = x.get_array_memory_size() as u64;
-            self.ctx.charge_memory(bytes)?;
-            charged += bytes;
+            res.grow(x.get_array_memory_size() as u64)?;
             batches.push(x);
         }
-        self.ctx.release_memory(charged);
 
         if batches.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::clone(&self.schema)));
         }
         // concat
+        res.grow(res.bytes())?; // concat 期间瞬时双份（峰值真实存在，就该记账）
         let input_schema = batches[0].schema();
         let mut cols: Vec<ArrayRef> = Vec::with_capacity(input_schema.fields().len());
         for c in 0..input_schema.fields().len() {

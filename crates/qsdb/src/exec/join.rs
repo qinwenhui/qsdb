@@ -51,6 +51,8 @@ pub struct CrossJoinExec {
     probe: Box<dyn ExecNode>,
     build: Option<Box<dyn ExecNode>>,
     build_state: Option<RecordBatch>,
+    /// 物化表的内存预留（随 `build_state` 存活到节点销毁）
+    build_res: Option<crate::memory::Reservation>,
     schema: SchemaRef,
     ctx: Arc<QueryContext>,
 }
@@ -69,6 +71,7 @@ impl CrossJoinExec {
             probe,
             build: Some(build),
             build_state: None,
+            build_res: None,
             schema,
             ctx,
         }
@@ -83,21 +86,26 @@ impl CrossJoinExec {
         };
         // 右 schema 从 build 节点自身（首批出现前用它 schema 的空批次形状不可行——
         // 直接收集批，再以首批 schema concat；无批则空表）
+        //
+        // 内存：预留随数据**存活**（RAII）——物化表常驻 `build_state`，
+        // 故预留也常驻 `build_res`，节点销毁即归还（旧实现收完立刻 release，
+        // 等于物化的表白占内存不记账）。
+        let mut res = self.ctx.try_reserve(0)?; // 空预留，随增长扩容
         let mut batches = Vec::new();
-        let mut charged = 0u64;
         while let Some(b) = build.next() {
             self.ctx.check()?;
             let x = b?;
-            let bytes = x.get_array_memory_size() as u64;
-            self.ctx.charge_memory(bytes)?;
-            charged += bytes;
+            res.grow(x.get_array_memory_size() as u64)?;
             batches.push(x);
         }
-        self.ctx.release_memory(charged);
+        let total = res.bytes();
+        res.grow(total)?; // concat 期间瞬时双份（峰值真实存在，就该记账）
         let table = match batches.split_first() {
             Some((first, _)) => crate::exec::spill::concat_batches(&batches, &first.schema())?,
             None => RecordBatch::new_empty(build.schema()),
         };
+        res.shrink(total); // 源批已随 Vec 释放
+        self.build_res = Some(res);
         self.build_state = Some(table);
         Ok(())
     }
@@ -182,6 +190,8 @@ pub struct HashJoinExec {
     ctx: Arc<QueryContext>,
     /// build 阶段产物（首拉时构建）
     build_state: Option<BuildState>,
+    /// build 侧物化表 + 键索引的内存预留（随 `build_state` 存活到节点销毁）
+    build_res: Option<crate::memory::Reservation>,
     /// semi/anti 族 build 产物（与 build_state 互斥，按 join_type 选）
     exists_state: Option<ExistsState>,
     probe_done: bool,
@@ -222,6 +232,10 @@ pub struct ExistsState {
     keys: ExistsKeys,
     /// build 侧出现过 NULL 键（NOT IN 三值语义用）
     has_null: bool,
+    /// 存在集内存预留（**此前只有 `ctx.check()`：不记账 → 无界增长**）。
+    /// 随状态存活——状态被 Arc 共享给并行分片，故预留也跟着 `Arc<ExistsState>` 走。
+    #[allow(dead_code)] // 只为 Drop（RAII 归还），不直接读
+    res: crate::memory::Reservation,
 }
 
 enum ExistsKeys {
@@ -317,6 +331,7 @@ impl HashJoinExec {
             schema,
             ctx,
             build_state: None,
+            build_res: None,
             exists_state: None,
             probe_done: false,
         }
@@ -329,19 +344,19 @@ impl HashJoinExec {
         if self.build_state.is_some() {
             return Ok(());
         }
-        // 物化右表
+        // 物化右表：预留随表存活（RAII），节点销毁即归还
+        let mut res = self.ctx.try_reserve(0)?;
         let mut batches = Vec::new();
-        let mut charged = 0u64;
         while let Some(b) = self.build.next() {
             self.ctx.check()?;
             let x = b?;
-            let bytes = x.get_array_memory_size() as u64;
-            self.ctx.charge_memory(bytes)?;
-            charged += bytes;
+            res.grow(x.get_array_memory_size() as u64)?;
             batches.push(x);
         }
-        self.ctx.release_memory(charged);
+        let total = res.bytes();
+        res.grow(total)?; // concat 期间瞬时双份
         let table = concat_batches(&batches, &self.build.schema())?;
+        res.shrink(total); // 源批已随 Vec 释放
 
         // 键哈希索引
         let mut key_cols: Vec<ArrayRef> = Vec::with_capacity(self.build_keys.len());
@@ -364,6 +379,10 @@ impl HashJoinExec {
         } else {
             HashIndex::Bytes(build_bytes_index(&key_cols, table.num_rows()))
         };
+        // 键索引（键值 + 行号列表）同样常驻，一并记账：粗估每行 16B
+        // （键拷贝 + 行号），量级正确即可——目的是让预算覆盖它，不追求逐字节。
+        res.grow(table.num_rows() as u64 * 16)?;
+        self.build_res = Some(res);
         self.build_state = Some(BuildState { table, index });
         Ok(())
     }
@@ -468,6 +487,8 @@ pub fn prepare_exists_state(
             }
         }
     }
+    // 存在集记账（容器容量口径；Bitmap 的 bits 是实打实的分配）
+    let mut res = ctx.try_reserve(0)?;
     let keys = match ints {
         Some(vals) if !vals.is_empty() => {
             let min = *vals.iter().min().unwrap();
@@ -481,15 +502,27 @@ pub fn prepare_exists_state(
                     let b = (v - min) as usize;
                     bits[b / 64] |= 1u64 << (b % 64);
                 }
+                res.grow(bits.capacity() as u64 * 8)?;
                 ExistsKeys::Bitmap { min, bits }
             } else {
+                let est = vals.capacity() as u64 * 24;
+                res.grow(est)?;
                 ExistsKeys::I64(vals.into_iter().collect())
             }
         }
         Some(_) => ExistsKeys::I64(Default::default()), // 空集
-        None => ExistsKeys::Bytes(bytes),
+        None => {
+            let est = bytes.iter().map(|k| k.capacity() as u64 + 40).sum::<u64>()
+                + bytes.capacity() as u64 * 8;
+            res.grow(est)?;
+            ExistsKeys::Bytes(bytes)
+        }
     };
-    Ok(Arc::new(ExistsState { keys, has_null }))
+    Ok(Arc::new(ExistsState {
+        keys,
+        has_null,
+        res,
+    }))
 }
 
 /// 掩码探测（聚合融合路径）：probe 批 → 半连接布尔掩码（true = 行入选）。
@@ -1015,6 +1048,8 @@ pub struct JoinCountExec {
     ctx: Arc<QueryContext>,
     /// 键 → 右表匹配行数（单整数键走 i64 快路径）
     counts: Option<CountMap>,
+    /// 计数 map 的内存预留（此前只有 `ctx.check()`，无记账 → 无界增长）
+    res: crate::memory::Reservation,
     emitted: bool,
     schema: SchemaRef,
 }
@@ -1039,11 +1074,12 @@ impl JoinCountExec {
         build_keys: Vec<PhysExpr>,
         left_outer: bool,
         ctx: Arc<QueryContext>,
-    ) -> Self {
+    ) -> crate::error::Result<Self> {
         let schema = Arc::new(arrow::datatypes::Schema::new(vec![
             arrow::datatypes::Field::new("count(*)", DataType::Int64, false),
         ]));
-        Self {
+        let res = ctx.try_reserve(0)?;
+        Ok(Self {
             probe,
             build,
             probe_keys,
@@ -1051,9 +1087,10 @@ impl JoinCountExec {
             left_outer,
             ctx,
             counts: None,
+            res,
             emitted: false,
             schema,
-        }
+        })
     }
 
     /// 单整数键快路径判定（与 semi-join 同款：免键编码）。
@@ -1114,6 +1151,7 @@ impl JoinCountExec {
                     for k in &dense_keys {
                         counts[(*k - mn) as usize] += 1;
                     }
+                    self.res.grow(counts.capacity() as u64 * 4)?;
                     self.counts = Some(CountMap::Direct {
                         min: mn,
                         counts,
@@ -1127,6 +1165,13 @@ impl JoinCountExec {
             }
         }
         // 右表为空 → 结果 0（用空 i64 map 表示）
+        let est = i64_map.capacity() as u64 * 24
+            + bytes_map
+                .keys()
+                .map(|k| k.capacity() as u64 + 40)
+                .sum::<u64>()
+            + bytes_map.capacity() as u64 * 8;
+        self.res.grow(est)?;
         self.counts = Some(if use_i64 && bytes_map.is_empty() {
             CountMap::I64(i64_map)
         } else {

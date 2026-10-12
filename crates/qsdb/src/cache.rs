@@ -43,6 +43,8 @@ struct Inner {
     used: usize,
     hits: u64,
     misses: u64,
+    /// 被挤兑/驱逐掉的累计字节（观测用：看内存压力是否在拿缓存换执行内存）。
+    evicted_bytes: u64,
 }
 
 /// segment 缓存（Clone 即共享）。
@@ -51,6 +53,8 @@ pub struct SegmentCache {
     budget: usize,
     inner: Option<Arc<Mutex<Inner>>>,
     tick_ctr: Arc<AtomicU64>,
+    /// 全局内存预算（缓存是它的**可挤兑**租户，见 `memory::MemoryPool`）。
+    pool: Option<Arc<crate::memory::MemoryPool>>,
 }
 
 impl SegmentCache {
@@ -61,6 +65,7 @@ impl SegmentCache {
                 budget: 0,
                 inner: None,
                 tick_ctr: Arc::new(AtomicU64::new(0)),
+                pool: None,
             };
         }
         Self {
@@ -71,9 +76,20 @@ impl SegmentCache {
                 used: 0,
                 hits: 0,
                 misses: 0,
+                evicted_bytes: 0,
             }))),
             tick_ctr: Arc::new(AtomicU64::new(0)),
+            pool: None,
         }
+    }
+
+    /// 累计被挤兑字节（观测）。
+    pub fn evicted_bytes(&self) -> u64 {
+        self.inner
+            .as_ref()
+            .and_then(|i| i.lock().ok())
+            .map(|i| i.evicted_bytes)
+            .unwrap_or(0)
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -180,6 +196,56 @@ impl SegmentCache {
                 tick,
             },
         );
+        let used = inner.used;
+        drop(inner);
+        self.sync_pool(used);
+    }
+
+    /// 挤兑：按 LRU 摘除至多 `want` 字节，返回**实际摘除**的字节数。
+    ///
+    /// 供全局内存池在压力下调用（`memory::Yielder::yield_bytes`）。注意口径：
+    /// 返回的是**索引侧持有量**——已被查询持有（在途 `Arc`）的批摘了也不还内存，
+    /// 与缓存自身的 `used` 记账同口径，故不会向预算虚报「已释放」。
+    ///
+    /// 与 `put` 的自动驱逐共用一套 LRU 顺序；本函数**只挤到够用**，不一挤到底
+    /// （避免一个重查询把热缓存全清了、后续查询全冷读）。
+    pub fn evict_bytes(&self, want: usize) -> usize {
+        let Some(inner_arc) = &self.inner else {
+            return 0;
+        };
+        let Ok(mut inner) = inner_arc.lock() else {
+            return 0;
+        };
+        let mut freed = 0usize;
+        while freed < want {
+            let Some((_, sig)) = inner.lru.iter().next().cloned() else {
+                break;
+            };
+            if let Some(e) = inner.map.remove(&sig) {
+                inner.used -= e.bytes; // 同步 used（否则记账虚高：条已摘、量未减）
+                freed += e.bytes;
+            }
+            inner.lru.retain(|(_, s)| s != &sig);
+        }
+        if freed > 0 {
+            inner.evicted_bytes += freed as u64;
+            let used = inner.used;
+            drop(inner);
+            self.sync_pool(used);
+        }
+        freed
+    }
+
+    /// 把「缓存侧已用」同步给全局预算（缓存是预算的可挤兑租户）。
+    fn sync_pool(&self, used: usize) {
+        if let Some(p) = &self.pool {
+            p.set_cache_used(used as u64);
+        }
+    }
+
+    /// 挂到全局内存池（`Qsdb::open` 时调用）。
+    pub fn attach_pool(&mut self, pool: Arc<crate::memory::MemoryPool>) {
+        self.pool = Some(pool);
     }
 
     /// 清空。
@@ -190,6 +256,7 @@ impl SegmentCache {
                 inner.lru.clear();
                 inner.used = 0;
             }
+            self.sync_pool(0);
         }
     }
 

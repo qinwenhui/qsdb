@@ -287,6 +287,9 @@ pub struct SetOpExec {
     emitted_null: bool,
     buf: Vec<u8>,
     ctx: std::sync::Arc<crate::query::QueryContext>,
+    /// 右表集合 + emitted 去重集合的内存预留（此前完全无记账 → 无界增长）
+    res: crate::memory::Reservation,
+    accounted: u64,
 }
 
 impl SetOpExec {
@@ -295,9 +298,10 @@ impl SetOpExec {
         right: Box<dyn ExecNode>,
         op: SetOpKind,
         ctx: &std::sync::Arc<crate::query::QueryContext>,
-    ) -> Self {
+    ) -> Result<Self> {
         let schema = left.schema();
-        Self {
+        let res = ctx.try_reserve(0)?;
+        Ok(Self {
             left,
             right,
             op,
@@ -308,7 +312,18 @@ impl SetOpExec {
             emitted_null: false,
             buf: Vec::new(),
             ctx: Arc::clone(ctx),
+            res,
+            accounted: 0,
+        })
+    }
+
+    /// 集合增长 → 增量预留（集合常驻 `right_set`，账跟着它走）。
+    fn grow_set(&mut self, est: u64) -> Result<()> {
+        if est > self.accounted {
+            self.res.grow(est - self.accounted)?;
+            self.accounted = est;
         }
+        Ok(())
     }
 
     fn row_key(batch: &RecordBatch, row: usize, buf: &mut Vec<u8>) -> Vec<u8> {
@@ -392,6 +407,8 @@ impl SetOpExec {
             while let Some(nb) = self.right.next() {
                 feed(nb?)?;
             }
+            let est = set.capacity() as u64 * 24; // 桶 + i64 键
+            self.grow_set(est)?;
             self.right_set = Some(SetKeys::I64 { set, has_null });
             return Ok(());
         }
@@ -409,6 +426,9 @@ impl SetOpExec {
             let b = nb?;
             feed(&b, &mut self.buf)?;
         }
+        let est =
+            set.iter().map(|k| k.capacity() as u64 + 40).sum::<u64>() + set.capacity() as u64 * 8;
+        self.grow_set(est)?;
         self.right_set = Some(SetKeys::Bytes(set));
         Ok(())
     }
@@ -571,7 +591,8 @@ impl SortExec {
         let mut run_paths: Vec<std::path::PathBuf> = Vec::new();
         let mut chunk: Vec<RecordBatch> = Vec::new();
         let mut chunk_bytes = 0u64;
-        let mut charged = 0u64;
+        // 内存预留：覆盖当前驻留 chunk（落盘即 shrink 归还）；RAII，函数返回即清零
+        let mut res = self.ctx.try_reserve(0)?;
 
         let flush_chunk = |chunk: &mut Vec<RecordBatch>,
                            chunk_bytes: &mut u64,
@@ -593,24 +614,32 @@ impl SortExec {
             self.ctx.check()?;
             let x = b?;
             let bytes = x.get_array_memory_size() as u64;
-            // 记账超限 → 当前 chunk 落盘，继续（总量受磁盘而非内存约束）
-            if self.ctx.charge_memory(bytes).is_err() {
-                self.ctx.release_memory(chunk_bytes);
+            // 要不到额度（自己的配额满 **或** 全库吃紧）→ 当前 chunk 落盘，
+            // 之后受磁盘而非内存约束（**溢出只改完成 vs 拒绝的边界**）
+            if res.grow(bytes).is_err() {
+                let back = chunk_bytes;
                 flush_chunk(&mut chunk, &mut chunk_bytes, &mut spill_dir, &mut run_paths)?;
-                // 单批超过全额限制：该批独立成 run（不再记账）
-                let mut single = Vec::new();
-                single.push(x);
-                flush_chunk(&mut single, &mut 0, &mut spill_dir, &mut run_paths)?;
+                res.shrink(back); // chunk 已写盘并从内存释放
+                if res.grow(bytes).is_ok() {
+                    // 腾空后单批放得下：继续攒
+                    chunk_bytes = bytes;
+                    chunk.push(x);
+                } else {
+                    // 单批仍超全额：独立成 run（不驻留内存）
+                    let mut single = Vec::new();
+                    single.push(x);
+                    flush_chunk(&mut single, &mut 0, &mut spill_dir, &mut run_paths)?;
+                }
                 continue;
             }
-            charged += bytes;
             chunk_bytes += bytes;
             chunk.push(x);
         }
-        self.ctx.release_memory(charged);
 
         if run_paths.is_empty() {
-            // 纯内存路径（原逻辑）
+            // 纯内存路径（原逻辑）。concat + take 期间瞬时约 2x——峰值真实存在，
+            // 就该记账（要不到额度就失败，而不是靠超额分配侥幸跑过）
+            res.grow(res.bytes())?;
             return sort_in_memory(chunk, &self.schema());
         }
         // 有 run：尾块排序成内存 run，k 路归并（一次性产出合并批；
@@ -715,17 +744,26 @@ pub struct DistinctExec {
     state: agg::GroupTable,
     schema: SchemaRef,
     emitted: bool,
+    ctx: Arc<crate::query::QueryContext>,
+    /// 去重表内存预留（**此前 Distinct 连 ctx 都没有**：不记账、不检查取消、
+    /// 不吃超时——隔离承诺在这里是空的）。RAII，节点销毁即归还。
+    res: crate::memory::Reservation,
+    accounted: u64,
 }
 
 impl DistinctExec {
-    pub fn new(input: Box<dyn ExecNode>) -> Self {
+    pub fn new(input: Box<dyn ExecNode>, ctx: Arc<crate::query::QueryContext>) -> Result<Self> {
         let schema = input.schema();
-        Self {
+        let res = ctx.try_reserve(0)?;
+        Ok(Self {
             input,
             state: agg::GroupTable::new(),
             schema,
             emitted: false,
-        }
+            ctx,
+            res,
+            accounted: 0,
+        })
     }
 }
 
@@ -748,12 +786,22 @@ impl ExecNode for DistinctExec {
             })
             .collect();
         while let Some(b) = self.input.next() {
+            if let Err(e) = self.ctx.check() {
+                return Some(Err(e));
+            }
             let batch = match b {
                 Ok(x) => x,
                 Err(e) => return Some(Err(e)),
             };
             if let Err(e) = self.state.ingest(&group_exprs, &[], &batch) {
                 return Some(Err(e));
+            }
+            let est = self.state.estimated_bytes();
+            if est > self.accounted {
+                if let Err(e) = self.res.grow(est - self.accounted) {
+                    return Some(Err(e));
+                }
+                self.accounted = est;
             }
         }
         self.emitted = true;
@@ -800,6 +848,15 @@ pub struct HashAggExec {
     schema: SchemaRef,
     emitted: bool,
     ctx: Arc<crate::query::QueryContext>,
+    /// 组表内存预留（随组表增长；节点销毁即归还）。
+    ///
+    /// 旧实现按「输入批 / 2」记一次且**永不 release**——既没算分片放大
+    /// （并行分片各建一份完整组表），账又只增不减。现按组表实际容量的
+    /// 增量预留，并把预留交给 `into_state` 转移给调用方（分片表在 merge
+    /// 期间仍活着，账不能提前放）。
+    res: crate::memory::Reservation,
+    /// 已入账的组表估算字节（增量预留用）
+    accounted: u64,
 }
 
 impl HashAggExec {
@@ -824,6 +881,7 @@ impl HashAggExec {
         }
         let mut state = agg::GroupTable::new();
         state.set_arity(aggs.len());
+        let res = ctx.try_reserve(0)?;
         Ok(Self {
             input,
             group,
@@ -832,7 +890,16 @@ impl HashAggExec {
             schema: Arc::new(arrow::datatypes::Schema::new(fields)),
             emitted: false,
             ctx,
+            res,
+            accounted: 0,
         })
+    }
+
+    /// 取走组表 + 它的内存预留（分片路径用：表要交给 merge，预留也得跟着走，
+    /// 否则 merge 期间「N 张分片表同时在内存」这个峰值就不在账上）。
+    pub fn into_state(self) -> (agg::GroupTable, crate::memory::Reservation) {
+        let Self { mut state, res, .. } = self;
+        (std::mem::take(&mut state), res)
     }
 }
 
@@ -858,15 +925,17 @@ impl ExecNode for HashAggExec {
                 Ok(x) => x,
                 Err(e) => return Some(Err(e)),
             };
-            // 聚合状态（分组表）随输入增长：按输入批记账近似
-            if let Err(e) = self
-                .ctx
-                .charge_memory(batch.get_array_memory_size() as u64 / 2)
-            {
-                return Some(Err(e));
-            }
             if let Err(e) = self.state.ingest(&self.group, &self.aggs, &batch) {
                 return Some(Err(e));
+            }
+            // 组表增长 → 增量预留（按实际容器容量，含分片放大）。
+            // 一批的滞后可接受：增长上界就是刚摄入这批的规模。
+            let est = self.state.estimated_bytes();
+            if est > self.accounted {
+                if let Err(e) = self.res.grow(est - self.accounted) {
+                    return Some(Err(e));
+                }
+                self.accounted = est;
             }
         }
         self.emitted = true;
