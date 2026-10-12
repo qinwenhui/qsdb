@@ -23,23 +23,75 @@ use arrow_flight::{
 };
 use futures::TryStreamExt;
 use futures::stream::{self, StreamExt};
-use qsdb::Qsdb;
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status, Streaming};
 
 pub struct QsdbFlightService {
-    db: Arc<Qsdb>,
-    token: Option<String>,
+    /// 与 HTTP 面**共用同一份** AppState：查询注册表（取消/并发闸）、token、指标。
+    state: Arc<crate::server::AppState>,
 }
 
 impl QsdbFlightService {
-    pub fn new(db: Arc<Qsdb>, token: Option<String>) -> Self {
-        Self { db, token }
+    pub fn new(state: Arc<crate::server::AppState>) -> Self {
+        Self { state }
+    }
+
+    /// 从 gRPC metadata 取客户端透传的 query id（契约 J11，与 HTTP 头同语义）。
+    fn client_query_id(meta: &MetadataMap) -> Result<Option<String>, Status> {
+        let Some(v) = meta.get("x-qsdb-query-id") else {
+            return Ok(None);
+        };
+        match v
+            .to_str()
+            .ok()
+            .filter(|s| crate::server::valid_client_query_id(s))
+        {
+            Some(id) => Ok(Some(id.to_string())),
+            None => Err(Status::invalid_argument(
+                "invalid x-qsdb-query-id: expect 1..=64 chars of [A-Za-z0-9._:-]",
+            )),
+        }
+    }
+
+    /// 经**注册表**执行 SQL——与 HTTP 面同语义：并发闸、可取消
+    /// （`/queries/{id}/cancel`）、J11 客户端 id。此前各 Flight 方法各建一个游离
+    /// ctx（`sql_collect` 更是走 benign ctx）：既不受闸门约束，也无法被取消。
+    ///
+    /// 返回（**实际使用**的 query_id, 执行结果）。
+    async fn run_registered(
+        &self,
+        meta: &MetadataMap,
+        sql: &str,
+    ) -> Result<(String, qsdb::sql::SqlResult), Status> {
+        let ctx = self
+            .state
+            .register_query(Self::client_query_id(meta)?, None, sql.to_string())
+            .map_err(|msg| {
+                // 并发闸拒绝：与 HTTP 面同一个码（RESOURCE_EXHAUSTED = 可退避重试）
+                crate::error_code::grpc_status_msg(
+                    crate::error_code::ErrorCode::TooManyQueries,
+                    msg,
+                )
+            })?;
+        let query_id = ctx.query_id.clone();
+        let db = Arc::clone(&self.state.db);
+        let sql_exec = sql.to_string();
+        let ctx_exec = Arc::clone(&ctx);
+        let res =
+            tokio::task::spawn_blocking(move || db.sql_with_context(&sql_exec, &ctx_exec)).await;
+        self.state.unregister_query(&query_id);
+        // 查询错误走**同一张码表**（`ErrorCode::from_qsdb`）→ gRPC status：
+        // 此前一律 invalid_argument，超时/内存超限/只读库全被压成"参数错"，
+        // Flight 客户端既看不出该不该重试，也映射不出 SQLState。
+        let res = res
+            .map_err(|e| Status::internal(format!("join: {e}")))?
+            .map_err(|e| crate::error_code::grpc_status(&e))?;
+        Ok((query_id, res))
     }
 
     /// Bearer 鉴权（token 配置时强制；同 HTTP API 约定）。
     fn check_auth(&self, meta: &MetadataMap) -> Result<(), Status> {
-        let Some(want) = &self.token else {
+        let Some(want) = &self.state.token else {
             return Ok(());
         };
         let got = meta
@@ -87,27 +139,20 @@ impl FlightService for QsdbFlightService {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        self.check_auth(request.metadata())?;
+        let meta = request.metadata().clone();
+        self.check_auth(&meta)?;
         let desc = request.into_inner();
         let sql = String::from_utf8(desc.cmd.to_vec())
             .map_err(|_| Status::invalid_argument("descriptor cmd must be UTF-8 SQL"))?;
-        let db = Arc::clone(&self.db);
-        let sql_for_task = sql.clone();
-        let (schema, rows) = tokio::task::spawn_blocking(move || {
-            let ctx = db.new_query_context(None);
-            match db.sql_with_context(&sql_for_task, &ctx)? {
-                qsdb::sql::SqlResult::Query { schema, batches } => {
-                    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-                    Ok((schema, rows))
-                }
-                qsdb::sql::SqlResult::Ok { message } => {
-                    Err(qsdb::QsdbError::invalid(format!("not a query: {message}")))
-                }
+        let (_, res) = self.run_registered(&meta, &sql).await?;
+        let (schema, rows) = match res {
+            qsdb::sql::SqlResult::Query { schema, batches } => {
+                (schema, batches.iter().map(|b| b.num_rows()).sum::<usize>())
             }
-        })
-        .await
-        .map_err(|e| Status::internal(format!("join: {e}")))?
-        .map_err(|e| Status::invalid_argument(format!("query: {e}")))?;
+            qsdb::sql::SqlResult::Ok { message } => {
+                return Err(Status::invalid_argument(format!("not a query: {message}")));
+            }
+        };
         let endpoint = FlightEndpoint {
             ticket: Some(Ticket {
                 ticket: sql.clone().into_bytes().into(),
@@ -134,23 +179,18 @@ impl FlightService for QsdbFlightService {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
-        self.check_auth(request.metadata())?;
+        let meta = request.metadata().clone();
+        self.check_auth(&meta)?;
         let desc = request.into_inner();
         let sql = String::from_utf8(desc.cmd.to_vec())
             .map_err(|_| Status::invalid_argument("descriptor cmd must be UTF-8 SQL"))?;
-        let db = Arc::clone(&self.db);
-        let schema = tokio::task::spawn_blocking(move || {
-            let ctx = db.new_query_context(None);
-            match db.sql_with_context(&sql, &ctx)? {
-                qsdb::sql::SqlResult::Query { schema, .. } => Ok(schema),
-                qsdb::sql::SqlResult::Ok { message } => {
-                    Err(qsdb::QsdbError::invalid(format!("not a query: {message}")))
-                }
+        let (_, res) = self.run_registered(&meta, &sql).await?;
+        let schema = match res {
+            qsdb::sql::SqlResult::Query { schema, .. } => schema,
+            qsdb::sql::SqlResult::Ok { message } => {
+                return Err(Status::invalid_argument(format!("not a query: {message}")));
             }
-        })
-        .await
-        .map_err(|e| Status::internal(format!("join: {e}")))?
-        .map_err(|e| Status::invalid_argument(format!("query: {e}")))?;
+        };
         let opts = arrow::ipc::writer::IpcWriteOptions::default();
         let result = SchemaAsIpc::new(&schema, &opts).try_into().map_err(
             |e: arrow::error::ArrowError| Status::internal(format!("schema encode: {e}")),
@@ -169,14 +209,17 @@ impl FlightService for QsdbFlightService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        self.check_auth(request.metadata())?;
+        let meta = request.metadata().clone();
+        self.check_auth(&meta)?;
         let sql = String::from_utf8(request.into_inner().ticket.to_vec())
             .map_err(|_| Status::invalid_argument("ticket must be UTF-8 SQL"))?;
-        let db = Arc::clone(&self.db);
-        let batches = tokio::task::spawn_blocking(move || db.sql_collect(&sql))
-            .await
-            .map_err(|e| Status::internal(format!("join: {e}")))?
-            .map_err(|e| Status::invalid_argument(format!("query: {e}")))?;
+        let (query_id, res) = self.run_registered(&meta, &sql).await?;
+        let batches = match res {
+            qsdb::sql::SqlResult::Query { batches, .. } => batches,
+            qsdb::sql::SqlResult::Ok { message } => {
+                return Err(Status::invalid_argument(format!("not a query: {message}")));
+            }
+        };
         if batches.is_empty() {
             return Err(Status::invalid_argument(
                 "query returned no batches; project at least one column",
@@ -191,7 +234,12 @@ impl FlightService for QsdbFlightService {
                     .map(Ok::<_, arrow_flight::error::FlightError>),
             ))
             .map_err(|e| Status::internal(format!("encode: {e:?}")));
-        Ok(Response::new(Box::pin(s)))
+        let mut resp: Response<Self::DoGetStream> = Response::new(Box::pin(s));
+        // J11 在 Flight 面的回显：响应 metadata 透出**实际使用**的 id
+        if let Ok(v) = tonic::metadata::MetadataValue::try_from(query_id.as_str()) {
+            resp.metadata_mut().insert("x-qsdb-query-id", v);
+        }
+        Ok(resp)
     }
 
     async fn do_put(
@@ -220,20 +268,21 @@ impl FlightService for QsdbFlightService {
                 .map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e)));
         let mut decoder = FlightDataDecoder::new(frames);
         let mut batches: Vec<RecordBatch> = Vec::new();
-        while let Some(decoded) = decoder
-            .try_next()
-            .await
-            .map_err(|e| Status::internal(format!("decode: {e}")))?
-        {
+        while let Some(decoded) = decoder.try_next().await.map_err(|e| {
+            // 流解码失败 = INVALID_IPC（同 HTTP 面 /write 的取码）
+            Status::invalid_argument(format!("decode: {e}"))
+        })? {
             if let DecodedPayload::RecordBatch(b) = decoded.payload {
                 batches.push(b);
             }
         }
-        let db = Arc::clone(&self.db);
+        let db = Arc::clone(&self.state.db);
         let result = tokio::task::spawn_blocking(move || db.append(&table, &batches))
             .await
             .map_err(|e| Status::internal(format!("join: {e}")))?
-            .map_err(|e| Status::invalid_argument(format!("append: {e}")))?;
+            // 写错误同表映射（只读库 → FAILED_PRECONDITION 等，此前一律
+            // invalid_argument，只读/内部错误全被压扁）
+            .map_err(|e| crate::error_code::grpc_status(&e))?;
         let ack = PutResult {
             app_metadata: format!(
                 "{{\"rows\":{},\"bytes\":{},\"segments\":{}}}",
@@ -269,17 +318,23 @@ impl FlightService for QsdbFlightService {
 
 /// 在指定地址启动 Flight 服务（h2c）。
 pub async fn serve_flight(
-    db: Arc<Qsdb>,
-    token: Option<String>,
+    state: Arc<crate::server::AppState>,
     bind: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use arrow_flight::flight_service_server::FlightServiceServer;
     let addr: std::net::SocketAddr = bind.parse()?;
-    let svc = QsdbFlightService::new(db, token);
-    println!("flight listening on {bind} (h2c)");
+    let svc = QsdbFlightService::new(state);
+    // 自持 listener：回显**实际绑定**端口（`--flight-bind 127.0.0.1:0` 才可用，
+    // 与 HTTP 侧 `--addr :0` 同口径）
+    let std_listener = std::net::TcpListener::bind(addr)?;
+    std_listener.set_nonblocking(true)?;
+    let bound = std_listener.local_addr()?;
+    let listener = tokio::net::TcpListener::from_std(std_listener)?;
+    let incoming: tonic::transport::server::TcpIncoming = listener.into();
+    println!("flight listening on {bound} (h2c)");
     tonic::transport::Server::builder()
         .add_service(FlightServiceServer::new(svc))
-        .serve(addr)
+        .serve_with_incoming(incoming)
         .await?;
     Ok(())
 }
@@ -290,6 +345,7 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_flight::flight_service_client::FlightServiceClient;
+    use qsdb::Qsdb;
 
     #[tokio::test]
     async fn flight_roundtrip() {
@@ -309,8 +365,8 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
-        let db2 = Arc::clone(&db);
-        let handle = tokio::spawn(async move { serve_flight(db2, None, &addr.to_string()).await });
+        let state = Arc::new(crate::server::AppState::new(Arc::clone(&db), None, 16));
+        let handle = tokio::spawn(async move { serve_flight(state, &addr.to_string()).await });
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))

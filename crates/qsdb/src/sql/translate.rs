@@ -1098,7 +1098,7 @@ fn resolve_table_function(
     };
     let files = crate::scan::resolve_file_locs(&path)?;
     let Some(first) = files.first() else {
-        return Err(QsdbError::not_found(format!("read_parquet: {path}")));
+        return Err(QsdbError::file_not_found(format!("read_parquet: {path}")));
     };
     let schema = crate::scan::file_arrow_schema(first)?;
     // F12：hive 目录语义——路径含 k=v 段 → 目录名组装分区列常量
@@ -2917,7 +2917,7 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
         E::Identifier(id) => {
             let idx = ctx
                 .index_of(&id.value)
-                .ok_or_else(|| QsdbError::not_found(format!("column '{}'", id.value)))?;
+                .ok_or_else(|| QsdbError::column_not_found(format!("column '{}'", id.value)))?;
             Ok(PhysExpr::Column {
                 idx,
                 name: ctx.cols[idx].0.clone(),
@@ -2930,7 +2930,9 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
             let idx = ctx
                 .index_of(&qual)
                 .or_else(|| ctx.index_of(&parts[1].value))
-                .ok_or_else(|| QsdbError::not_found(format!("column '{}'", parts[1].value)))?;
+                .ok_or_else(|| {
+                    QsdbError::column_not_found(format!("column '{}'", parts[1].value))
+                })?;
             Ok(PhysExpr::Column {
                 idx,
                 name: ctx.cols[idx].0.clone(),

@@ -265,7 +265,7 @@ pub fn drop_table(store: &Store, db: &str, table: &str) -> Result<()> {
     let _guard = PartitionLock::acquire(&catalog_lock(root))?;
     let names = read_table_names(store, db)?;
     if !names.iter().any(|n| n == table) {
-        return Err(QsdbError::not_found(format!("table {db}.{table}")));
+        return Err(QsdbError::table_not_found(format!("table {db}.{table}")));
     }
     let tdir = table_dir(root, db, table);
     crate::fsutil::move_to_trash(root, &tdir)?;
@@ -287,7 +287,7 @@ pub fn alter_add_column(store: &Store, db: &str, table: &str, column: ColumnDef)
     let _guard = PartitionLock::acquire(&catalog_lock(root))?;
     let names = read_table_names(store, db)?;
     if !names.iter().any(|n| n == table) {
-        return Err(QsdbError::not_found(format!("table {db}.{table}")));
+        return Err(QsdbError::table_not_found(format!("table {db}.{table}")));
     }
     let path = table_json_path(root, db, table);
     let text = store
@@ -340,7 +340,7 @@ impl TableDefCache {
         let path = table_json_path(store.root(), db, table);
         let md = store
             .stat(&path)?
-            .ok_or_else(|| QsdbError::not_found(format!("table {db}.{table}")))?;
+            .ok_or_else(|| QsdbError::table_not_found(format!("table {db}.{table}")))?;
         let key = (db.to_string(), table.to_string());
         {
             let cache = self
@@ -456,7 +456,7 @@ fn drop_table_remote(store: &Store, db: &str, table: &str) -> Result<()> {
     crate::remote::with_partition_mutex(&store.root().join("_catalog"), || {
         catalog_occ(store, db, |names| {
             if !names.iter().any(|n| n == table) {
-                return Err(QsdbError::not_found(format!("table {db}.{table}")));
+                return Err(QsdbError::table_not_found(format!("table {db}.{table}")));
             }
             Ok(names.into_iter().filter(|n| n != table).collect())
         })
@@ -472,7 +472,7 @@ fn drop_table_remote(store: &Store, db: &str, table: &str) -> Result<()> {
 fn alter_add_column_remote(store: &Store, db: &str, table: &str, column: ColumnDef) -> Result<()> {
     let names = read_table_names(store, db)?;
     if !names.iter().any(|n| n == table) {
-        return Err(QsdbError::not_found(format!("table {db}.{table}")));
+        return Err(QsdbError::table_not_found(format!("table {db}.{table}")));
     }
     let path = table_json_path(store.root(), db, table);
     crate::remote::occ_update_bytes(store, &path, |cur| {

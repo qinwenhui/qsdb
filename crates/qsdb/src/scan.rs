@@ -550,7 +550,7 @@ pub(crate) fn resolve_file_locs(pattern: &str) -> Result<Vec<FileLoc>> {
         if p.is_file() {
             return Ok(vec![FileLoc::Local(p)]);
         }
-        return Err(QsdbError::not_found(format!(
+        return Err(QsdbError::file_not_found(format!(
             "read_parquet: file not found: {norm}"
         )));
     }
@@ -563,7 +563,7 @@ pub(crate) fn resolve_file_locs(pattern: &str) -> Result<Vec<FileLoc>> {
     };
     let base = PathBuf::from(&base_str);
     if !base.is_dir() {
-        return Err(QsdbError::not_found(format!(
+        return Err(QsdbError::file_not_found(format!(
             "read_parquet: directory not found: {base_str}"
         )));
     }
@@ -583,7 +583,7 @@ pub(crate) fn resolve_file_locs(pattern: &str) -> Result<Vec<FileLoc>> {
         .collect();
     out.sort_by_key(FileLoc::display_path);
     if out.is_empty() {
-        return Err(QsdbError::not_found(format!(
+        return Err(QsdbError::file_not_found(format!(
             "read_parquet: no file matches {norm}"
         )));
     }
@@ -819,7 +819,7 @@ impl ScanPlan {
                 }
                 for name in &p {
                     if def.column(name).is_none() {
-                        return Err(QsdbError::not_found(format!(
+                        return Err(QsdbError::column_not_found(format!(
                             "column '{name}' not in table {}",
                             def.name
                         )));
@@ -934,7 +934,7 @@ impl ScanPlan {
 
 fn resolve_value(column: &str, value: Literal, def: &TableDef) -> Result<Literal> {
     let col = def.column(column).ok_or_else(|| {
-        QsdbError::not_found(format!("column '{column}' not in table {}", def.name))
+        QsdbError::column_not_found(format!("column '{column}' not in table {}", def.name))
     })?;
     if value.is_null() {
         return Ok(value);

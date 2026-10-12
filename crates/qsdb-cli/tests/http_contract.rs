@@ -1,0 +1,654 @@
+//! HTTP 契约回归测试（本仓首个 HTTP 层测试）。
+//!
+//! 起**真** `qsdb server` 子进程（`CARGO_BIN_EXE_qsdb`），用手写 HTTP/1.1 打真实端点
+//! ——不引 HTTP 客户端依赖（同 `qsdb-bench/src/bin/bench_server.rs` 的做法）。
+//!
+//! 覆盖的是**协议面契约**，即"驱动/外部工具依赖的稳定行为"：
+//! - J11：`X-QSDB-Query-Id` 透传（采用 / 非法 400 / 冲突回退 / 精确取消）
+//! - 错误体恒为 `{error, code}`（含框架层抽取失败——此前是纯文本）
+//! - 请求严格化：未知 body 字段、非法的 format / mode / withSchema 值都显式报错
+//! - 并发闸的专属 code `TOO_MANY_QUERIES`（与只读 503 区分）
+//! - `PUT /api/v1/config` 的键形态与 `applied` 诚实性
+//!
+//! 慢查询用非等值 join（`CrossJoinFilter` 嵌套循环，流式 count：不吃执行内存，
+//! 天然长查询，用来制造并发窗口）。
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use arrow::array::Int64Array;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+
+// ---------------------------------------------------------------------------
+// 测试用 server 进程 + 手写 HTTP 客户端
+// ---------------------------------------------------------------------------
+
+/// 起一个真 server；Drop 时杀进程 + 清目录。
+struct Server {
+    child: Child,
+    port: u16,
+    root: std::path::PathBuf,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+impl Server {
+    fn start(extra_args: &[&str]) -> Server {
+        // 每个 server 独立目录：进程内自增序号（`Instant::now().elapsed()` 恒 ≈0，
+        // 会让并行跑的测试共用一个目录，互相删——踩过）
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("qsdb_http_test_{}_{}", std::process::id(), uniq));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mkdir temp root");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_qsdb"));
+        cmd.args(["server", "--path"])
+            .arg(&root)
+            .args(["--addr", "127.0.0.1:0"])
+            .args(extra_args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn qsdb server");
+        // 从 stderr 抓实际绑定端口（`--addr :0` 会回显真实端口）
+        let mut stderr = child.stderr.take().expect("stderr piped");
+        let mut buf = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let port = loop {
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("server 未在 30s 内就绪: {}", String::from_utf8_lossy(&buf));
+            }
+            let mut chunk = [0u8; 512];
+            match stderr.read(&mut chunk) {
+                Ok(0) | Err(_) => {
+                    let _ = child.kill();
+                    panic!("server 提前退出: {}", String::from_utf8_lossy(&buf));
+                }
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf);
+                    if let Some(p) = parse_listening_port(&text) {
+                        break p;
+                    }
+                }
+            }
+        };
+        Server { child, port, root }
+    }
+}
+
+/// 从 `qsdb server listening on http://127.0.0.1:PORT …` 抓端口。
+fn parse_listening_port(text: &str) -> Option<u16> {
+    let idx = text.find("listening on http://127.0.0.1:")?;
+    let rest = &text[idx + "listening on http://127.0.0.1:".len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// 响应：状态码 + 头（小写名）+ body 字节。
+struct Resp {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl Resp {
+    fn header(&self, name: &str) -> Option<&str> {
+        let name = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.as_str())
+    }
+    fn json(&self) -> serde_json::Value {
+        serde_json::from_slice(&self.body).unwrap_or_else(|e| {
+            panic!(
+                "响应不是 JSON（{}）: {}",
+                e,
+                String::from_utf8_lossy(&self.body)
+            )
+        })
+    }
+    fn code(&self) -> String {
+        self.json()
+            .get("code")
+            .and_then(|c| c.as_str())
+            .unwrap_or("<no code>")
+            .to_string()
+    }
+}
+
+/// 手写 HTTP/1.1（`Connection: close` → 读到 EOF）。
+fn http(port: u16, method: &str, path: &str, headers: &[(&str, &str)], body: &[u8]) -> Resp {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
+    req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    s.write_all(req.as_bytes()).unwrap();
+    s.write_all(body).unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).unwrap();
+
+    let sep = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("no header/body separator");
+    let head = String::from_utf8_lossy(&raw[..sep]).to_string();
+    let mut lines = head.lines();
+    let status: u16 = lines
+        .next()
+        .and_then(|l| l.split(' ').nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    let rest = raw[sep + 4..].to_vec();
+    let chunked = headers
+        .iter()
+        .any(|(k, v)| k == "transfer-encoding" && v.contains("chunked"));
+    let body = if chunked { dechunk(&rest) } else { rest };
+    Resp {
+        status,
+        headers,
+        body,
+    }
+}
+
+/// 极简 chunked 解码（JSON 响应一般非 chunked，但别让测试因编码形式假失败）。
+fn dechunk(mut b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    while let Some(pos) = b.windows(2).position(|w| w == b"\r\n") {
+        let size_str = String::from_utf8_lossy(&b[..pos]);
+        let Ok(size) = usize::from_str_radix(size_str.split(';').next().unwrap_or("0").trim(), 16)
+        else {
+            break;
+        };
+        if size == 0 {
+            break;
+        }
+        let start = pos + 2;
+        out.extend_from_slice(&b[start..start + size]);
+        b = &b[start + size + 2..];
+    }
+    out
+}
+
+fn query(port: u16, sql: &str, qid: Option<&str>) -> Resp {
+    let mut h = vec![("Content-Type", "application/json")];
+    if let Some(id) = qid {
+        h.push(("X-QSDB-Query-Id", id));
+    }
+    let body = serde_json::json!({ "sql": sql }).to_string();
+    http(port, "POST", "/api/v1/query", &h, body.as_bytes())
+}
+
+/// Arrow IPC 流：两列 Int64（nullable，与 DDL 默认一致）。
+fn ipc_two_int_cols(n: usize) -> Vec<u8> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int64, true),
+        Field::new("b", DataType::Int64, true),
+    ]));
+    let vals: Vec<i64> = (0..n as i64).collect();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vals.clone())),
+            Arc::new(Int64Array::from(vals)),
+        ],
+    )
+    .expect("build batch");
+    let mut buf = Vec::new();
+    {
+        let mut w =
+            arrow::ipc::writer::StreamWriter::try_new(&mut buf, &schema).expect("ipc writer");
+        w.write(&batch).expect("write batch");
+        w.finish().expect("finish ipc");
+    }
+    buf
+}
+
+/// 建表 + 灌 n 行；返回慢查询 SQL（非等值 join：n=3000 → 9e6 对 ≈ 1s 量级）。
+fn setup_slow_table(port: u16, n: usize) -> String {
+    let r = query(port, "CREATE TABLE t (a BIGINT, b BIGINT)", None);
+    assert_eq!(
+        r.status,
+        200,
+        "create table: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let r = http(
+        port,
+        "POST",
+        "/api/v1/write?table=t&mode=append",
+        &[("Content-Type", "application/octet-stream")],
+        &ipc_two_int_cols(n),
+    );
+    assert_eq!(r.status, 200, "write: {}", String::from_utf8_lossy(&r.body));
+    "SELECT count(*) FROM t a JOIN t b ON a.a > b.a".to_string()
+}
+
+// ---------------------------------------------------------------------------
+// 1. 契约面：J11 采用/回显 + 请求严格化 + PUT /config 键形态
+// ---------------------------------------------------------------------------
+
+#[test]
+fn j11_adoption_echo_and_request_strictness() {
+    let srv = Server::start(&[]);
+    let p = srv.port;
+
+    // --- J11：客户端 id 被采用，且响应头 + body 都回显 ---
+    let r = query(p, "SELECT 42 AS x", Some("drv-abc-1"));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.header("x-qsdb-query-id"),
+        Some("drv-abc-1"),
+        "响应头应回显 id"
+    );
+    assert_eq!(
+        r.json()["queryId"],
+        "drv-abc-1",
+        "body.queryId 应为客户端 id"
+    );
+
+    // 不带 header → 服务端生成 `q…`
+    let r = query(p, "SELECT 1", None);
+    let id = r.json()["queryId"].as_str().unwrap_or_default().to_string();
+    assert!(id.starts_with('q'), "服务端生成的 id 应有 q 前缀: {id}");
+    assert_eq!(
+        r.header("x-qsdb-query-id"),
+        Some(id.as_str()),
+        "服务端 id 也要回显"
+    );
+
+    // --- J11：非法 id → 400 INVALID_ARGUMENT（不静默忽略） ---
+    for bad in ["bad id!", "", &"x".repeat(65)] {
+        let r = query(p, "SELECT 1", Some(bad));
+        assert_eq!(r.status, 400, "非法 id {bad:?} 应 400");
+        assert_eq!(r.code(), "INVALID_ARGUMENT", "非法 id {bad:?}");
+    }
+
+    // --- 框架层抽取失败 → 结构化错误体（此前是纯文本，无 code） ---
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/query",
+        &[("Content-Type", "application/json")],
+        b"{not json",
+    );
+    assert_eq!(r.status, 400, "非法 JSON 应 400");
+    assert_eq!(r.code(), "INVALID_ARGUMENT", "非法 JSON 也要有 code");
+
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/query",
+        &[("Content-Type", "application/json")],
+        br#"{"sql":123}"#,
+    );
+    assert_eq!(r.status, 400, "body 类型错应归一为 400");
+    assert_eq!(r.code(), "INVALID_ARGUMENT");
+
+    // --- 未知 body 字段（拼错键）→ 400，而不是静默忽略 ---
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/query",
+        &[("Content-Type", "application/json")],
+        br#"{"sql":"SELECT 1","formatt":"ipc"}"#,
+    );
+    assert_eq!(r.status, 400, "拼错键应 400");
+    assert_eq!(r.code(), "INVALID_ARGUMENT");
+
+    // --- 值校验：format / mode / withSchema ---
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/query",
+        &[("Content-Type", "application/json")],
+        br#"{"sql":"SELECT 1","format":"arrow"}"#,
+    );
+    assert_eq!(r.status, 400, "format=arrow 应 400");
+    assert_eq!(r.code(), "INVALID_ARGUMENT");
+    // 合法值仍工作
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/query",
+        &[("Content-Type", "application/json")],
+        br#"{"sql":"SELECT 1 AS x","format":"ipc"}"#,
+    );
+    assert_eq!(r.status, 200);
+    assert!(
+        r.header("content-type").unwrap_or("").contains("arrow"),
+        "format=ipc 应回 Arrow 流"
+    );
+    assert!(r.header("x-qsdb-query-id").is_some(), "IPC 通道也要回显 id");
+
+    let r = http(p, "GET", "/api/v1/tables?withSchema=maybe", &[], &[]);
+    assert_eq!(r.status, 400, "withSchema=maybe 应 400（此前静默当 false）");
+    assert_eq!(r.code(), "INVALID_ARGUMENT");
+    for ok in ["1", "true", "yes", "on", ""] {
+        let r = http(
+            p,
+            "GET",
+            &format!("/api/v1/tables?withSchema={ok}"),
+            &[],
+            &[],
+        );
+        assert_eq!(r.status, 200, "withSchema={ok:?} 应被接受");
+        assert!(
+            r.json().get("tables").is_some(),
+            "withSchema=1 应回带列集形态"
+        );
+    }
+    for no in ["0", "false", "no", "off"] {
+        let r = http(
+            p,
+            "GET",
+            &format!("/api/v1/tables?withSchema={no}"),
+            &[],
+            &[],
+        );
+        assert_eq!(r.status, 200, "withSchema={no:?} 应被接受（假）");
+        assert!(r.json().get("tables").is_some());
+    }
+
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/write?table=t&mode=mangle",
+        &[("Content-Type", "application/octet-stream")],
+        b"x",
+    );
+    assert_eq!(r.status, 400, "mode=mangle 应 400");
+    assert_eq!(r.code(), "INVALID_ARGUMENT");
+
+    // 缺 query 参数 → 结构化 400（此前纯文本）
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/write?mode=append",
+        &[("Content-Type", "application/octet-stream")],
+        b"x",
+    );
+    assert_eq!(r.status, 400);
+    assert_eq!(r.code(), "INVALID_ARGUMENT");
+
+    // --- PUT /api/v1/config：GET 的键形态（camelCase）必须能用 + applied 诚实 ---
+    let r = http(
+        p,
+        "PUT",
+        "/api/v1/config",
+        &[("Content-Type", "application/json")],
+        br#"{"queryTimeoutMs":12345}"#,
+    );
+    assert_eq!(r.status, 200);
+    assert_eq!(r.json()["applied"], true, "camelCase 键应生效");
+    assert_eq!(r.json()["queryTimeoutMs"], 12345);
+    // 拼错键 → applied:false（不再假装成功）
+    let r = http(
+        p,
+        "PUT",
+        "/api/v1/config",
+        &[("Content-Type", "application/json")],
+        br#"{"queryTimeout":999}"#,
+    );
+    assert_eq!(r.status, 200);
+    assert_eq!(r.json()["applied"], false, "拼错键应报 applied:false");
+    assert_eq!(r.json()["queryTimeoutMs"], 12345, "值不该被改动");
+    // snake_case 亦可（与 --config 文件同形）
+    let r = http(
+        p,
+        "PUT",
+        "/api/v1/config",
+        &[("Content-Type", "application/json")],
+        br#"{"query_timeout_ms":0}"#,
+    );
+    assert_eq!(r.json()["queryTimeoutMs"], 0);
+}
+
+// ---------------------------------------------------------------------------
+// 2. J11 并发：同 id 冲突回退 + 按 id 精确取消
+// ---------------------------------------------------------------------------
+
+#[test]
+fn j11_conflict_fallback_and_precise_cancel() {
+    let srv = Server::start(&[]);
+    let p = srv.port;
+    let slow = setup_slow_table(p, 3000);
+
+    // 两条**同 id** 并发：一条采用、另一条回退服务端生成（不报错、不顶掉在跑的）
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let sql = slow.clone();
+        handles.push(std::thread::spawn(move || {
+            query(p, &sql, Some("drv-race-1"))
+        }));
+    }
+    let ids: Vec<String> = handles
+        .into_iter()
+        .map(|h| {
+            let r = h.join().expect("thread");
+            assert_eq!(
+                r.status,
+                200,
+                "并发查询都应 200: {}",
+                String::from_utf8_lossy(&r.body)
+            );
+            r.header("x-qsdb-query-id").unwrap_or_default().to_string()
+        })
+        .collect();
+    assert_eq!(
+        ids.iter().filter(|i| *i == "drv-race-1").count(),
+        1,
+        "恰好一条采用客户端 id: {ids:?}"
+    );
+    assert_eq!(
+        ids.iter().filter(|i| i.starts_with('q')).count(),
+        1,
+        "另一条应回退服务端生成: {ids:?}"
+    );
+
+    // 按客户端 id 精确取消（零扫描）
+    let sql = slow.clone();
+    let run = std::thread::spawn(move || query(p, &sql, Some("drv-cancel-1")));
+    std::thread::sleep(Duration::from_millis(400));
+    let listed = http(p, "GET", "/api/v1/queries", &[], &[]);
+    assert_eq!(listed.status, 200);
+    let listed_txt = String::from_utf8_lossy(&listed.body).to_string();
+    assert!(
+        listed_txt.contains("drv-cancel-1"),
+        "运行中查询列表应以客户端 id 为键: {listed_txt}"
+    );
+    let c = http(p, "POST", "/api/v1/queries/drv-cancel-1/cancel", &[], b"");
+    assert_eq!(
+        c.status,
+        200,
+        "取消请求应 200: {}",
+        String::from_utf8_lossy(&c.body)
+    );
+    let r = run.join().expect("thread");
+    assert_eq!(r.status, 400, "被取消的查询应失败");
+    assert_eq!(r.code(), "QUERY_CANCELLED", "应带 QUERY_CANCELLED 码");
+}
+
+// ---------------------------------------------------------------------------
+// 4. 错误码目录：运行期可查 + 码表外的码不存在 + 判定不靠文案嗅探
+// ---------------------------------------------------------------------------
+
+#[test]
+fn error_catalog_endpoint_and_no_off_catalog_codes() {
+    let srv = Server::start(&[]);
+    let p = srv.port;
+
+    // 目录端点：免鉴权（冷启动即可拉），码集合与文档一致（条数由代码侧枚举定）
+    let r = http(p, "GET", "/api/v1/error-codes", &[], &[]);
+    assert_eq!(r.status, 200, "目录端点应免鉴权可读");
+    let codes = r.json()["codes"].as_array().cloned().unwrap_or_default();
+    assert_eq!(codes.len(), 20, "目录应列出全部 20 个码");
+    for c in &codes {
+        for k in ["code", "http", "retry", "category", "sqlState"] {
+            assert!(c.get(k).is_some(), "目录条目缺字段 {k}: {c}");
+        }
+    }
+    let find = |want: &str| {
+        codes
+            .iter()
+            .find(|c| c["code"] == want)
+            .unwrap_or_else(|| panic!("目录缺 {want}"))
+            .clone()
+    };
+    // 两个 503：状态码相同、retry 相反——驱动靠 code 而非状态码决策
+    assert_eq!(find("TOO_MANY_QUERIES")["http"], 503);
+    assert_eq!(find("TOO_MANY_QUERIES")["retry"], true);
+    assert_eq!(find("READ_ONLY")["http"], 503);
+    assert_eq!(find("READ_ONLY")["retry"], false);
+
+    // --- 表名里带 "column"：不能因为文案含 column 就判成列不存在 ---
+    let r = query(p, "SELECT * FROM t_column", None);
+    assert_eq!(r.status, 400, "查询端点的表不存在应 400");
+    assert_eq!(
+        r.code(),
+        "TABLE_NOT_FOUND",
+        "`t_column` 是表名不是列名（旧实现嗅探文案会误判）: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+
+    // 真·列不存在 → COLUMN_NOT_FOUND
+    let r = query(p, "CREATE TABLE real_t (a BIGINT, b BIGINT)", None);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let r = query(p, "SELECT nope FROM real_t", None);
+    assert_eq!(r.status, 400);
+    assert_eq!(
+        r.code(),
+        "COLUMN_NOT_FOUND",
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+
+    // --- /write 的 IPC 解码失败 → INVALID_IPC（此前发的是目录外的 BAD_REQUEST）---
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/write?table=real_t&mode=append",
+        &[("Content-Type", "application/octet-stream")],
+        b"definitely not arrow ipc",
+    );
+    assert_eq!(r.status, 400, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.code(), "INVALID_IPC");
+
+    // --- 缺 Content-Type：415 归一到 400（一个码只对应一个状态码）---
+    let r = http(p, "POST", "/api/v1/query", &[], br#"{"sql":"SELECT 1"}"#);
+    assert_eq!(
+        r.status,
+        400,
+        "抽取器拒绝统一 400：{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(r.code(), "INVALID_ARGUMENT");
+}
+
+// ---------------------------------------------------------------------------
+// 5. 只读库：READ_ONLY（503，永不重试）——与并发闸的 503 分开
+// ---------------------------------------------------------------------------
+
+#[test]
+fn read_only_rejects_writes_with_dedicated_code() {
+    let srv = Server::start(&["--read-only"]);
+    let p = srv.port;
+
+    // 读端点照常（只读 ≠ 不可用）
+    let r = query(p, "SELECT 1", None);
+    assert_eq!(
+        r.status,
+        200,
+        "只读库的读必须可用: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+
+    // /write → 503 READ_ONLY（不是 UNAVAILABLE）
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/write?table=t&mode=append",
+        &[("Content-Type", "application/octet-stream")],
+        &ipc_two_int_cols(1),
+    );
+    assert_eq!(r.status, 503, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.code(), "READ_ONLY");
+    assert_eq!(r.json()["error"], "database is read-only");
+
+    // 走 SQL 的写（DDL）也经内核只读闸 → 同一个码
+    let r = query(p, "CREATE TABLE t (a BIGINT)", None);
+    assert_eq!(
+        r.status,
+        503,
+        "内核只读拒写也应 503: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(
+        r.code(),
+        "READ_ONLY",
+        "内核 ReadOnly 错误要落到专属码（此前是 INVALID_ARGUMENT）"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3. 并发闸：专属 code TOO_MANY_QUERIES（与只读 503 区分）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn concurrency_gate_has_dedicated_code() {
+    let srv = Server::start(&["--max-concurrent-queries", "1"]);
+    let p = srv.port;
+    let slow = setup_slow_table(p, 3000);
+
+    let sql = slow.clone();
+    let first = std::thread::spawn(move || query(p, &sql, None));
+    std::thread::sleep(Duration::from_millis(400));
+
+    // 闸满：立刻 503 + 专属 code（不排队）
+    let r = query(p, "SELECT 1", None);
+    assert_eq!(
+        r.status,
+        503,
+        "第 2 条并发应 503: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(
+        r.code(),
+        "TOO_MANY_QUERIES",
+        "闸门应有专属 code，区别于只读 503"
+    );
+    assert!(
+        r.json()["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("concurrent"),
+        "文案应说明并发上限"
+    );
+
+    let r1 = first.join().expect("thread");
+    assert_eq!(r1.status, 200, "第一条应正常完成");
+
+    // 闸门是闸门不是熔断：空出后立刻可查
+    let r = query(p, "SELECT 1", None);
+    assert_eq!(r.status, 200, "闸门释放后应立刻可查");
+}

@@ -477,7 +477,7 @@ pub fn expand_s3_glob(pattern: &str) -> Result<Vec<String>> {
         .collect();
     urls.sort();
     if urls.is_empty() {
-        return Err(QsdbError::not_found(format!(
+        return Err(QsdbError::file_not_found(format!(
             "read_parquet: no object matches {pattern}"
         )));
     }

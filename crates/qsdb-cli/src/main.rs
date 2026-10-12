@@ -10,6 +10,7 @@ use arrow::array::Array;
 use arrow::record_batch::RecordBatch;
 use clap::Parser;
 use qsdb::sql::SqlResult;
+mod error_code;
 #[cfg(feature = "flight")]
 mod flight;
 mod server;
@@ -61,14 +62,26 @@ enum Cmd {
         /// 自动 compaction 周期（秒）
         #[arg(long)]
         auto_compact_secs: Option<u64>,
-        /// 热数据缓存预算（MB；0 = 关闭，默认 1024）。
-        /// 默认值依据见 `QsdbOptions::scan_cache_bytes` 文档——256MB 时宽投影
-        /// 的缓存上界（budget/8）卡在片段大小边缘，几乎不命中。
-        #[arg(long, default_value_t = 1024)]
+        /// 热数据缓存预算（MB；0 = 关闭，默认 256）。
+        /// 保守默认守低占用定位；宽投影要快请显式调大（代价见
+        /// `QsdbOptions::scan_cache_bytes` 文档的内存-性能权衡）。
+        #[arg(long, default_value_t = 256)]
         cache_mb: usize,
-        /// 并发查询上限（0 = 不限）
-        #[arg(long, default_value_t = 0)]
+        /// 并发查询上限（0 = 不限；默认 16）。**防 OOM 双闸之一**：
+        /// 超限请求直接 503（不排队——闸门的职责是拒绝，不是缓冲）。
+        /// **16 是过渡默认**：它 ≈ 机器内存 ÷ 单查询上限，是当前唯一的系统级
+        /// 内存上界；但闸门数的是**条数**，分不清 µs 级轻查询与吃 4GB 的重查询，
+        /// 故对轻查询并发有副作用。最终取定随「全局内存预算 + 溢出」准入设计
+        /// 一并做（见 docs/configuration.md 内存模型一节）——在那之前，按机器
+        /// 容量显式传参即可。
+        #[arg(long, default_value_t = 16)]
         max_concurrent_queries: usize,
+        /// 单查询执行内存上限（MB；**0 = 不限**；不给则默认 4096 = 4GB）。
+        /// **防 OOM 双闸之二**，只约束显式物化算子的记账（join build /
+        /// sort spill / window / udaf；流式扫描/聚合不驻留故不记账）。
+        /// 显式给定时优先于 `--config` 里的同名项。
+        #[arg(long)]
+        query_memory_limit_mb: Option<u64>,
         /// 配置文件（JSON：query_timeout_ms / query_memory_limit_bytes）
         #[arg(long)]
         config: Option<PathBuf>,
@@ -106,7 +119,8 @@ enum Cmd {
         /// （segment/元数据 rename 前 fsync，掉电安全，写吞吐实测约 -25%）
         #[arg(long, default_value = "process-crash")]
         durability: String,
-        /// 只读模式（standby/只读副本）：写端点 503
+        /// 只读模式（standby/只读副本）：写/DDL 一律 503 `READ_ONLY`
+        /// （读完全不受影响；客户端**永不重试**该码，换可写实例才对）
         #[arg(long, default_value_t = false)]
         read_only: bool,
     },
@@ -338,6 +352,7 @@ fn main() {
             auto_compact_secs,
             cache_mb,
             max_concurrent_queries,
+            query_memory_limit_mb,
             flight_bind,
             file_cache_mb,
             storage_type,
@@ -448,6 +463,8 @@ fn main() {
                 token,
                 auto_compact_secs,
                 Some(max_concurrent_queries),
+                // MB → 字节；未显式给则 None（让配置文件优先，再由 serve 兜 4GB）
+                query_memory_limit_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
                 config.as_deref(),
                 flight_bind,
                 staging_secs,

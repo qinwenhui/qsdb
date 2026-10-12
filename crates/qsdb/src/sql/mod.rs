@@ -149,7 +149,7 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
             Ok(()) => Ok(SqlResult::Ok {
                 message: "table dropped".into(),
             }),
-            Err(e) if if_exists && matches!(e, QsdbError::NotFound(_)) => Ok(SqlResult::Ok {
+            Err(e) if if_exists && matches!(e, QsdbError::NotFound { .. }) => Ok(SqlResult::Ok {
                 message: "table dropped".into(),
             }),
             Err(e) => Err(e),
@@ -259,9 +259,11 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
                 Ok(()) => Ok(SqlResult::Ok {
                     message: format!("user '{name}' dropped"),
                 }),
-                Err(e) if if_exists && matches!(e, QsdbError::NotFound(_)) => Ok(SqlResult::Ok {
-                    message: format!("user '{name}' dropped"),
-                }),
+                Err(e) if if_exists && matches!(e, QsdbError::NotFound { .. }) => {
+                    Ok(SqlResult::Ok {
+                        message: format!("user '{name}' dropped"),
+                    })
+                }
                 Err(e) => Err(e),
             }
         }
@@ -592,7 +594,7 @@ fn reorder_rows(
             def.columns
                 .iter()
                 .position(|c| c.name.eq_ignore_ascii_case(n))
-                .ok_or_else(|| QsdbError::not_found(format!("column '{n}'")))
+                .ok_or_else(|| QsdbError::column_not_found(format!("column '{n}'")))
         })
         .collect::<Result<_>>()?;
     let mut seen = vec![false; def.columns.len()];

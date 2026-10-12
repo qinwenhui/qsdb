@@ -71,14 +71,22 @@ pub struct QsdbOptions {
     /// （远端模式 = 孤儿对象安全期：不被 manifest 引用且早于该期限才可删）
     pub trash_grace_ms: u64,
     /// 热数据缓存预算（字节）：segment 级**解码后**的 Arrow 批 LRU 缓存。
-    /// `0` = 关闭；默认 **1GB**。
+    /// `0` = 关闭；默认 **256MB**（保守值，守低占用定位）。
     ///
-    /// **默认值依据（2026-10-12 实测）**：收集器的单条累积上界是
-    /// `budget / 8`（8 分片并行时的防爆内存系数），而 10M 行 × 4 列的
-    /// 单分片片段约 32~64MB。原默认 256MB → 上界 32MB **恰好卡在边缘**：
-    /// 16 个分片只进 11 个 → 付了缓存成本却几乎不命中（比关缓存还慢）。
-    /// 提到 1GB（上界 128MB）后全命中，宽投影查询快 **16x**。
-    /// 预算只是**上限**（按需分配，不预占）。
+    /// **权衡（2026-10-12 实测，10M × 4 列）**：
+    /// - 256MB：缓存上界 `budget/8 = 32MB` **卡在分片片段（32~64MB）边缘**
+    ///   → 16 分片只进 11 个 → **付了缓存成本却几乎不命中**（0.18s，比关缓存
+    ///   的 0.14s 还慢）；但查询期工作集仅 **15~17MB**。
+    /// - 1GB：全命中 → 宽投影 **0.011s（快 16x）**；代价是查询期 RSS 到
+    ///   **1.2GB**（mem_vs 实测）——**违背"极致低占用"定位**。
+    ///
+    /// **故默认取保守值**：宽投影要快的部署显式调大（`--cache-mb`）。
+    /// 根治方向是**缓存粒度**（按批/RG 分块，使小预算也能部分命中），
+    /// 而不是放大预算。
+    ///
+    /// **注意**：本预算是**缓存索引的记账上限**（LRU 驱逐保证 `used ≤ budget`），
+    /// **不是进程内存硬上限**——已被驱逐但仍在途使用的批由 Arc 持有、
+    /// 不计入 `used`，故实际峰值可超预算。
     ///
     /// **性能口径警告**：本缓存让同一 segment 的重复查询免解码，收益显著——
     /// 但它不是与"每次现解码"的引擎（如 DuckDB `read_parquet`）可直接比较的
@@ -89,6 +97,15 @@ pub struct QsdbOptions {
     /// 默认查询超时（毫秒）；None/0 = 不超时
     pub query_timeout_ms: Option<u64>,
     /// 默认单查询内存上限（字节）；None = 不限。超限查询被终止而非 OOM 全库。
+    ///
+    /// **库默认不限**（嵌入方自控内存策略）；`qsdb server` 兜底 **4GB**
+    /// （`--query-memory-limit-mb`）——server 是唯一会叠加多查询的部署面。
+    /// 只约束**显式物化算子**（join build / sort spill / window / udaf）的记账，
+    /// 流式扫描/聚合不驻留故不记账。
+    ///
+    /// **与并发闸（server `--max-concurrent-queries`）相互独立**：二者不构成
+    /// 一个内存上界，最坏占用 ≈ `limit × 并发数`，需按机器容量各自收紧。
+    /// 详见 `docs/configuration.md` 内存模型一节。
     pub query_memory_limit_bytes: Option<u64>,
     /// 远端外表（read_parquet s3://）段文件本地缓存预算（字节）；0 = 关闭。
     /// 布局 `{root}/_filecache/{url_hash}/{etag}/…`，ETag 键控自动失效。
@@ -111,7 +128,7 @@ impl Default for QsdbOptions {
         Self {
             storage: StorageConfig::Local,
             trash_grace_ms: 10 * 60 * 1000,
-            scan_cache_bytes: 1024 * 1024 * 1024,
+            scan_cache_bytes: 256 * 1024 * 1024,
             query_timeout_ms: None,
             query_memory_limit_bytes: None,
             file_cache_bytes: 0,
@@ -355,7 +372,7 @@ impl Qsdb {
     /// 写路径统一闸门：只读句柄拒绝一切变更。
     fn ensure_writable(&self) -> Result<()> {
         if self.read_only {
-            return Err(QsdbError::invalid(
+            return Err(QsdbError::read_only(
                 "database is opened read-only; write/DDL/compact/gc rejected",
             ));
         }
@@ -366,7 +383,7 @@ impl Qsdb {
         let db = self.db_name(db);
         let names = read_table_names(&self.store, db)?;
         if !names.iter().any(|n| n == table) {
-            return Err(QsdbError::not_found(format!("table {db}.{table}")));
+            return Err(QsdbError::table_not_found(format!("table {db}.{table}")));
         }
         self.defs.get(&self.store, db, table)
     }
@@ -737,8 +754,25 @@ impl Qsdb {
     /// 新建查询上下文（server 会话层用；嵌入用户也可自建以获得取消/超时能力）。
     /// 超时/内存上限取**运行期配置**（可热更）；显式 timeout_ms 优先。
     pub fn new_query_context(&self, timeout_ms: Option<u64>) -> Arc<crate::query::QueryContext> {
+        self.new_query_context_with_id(None, timeout_ms)
+    }
+
+    /// 同上，但允许**指定 query id**（`None` = 服务端生成 `q` + uuid v7）。
+    ///
+    /// 用途（契约 J11）：调用方在执行前就知道 id，才能把它与自己的请求标识
+    /// （如 JDBC `Statement`）绑定，从而**零扫描、零误伤**地取消——否则只能按
+    /// SQL 文本反查运行中查询，同 SQL 并发会一并取消。id 原样使用（不加前缀）
+    /// 以便调用方直接按自己发出的值匹配。
+    ///
+    /// **唯一性由调用方负责**：内核不查重，Server 层在"已被运行中查询占用"时
+    /// 回退为服务端生成，并以响应头回显**实际**使用的 id。
+    pub fn new_query_context_with_id(
+        &self,
+        query_id: Option<String>,
+        timeout_ms: Option<u64>,
+    ) -> Arc<crate::query::QueryContext> {
         crate::query::QueryContext::new(
-            format!("q{}", uuid::Uuid::now_v7().simple()),
+            query_id.unwrap_or_else(|| format!("q{}", uuid::Uuid::now_v7().simple())),
             timeout_ms.or_else(|| self.runtime.query_timeout_ms()),
             self.runtime.query_memory_limit_bytes(),
         )
@@ -1586,9 +1620,11 @@ mod tests {
     fn errors_not_found() {
         let root = tmp_root("nf");
         let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
+        // 类别是机器可读的（上层据此选 TABLE_NOT_FOUND / COLUMN_NOT_FOUND，
+        // 不再嗅探文案）
         assert!(matches!(
             db.append("nope", &[]),
-            Err(QsdbError::NotFound(_))
+            Err(ref e) if e.not_found_kind() == Some(crate::error::NotFoundKind::Table)
         ));
         assert!(
             db.scan(ScanRequest {

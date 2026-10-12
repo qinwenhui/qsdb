@@ -40,7 +40,7 @@ pub mod write_buffer;
 
 pub use api::{PartitionStat, Qsdb, QsdbOptions, ScanRequest};
 pub use catalog::{ColumnDef, TableDef};
-pub use error::{QsdbError, Result};
+pub use error::{NotFoundKind, QsdbError, Result};
 pub use expr::udaf;
 pub use expr::udf;
 pub use manifest::{ColumnStats, PartitionManifest, SegmentEntry};

@@ -29,6 +29,8 @@ use qsdb::sql::SqlResult;
 use qsdb::write_buffer::{WriteBuffer, WriteBufferOptions};
 use qsdb::{Qsdb, QsdbError};
 
+use crate::error_code::ErrorCode;
+
 /// 运行中查询注册条目。
 pub struct QueryEntry {
     pub ctx: Arc<qsdb::query::QueryContext>,
@@ -50,11 +52,32 @@ pub struct AppState {
 }
 
 impl AppState {
-    fn register_query(
+    /// 组装共享状态（HTTP 与 Flight 两面共用同一份；Flight 的单测也走这里）。
+    pub(crate) fn new(db: Arc<Qsdb>, token: Option<String>, max_concurrent_queries: usize) -> Self {
+        let writer = db.writer(WriteBufferOptions::default());
+        Self {
+            tokens: std::sync::Mutex::new(HashMap::new()),
+            db,
+            writer,
+            token,
+            metrics: Metrics::default(),
+            queries: std::sync::Mutex::new(HashMap::new()),
+            max_concurrent_queries,
+        }
+    }
+
+    /// 建查询上下文并注册为"运行中"——**并发限额与 id 归属都在同一把锁内定**。
+    ///
+    /// `want_id` = 客户端经 `X-QSDB-Query-Id` 透传的建议 id（契约 J11）：
+    /// 未被占用则原样采用（驱动即可零扫描地 cancel）；**已被运行中查询占用则
+    /// 回退服务端生成**——不报错、不顶掉在跑的那条，调用方以返回的 ctx 为准
+    /// （响应回显实际 id）。
+    pub(crate) fn register_query(
         &self,
-        ctx: Arc<qsdb::query::QueryContext>,
+        want_id: Option<String>,
+        timeout_ms: Option<u64>,
         sql: String,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<Arc<qsdb::query::QueryContext>, String> {
         let mut q = self
             .queries
             .lock()
@@ -66,11 +89,23 @@ impl AppState {
                 self.max_concurrent_queries
             ));
         }
-        q.insert(ctx.query_id.clone(), QueryEntry { ctx, sql });
-        Ok(())
+        let ctx = match want_id {
+            Some(id) if !q.contains_key(&id) => {
+                self.db.new_query_context_with_id(Some(id), timeout_ms)
+            }
+            _ => self.db.new_query_context(timeout_ms),
+        };
+        q.insert(
+            ctx.query_id.clone(),
+            QueryEntry {
+                ctx: Arc::clone(&ctx),
+                sql,
+            },
+        );
+        Ok(ctx)
     }
 
-    fn unregister_query(&self, id: &str) {
+    pub(crate) fn unregister_query(&self, id: &str) {
         if let Ok(mut q) = self.queries.lock() {
             q.remove(id);
         }
@@ -142,6 +177,14 @@ pub struct ServerConfigFile {
     pub query_memory_limit_bytes: Option<u64>,
 }
 
+/// 单查询执行内存的兜底默认闸门（4GB）。
+///
+/// **为什么需要一个默认**：`QsdbOptions` 的库默认是 `None`（不限，嵌入方自控），
+/// 而 server 是唯一会把多个查询叠在一起跑的部署面——不加默认就是"N 个查询
+/// 各自无界"。4GB 只约束**物化算子**的记账（join build / sort spill / window /
+/// udaf），流式路径不吃这个额度，故常规分析查询远够。
+const DEFAULT_QUERY_MEMORY_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
     db: Arc<Qsdb>,
@@ -149,33 +192,37 @@ pub async fn serve(
     token: Option<String>,
     auto_compact_secs: Option<u64>,
     max_concurrent_queries: Option<usize>,
+    // 单查询执行内存闸门（字节；`Some(0)` = 显式不限，`None` = 未指定，交由
+    // 配置文件 / 兜底默认决定）。
+    query_memory_limit_bytes: Option<u64>,
     config_file: Option<&std::path::Path>,
     #[cfg_attr(not(feature = "flight"), allow(unused_variables))] flight_bind: Option<String>,
     #[cfg_attr(not(feature = "s3"), allow(unused_variables))] staging_upload_secs: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut cfg = ServerConfigFile::default();
     if let Some(path) = config_file {
         let text = std::fs::read_to_string(path)?;
-        let cfg: ServerConfigFile = serde_json::from_str(&text)
+        cfg = serde_json::from_str(&text)
             .map_err(|e| format!("parse config {}: {e}", path.display()))?;
-        let rt = db.runtime();
-        if let Some(ms) = cfg.query_timeout_ms {
-            rt.set_query_timeout_ms(ms);
-        }
-        if let Some(bytes) = cfg.query_memory_limit_bytes {
-            rt.set_query_memory_limit_bytes(bytes);
-        }
         eprintln!("config file applied: {}", path.display());
     }
-    let writer = db.writer(WriteBufferOptions::default());
-    let state = Arc::new(AppState {
-        tokens: std::sync::Mutex::new(HashMap::new()),
+    let rt = db.runtime();
+    if let Some(ms) = cfg.query_timeout_ms {
+        rt.set_query_timeout_ms(ms);
+    }
+    // 单查询执行内存闸门（防 OOM 双闸之二）：CLI 显式值 > 配置文件 > 兜底默认。
+    // 未经此闸时单查询执行内存无上界（`QsdbOptions` 默认 None = 不限），
+    // 并发下即 N 倍无界内存——见 docs/configuration.md 内存模型一节。
+    rt.set_query_memory_limit_bytes(
+        query_memory_limit_bytes
+            .or(cfg.query_memory_limit_bytes)
+            .unwrap_or(DEFAULT_QUERY_MEMORY_LIMIT_BYTES),
+    );
+    let state = Arc::new(AppState::new(
         db,
-        writer,
         token,
-        metrics: Metrics::default(),
-        queries: std::sync::Mutex::new(HashMap::new()),
-        max_concurrent_queries: max_concurrent_queries.unwrap_or(0),
-    });
+        max_concurrent_queries.unwrap_or(0),
+    ));
 
     // 写入走大 body（Arrow IPC 批）；默认 2MB 限制放大到 1GB
     let write_layer = axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024);
@@ -183,6 +230,7 @@ pub async fn serve(
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/api/v1/auth/login", post(auth_login))
+        .route("/api/v1/error-codes", get(error_codes))
         .route("/api/v1/files", get(download_file))
         .route("/api/v1/query", post(query))
         .route("/api/v1/write", post(write))
@@ -245,18 +293,21 @@ pub async fn serve(
     });
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    // 回显**实际绑定**的地址（而非入参）：`--addr 127.0.0.1:0` 才能被用起来，
+    // 测试/编排也能据此拿到真实端口。
+    let bound = listener.local_addr()?;
     eprintln!(
-        "qsdb server listening on http://{addr} (token auth: {})",
+        "qsdb server listening on http://{bound} (token auth: {})",
         if state.token.is_some() { "on" } else { "off" }
     );
 
     // Arrow Flight（feature-gated）：独立 h2c 口，与 HTTP 并行
     #[cfg(feature = "flight")]
     let flight_task = flight_bind.map(|bind| {
-        let db = Arc::clone(&state.db);
-        let token = state.token.clone();
+        // Flight 与 HTTP 共用同一份 AppState → 同一张查询注册表（取消 + 并发闸 + J11）
+        let st = Arc::clone(&state);
         tokio::spawn(async move {
-            if let Err(e) = crate::flight::serve_flight(db, token, &bind).await {
+            if let Err(e) = crate::flight::serve_flight(st, &bind).await {
                 eprintln!("flight server error: {e}");
             }
         })
@@ -375,42 +426,77 @@ fn new_token() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(seed.to_le_bytes())
 }
 
-/// 错误响应体（J3）：`{"error": <人读文案>, "code": <稳定机器码>}`。
+/// 抽取器拒绝 → 契约错误体（`{error, code}`）。
 ///
-/// `code` 是**契约级稳定**标识，驱动据此精确映射 SQLState；`error` 文案可能
-/// 随版本变化，消费方不应依赖其内容（驱动此前只能靠 message 前缀
-/// `"query timeout: "` 识别超时——文案一改就断）。
-fn err_response(status: StatusCode, msg: String) -> Response {
-    err_response_code(status, status_code_of(status), msg)
+/// axum 内建抽取器失败时回的是**纯文本**，违反 `docs/对接契约.md` §3.2 的
+/// "错误体恒为 `{error, code}`"承诺——驱动拿不到机器码，只能按文案猜。
+/// 现在一律 `400 INVALID_ARGUMENT`（422/415 一并归一到 400）：契约要求
+/// **一个码恒定一个状态码**，抽取器拒绝不该另开状态码分支。
+fn rejection_response(msg: String) -> Response {
+    ErrorCode::InvalidArgument.response(msg)
 }
 
-fn err_response_code(status: StatusCode, code: &str, msg: String) -> Response {
-    (
-        status,
-        Json(serde_json::json!({ "error": msg, "code": code })),
-    )
-        .into_response()
+/// `Json<T>`：拒绝时回结构化错误体（语义同 [`rejection_response`]）。
+struct StructuredJson<T>(T);
+
+impl<T, S> axum::extract::FromRequest<S> for StructuredJson<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(v)) => Ok(StructuredJson(v)),
+            Err(rej) => Err(rejection_response(rej.body_text())),
+        }
+    }
 }
 
-/// 无 QsdbError 上下文的通用状态码 → 机器码。
-fn status_code_of(s: StatusCode) -> &'static str {
-    match s {
-        StatusCode::UNAUTHORIZED => "UNAUTHORIZED",
-        StatusCode::FORBIDDEN => "FORBIDDEN",
-        StatusCode::BAD_REQUEST => "BAD_REQUEST",
-        StatusCode::NOT_FOUND => "NOT_FOUND",
-        StatusCode::SERVICE_UNAVAILABLE => "UNAVAILABLE",
-        StatusCode::REQUEST_TIMEOUT => "QUERY_TIMEOUT",
-        StatusCode::NOT_IMPLEMENTED => "UNSUPPORTED",
-        StatusCode::CONFLICT => "CONFLICT",
-        _ => "INTERNAL",
+/// `Query<T>`：同上（query string 缺参 / 类型错）。
+///
+/// 实现的是 **FromRequestParts**（只读 URI，不碰 body）——否则会与 handler 末尾
+/// 的 body 抽取器（`Bytes`）争"消费请求"，写端点直接不是合法 Handler。
+struct StructuredQuery<T>(T);
+
+impl<T, S> axum::extract::FromRequestParts<S> for StructuredQuery<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        match Query::<T>::from_request_parts(parts, state).await {
+            Ok(Query(v)) => Ok(StructuredQuery(v)),
+            Err(rej) => Err(rejection_response(rej.body_text())),
+        }
+    }
+}
+
+/// 查询串布尔参数的**严格**解析：只认这份清单，其余一律 400。
+///
+/// 此前 `?withSchema=maybe` 会静默当 false（走了 N+1 却不报错）——静默失败在
+/// 协议面比报错危险得多。`""`（`?withSchema` 裸传）= true，按旗标惯例。
+fn parse_bool_param(name: &str, v: Option<&str>) -> std::result::Result<bool, String> {
+    let Some(raw) = v else { return Ok(false) };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!(
+            "invalid {name}: expect 1/0/true/false/yes/no/on/off (got {raw:?})"
+        )),
     }
 }
 
 /// POST /api/v1/auth/login：Basic 认证 → 签发 Bearer token（进程内存态）。
 async fn auth_login(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let Some(role) = auth_role(&s, &headers) else {
-        return err_response(StatusCode::UNAUTHORIZED, "invalid credentials".into());
+        return ErrorCode::Unauthorized.response("invalid credentials");
     };
     let token = new_token();
     if let Ok(mut t) = s.tokens.lock() {
@@ -435,24 +521,21 @@ struct FileParams {
 async fn download_file(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(p): Query<FileParams>,
+    StructuredQuery(p): StructuredQuery<FileParams>,
 ) -> Response {
     let Some(role) = auth_role(&s, &headers) else {
-        return err_response(StatusCode::UNAUTHORIZED, "unauthorized".into());
+        return ErrorCode::Unauthorized.response("unauthorized");
     };
     if !role.is_admin() {
-        return err_response(StatusCode::FORBIDDEN, "file download requires admin".into());
+        return ErrorCode::Forbidden.response("file download requires admin");
     }
     // 路径安全检查
     let rel = p.path.replace('\\', "/");
     if rel.contains("..") || rel.starts_with('/') {
-        return err_response(StatusCode::BAD_REQUEST, "invalid path".into());
+        return ErrorCode::InvalidArgument.response("invalid path");
     }
     if rel.starts_with("_trash/") || rel.starts_with("_filecache/") {
-        return err_response(
-            StatusCode::FORBIDDEN,
-            "internal paths not downloadable".into(),
-        );
+        return ErrorCode::Forbidden.response("internal paths not downloadable");
     }
     let full = s.db.root().join(&rel);
     let result = tokio::task::spawn_blocking(move || std::fs::read(&full)).await;
@@ -469,9 +552,25 @@ async fn download_file(
             )
                 .into_response()
         }
-        Ok(Err(e)) => err_response(StatusCode::NOT_FOUND, format!("file not found: {e}")),
-        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, format!("io task: {e}")),
+        Ok(Err(e)) => ErrorCode::NotFound.response(format!("file not found: {e}")),
+        Err(e) => ErrorCode::Internal.response(format!("io task: {e}")),
     }
+}
+
+/// GET /api/v1/error-codes：错误码目录（机器可读，由 [`ErrorCode`] 直接产出）。
+///
+/// 目录是**静态**的（不含实例信息、不含凭证），故与 `/health`、`/metrics` 同口径
+/// **不鉴权**：驱动冷启动即可据此自配置 `code → SQLState/重试策略` 映射，
+/// 不必把码表硬编码进驱动——内核加码时驱动自动跟上。
+async fn error_codes() -> Response {
+    let codes: Vec<serde_json::Value> = ErrorCode::ALL.iter().map(|c| c.entry()).collect();
+    Json(serde_json::json!({
+        "version": 1,
+        "doc": "docs/error-codes.md",
+        "stability": "只增不改：已发布码的语义与 HTTP 状态码永久冻结；error 文案不做兼容承诺",
+        "codes": codes,
+    }))
+    .into_response()
 }
 
 async fn health(State(_s): State<Arc<AppState>>) -> impl IntoResponse {
@@ -499,37 +598,76 @@ async fn metrics(State(s): State<Arc<AppState>>) -> Response {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)] // 拼错键（"formatt"）→ 400，不静默走默认值
 struct QueryBody {
     sql: String,
     #[serde(default)]
     format: Option<String>,
 }
 
+/// J11：客户端透传 query id 的合法性。放行 `[A-Za-z0-9._:-]`、长度 `1..=64`
+/// ——够容纳 UUID / ULID / KSUID / 驱动自有前缀，又不至于让 id 变成日志、
+/// 指标或注册表 key 的注入载体。非法值一律 400（**不静默忽略**）。
+pub(crate) fn valid_client_query_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+}
+
 async fn query(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<QueryBody>,
+    StructuredJson(body): StructuredJson<QueryBody>,
 ) -> Response {
     let Some(role) = auth_role(&s, &headers) else {
-        return err_response(StatusCode::UNAUTHORIZED, "unauthorized".into());
+        return ErrorCode::Unauthorized.response("unauthorized");
     };
     s.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+    // format 值校验（拼错如 "arrow" 此前静默回 JSON——静默失败在协议面危险）
+    let fmt = match body.format.as_deref() {
+        None => "json".to_string(),
+        Some(f) if f.eq_ignore_ascii_case("json") => "json".to_string(),
+        Some(f) if f.eq_ignore_ascii_case("ipc") => "ipc".to_string(),
+        Some(f) => {
+            s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+            return ErrorCode::InvalidArgument
+                .response(format!("invalid format: expect json|ipc (got {f:?})"));
+        }
+    };
     // 会话：每请求一个 QueryContext（超时可经 X-QSDB-Timeout 头覆盖）
     let timeout_ms: Option<u64> = headers
         .get("x-qsdb-timeout-ms")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok());
-    let ctx = s.db.new_query_context(timeout_ms);
-    if let Err(msg) = s.register_query(Arc::clone(&ctx), body.sql.clone()) {
-        s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-        return err_response(StatusCode::SERVICE_UNAVAILABLE, msg);
-    }
+    // J11：客户端可在执行前指定 query id，从而零扫描、零误伤地取消自己的查询。
+    // 非法值**显式 400**——静默忽略正是 J6 那条 serde alias 坑的教训。
+    let want_id = match headers.get("x-qsdb-query-id") {
+        None => None,
+        Some(v) => match v.to_str().ok().filter(|s| valid_client_query_id(s)) {
+            Some(id) => Some(id.to_string()),
+            None => {
+                s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                return ErrorCode::InvalidArgument
+                    .response("invalid X-QSDB-Query-Id: expect 1..=64 chars of [A-Za-z0-9._:-]");
+            }
+        },
+    };
+    let ctx = match s.register_query(want_id, timeout_ms, body.sql.clone()) {
+        Ok(ctx) => ctx,
+        Err(msg) => {
+            s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+            // 专属 code：同为 503 还有"只读库拒绝写"（UNAVAILABLE），驱动必须能
+            // 区分「并发满 → 可退避重试」与「只读 → 永不重试」。
+            return ErrorCode::TooManyQueries.response(msg);
+        }
+    };
     let query_id = ctx.query_id.clone();
     let reg = Arc::clone(&s);
     let t = Instant::now();
     let st = Arc::clone(&s);
     let sql = body.sql;
-    let fmt = body.format.unwrap_or_else(|| "json".into());
     let ctx_exec = Arc::clone(&ctx);
     let result =
         tokio::task::spawn_blocking(move || st.db.sql_with_role_and_context(&sql, role, &ctx_exec))
@@ -537,40 +675,31 @@ async fn query(
     reg.unregister_query(&query_id);
     let elapsed = t.elapsed().as_nanos() as u64;
     s.metrics.observe_query(elapsed);
-    match result {
+    // 响应头回声用（下面的 JSON 分支会把 query_id 移走）
+    let echo_id = query_id.clone();
+    let mut resp = match result {
         Ok(Ok(r)) => match r {
             SqlResult::Query { schema, batches } => {
                 let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
                 if fmt.eq_ignore_ascii_case("ipc") {
                     match batches_to_ipc(&schema, &batches) {
-                        // J4：IPC 通道经响应头透出 queryId（驱动 cancel 用）
                         Ok(bytes) => (
-                            [
-                                (
-                                    axum::http::header::CONTENT_TYPE,
-                                    axum::http::HeaderValue::from_static(
-                                        "application/vnd.apache.arrow.stream",
-                                    ),
+                            [(
+                                axum::http::header::CONTENT_TYPE,
+                                axum::http::HeaderValue::from_static(
+                                    "application/vnd.apache.arrow.stream",
                                 ),
-                                (
-                                    axum::http::HeaderName::from_static("x-qsdb-query-id"),
-                                    axum::http::HeaderValue::from_str(&query_id).unwrap_or_else(
-                                        |_| axum::http::HeaderValue::from_static(""),
-                                    ),
-                                ),
-                            ],
+                            )],
                             bytes,
                         )
                             .into_response(),
                         Err(e) => {
                             s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-                            err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                            ErrorCode::Internal.response(e.to_string())
                         }
                     }
                 } else {
                     match batches_to_json(&schema, &batches) {
-                        // J4：透出 queryId——配合 /api/v1/queries/{id}/cancel
-                        // 让 JDBC Statement.cancel() 能精确取消
                         Ok(v) => Json(serde_json::json!({
                             "queryId": query_id,
                             "schema": schema_fields(&schema),
@@ -581,7 +710,7 @@ async fn query(
                         .into_response(),
                         Err(e) => {
                             s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-                            err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                            ErrorCode::Internal.response(e.to_string())
                         }
                     }
                 }
@@ -597,8 +726,16 @@ async fn query(
             s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
             status_of_query(&e, e.to_string())
         }
-        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => ErrorCode::Internal.response(e.to_string()),
+    };
+    // J4/J11：**所有**已注册查询的响应（JSON 通道、IPC 通道、失败/超时/取消）
+    // 统一回显**实际使用**的 query id——客户端透传的 id 若因冲突被回退，驱动
+    // 据此处回声即可发现自己拿到的不是原值。
+    if let Ok(v) = axum::http::HeaderValue::from_str(&echo_id) {
+        resp.headers_mut()
+            .insert(axum::http::HeaderName::from_static("x-qsdb-query-id"), v);
     }
+    resp
 }
 
 #[derive(serde::Deserialize)]
@@ -613,29 +750,36 @@ struct WriteParams {
 async fn write(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(p): Query<WriteParams>,
+    StructuredQuery(p): StructuredQuery<WriteParams>,
     body: axum::body::Bytes,
 ) -> Response {
     if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
-        return err_response(StatusCode::UNAUTHORIZED, "unauthorized".into());
+        return ErrorCode::Unauthorized.response("unauthorized");
     }
     if s.db.read_only() {
-        return err_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "database is read-only".into(),
-        );
+        return ErrorCode::ReadOnly.response("database is read-only");
     }
     s.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
     let t = Instant::now();
+    // mode 值校验（在解码 body 之前——拼错的值此前静默按 append 处理）
+    let mode = match p.mode.as_deref() {
+        None => "append".to_string(),
+        Some(m) if m.eq_ignore_ascii_case("append") => "append".to_string(),
+        Some(m) if m.eq_ignore_ascii_case("overwrite") => "overwrite".to_string(),
+        Some(m) => {
+            s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+            return ErrorCode::InvalidArgument
+                .response(format!("invalid mode: expect append|overwrite (got {m:?})"));
+        }
+    };
     // IPC 解码（同步 CPU 工作，直接做）
     let batches = match ipc_to_batches(&body) {
         Ok(b) => b,
         Err(e) => {
             s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-            return err_response(StatusCode::BAD_REQUEST, e.to_string());
+            return ErrorCode::InvalidIpc.response(e.to_string());
         }
     };
-    let mode = p.mode.unwrap_or_else(|| "append".into());
     let mode_out = mode.clone();
     let st = Arc::clone(&s);
     let table = p.table.clone();
@@ -689,7 +833,7 @@ async fn write(
             s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
             status_of_query(&e, e.to_string())
         }
-        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => ErrorCode::Internal.response(e.to_string()),
     }
 }
 
@@ -718,15 +862,18 @@ struct TablesQuery {
 async fn tables(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(q): Query<TablesQuery>,
+    StructuredQuery(q): StructuredQuery<TablesQuery>,
 ) -> Response {
     if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
-        return err_response(StatusCode::UNAUTHORIZED, "unauthorized".into());
+        return ErrorCode::Unauthorized.response("unauthorized");
     }
-    let want_schema = matches!(
-        q.with_schema.as_deref(),
-        Some("1") | Some("true") | Some("yes")
-    );
+    let want_schema = match parse_bool_param("withSchema", q.with_schema.as_deref()) {
+        Ok(v) => v,
+        Err(msg) => {
+            s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+            return ErrorCode::InvalidArgument.response(msg);
+        }
+    };
     let st = Arc::clone(&s);
     match tokio::task::spawn_blocking(move || {
         let list = st.db.tables()?;
@@ -749,7 +896,7 @@ async fn tables(
     {
         Ok(Ok(v)) => Json(v).into_response(),
         Ok(Err(e)) => status_of(&e, e.to_string()),
-        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => ErrorCode::Internal.response(e.to_string()),
     }
 }
 
@@ -759,7 +906,7 @@ async fn schema(
     Path(table): Path<String>,
 ) -> Response {
     if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
-        return err_response(StatusCode::UNAUTHORIZED, "unauthorized".into());
+        return ErrorCode::Unauthorized.response("unauthorized");
     }
     let table_out = table.clone();
     let st = Arc::clone(&s);
@@ -769,7 +916,7 @@ async fn schema(
             Json(serde_json::json!({ "table": table_out, "columns": cols })).into_response()
         }
         Ok(Err(e)) => status_of(&e, e.to_string()),
-        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => ErrorCode::Internal.response(e.to_string()),
     }
 }
 
@@ -779,7 +926,7 @@ async fn partitions(
     Path(table): Path<String>,
 ) -> Response {
     if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
-        return err_response(StatusCode::UNAUTHORIZED, "unauthorized".into());
+        return ErrorCode::Unauthorized.response("unauthorized");
     }
     let st = Arc::clone(&s);
     let res = tokio::task::spawn_blocking(move || st.db.partition_stats(&table)).await;
@@ -803,13 +950,13 @@ async fn partitions(
                 .into_response()
         }
         Ok(Err(e)) => status_of(&e, e.to_string()),
-        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => ErrorCode::Internal.response(e.to_string()),
     }
 }
 
 async fn stats(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
-        return err_response(StatusCode::UNAUTHORIZED, "unauthorized".into());
+        return ErrorCode::Unauthorized.response("unauthorized");
     }
     let st = Arc::clone(&s);
     let res = tokio::task::spawn_blocking(move || {
@@ -830,13 +977,13 @@ async fn stats(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     match res {
         Ok(Ok(v)) => Json(v).into_response(),
         Ok(Err(e)) => status_of(&e, e.to_string()),
-        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => ErrorCode::Internal.response(e.to_string()),
     }
 }
 
 async fn get_config(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
-        return err_response(StatusCode::UNAUTHORIZED, "unauthorized".into());
+        return ErrorCode::Unauthorized.response("unauthorized");
     }
     let rt = s.db.runtime();
     let opts = s.db.options();
@@ -862,19 +1009,23 @@ async fn get_config(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Respo
 
 #[derive(serde::Deserialize, Default)]
 struct ConfigUpdate {
-    #[serde(default)]
+    // snake_case 为规范名（与 `--config` 文件同形）；**camelCase 别名是必需的**：
+    // `GET /api/v1/config` 回的就是 camelCase，不别名则"读-改-写"式整轮 PUT 被
+    // **静默忽略**（实测 2026-10-12：PUT {"queryTimeoutMs":12345} → HTTP 200 +
+    // applied:true 而值纹丝不动）。契约文档与 GET 的键形态均以 camelCase 为准。
+    #[serde(default, alias = "queryTimeoutMs")]
     query_timeout_ms: Option<u64>,
-    #[serde(default)]
+    #[serde(default, alias = "queryMemoryLimitBytes")]
     query_memory_limit_bytes: Option<u64>,
 }
 
 async fn put_config(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<ConfigUpdate>,
+    StructuredJson(body): StructuredJson<ConfigUpdate>,
 ) -> Response {
     if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
-        return err_response(StatusCode::UNAUTHORIZED, "unauthorized".into());
+        return ErrorCode::Unauthorized.response("unauthorized");
     }
     let rt = s.db.runtime();
     if let Some(ms) = body.query_timeout_ms {
@@ -883,17 +1034,20 @@ async fn put_config(
     if let Some(bytes) = body.query_memory_limit_bytes {
         rt.set_query_memory_limit_bytes(bytes);
     }
+    // `applied` = **确实落了至少一个已知字段**（空 body 或全未知/拼错键 → false）。
+    // 恒返回 true 会在客户端拼错键时给出"成功"的假信号。
+    let applied = body.query_timeout_ms.is_some() || body.query_memory_limit_bytes.is_some();
     Json(serde_json::json!({
         "queryTimeoutMs": rt.query_timeout_ms().unwrap_or(0),
         "queryMemoryLimitBytes": rt.query_memory_limit_bytes().unwrap_or(0),
-        "applied": true,
+        "applied": applied,
     }))
     .into_response()
 }
 
 async fn list_queries(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
-        return err_response(StatusCode::UNAUTHORIZED, "unauthorized".into());
+        return ErrorCode::Unauthorized.response("unauthorized");
     }
     let entries: Vec<serde_json::Value> = match s.queries.lock() {
         Ok(q) => q
@@ -909,10 +1063,7 @@ async fn list_queries(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Res
             })
             .collect(),
         Err(_) => {
-            return err_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "registry poisoned".into(),
-            );
+            return ErrorCode::Internal.response("registry poisoned");
         }
     };
     Json(serde_json::json!({ "queries": entries, "count": entries.len() })).into_response()
@@ -924,7 +1075,7 @@ async fn cancel_query(
     Path(id): Path<String>,
 ) -> Response {
     if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
-        return err_response(StatusCode::UNAUTHORIZED, "unauthorized".into());
+        return ErrorCode::Unauthorized.response("unauthorized");
     }
     match s.queries.lock() {
         Ok(q) => match q.get(&id) {
@@ -932,12 +1083,9 @@ async fn cancel_query(
                 e.ctx.cancel();
                 Json(serde_json::json!({ "cancelled": id })).into_response()
             }
-            None => err_response(StatusCode::NOT_FOUND, format!("query {id} not running")),
+            None => ErrorCode::NotFound.response(format!("query {id} not running")),
         },
-        Err(_) => err_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "registry poisoned".into(),
-        ),
+        Err(_) => ErrorCode::Internal.response("registry poisoned"),
     }
 }
 
@@ -948,8 +1096,7 @@ async fn cancel_query(
 /// 错误 → 响应（**资源端点**语义：`/tables`、`/schema`、`/partitions`、`/stats`）。
 /// 这些端点上 404 是准确的「资源不存在」。
 fn status_of(e: &QsdbError, msg: String) -> Response {
-    let (status, code) = map_err(e, false);
-    err_response_code(status, code, msg)
+    ErrorCode::from_qsdb(e, false).response(msg)
 }
 
 /// 错误 → 响应（**查询/写入端点**语义）。
@@ -958,35 +1105,13 @@ fn status_of(e: &QsdbError, msg: String) -> Response {
 /// 不是 HTTP 资源语义——返回 404 会让网关误判为路由错误。改 400，
 /// 并用 code `TABLE_NOT_FOUND` / `COLUMN_NOT_FOUND` 便于驱动映射 SQLState。
 fn status_of_query(e: &QsdbError, msg: String) -> Response {
-    let (status, code) = map_err(e, true);
-    err_response_code(status, code, msg)
+    ErrorCode::from_qsdb(e, true).response(msg)
 }
 
-/// 错误 → (HTTP 状态码, 机器码)。`query_ctx` 区分查询语义与资源语义。
-fn map_err(e: &QsdbError, query_ctx: bool) -> (StatusCode, &'static str) {
-    match e {
-        // J3：超时/取消/内存超限此前全落 500 兜底，只能靠文案前缀识别
-        QsdbError::QueryTimeout(_) => (StatusCode::REQUEST_TIMEOUT, "QUERY_TIMEOUT"),
-        QsdbError::QueryCancelled(_) => (StatusCode::BAD_REQUEST, "QUERY_CANCELLED"),
-        QsdbError::QueryMemoryLimit(_) => (StatusCode::BAD_REQUEST, "QUERY_MEMORY_LIMIT"),
-        QsdbError::NotFound(m) if query_ctx => (
-            StatusCode::BAD_REQUEST,
-            if m.contains("column") {
-                "COLUMN_NOT_FOUND"
-            } else {
-                "TABLE_NOT_FOUND"
-            },
-        ),
-        QsdbError::NotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
-        QsdbError::Parse(_) => (StatusCode::BAD_REQUEST, "PARSE_ERROR"),
-        QsdbError::InvalidArgument(_) => (StatusCode::BAD_REQUEST, "INVALID_ARGUMENT"),
-        QsdbError::Type(_) => (StatusCode::BAD_REQUEST, "TYPE_ERROR"),
-        QsdbError::AlreadyExists(_) => (StatusCode::CONFLICT, "ALREADY_EXISTS"),
-        QsdbError::Unsupported(_) => (StatusCode::NOT_IMPLEMENTED, "UNSUPPORTED"),
-        QsdbError::Meta(_) => (StatusCode::INTERNAL_SERVER_ERROR, "METADATA_ERROR"),
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
-    }
-}
+// 错误 → 响应/状态码的映射**只有一处**：`error_code::ErrorCode::from_qsdb`
+// （删掉了 `map_err` + `status_code_of` 这组状态派生兜底——它们能让响应发出
+// `BAD_REQUEST` 这类目录外的码，且"列不存在"曾靠 `msg.contains("column")`
+// 嗅探文案判定，表名含 column 即误判）。
 
 fn batches_to_ipc(
     schema: &arrow::datatypes::SchemaRef,
