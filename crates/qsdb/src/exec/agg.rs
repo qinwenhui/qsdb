@@ -939,6 +939,7 @@ impl GroupTable {
                 if sg == EMPTY {
                     let gid = self.push_group(&k.to_le_bytes(), &[crate::types::Literal::Int64(k)]);
                     self.fast_slots_inline[idx] = (k, gid);
+                    // 负载因子 0.5（实测 0.75 更慢：探测链变长的代价 > 表变小的收益）
                     if self.len() * 2 >= self.fast_slots_inline.len() {
                         let mut cap = self.fast_slots_inline.len() * 2;
                         while cap < (self.len() + 1) * 2 {
