@@ -82,9 +82,10 @@ fn like_general_and_escape() {
     assert!(q(&db, "SELECT b FROM t WHERE a LIKE 'z%'") == vec!["4"]);
     // 显式 ESCAPE：字面 % 匹配
     // 无通配转义发生——应能正常执行（ESCAPE 语法被正确解析）
-    assert!(db
-        .sql_collect("SELECT b FROM t WHERE a LIKE 'zz!-abc' ESCAPE '!'")
-        .is_ok());
+    assert!(
+        db.sql_collect("SELECT b FROM t WHERE a LIKE 'zz!-abc' ESCAPE '!'")
+            .is_ok()
+    );
     // 非 ILIKE 大小写敏感
     assert!(q(&db, "SELECT b FROM t WHERE a LIKE 'AX%'") == Vec::<String>::new());
 }
