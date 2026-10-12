@@ -780,6 +780,29 @@ struct ScanPlan {
     /// 值已 cast 到列类型的谓词
     predicate: Option<Predicate>,
     output_schema: SchemaRef,
+    /// 每投影列的来源（与 `projection` 同序）：
+    /// `None` = 分区列（常量重建）；`Some(i)` = 读批的第 i 列
+    /// （读批列序 = `read_columns` 序）。bind 期算定，避免组装批时
+    /// 每批每列做 `schema.index_of(name)` 字符串查找。
+    proj_src: Vec<Option<usize>>,
+}
+
+/// 计算 `proj_src`（见 `ScanPlan::proj_src`）。
+fn compute_proj_src(
+    def: &TableDef,
+    projection: &[String],
+    read_columns: &[String],
+) -> Vec<Option<usize>> {
+    projection
+        .iter()
+        .map(|name| {
+            if def.partition_keys.iter().any(|k| k == name) {
+                None
+            } else {
+                read_columns.iter().position(|c| c == name)
+            }
+        })
+        .collect()
 }
 
 impl ScanPlan {
@@ -838,12 +861,14 @@ impl ScanPlan {
             })
             .collect();
 
+        let proj_src = compute_proj_src(&def, &projection, &read_columns);
         Ok(Self {
             def,
             projection,
             read_columns,
             predicate,
             output_schema: Arc::new(Schema::new(fields)),
+            proj_src,
         })
     }
 
@@ -1434,27 +1459,63 @@ fn assemble_output(
 ) -> Result<RecordBatch> {
     let n = filtered.num_rows();
     let mut cols: Vec<ArrayRef> = Vec::with_capacity(plan.projection.len());
-    for name in &plan.projection {
-        if let Some(pv) = partition_values.get(name) {
-            let c = plan.def.column(name).unwrap();
-            cols.push(constant_array(pv, &c.logical_type.arrow_type(), n)?);
-        } else {
-            let idx = filtered
-                .schema()
-                .index_of(name)
-                .map_err(|_| QsdbError::invalid(format!("column '{name}' missing after read")))?;
-            cols.push(Arc::clone(filtered.column(idx)));
+    // 用 bind 期算定的 proj_src（原实现每批每列做 schema.index_of 字符串查找）
+    for (i, name) in plan.projection.iter().enumerate() {
+        match plan.proj_src.get(i).copied().flatten() {
+            None => {
+                // 分区列：从目录值常量重建
+                let pv = partition_values
+                    .get(name)
+                    .ok_or_else(|| QsdbError::meta(format!("partition value '{name}' missing")))?;
+                let c = plan.def.column(name).unwrap();
+                cols.push(constant_array(pv, &c.logical_type.arrow_type(), n)?);
+            }
+            Some(idx) => {
+                let col = filtered.column(idx);
+                cols.push(if col.len() == n {
+                    Arc::clone(col)
+                } else {
+                    // 防御：读批列序与 read_columns 不一致（布局漂移）
+                    let j = filtered.schema().index_of(name).map_err(|_| {
+                        QsdbError::invalid(format!("column '{name}' missing after read"))
+                    })?;
+                    Arc::clone(filtered.column(j))
+                });
+            }
         }
     }
     RecordBatch::try_new(Arc::clone(&plan.output_schema), cols)
         .map_err(|e| QsdbError::invalid(format!("assemble output failed: {e}")))
 }
 
+/// 常量数组（分区列重建用）。
+///
+/// 原实现每批分配 `Vec<(usize, usize)>`（**n × 16 字节**）再跑 `interleave`——
+/// 8192 行批即 128KB 分配 × 批数，冷读口径下使分区表扫描比非分区表慢 3.4x。
+/// 改为按类型直接构造 typed 数组（分配量降至 n × 元素宽度，且无 kernel 调度）。
 fn constant_array(lit: &Literal, dt: &DataType, n: usize) -> Result<ArrayRef> {
-    let one = literal_to_array(lit, dt)?;
-    let indices: Vec<(usize, usize)> = vec![(0, 0); n];
-    arrow::compute::interleave(&[one.as_ref()], &indices)
-        .map_err(|e| QsdbError::invalid(format!("const array failed: {e}")))
+    use arrow::array::{
+        BooleanArray, Date32Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+        Int64Array, StringArray,
+    };
+    Ok(match (lit, dt) {
+        (Literal::Boolean(v), DataType::Boolean) => Arc::new(BooleanArray::from(vec![*v; n])),
+        (Literal::Int8(v), DataType::Int8) => Arc::new(Int8Array::from(vec![*v; n])),
+        (Literal::Int16(v), DataType::Int16) => Arc::new(Int16Array::from(vec![*v; n])),
+        (Literal::Int32(v), DataType::Int32) => Arc::new(Int32Array::from(vec![*v; n])),
+        (Literal::Int64(v), DataType::Int64) => Arc::new(Int64Array::from(vec![*v; n])),
+        (Literal::Float32(v), DataType::Float32) => Arc::new(Float32Array::from(vec![*v; n])),
+        (Literal::Float64(v), DataType::Float64) => Arc::new(Float64Array::from(vec![*v; n])),
+        (Literal::Date(v), DataType::Date32) => Arc::new(Date32Array::from(vec![*v; n])),
+        (Literal::Utf8(v), DataType::Utf8) => Arc::new(StringArray::from(vec![v.as_str(); n])),
+        // 其余（Decimal/Time/Timestamp 等）：回退通用路径（形态由 literal_to_array 决定）
+        _ => {
+            let one = literal_to_array(lit, dt)?;
+            let indices: Vec<(usize, usize)> = vec![(0, 0); n];
+            arrow::compute::interleave(&[one.as_ref()], &indices)
+                .map_err(|e| QsdbError::invalid(format!("const array failed: {e}")))?
+        }
+    })
 }
 
 /// 文件 row group 数（分片细分用；失败由调用方回退文件粒度）。
