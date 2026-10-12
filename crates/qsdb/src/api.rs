@@ -1480,6 +1480,59 @@ mod tests {
     }
 
     #[test]
+    fn underscore_prefixed_partition_key_is_visible() {
+        // F22：分区列名以 `_` 开头（qsdb-sync 的 `__dt`）时，目录是 `__dt=2026-…`，
+        // 而读路径按「不以 `_` 开头」筛分区目录 → 写者建了、读者全跳过：
+        // 行在盘上而 count/scan 归零，且写路径毫无报错。前缀不再是分区判据。
+        let root = tmp_root("f22");
+        let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
+        db.sql("CREATE TABLE t (__dt DATE, v BIGINT) PARTITIONED BY (__dt)")
+            .unwrap();
+        db.sql("INSERT INTO t VALUES ('2026-10-12', 1), ('2026-10-12', 2)")
+            .unwrap();
+
+        // ① 元数据面可见
+        let parts = db.partition_stats("t").unwrap();
+        assert_eq!(parts.len(), 1, "分区目录必须被认出来: {parts:?}");
+        assert_eq!(parts[0].name, "__dt=2026-10-12");
+        assert_eq!(parts[0].rows, 2);
+
+        // ② 扫描面可见（这才是 F22 的病灶：数据在、读不到）
+        let rows: usize = db
+            .scan_collect(ScanRequest {
+                table: "t".into(),
+                ..Default::default()
+            })
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 2);
+
+        // ③ 谓词下推仍走分区裁剪（`__dt` 与普通分区列同权）
+        let hit: usize = db
+            .scan_collect(ScanRequest {
+                table: "t".into(),
+                predicate: Some(crate::scan::Predicate::Eq {
+                    column: "__dt".into(),
+                    value: crate::types::cast::cast_literal(
+                        &crate::types::Literal::Utf8("2026-10-12".into()),
+                        &LogicalType::Date,
+                    )
+                    .unwrap(),
+                }),
+                ..Default::default()
+            })
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(hit, 2);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn read_only_rejects_writes() {
         let root = tmp_root("ro");
         // 先以读写模式建表写数

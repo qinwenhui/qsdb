@@ -68,6 +68,20 @@ pub fn partition_value_string(lit: &Literal) -> String {
     }
 }
 
+/// 目录名是否是**分区目录段**：只认 hive 形态 `k=v`（F22）。
+///
+/// 历史判据是「含 `=` **且**不以 `_`/`.` 开头」，为的是别把内部目录当分区。
+/// 代价是**写者能建、读者看不见**：分区列名叫 `__dt` 时目录形如
+/// `__dt=2026-10-12`，`list_partitions` 直接跳过——行在盘上、count/scan 归零，
+/// 而写路径毫无征兆（qsdb-sync F22 实测）。
+///
+/// 内部目录本就不长这样：`_catalog` / `_trash` / `_filecache` 在**库根**而非
+/// 表目录下，表目录里唯一的内部物 `_index.lock` 是**文件**且不含 `=`。
+/// 故 `=` 一项即足以判别，前缀不再是判据——分区列名不必再回避 `_` 开头。
+pub fn is_partition_dir_name(name: &str) -> bool {
+    name.contains('=')
+}
+
 /// 一组分区键值 → 相对目录路径 `k1=v1/k2=v2`。
 pub fn partition_dir(keys: &[String], values: &[Literal]) -> Result<PathBuf> {
     if keys.len() != values.len() {

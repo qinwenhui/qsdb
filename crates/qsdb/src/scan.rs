@@ -975,11 +975,8 @@ pub fn list_partitions(
                 continue;
             };
             for entry in entries {
-                if entry.is_dir
-                    && entry.name.contains('=')
-                    && !entry.name.starts_with('_')
-                    && !entry.name.starts_with('.')
-                {
+                // 判据见 `partition::is_partition_dir_name`（F22：不再排除 `_` 前缀）
+                if entry.is_dir && crate::partition::is_partition_dir_name(&entry.name) {
                     next.push(entry.path);
                 }
             }
@@ -1644,10 +1641,11 @@ impl Scan {
                     #[cfg(feature = "s3")]
                     FileLoc::S3(u) => PathBuf::from(u),
                 };
+                // 与内部分区同一判据（F22）：外表路径里的 `__dt=…` 段同样是分区
                 p.ancestors().any(|a| {
                     a.file_name()
                         .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.contains('=') && !n.starts_with('_'))
+                        .is_some_and(crate::partition::is_partition_dir_name)
                 })
             });
         let mut plans = Vec::with_capacity(files.len());
