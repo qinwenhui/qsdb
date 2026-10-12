@@ -371,3 +371,40 @@ fn date_trunc_units() {
     );
     assert!(q(&db, "SELECT date_trunc('month', dt) FROM t WHERE cnt = 3") == vec!["NULL"]);
 }
+
+// ── J10：TIME 字面量/列（qsdb-jdbc 反馈的回归）───────────────────────────
+
+#[test]
+fn j10_time_literal_projection() {
+    let (db, _r) = db("j10_time");
+    // 原 bug：TypedString 绑定只识别 Date，其余一律 cast 到 Timestamp
+    // → `TIME '...'` 触发 arrow 不支持的 Time64→Timestamp 转换
+    assert!(q(&db, "SELECT TIME '08:30:00'") == vec!["08:30:00"]);
+    assert!(q(&db, "SELECT TIME '08:30:00' AS t") == vec!["08:30:00"]);
+    // 三种 temporal 字面量各保持原类型
+    assert!(q(&db, "SELECT DATE '2026-10-12'") == vec!["2026-10-12"]);
+    assert!(q(&db, "SELECT TIMESTAMP '2026-10-12 08:30:00'") == vec!["2026-10-12T08:30:00"]);
+}
+
+#[test]
+fn j10_time_column_ops() {
+    let (db, _r) = db("j10_timecol");
+    db.sql("CREATE TABLE tt (id BIGINT, tm TIME)").unwrap();
+    db.sql(
+        "INSERT INTO tt VALUES (1, TIME '08:30:00'), (2, TIME '12:00:00'), (3, TIME '23:59:59')",
+    )
+    .unwrap();
+    // 比较（等值/范围/BETWEEN）
+    assert!(q(&db, "SELECT id FROM tt WHERE tm = TIME '12:00:00'") == vec!["2"]);
+    assert!(q(&db, "SELECT id FROM tt WHERE tm > TIME '09:00:00'") == vec!["2", "3"]);
+    assert!(
+        q(
+            &db,
+            "SELECT id FROM tt WHERE tm BETWEEN TIME '08:00:00' AND TIME '13:00:00'"
+        ) == vec!["1", "2"]
+    );
+    // 排序 / 聚合 / CAST
+    assert!(raw(&db, "SELECT tm FROM tt ORDER BY tm DESC LIMIT 1") == vec!["23:59:59"]);
+    assert!(q(&db, "SELECT min(tm) FROM tt") == vec!["08:30:00"]);
+    assert!(q(&db, "SELECT CAST(tm AS STRING) FROM tt WHERE id = 1") == vec!["08:30:00"]);
+}

@@ -2940,8 +2940,14 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
         E::Value(v) => Ok(PhysExpr::Lit(value_to_literal(v)?)),
         E::TypedString(_) => {
             let lit = constant_expr(e)?;
+            // J10 修复（qsdb-jdbc 反馈）：原实现只识别 Date，**其余一律 cast 到
+            // Timestamp**——`TIME '08:30:00'` 的 Literal::Time 落进兜底分支后被
+            // 请求 Time64→Timestamp 转换，而 arrow 不支持该方向 → 投影即报错。
+            // 三种 temporal 字面量各自保持原类型直通。
             let ty = match &lit {
                 Literal::Date(_) => LogicalType::Date,
+                Literal::Time(_) => LogicalType::Time,
+                Literal::Timestamp(_) => LogicalType::Timestamp { timezone: None },
                 _ => LogicalType::Timestamp { timezone: None },
             };
             Ok(PhysExpr::Lit(lit).cast_to(ty))
