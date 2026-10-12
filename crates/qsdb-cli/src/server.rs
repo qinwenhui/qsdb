@@ -543,11 +543,22 @@ async fn query(
                 let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
                 if fmt.eq_ignore_ascii_case("ipc") {
                     match batches_to_ipc(&schema, &batches) {
+                        // J4：IPC 通道经响应头透出 queryId（驱动 cancel 用）
                         Ok(bytes) => (
-                            [(
-                                axum::http::header::CONTENT_TYPE,
-                                "application/vnd.apache.arrow.stream",
-                            )],
+                            [
+                                (
+                                    axum::http::header::CONTENT_TYPE,
+                                    axum::http::HeaderValue::from_static(
+                                        "application/vnd.apache.arrow.stream",
+                                    ),
+                                ),
+                                (
+                                    axum::http::HeaderName::from_static("x-qsdb-query-id"),
+                                    axum::http::HeaderValue::from_str(&query_id).unwrap_or_else(
+                                        |_| axum::http::HeaderValue::from_static(""),
+                                    ),
+                                ),
+                            ],
                             bytes,
                         )
                             .into_response(),
@@ -558,7 +569,10 @@ async fn query(
                     }
                 } else {
                     match batches_to_json(&schema, &batches) {
+                        // J4：透出 queryId——配合 /api/v1/queries/{id}/cancel
+                        // 让 JDBC Statement.cancel() 能精确取消
                         Ok(v) => Json(serde_json::json!({
+                            "queryId": query_id,
                             "schema": schema_fields(&schema),
                             "rows": v,
                             "rowCount": rows,
@@ -573,6 +587,7 @@ async fn query(
                 }
             }
             SqlResult::Ok { message } => Json(serde_json::json!({
+                "queryId": query_id,
                 "message": message,
                 "elapsedMs": elapsed as f64 / 1e6,
             }))
@@ -678,13 +693,61 @@ async fn write(
     }
 }
 
-async fn tables(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+/// 表列定义 → JSON（`/schema` 与 `/tables?withSchema=1` 共用）。
+fn columns_json(def: &qsdb::catalog::TableDef) -> Vec<serde_json::Value> {
+    def.columns
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "name": c.name,
+                "type": c.logical_type.to_string(),
+                "nullable": c.nullable,
+                "partition": def.partition_keys.contains(&c.name),
+            })
+        })
+        .collect()
+}
+
+#[derive(serde::Deserialize, Default)]
+struct TablesQuery {
+    /// `?withSchema=1`（或 true）：一并返回每表列定义（J6，消除 getColumns 的 N+1）
+    #[serde(default, alias = "withSchema")]
+    with_schema: Option<String>,
+}
+
+async fn tables(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<TablesQuery>,
+) -> Response {
     if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
         return err_response(StatusCode::UNAUTHORIZED, "unauthorized".into());
     }
+    let want_schema = matches!(
+        q.with_schema.as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    );
     let st = Arc::clone(&s);
-    match tokio::task::spawn_blocking(move || st.db.tables()).await {
-        Ok(Ok(list)) => Json(serde_json::json!({ "tables": list })).into_response(),
+    match tokio::task::spawn_blocking(move || {
+        let list = st.db.tables()?;
+        if !want_schema {
+            return Ok(serde_json::json!({ "tables": list }));
+        }
+        // J6：JDBC getColumns 原先要 N+1 次请求（列表 + 逐表 schema）。
+        // 万级表名下首次连接翻库表明显慢，一次返回列集即可。
+        let mut out = Vec::with_capacity(list.len());
+        for t in &list {
+            let cols = match st.db.table_def(t) {
+                Ok(def) => columns_json(&def),
+                Err(_) => Vec::new(), // 并发 DROP 等：跳过而非整体失败
+            };
+            out.push(serde_json::json!({ "name": t, "columns": cols }));
+        }
+        Ok(serde_json::json!({ "tables": out }))
+    })
+    .await
+    {
+        Ok(Ok(v)) => Json(v).into_response(),
         Ok(Err(e)) => status_of(&e, e.to_string()),
         Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -702,18 +765,7 @@ async fn schema(
     let st = Arc::clone(&s);
     match tokio::task::spawn_blocking(move || st.db.table_def(&table)).await {
         Ok(Ok(def)) => {
-            let cols: Vec<serde_json::Value> = def
-                .columns
-                .iter()
-                .map(|c| {
-                    serde_json::json!({
-                        "name": c.name,
-                        "type": c.logical_type.to_string(),
-                        "nullable": c.nullable,
-                        "partition": def.partition_keys.contains(&c.name),
-                    })
-                })
-                .collect();
+            let cols = columns_json(&def);
             Json(serde_json::json!({ "table": table_out, "columns": cols })).into_response()
         }
         Ok(Err(e)) => status_of(&e, e.to_string()),
