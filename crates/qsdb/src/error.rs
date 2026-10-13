@@ -25,7 +25,15 @@ pub enum NotFoundKind {
     Object,
 }
 
+/// **`#[non_exhaustive]` 是刻意标的**（qsdb-sync F27）：错误是**内核产出、
+/// 嵌入方消费**的类型，而我们会加变体（`StaleWriter` / `WriteConflict` /
+/// `MemoryPressure` …），外部穷尽匹配会一次次被打断。
+///
+/// 规则：**结果/错误类标 `non_exhaustive`；嵌入方要构造的类型不标。**
+/// 带**具名字段**的变体（`NotFound` / `WriteConflict`）另在变体上标——
+/// 实测枚举级只强制外部加通配臂，**防不住"给变体加字段"**（那要变体级 `..`）。
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum QsdbError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -58,6 +66,7 @@ pub enum QsdbError {
     /// `kind` = 机器可读类别（上层据此选错误码）；`name` = 人读描述
     /// （沿用历史文案形态，如 `table default.t` / `column 'x' not in table t`）。
     #[error("not found: {name}")]
+    #[non_exhaustive]
     NotFound { kind: NotFoundKind, name: String },
 
     /// 对象已存在
@@ -73,6 +82,7 @@ pub enum QsdbError {
     /// 只在调用方显式传了期望 `generation` 时才可能出现（qsdb-sync F24：
     /// 同分区并发 overwrite 原本是**静默 last-writer-wins**——先写者的数据无声消失）。
     #[error("write conflict: partition {partition} generation is {actual}, expected {expected}")]
+    #[non_exhaustive]
     WriteConflict {
         partition: String,
         expected: u64,

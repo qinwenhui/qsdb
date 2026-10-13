@@ -198,7 +198,9 @@ fn projection_and_where() {
         ))
         .unwrap()
     {
-        qsdb::sql::SqlResult::Query { schema, batches } => {
+        qsdb::sql::SqlResult::Query {
+            schema, batches, ..
+        } => {
             let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
             assert_eq!(names, vec!["id", "w"]);
             assert!(batches.iter().all(|b| b.num_rows() == 0));

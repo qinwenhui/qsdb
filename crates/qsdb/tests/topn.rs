@@ -176,7 +176,7 @@ fn topn_under_tiny_quota_still_correct() {
         .unwrap_or_else(|e| panic!("小预算下 TopN 应完成: {e}"));
     let batches = match out {
         qsdb::sql::SqlResult::Query { batches, .. } => batches,
-        qsdb::sql::SqlResult::Ok { .. } => panic!("expected query"),
+        _ => panic!("expected query"),
     };
     let vals: Vec<String> = batches
         .iter()

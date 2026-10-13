@@ -311,7 +311,8 @@ fn rows_of(db: &Qsdb, sql: &str, ctx: Option<&Arc<QueryContext>>) -> Vec<String>
     };
     let batches = match out {
         qsdb::sql::SqlResult::Query { batches, .. } => batches,
-        qsdb::sql::SqlResult::Ok { .. } => panic!("expected query"),
+        // `SqlResult` 是 `#[non_exhaustive]`（F27）：外部匹配必须留通配臂
+        _ => panic!("expected query"),
     };
     batches
         .iter()
@@ -388,7 +389,8 @@ fn sorted_vals(db: &Qsdb, ctx: &Arc<QueryContext>) -> Vec<i64> {
         .expect("排序应完成");
     let batches = match out {
         qsdb::sql::SqlResult::Query { batches, .. } => batches,
-        qsdb::sql::SqlResult::Ok { .. } => panic!("expected query"),
+        // `SqlResult` 是 `#[non_exhaustive]`（F27）：外部匹配必须留通配臂
+        _ => panic!("expected query"),
     };
     batches
         .iter()

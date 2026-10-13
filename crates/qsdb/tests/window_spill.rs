@@ -89,7 +89,7 @@ fn quota_ctx(limit: Option<u64>) -> Arc<QueryContext> {
 fn batches_of(db: &Qsdb, sql: &str, ctx: &Arc<QueryContext>) -> Result<Vec<RecordBatch>> {
     match db.sql_with_context(sql, ctx) {
         Ok(qsdb::sql::SqlResult::Query { batches, .. }) => Ok(batches),
-        Ok(qsdb::sql::SqlResult::Ok { .. }) => panic!("expected query: {sql}"),
+        Ok(_) => panic!("expected query: {sql}"),
         Err(e) => Err(e),
     }
 }

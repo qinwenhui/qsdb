@@ -102,7 +102,7 @@ fn memory_limit_spills_sort() {
         .unwrap();
     let batches = match &out {
         qsdb::sql::SqlResult::Query { batches, .. } => batches,
-        qsdb::sql::SqlResult::Ok { .. } => panic!("expected query result"),
+        _ => panic!("expected query result"),
     };
     let rows: Vec<String> = batches
         .iter()

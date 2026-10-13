@@ -566,7 +566,7 @@ fn zero_row_result_survives_every_format() {
             .expect("ipc stream 应能解析（零行也是合法流）");
         assert_eq!(rd.schema().field(0).name(), "a");
         let mut read_rows = 0usize;
-        while let Some(b) = rd.next() {
+        for b in rd.by_ref() {
             read_rows += b.expect("零行批应可解").num_rows();
         }
         assert_eq!(read_rows, 0, "ipc 流读出来必须是零行");

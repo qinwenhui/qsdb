@@ -20,8 +20,20 @@ use crate::types::{Literal, LogicalType};
 use crate::write::WriteResult;
 
 /// SQL 执行结果。
+///
+/// **`#[non_exhaustive]` 是刻意标的**（qsdb-sync F27）——这是个**内核产出、
+/// 嵌入方只消费**的类型，J12 给 `Ok` 加两个字段就把首个嵌入方的编译打断了
+/// （穷尽匹配 → E0027）。规则（2026-10-13 与 F27 一并定）：
+/// **结果/错误类类型标 `non_exhaustive`；嵌入方要构造或按字段取值的
+/// 输入/格式类型（`Literal` / `SegmentEntry` / `PartitionManifest` …）不标。**
+///
+/// ⚠️ **枚举级标注不足以防"加字段"，必须同时标在变体上**（实测）：
+/// 枚举级只要求外部加通配臂（E0004）；外部若把变体字段列全了，加字段照样
+/// 报 E0027。变体级才会强制外部写 `..`（E0638）。**别把变体上这两行删了。**
+#[non_exhaustive]
 pub enum SqlResult {
     /// 查询结果批
+    #[non_exhaustive]
     Query {
         schema: Arc<arrow::datatypes::Schema>,
         batches: Vec<RecordBatch>,
@@ -31,6 +43,7 @@ pub enum SqlResult {
     /// `message` 是**给人看的文案**（码表文档明确"文案不做兼容承诺"），
     /// 机器消费请用 `rows_affected` / `command`（J12：qsdb-jdbc 的
     /// `executeUpdate` 此前只能解析文案拿行数，是契约面上的脆弱点）。
+    #[non_exhaustive]
     Ok {
         message: String,
         /// DML 影响行数；DDL 无意义（`None`）

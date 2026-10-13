@@ -102,7 +102,7 @@ fn rows_with_ctx(db: &Qsdb, sql: &str, ctx: &Arc<QueryContext>) -> Vec<String> {
         .unwrap_or_else(|e| panic!("查询失败: {e}\nSQL: {sql}"));
     let batches = match out {
         qsdb::sql::SqlResult::Query { batches, .. } => batches,
-        qsdb::sql::SqlResult::Ok { .. } => panic!("expected query"),
+        _ => panic!("expected query"),
     };
     let mut v: Vec<String> = batches
         .iter()
@@ -234,7 +234,7 @@ fn join_spills_under_global_budget_too() {
         .unwrap_or_else(|e| panic!("预算压力下应溢出完成，而不是失败: {e}"))
     {
         qsdb::sql::SqlResult::Query { batches, .. } => batches,
-        qsdb::sql::SqlResult::Ok { .. } => panic!("expected query"),
+        _ => panic!("expected query"),
     };
     let n: usize = out.iter().map(|b| b.num_rows()).sum();
     assert_eq!(n, 50, "LIMIT 50 应返回 50 行");

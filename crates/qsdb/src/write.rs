@@ -25,7 +25,11 @@ use crate::stats;
 use crate::store::Store;
 
 /// 写入结果。
+///
+/// `#[non_exhaustive]`：**内核产出、嵌入方只消费**（F27 规则，见
+/// `SqlResult` 的说明）——加字段不该打断嵌入方编译。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct WriteResult {
     pub rows: u64,
     pub bytes: u64,

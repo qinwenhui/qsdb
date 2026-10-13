@@ -1076,6 +1076,9 @@ fn main() {
                 peak_rss_kb() as f64 / 1024.0
             ),
             Err(e) => println!("SQL ERR: {e}"),
+            // `SqlResult` 是 `#[non_exhaustive]`（F27：内核产出、嵌入方只消费
+            // ——加变体/加字段不该打断嵌入方编译），故外部匹配需要通配臂。
+            Ok(_) => println!("SQL ok: {:.3}s", t0.elapsed().as_secs_f64()),
         }
         if let Some(d) = qsdb::write::write_prof_dump() {
             println!("[write-prof] {d}");

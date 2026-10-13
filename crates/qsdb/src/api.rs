@@ -227,7 +227,13 @@ pub struct ScanRequest {
 const APPEND_MERGE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// 分区统计（`Qsdb::partition_stats`；qsdb-sync 轮询契约）。
+///
+/// `#[non_exhaustive]`：**内核产出、嵌入方只消费**（F27 规则）。这条对本类型
+/// 尤其切题——qsdb-sync 反馈过"check 报告因 `PartitionStat` 未透出 `epoch`
+/// 而需读 src manifest 才能判复合序"，即**我们很可能要给它加 `epoch` 字段**；
+/// 标了之后那次加字段不会打断他们的编译（外部用 `..` 取值即可）。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PartitionStat {
     /// 相对表目录的分区名（`/` 分隔）
     pub name: String,

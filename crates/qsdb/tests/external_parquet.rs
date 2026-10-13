@@ -200,7 +200,9 @@ fn limit_zero_schema_contract() {
         dir.join("a.parquet").to_string_lossy().replace('\\', "/")
     );
     match db.sql(&sql).unwrap() {
-        qsdb::sql::SqlResult::Query { schema, batches } => {
+        qsdb::sql::SqlResult::Query {
+            schema, batches, ..
+        } => {
             assert!(batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0));
             let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
             assert_eq!(names, vec!["tenant", "amount"]);

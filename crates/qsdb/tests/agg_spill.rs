@@ -69,7 +69,7 @@ fn rows_of(db: &Qsdb, sql: &str, limit: Option<u64>) -> Vec<String> {
         .unwrap_or_else(|e| panic!("查询失败（limit={limit:?}）: {e}\nSQL: {sql}"));
     let batches = match out {
         qsdb::sql::SqlResult::Query { batches, .. } => batches,
-        qsdb::sql::SqlResult::Ok { .. } => panic!("expected query"),
+        _ => panic!("expected query"),
     };
     batches
         .iter()
@@ -194,7 +194,7 @@ fn global_budget_pressure_also_spills() {
         .unwrap_or_else(|e| panic!("预算压力下应溢出完成，而不是失败: {e}"))
     {
         qsdb::sql::SqlResult::Query { batches, .. } => batches,
-        qsdb::sql::SqlResult::Ok { .. } => panic!("expected query"),
+        _ => panic!("expected query"),
     };
     let n: usize = out.iter().map(|b| b.num_rows()).sum();
     assert_eq!(n, 1500, "15 组… 应为 1500 组");

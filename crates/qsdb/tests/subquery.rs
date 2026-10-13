@@ -166,7 +166,9 @@ fn limit_zero_schema_contract() {
     // 同步工具 schema 协商契约：SELECT ... LIMIT 0 → 零行仍携带完整 schema
     let (db, root) = setup("limit0");
     match db.sql("SELECT tenant, amt FROM sales LIMIT 0") {
-        Ok(qsdb::sql::SqlResult::Query { schema, batches }) => {
+        Ok(qsdb::sql::SqlResult::Query {
+            schema, batches, ..
+        }) => {
             assert_eq!(schema.fields().len(), 2);
             assert_eq!(schema.field(0).name(), "tenant");
             assert_eq!(schema.field(1).name(), "amt");

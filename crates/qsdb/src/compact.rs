@@ -24,7 +24,10 @@ use crate::store::Store;
 use crate::write::{data_schema, writer_props};
 
 /// Compaction 结果。
+///
+/// `#[non_exhaustive]`：**内核产出、嵌入方只消费**（F27 规则）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CompactResult {
     pub partitions_compacted: u64,
     pub segments_merged: u64,

@@ -728,7 +728,9 @@ async fn query(
     let echo_id = query_id.clone();
     let mut resp = match result {
         Ok(Ok(r)) => match r {
-            SqlResult::Query { schema, batches } => {
+            SqlResult::Query {
+                schema, batches, ..
+            } => {
                 let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
                 if fmt.eq_ignore_ascii_case("ipc") {
                     match batches_to_ipc(&schema, &batches) {
@@ -816,6 +818,7 @@ async fn query(
                 message,
                 rows_affected,
                 command,
+                ..
             } => {
                 // **结构化回执**（J12）：`command` + `rowsAffected` 让驱动不必解析
                 // `message` 文案（码表文档明确"文案不做兼容承诺"）。
@@ -833,6 +836,9 @@ async fn query(
                 }
                 Json(body).into_response()
             }
+            // `SqlResult` 是 `#[non_exhaustive]`（F27）：内核加变体不该打断
+            // 嵌入方编译，故此处必须有通配臂。（`SqlResult` 无 `Debug`，别用 `{other:?}`）
+            _ => ErrorCode::Internal.response("unhandled SqlResult variant".to_string()),
         },
         Ok(Err(e)) => {
             s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);

@@ -604,7 +604,9 @@ fn run(db: &Qsdb, sql: &str) {
 fn print_result(r: &SqlResult, elapsed: std::time::Duration) {
     match r {
         SqlResult::Ok { message, .. } => println!("{message} ({elapsed:?})"),
-        SqlResult::Query { schema, batches } => {
+        SqlResult::Query {
+            schema, batches, ..
+        } => {
             let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             if rows == 0 {
                 println!("(0 rows, {elapsed:?})");
@@ -652,6 +654,9 @@ fn print_result(r: &SqlResult, elapsed: std::time::Duration) {
             println!("({rows} rows, {elapsed:?})");
             let _ = std::io::stdout().flush();
         }
+        // `SqlResult` 是 `#[non_exhaustive]`（F27）：内核加变体不该打断嵌入方
+        // 编译，故外部匹配留通配臂（**放最后**，放前面会让上面的臂不可达）。
+        _ => println!("(unhandled result variant, {elapsed:?})"),
     }
 }
 
