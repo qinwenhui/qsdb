@@ -676,6 +676,7 @@ pub(crate) fn overwrite_partition(
             &schema,
             &file_schema,
             expected,
+            epoch,
         );
         #[cfg(not(feature = "remote"))]
         {
@@ -922,10 +923,19 @@ pub(crate) fn occ_replace_entries(
     values: &[crate::types::Literal],
     entries: &[SegmentEntry],
     expected: Option<u64>,
+    epoch: u64,
 ) -> Result<()> {
     let mpath = PartitionManifest::manifest_path(dir);
     crate::remote::with_partition_mutex(dir, || {
         crate::remote::occ_commit(store, &mpath, |cur| {
+            // F26：**身份代先判**，覆盖也是写，过期写者一样不许干。
+            // 这一步省不得 —— 下面的 `PartitionManifest::new` 会把 epoch 抹回 0，
+            // 于是一次"旧代写者的覆盖"不再是"没拦住"，而是**把盘上身份代降级**
+            // 的既成事实：老进程此后 append 重新畅通（`check_writer_epoch` 全 0
+            // 恒通过），F25 整条防线被一次 overwrite 擦掉。先判后盖章，缺一不可。
+            if let Some(c) = cur.as_ref() {
+                c.check_writer_epoch(epoch)?;
+            }
             // CAS 在 **OCC 闭包内**校验：每次重试都拿最新 manifest，故并发写者
             // 之间的窗口被 etag 条件写兜住（不是"先读后写"那种假 CAS）
             if let Some(exp) = expected {
@@ -940,6 +950,7 @@ pub(crate) fn occ_replace_entries(
             //      会被同步工具当成"没变"而漏掉**。
             // 本地路径无此问题：那边走 `PartitionManifest::commit()`，它自带 +1。
             m.generation = cur.as_ref().map_or(1, |c| c.generation + 1);
+            m.epoch = epoch; // F26：提交无条件盖章（与本地 `commit()`、`occ_append_entry` 同口径）
             m.segments = entries.to_vec();
             Ok(m)
         })
@@ -962,6 +973,7 @@ fn overwrite_partition_remote(
     schema: &SchemaRef,
     file_schema: &Option<SchemaRef>,
     expected: Option<u64>,
+    epoch: u64,
 ) -> Result<WriteResult> {
     let col_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
     let mut result = WriteResult::default();
@@ -992,7 +1004,7 @@ fn overwrite_partition_remote(
         new_segments.push(entry);
     }
     if staging.is_none() {
-        occ_replace_entries(store, dir, def, values, &new_segments, expected)?;
+        occ_replace_entries(store, dir, def, values, &new_segments, expected, epoch)?;
     }
     // staging 路径：写盘即 ACK，提交在 `flush_staged` —— 期望值随暂存记录一起落盘，
     // 由 flush 提交时校验（见 `StagedRecord::expected_generation`）

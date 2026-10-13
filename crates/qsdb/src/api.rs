@@ -862,6 +862,9 @@ impl Qsdb {
         let Some(old) = crate::manifest::PartitionManifest::read(&self.store, &dir)? else {
             return Ok(0);
         };
+        // F26：本地清空同样是**破坏性写**，同样要判身份——远端那条补了，这条
+        // 不补就是"只堵了一扇门"。过期写者能把新代的数据整块清掉。
+        old.check_writer_epoch(self.writer_epoch())?;
         let rows = old.total_rows();
         let mut empty = crate::manifest::PartitionManifest::new(vec![], def.schema_fingerprint());
         // generation 继承（F2 修复，qsdb-sync 反馈）：与远端路径一致——
@@ -895,7 +898,7 @@ impl Qsdb {
         // 返回空 → 原实现空循环后返回 Ok(0) 却不清数据（静默无效）。
         // 无分区表的 segment 直接位于表目录下，走专门清空路径。
         if def.partition_keys.is_empty() {
-            return self.clear_unpartitioned(&tdir);
+            return self.clear_unpartitioned(&tdir, &def);
         }
         let parts = crate::scan::list_partitions(&self.store, &tdir, def.partition_keys.len());
         let mut cleared = 0u64;
@@ -911,15 +914,44 @@ impl Qsdb {
         Ok(cleared)
     }
 
-    /// 清空**无分区表**：无 manifest/分区目录，segment 直接位于表目录下。
-    /// 表目录锁内逐个移入 trash（延迟回收语义与分区路径一致）。
-    fn clear_unpartitioned(&self, tdir: &std::path::Path) -> Result<u64> {
+    /// 清空**无分区表**：manifest 就在表目录下（`write::pdir()` 对空分区键返回
+    /// `table_dir`），因此与分区表走**同一套提交语义**。
+    ///
+    /// 曾经这里直接搬 parquet 而**不动 manifest**，注释还断言"无分区表没有
+    /// manifest"——那个断言是错的。后果分两层：
+    /// ① manifest 继续引用已搬走的段 → `SELECT` 从此**永久报 open failed**
+    ///    （表被搞坏，之后的 INSERT 只是往坏 manifest 上再挂一段）；
+    /// ② `count(*)` 按目录求和、`SELECT` 按 manifest —— 同一张表**两个真值来源**。
+    ///
+    /// 现在改为「提交空 manifest + 旧段留给 GC」，与分区路径完全同构（延迟回收
+    /// 保护在途扫描），并补齐写者身份校验/盖章（F26 同族：清空是破坏性写）。
+    fn clear_unpartitioned(&self, tdir: &std::path::Path, def: &Arc<TableDef>) -> Result<u64> {
+        let epoch = self.writer_epoch();
         if !self.store.is_local() {
             #[cfg(feature = "remote")]
             {
-                return Err(QsdbError::unsupported(
-                    "TRUNCATE on unpartitioned remote table not supported yet",
-                ));
+                // 远端无分区表：OCC 空替换提交。不再"暂不支持"——append 能写
+                // 就该能清，这个不对称只会逼调用方绕过内核。
+                let mpath = crate::manifest::PartitionManifest::manifest_path(tdir);
+                let mut rows = 0u64;
+                crate::remote::with_partition_mutex(tdir, || {
+                    crate::remote::occ_commit(&self.store, &mpath, |cur| {
+                        if let Some(c) = cur.as_ref() {
+                            c.check_writer_epoch(epoch)?;
+                        }
+                        let mut m = cur.unwrap_or_else(|| {
+                            crate::manifest::PartitionManifest::new(
+                                vec![],
+                                def.schema_fingerprint(),
+                            )
+                        });
+                        rows = m.total_rows();
+                        m.segments = Vec::new();
+                        m.epoch = epoch;
+                        Ok(m)
+                    })
+                })?;
+                return Ok(rows);
             }
             #[cfg(not(feature = "remote"))]
             {
@@ -929,14 +961,19 @@ impl Qsdb {
             }
         }
         let _guard = crate::fsutil::PartitionLock::acquire_local(&tdir.join(".lock"))?;
-        let mut rows = 0u64;
-        for entry in self.store.read_dir(tdir).unwrap_or_default() {
-            if !entry.name.ends_with(".parquet") {
-                continue;
-            }
-            rows += crate::scan::parquet_row_count(&entry.path).unwrap_or(0);
-            crate::fsutil::move_to_trash(self.store.root(), &entry.path)?;
-        }
+        let Some(old) = crate::manifest::PartitionManifest::read(&self.store, tdir)? else {
+            return Ok(0); // 无 manifest = 空表（合法状态）
+        };
+        old.check_writer_epoch(epoch)?;
+        let rows = old.total_rows();
+        let mut empty = crate::manifest::PartitionManifest::new(vec![], def.schema_fingerprint());
+        // generation 继承（F2 契约：清空是「提交」不是「重置」，单调递增是同步
+        // 工具的增量判据）
+        empty.generation = old.generation;
+        empty.commit(&self.store, tdir, epoch)?;
+        let _ = crate::index::PartitionsIndex::upsert(&self.store, tdir, "", &empty);
+        // 旧文件留原地（延迟回收，保护在途扫描；GC 按 manifest 年龄清理）
+        let _ = old;
         Ok(rows)
     }
 
@@ -1148,9 +1185,15 @@ impl Qsdb {
         ordered: &[Literal],
     ) -> Result<u64> {
         let mut rows = 0u64;
+        let epoch = self.writer_epoch();
         let mpath = crate::manifest::PartitionManifest::manifest_path(dir);
         crate::remote::with_partition_mutex(dir, || {
             crate::remote::occ_commit(&self.store, &mpath, |cur| {
+                // F26：清空分区是**破坏性写**——过期写者能把新代的数据整块清掉，
+                // 且这条路径此前连校验都没有。与 append/overwrite 同闸。
+                if let Some(c) = cur.as_ref() {
+                    c.check_writer_epoch(epoch)?;
+                }
                 let mut m = cur.unwrap_or_else(|| {
                     crate::manifest::PartitionManifest::new(vec![], def.schema_fingerprint())
                 });
@@ -1162,6 +1205,7 @@ impl Qsdb {
                     .zip(ordered.iter().cloned())
                     .collect();
                 m.segments = Vec::new();
+                m.epoch = epoch; // 盖章（清空也是提交；此前只在既有 manifest 上继承旧值）
                 Ok(m)
             })
         })?;
@@ -1302,14 +1346,13 @@ impl Qsdb {
         let def = self.def(None, table)?;
         let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
         if def.partition_keys.is_empty() {
-            // 无分区表：累加各 segment 的 parquet footer num_rows（零解码）
-            let mut total = 0u64;
-            for entry in self.store.read_dir(&tdir).unwrap_or_default() {
-                if !entry.name.ends_with(".parquet") {
-                    continue;
-                }
-                total += crate::scan::parquet_row_count(&entry.path)?;
-            }
+            // 无分区表：manifest 就在表目录下（`write::pdir()` 对空分区键 = tdir），
+            // **必须读 manifest，不能列目录求和**。写路径按"延迟回收"语义把旧段
+            // 留在原地等 GC（保护在途扫描），列目录会把孤儿段算进来 —— 实测
+            // `INSERT OVERWRITE` 后 `SELECT *` 回 1 行而 `count(*)` 回 3 行，
+            // 同一张表两个真值来源（静默错值）。manifest 才是唯一真值。
+            let total = crate::manifest::PartitionManifest::read(&self.store, &tdir)?
+                .map_or(0, |m| m.total_rows());
             return Ok(Some(total));
         }
         // ★ idx 快路径：partitions.idx 已含全分区 manifest 快照（index.rs 模块
@@ -1423,6 +1466,8 @@ impl Qsdb {
                 if rec.overwrite {
                     // F24：CAS 期望值随暂存记录落盘，**在这里**校验——写盘即 ACK 的
                     // 路径上，冲突只能推迟到提交时刻暴露（届时数据仍一致：报错则不提交）
+                    // F26：身份代同 append 分支一致。覆盖分支此前漏传 epoch（既没校验
+                    // 也没盖章），是"staged overwrite 能擦掉写者身份"的那一半。
                     crate::write::occ_replace_entries(
                         &self.store,
                         &dir,
@@ -1430,6 +1475,7 @@ impl Qsdb {
                         &rec.partition_values,
                         std::slice::from_ref(&rec.entry),
                         rec.expected_generation,
+                        self.writer_epoch(),
                     )?;
                 } else {
                     crate::write::occ_append_entry(

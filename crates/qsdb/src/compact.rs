@@ -134,6 +134,10 @@ fn compact_partition_inner(
     if manifest.segments.len() < 2 {
         return Ok(None);
     }
+    // F26：身份代先判。compact 会在末尾 `commit(.., opts.writer_epoch)` **盖章**——
+    // 过期写者一旦放行，不只白读了整分区，还把盘上身份代**降级**回自己的代
+    // （与远端 `occ_replace_entries` 同一失效机制）。校验放在读段之前。
+    manifest.check_writer_epoch(opts.writer_epoch)?;
 
     // 读全部 segments → 合并批（旧 segment 缺列补 NULL → 自然迁移到新 schema）
     let schema = data_schema(def);

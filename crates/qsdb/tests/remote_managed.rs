@@ -372,6 +372,175 @@ fn remote_overwrite_cas_detects_concurrent_write() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+// --- F26：身份代必须覆盖**全部**写路径（qsdb-sync 复测发现） -----------------
+
+/// 分区目录（按分区**编码规则**推，别硬写日期字面量——`Date(19_000)` 是哪天
+/// 得算，写死过一次教训）。
+fn pdir_of(db: &Qsdb) -> std::path::PathBuf {
+    let rel =
+        qsdb::partition::partition_dir(&["dt".to_string()], &[Literal::Date(19_000)]).unwrap();
+    db.store().root().join("default").join("t").join(rel)
+}
+
+/// 盘上身份代。
+fn on_disk_epoch(db: &Qsdb) -> u64 {
+    qsdb::manifest::PartitionManifest::read(db.store(), &pdir_of(db))
+        .unwrap()
+        .expect("分区 manifest 应存在")
+        .epoch
+}
+
+fn stale_err<T>(r: qsdb::error::Result<T>, what: &str) -> qsdb::error::QsdbError {
+    match r {
+        Ok(_) => panic!("{what}：过期写者本应被拒，却成功了"),
+        Err(e) => e,
+    }
+}
+
+/// **F26**：F25 声称"append / overwrite / 远端 OCC / compaction 四条路径全覆盖"，
+/// 实际只有两条。`occ_replace_entries`（远端 overwrite + staged overwrite）与
+/// `clear_partition_remote`（TRUNCATE / 清分区）既不校验、也不盖章。
+///
+/// 盖章缺失比"没拦住"更重：闭包内 `PartitionManifest::new()` 会把 epoch 抹回 0，
+/// 于是一次旧代写者的 overwrite 不是"侥幸通过"，而是把盘上身份代**降级**成既成
+/// 事实 —— 老进程随后 append 重新畅通（`check_writer_epoch` 全 0 恒通过），
+/// F25 整条防线被一次覆盖擦掉。本测试锁住四条路径的**校验 + 盖章**。
+#[test]
+fn remote_epoch_covers_every_write_path() {
+    let root = tmp_root("epoch_all");
+    let mem: Arc<InMemory> = Arc::new(InMemory::default());
+    let open = |ep: u64| {
+        let store = Store::remote("s3://test-b/qsdb", mem.clone(), "qsdb");
+        let opts = QsdbOptions {
+            writer_epoch: ep,
+            ..QsdbOptions::default()
+        };
+        Qsdb::open_with_store(&root, opts, store).unwrap()
+    };
+    let dt = [("dt", Literal::Date(19_000))];
+
+    // ① append 盖章（F25 已覆盖，此处防回归）
+    let db1 = open(1);
+    db1.sql("CREATE TABLE t (dt DATE, v BIGINT) PARTITIONED BY (dt)")
+        .unwrap();
+    db1.append("t", &[batch(19_000, vec![1])]).unwrap();
+    assert_eq!(on_disk_epoch(&db1), 1, "append 盖章");
+
+    // ② **overwrite 盖章**（F26：此前被 `new()` 抹成 0）
+    db1.overwrite_partition("t", &dt, &[batch(19_000, vec![2])])
+        .unwrap();
+    assert_eq!(
+        on_disk_epoch(&db1),
+        1,
+        "远端 overwrite 必须盖章——抹回 0 等于把身份代降级"
+    );
+
+    // ③ 正当接管（epoch 2）照常可写，并刷新身份代
+    let db2 = open(2);
+    db2.append("t", &[batch(19_000, vec![3])]).unwrap();
+    assert_eq!(on_disk_epoch(&db2), 2, "接管代盖章");
+
+    // ④ 老进程（epoch 1）此后**三条写路径全被拒**
+    let stale = open(1);
+    // 行数账：① append 1 行 → ② overwrite **替换掉**那 1 行 → ③ append 1 行 = 2 行
+    assert_eq!(
+        count(&stale, "SELECT count(*) FROM t"),
+        2,
+        "读不受身份代影响"
+    );
+    for (what, err) in [
+        (
+            "append",
+            stale_err(stale.append("t", &[batch(19_000, vec![9])]), "append"),
+        ),
+        (
+            "overwrite",
+            stale_err(
+                stale.overwrite_partition("t", &dt, &[batch(19_000, vec![9])]),
+                "overwrite",
+            ),
+        ),
+        (
+            "clear（TRUNCATE）",
+            stale_err(stale.sql("TRUNCATE TABLE t"), "clear"),
+        ),
+    ] {
+        assert!(
+            matches!(err, qsdb::error::QsdbError::StaleWriter(_)),
+            "{what} 应报 STALE_WRITER，实得 {err:?}"
+        );
+    }
+    // 被拒的写**什么都没动**：数据在、身份代还在第 2 代
+    assert_eq!(
+        count(&stale, "SELECT count(*) FROM t"),
+        2,
+        "被拒的写不能动数据"
+    );
+    assert_eq!(on_disk_epoch(&stale), 2, "被拒的写不能改身份代");
+
+    // ⑤ 第 2 代仍可写（别把所有人一起拦了）
+    db2.append("t", &[batch(19_000, vec![4])]).unwrap();
+    assert_eq!(count(&db2, "SELECT count(*) FROM t"), 3);
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **F26 另一半：staging 路径**。写盘即 ACK，提交推迟到 `flush_staged` ——
+/// 该路径的 overwrite 分支此前没把 epoch 传给 `occ_replace_entries`。
+/// 过期写者在这条路径上只能在 flush 时刻暴露，但必须暴露（且不落盘）。
+#[test]
+fn remote_staged_overwrite_stamps_and_rejects_stale() {
+    let root = tmp_root("epoch_staged");
+    let mem: Arc<InMemory> = Arc::new(InMemory::default());
+    let open = |ep: u64| {
+        let store = Store::remote("s3://test-b/qsdb", mem.clone(), "qsdb");
+        let opts = QsdbOptions {
+            writer_epoch: ep,
+            staging_dir: Some(root.join(format!("staging{ep}"))),
+            ..QsdbOptions::default()
+        };
+        Qsdb::open_with_store(&root, opts, store).unwrap()
+    };
+    let dt = [("dt", Literal::Date(19_000))];
+
+    let db1 = open(1);
+    db1.sql("CREATE TABLE t (dt DATE, v BIGINT) PARTITIONED BY (dt)")
+        .unwrap();
+    db1.overwrite_partition("t", &dt, &[batch(19_000, vec![1])])
+        .unwrap();
+    let (n, _) = db1.flush_staged().unwrap();
+    assert_eq!(n, 1, "staged overwrite 应被 flush 提交");
+    assert_eq!(on_disk_epoch(&db1), 1, "staged overwrite 提交也要盖章");
+
+    // 代 2 接管
+    let db2 = open(2);
+    db2.overwrite_partition("t", &dt, &[batch(19_000, vec![2])])
+        .unwrap();
+    db2.flush_staged().unwrap();
+    assert_eq!(on_disk_epoch(&db2), 2);
+
+    // 老代 1：写盘即 ACK **成功**（这是 staging 的语义），但 flush 必须拒
+    let stale = open(1);
+    stale
+        .overwrite_partition("t", &dt, &[batch(19_000, vec![9])])
+        .unwrap();
+    let err = stale
+        .flush_staged()
+        .expect_err("过期写者的 staged overwrite 必须在 flush 时被拒");
+    assert!(
+        matches!(err, qsdb::error::QsdbError::StaleWriter(_)),
+        "实得 {err:?}"
+    );
+    assert_eq!(on_disk_epoch(&stale), 2, "被拒的 flush 不能改身份代");
+    assert_eq!(
+        count(&stale, "SELECT count(*) FROM t WHERE v = 2"),
+        1,
+        "被拒的 flush 不能换掉新代数据（segment 已 PUT 但 manifest 是唯一真值）"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
 // --- 保留原语（编译期锚定 object_store 条件写 API 形状） ---------------------
 
 #[test]

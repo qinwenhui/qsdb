@@ -217,5 +217,20 @@ qsdb server --path /data/db --addr 0.0.0.0:9430 --writer-epoch 1
 2. **内核自己也不许回退写**：盘上 `epoch` 比本进程配置大 → 写被拒，
    返回 `STALE_WRITER`（409，`retry=no`）——防止"接管后老进程又连回来"。
 
+**覆盖范围（F26：这里曾经写"四条路径"，错了两条）**。凡是产生一次分区提交的
+路径都**既校验又盖章**，一条不能少——漏盖章比漏校验更重：新 manifest 由
+`PartitionManifest::new()` 建出、epoch 初值 0，一次放行的旧代写就把盘上身份
+**降级**成既成事实，此后老进程全线畅通。
+
+| 写路径 | 校验 | 盖章 |
+|---|---|---|
+| 本地 append / overwrite | ✅ | ✅（`PartitionManifest::commit`） |
+| 远端 append（含 staged append） | ✅ | ✅ |
+| 远端 overwrite（含 staged overwrite） | ✅ | ✅ |
+| 本地 / 远端 compaction | ✅ | ✅ |
+| 本地 / 远端清空分区、**TRUNCATE**（含**无分区表**） | ✅ | ✅ |
+
+回归钉在 `tests/writer_epoch.rs` + `tests/unpartitioned.rs` + `tests/remote_managed.rs`。
+
 默认全 0 时两项都是 no-op（与旧版行为完全一致）；只有运维显式抬高过 epoch 之后，
 忘配 / 配小的进程才会被拦下。
