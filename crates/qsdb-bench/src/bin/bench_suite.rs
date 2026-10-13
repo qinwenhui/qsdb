@@ -883,6 +883,76 @@ fn has(flag: &str) -> bool {
     std::env::args().any(|x| x == flag)
 }
 
+/// **单实例闸：同一个 `--dir` 同时只允许一个 bench_suite。**
+///
+/// 为什么必须有：两个实例跑同一目录会**互相 DROP/写同一张表**，症状极具误导性——
+/// 实测把 `t_ins` 写成"manifest 引用已被删掉的段文件"（另一个实例 DROP 时移走了文件），
+/// 于是 `count(*)` 给错数、`count(id)` 直接报 "No such file or directory"，
+/// **看起来像引擎把表写坏了**。排查前先排掉这一条。
+///
+/// 子进程（`--all` 派生的 `--case`）靠 `QSDB_BENCH_CHILD=1` 跳过——父进程才是持锁者。
+struct DirLock(std::path::PathBuf);
+
+impl DirLock {
+    fn acquire(dir: &std::path::Path) -> Self {
+        let p = dir.join(".bench_suite.lock");
+        for _ in 0..2 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&p)
+            {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{}", std::process::id());
+                    return Self(p);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let pid = std::fs::read_to_string(&p)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok());
+                    if held(&p, pid) {
+                        eprintln!(
+                            "另一个 bench_suite（pid={}）正在用同一个 --dir {}。\n\
+                             并发跑同一目录会互相删表/删段（数字全废、表会被写坏）——\
+                             先等它结束，或杀掉它再跑。",
+                            pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+                            dir.display()
+                        );
+                        std::process::exit(2);
+                    }
+                    let _ = std::fs::remove_file(&p); // 陈旧锁（持锁进程已消失）
+                }
+                Err(e) => panic!("创建锁 {} 失败: {e}", p.display()),
+            }
+        }
+        panic!("无法获取锁 {}", p.display());
+    }
+}
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// 持锁进程是否还活着。unix 看 `/proc`；其它平台没有这个原语，
+/// 退回"锁文件 2 小时内视为仍被持有"（宁可信其有，别静默并发）。
+fn held(path: &std::path::Path, pid: Option<u32>) -> bool {
+    #[cfg(unix)]
+    if let Some(p) = pid {
+        return std::path::Path::new(&format!("/proc/{p}")).exists();
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|d| d.as_secs() < 7200)
+        .unwrap_or(false)
+}
+
 fn main() {
     let dir = PathBuf::from(arg("--dir").unwrap_or_else(|| "/root/bench/suite-data".into()));
     let rows: i64 = arg("--rows")
@@ -896,6 +966,12 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(10.0);
     std::fs::create_dir_all(&dir).expect("mkdir");
+    // 单实例闸（子进程靠环境变量让位给父进程；`--list` 不碰数据，不受闸）
+    let _lock = if has("--list") || std::env::var_os("QSDB_BENCH_CHILD").is_some() {
+        None
+    } else {
+        Some(DirLock::acquire(&dir))
+    };
 
     if has("--list") {
         println!("{:<20} {:<6} 说明", "用例", "分组");
@@ -994,6 +1070,8 @@ fn main() {
                 "--case",
                 name,
             ])
+            // 子进程不抢锁（父进程持着）
+            .env("QSDB_BENCH_CHILD", "1")
             .output()
             .expect("spawn child");
         let text = String::from_utf8_lossy(&out.stdout);
