@@ -4,6 +4,7 @@
 //! overwrite：锁内 写新数据 → 只含新 segment 的 manifest 原子替换（提交点）
 //!            → 旧数据文件留原地，GC 安全期后回收（保护在途扫描）
 
+use rayon::prelude::*;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -218,6 +219,74 @@ fn serialize_segment<W: std::io::Write + Send>(
 
 /// 写一个 segment：所有批进一个 parquet 文件（tmp → rename 定名）。
 /// 序列化直写本地文件（§4 热路径豁免）；stat/定名经 Store。
+/// 并行写段的**行数阈值**：单次提交的数据超过它，就切成多段**并行编码**
+/// （每个 worker 一段，一次提交仍只有一次 manifest）。
+///
+/// 为什么按行切、而不是"并行编码同一个文件里的多个 row group"：我们的表格式
+/// 本来就允许一个分区有**多个段文件**（manifest 引用列表），切成多段最省事、
+/// 且顺带把"读侧并行度"也提上去了（文件级分片更细）。DuckDB 走的是单文件多
+/// row group 并行，效果等价。
+const PARALLEL_SEG_ROWS: u64 = 256 * 1024;
+
+/// 写段：小的单线程；大的**切块并行**（返回多个 entry，调用方一次提交）。
+fn write_segments(
+    store: &Store,
+    partition_dir: &Path,
+    batches: &[RecordBatch],
+    file_schema: &SchemaRef,
+    props: WriterProperties,
+    column_names: &[String],
+) -> Result<Vec<SegmentEntry>> {
+    let total_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+    let threads = rayon::current_num_threads().clamp(1, 16);
+    let chunks = if total_rows < PARALLEL_SEG_ROWS || threads <= 1 {
+        1
+    } else {
+        let by_rows = (total_rows / PARALLEL_SEG_ROWS).min(threads as u64) as usize;
+        by_rows.max(1)
+    };
+    if chunks <= 1 {
+        return Ok(vec![write_segment(
+            store,
+            partition_dir,
+            batches,
+            file_schema,
+            props,
+            column_names,
+        )?]);
+    }
+    // 按行数把 batches 切成 chunks 组（保持组内顺序；组间顺序由 entry 顺序保留）
+    let per = total_rows.div_ceil(chunks as u64);
+    let mut groups: Vec<Vec<RecordBatch>> = vec![Vec::new(); chunks];
+    let mut gi = 0usize;
+    let mut acc = 0u64;
+    for b in batches {
+        if acc >= per && gi + 1 < chunks {
+            gi += 1;
+            acc = 0;
+        }
+        acc += b.num_rows() as u64;
+        groups[gi].push(b.clone());
+    }
+    let entries: Vec<Result<SegmentEntry>> = groups
+        .into_iter()
+        .filter(|g| !g.is_empty())
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|g| {
+            write_segment(
+                store,
+                partition_dir,
+                &g,
+                file_schema,
+                props.clone(),
+                column_names,
+            )
+        })
+        .collect();
+    entries.into_iter().collect()
+}
+
 fn write_segment(
     store: &Store,
     partition_dir: &Path,
@@ -450,7 +519,7 @@ pub(crate) fn append_partition(
     P_CALLS.fetch_add(1, AtomicOrd::Relaxed);
 
     let t = std::time::Instant::now();
-    let entry = write_segment(
+    let entries = write_segments(
         store,
         &dir,
         batches,
@@ -480,7 +549,10 @@ pub(crate) fn append_partition(
         }
         manifest.schema_fingerprint = def.schema_fingerprint();
     }
-    manifest.segments.push(entry.clone());
+    let rows: u64 = entries.iter().map(|e| e.row_count).sum();
+    let bytes: u64 = entries.iter().map(|e| e.byte_size).sum();
+    let nseg = entries.len() as u32;
+    manifest.segments.extend(entries.iter().cloned());
     P_MAN_READ_NS.fetch_add(t.elapsed().as_nanos() as u64, AtomicOrd::Relaxed);
     let t = std::time::Instant::now();
     manifest.commit(store, &dir)?;
@@ -493,9 +565,9 @@ pub(crate) fn append_partition(
     drop(_guard);
 
     Ok(WriteResult {
-        rows: entry.row_count,
-        bytes: entry.byte_size,
-        segments: 1,
+        rows,
+        bytes,
+        segments: nseg,
     })
 }
 
