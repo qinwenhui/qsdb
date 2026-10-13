@@ -43,15 +43,15 @@
 //! 解析实现量：任何语言 ~80 行（读一遍头，然后 `while !eof` 逐块）。规范见
 //! `docs/rows-format.md`。
 
+use arrow::array::types::IntervalMonthDayNanoType;
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, Date32Array,
     Date32Builder, Decimal128Array, Decimal128Builder, Float32Array, Float32Builder, Float64Array,
-    Float64Builder, Int16Array, Int16Builder, Int32Array, Int32Builder, Int64Array, Int64Builder,
-    Int8Array, Int8Builder, IntervalMonthDayNanoArray, IntervalMonthDayNanoBuilder, StringArray,
+    Float64Builder, Int8Array, Int8Builder, Int16Array, Int16Builder, Int32Array, Int32Builder,
+    Int64Array, Int64Builder, IntervalMonthDayNanoArray, IntervalMonthDayNanoBuilder, StringArray,
     StringBuilder, Time64NanosecondArray, Time64NanosecondBuilder, TimestampNanosecondArray,
     TimestampNanosecondBuilder,
 };
-use arrow::array::types::IntervalMonthDayNanoType;
 use arrow::datatypes::{DataType, Field, IntervalUnit, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
@@ -157,7 +157,7 @@ fn tag_of(dt: &DataType) -> Result<RowType> {
             return Err(QsdbError::unsupported(format!(
                 "rows: column type {other:?} not supported (see docs/rows-format.md §二)"
             )));
-        },
+        }
     })
 }
 
@@ -170,7 +170,7 @@ fn type_and_meta(dt: &DataType) -> Result<(RowType, Vec<u8>)> {
             m.extend_from_slice(&(tz.len() as u16).to_le_bytes());
             m.extend_from_slice(tz.as_bytes());
             m
-        },
+        }
         DataType::Timestamp(_, None) => 0u16.to_le_bytes().to_vec(),
         DataType::Decimal128(p, s) => vec![*p, *s as u8],
         DataType::Utf8 => 0u32.to_le_bytes().to_vec(), // max_chars：Arrow 层无此信息
@@ -182,7 +182,10 @@ fn type_and_meta(dt: &DataType) -> Result<(RowType, Vec<u8>)> {
 /// (标签, meta) → Arrow 类型。与 [`type_and_meta`] 严格互逆。
 fn type_from_meta(t: RowType, meta: &[u8], name: &str) -> Result<DataType> {
     let bad = |what: &str| {
-        QsdbError::invalid(format!("rows: column '{name}' {what} (type tag {})", t as u8))
+        QsdbError::invalid(format!(
+            "rows: column '{name}' {what} (type tag {})",
+            t as u8
+        ))
     };
     Ok(match t {
         RowType::Bool => expect_empty(meta, t, name, DataType::Boolean)?,
@@ -197,7 +200,7 @@ fn type_from_meta(t: RowType, meta: &[u8], name: &str) -> Result<DataType> {
                 return Err(bad("VARCHAR meta must be 4 bytes (max_chars u32)"));
             }
             DataType::Utf8
-        },
+        }
         RowType::Binary => expect_empty(meta, t, name, DataType::Binary)?,
         RowType::Date32 => expect_empty(meta, t, name, DataType::Date32)?,
         RowType::Time64Ns => expect_empty(meta, t, name, DataType::Time64(TimeUnit::Nanosecond))?,
@@ -220,14 +223,19 @@ fn type_from_meta(t: RowType, meta: &[u8], name: &str) -> Result<DataType> {
                 )
             };
             DataType::Timestamp(TimeUnit::Nanosecond, tz)
-        },
+        }
         RowType::Decimal => {
             if meta.len() != 2 {
                 return Err(bad("DECIMAL meta must be precision u8 + scale i8"));
             }
             DataType::Decimal128(meta[0], meta[1] as i8)
-        },
-        RowType::Interval => expect_empty(meta, t, name, DataType::Interval(IntervalUnit::MonthDayNano))?,
+        }
+        RowType::Interval => expect_empty(
+            meta,
+            t,
+            name,
+            DataType::Interval(IntervalUnit::MonthDayNano),
+        )?,
     })
 }
 
@@ -309,7 +317,11 @@ fn write_header(out: &mut Vec<u8>, n_cols: usize, schema: Option<&SchemaRef>) ->
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
         out.extend_from_slice(name);
         out.push(t as u8);
-        out.push(if f.is_nullable() { COL_FLAG_NULLABLE } else { 0 });
+        out.push(if f.is_nullable() {
+            COL_FLAG_NULLABLE
+        } else {
+            0
+        });
         out.extend_from_slice(&(meta.len() as u16).to_le_bytes());
         out.extend_from_slice(&meta);
     }
@@ -360,35 +372,37 @@ fn write_value(out: &mut Vec<u8>, a: &ArrayRef, i: usize) -> Result<()> {
     }
     match dt {
         DataType::Boolean => out.push(u8::from(downcast::<BooleanArray>(a, dt)?.value(i))),
-        DataType::Int8 => out.extend_from_slice(&downcast::<Int8Array>(a, dt)?.value(i).to_le_bytes()),
+        DataType::Int8 => {
+            out.extend_from_slice(&downcast::<Int8Array>(a, dt)?.value(i).to_le_bytes())
+        }
         DataType::Int16 => {
             out.extend_from_slice(&downcast::<Int16Array>(a, dt)?.value(i).to_le_bytes())
-        },
+        }
         DataType::Int32 => {
             out.extend_from_slice(&downcast::<Int32Array>(a, dt)?.value(i).to_le_bytes())
-        },
+        }
         DataType::Int64 => {
             out.extend_from_slice(&downcast::<Int64Array>(a, dt)?.value(i).to_le_bytes())
-        },
+        }
         DataType::Float32 => {
             out.extend_from_slice(&downcast::<Float32Array>(a, dt)?.value(i).to_le_bytes())
-        },
+        }
         DataType::Float64 => {
             out.extend_from_slice(&downcast::<Float64Array>(a, dt)?.value(i).to_le_bytes())
-        },
+        }
         DataType::Utf8 => {
             let s = downcast::<StringArray>(a, dt)?.value(i).as_bytes();
             out.extend_from_slice(&(s.len() as u32).to_le_bytes());
             out.extend_from_slice(s);
-        },
+        }
         DataType::Binary => {
             let s = downcast::<BinaryArray>(a, dt)?.value(i);
             out.extend_from_slice(&(s.len() as u32).to_le_bytes());
             out.extend_from_slice(s);
-        },
+        }
         DataType::Date32 => {
             out.extend_from_slice(&downcast::<Date32Array>(a, dt)?.value(i).to_le_bytes())
-        },
+        }
         DataType::Time64(TimeUnit::Nanosecond) => out.extend_from_slice(
             &downcast::<Time64NanosecondArray>(a, dt)?
                 .value(i)
@@ -399,21 +413,22 @@ fn write_value(out: &mut Vec<u8>, a: &ArrayRef, i: usize) -> Result<()> {
                 .value(i)
                 .to_le_bytes(),
         ),
-        DataType::Decimal128(_, _) => out.extend_from_slice(
-            &downcast::<Decimal128Array>(a, dt)?.value(i).to_le_bytes(),
-        ),
+        DataType::Decimal128(_, _) => {
+            out.extend_from_slice(&downcast::<Decimal128Array>(a, dt)?.value(i).to_le_bytes())
+        }
         DataType::Interval(IntervalUnit::MonthDayNano) => {
-            let (m, d, ns) =
-                IntervalMonthDayNanoType::to_parts(downcast::<IntervalMonthDayNanoArray>(a, dt)?.value(i));
+            let (m, d, ns) = IntervalMonthDayNanoType::to_parts(
+                downcast::<IntervalMonthDayNanoArray>(a, dt)?.value(i),
+            );
             out.extend_from_slice(&m.to_le_bytes());
             out.extend_from_slice(&d.to_le_bytes());
             out.extend_from_slice(&ns.to_le_bytes());
-        },
+        }
         other => {
             return Err(QsdbError::unsupported(format!(
                 "rows: column type {other:?} not supported"
             )));
-        },
+        }
     }
     Ok(())
 }
@@ -461,9 +476,8 @@ pub fn decode_with_schema(bytes: &[u8], schema: &SchemaRef) -> Result<Vec<Record
     }
     // 先校验每列类型受支持（别写到一半才发现）
     for f in schema.fields() {
-        type_and_meta(f.data_type()).map_err(|e| {
-            QsdbError::invalid(format!("rows: column '{}': {e}", f.name()))
-        })?;
+        type_and_meta(f.data_type())
+            .map_err(|e| QsdbError::invalid(format!("rows: column '{}': {e}", f.name())))?;
     }
     read_chunks(&mut r, schema)
 }
@@ -594,20 +608,22 @@ impl ColBuilder {
             DataType::Binary => Self::Bin(BinaryBuilder::new()),
             DataType::Date32 => Self::Date32(Date32Builder::new()),
             DataType::Time64(TimeUnit::Nanosecond) => Self::Time64(Time64NanosecondBuilder::new()),
-            DataType::Timestamp(TimeUnit::Nanosecond, _) => Self::Ts(TimestampNanosecondBuilder::new()),
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                Self::Ts(TimestampNanosecondBuilder::new())
+            }
             DataType::Decimal128(p, s) => {
                 let mut b = Decimal128Builder::new();
                 b = b.with_data_type(DataType::Decimal128(*p, *s));
                 Self::Dec(b)
-            },
+            }
             DataType::Interval(IntervalUnit::MonthDayNano) => {
                 Self::Interval(IntervalMonthDayNanoBuilder::new())
-            },
+            }
             other => {
                 return Err(QsdbError::unsupported(format!(
                     "rows: column type {other:?} not supported"
                 )));
-            },
+            }
         })
     }
 
@@ -634,7 +650,7 @@ impl ColBuilder {
                 } else {
                     b.append_value(v != 0);
                 }
-            },
+            }
             Self::I8(b) => fixed!(b, 1, i8),
             Self::I16(b) => fixed!(b, 2, i16),
             Self::I32(b) => fixed!(b, 4, i32),
@@ -646,11 +662,13 @@ impl ColBuilder {
                 if is_null {
                     b.append_null();
                 } else {
-                    b.append_value(std::str::from_utf8(s).map_err(|_| {
-                        QsdbError::invalid("rows: string value not valid UTF-8")
-                    })?);
+                    b.append_value(
+                        std::str::from_utf8(s).map_err(|_| {
+                            QsdbError::invalid("rows: string value not valid UTF-8")
+                        })?,
+                    );
                 }
-            },
+            }
             Self::Bin(b) => {
                 let s = r.var()?;
                 if is_null {
@@ -658,7 +676,7 @@ impl ColBuilder {
                 } else {
                     b.append_value(s);
                 }
-            },
+            }
             Self::Date32(b) => fixed!(b, 4, i32),
             Self::Time64(b) => fixed!(b, 8, i64),
             Self::Ts(b) => fixed!(b, 8, i64),
@@ -672,10 +690,11 @@ impl ColBuilder {
                         i32::from_le_bytes([s[0], s[1], s[2], s[3]]),
                         i32::from_le_bytes([s[4], s[5], s[6], s[7]]),
                     );
-                    let ns = i64::from_le_bytes([s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15]]);
+                    let ns =
+                        i64::from_le_bytes([s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15]]);
                     b.append_value(IntervalMonthDayNanoType::make_value(m, d, ns));
                 }
-            },
+            }
         }
         Ok(())
     }
@@ -782,7 +801,6 @@ mod tests {
             schema,
             vec![
                 Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)])), // 0
-
                 Arc::new(Int8Array::from(vec![Some(-1), None, Some(127)])),
                 Arc::new(Int16Array::from(vec![Some(-2), Some(0), None])),
                 Arc::new(Int32Array::from(vec![None, Some(7), Some(-9)])),
@@ -926,9 +944,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8View, true)]));
         let b = RecordBatch::try_new(
             schema,
-            vec![Arc::new(
-                arrow::array::StringViewArray::from(vec!["a"]),
-            )],
+            vec![Arc::new(arrow::array::StringViewArray::from(vec!["a"]))],
         )
         .unwrap();
         let e = encode(std::slice::from_ref(&b)).unwrap_err();

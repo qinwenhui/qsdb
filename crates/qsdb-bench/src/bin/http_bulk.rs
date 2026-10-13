@@ -122,7 +122,7 @@ fn whole_body(fmt: &str, batches: &[RecordBatch]) -> Vec<u8> {
             }
             w.finish().unwrap();
             buf
-        },
+        }
         "bulk" => qsdb::bulk::encode(batches).expect("bulk encode"),
         // 行式**写侧形态**：flags=0，schema 由端点按 table= 查表定义给
         "rows" => qsdb::rows::encode_values(&batches[0].schema(), batches).expect("rows encode"),
@@ -136,7 +136,7 @@ fn whole_body(fmt: &str, batches: &[RecordBatch]) -> Vec<u8> {
             }
             drop(w);
             buf
-        },
+        }
         other => panic!("未知 format {other}"),
     }
 }
@@ -161,7 +161,12 @@ fn main() {
         "源：{} 批 / {} 行 / schema = {:?}",
         batches.len(),
         batches.iter().map(|b| b.num_rows()).sum::<usize>(),
-        batches[0].schema().fields().iter().map(|f| f.name()).collect::<Vec<_>>()
+        batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name())
+            .collect::<Vec<_>>()
     );
 
     let fmts = ["ipc", "bulk", "rows", "csv"];
@@ -206,7 +211,10 @@ fn main() {
                 &body,
             );
             if st != 200 {
-                println!("  批 {n} 失败 status={st} {}", resp.lines().last().unwrap_or(""));
+                println!(
+                    "  批 {n} 失败 status={st} {}",
+                    resp.lines().last().unwrap_or("")
+                );
                 break;
             }
             n += 1;
