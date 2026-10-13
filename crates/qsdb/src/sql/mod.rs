@@ -774,6 +774,12 @@ struct InsertSink<'a> {
     /// OVERWRITE：分区值 → 该分区全宽批
     buckets: Vec<(Vec<Literal>, Vec<RecordBatch>)>,
     total: u64,
+    /// 分段计时（`QSDB_INSERT_PROF=1` 时打印）：对齐 / 落段 / 批数。
+    /// 动机：`INSERT … SELECT` 曾比 `db.append` 慢 6 倍而同为"扫 + 写"，
+    /// 没有分段数字只能猜（见 `docs/真机基准对账.md`）。
+    prof_align_ns: u128,
+    prof_append_ns: u128,
+    prof_batches: u64,
 }
 
 impl<'a> InsertSink<'a> {
@@ -796,12 +802,18 @@ impl<'a> InsertSink<'a> {
             pending_bytes: 0,
             buckets: Vec::new(),
             total: 0,
+            prof_align_ns: 0,
+            prof_append_ns: 0,
+            prof_batches: 0,
         })
     }
 
     /// 推入一批**源列序**的批（SELECT 结果），内部先按 `perm` 对齐到表列序。
     fn push(&mut self, batch: &RecordBatch) -> Result<()> {
+        let t0 = std::time::Instant::now();
         let aligned = align_insert_batch(self.def, self.perm, batch)?;
+        self.prof_align_ns += t0.elapsed().as_nanos();
+        self.prof_batches += 1;
         self.push_aligned(aligned)
     }
 
@@ -845,7 +857,9 @@ impl<'a> InsertSink<'a> {
         if self.pending.is_empty() {
             return Ok(());
         }
+        let t0 = std::time::Instant::now();
         let r: WriteResult = self.db.append(self.table, &self.pending)?;
+        self.prof_append_ns += t0.elapsed().as_nanos();
         self.total += r.rows;
         self.pending.clear();
         self.res.shrink(self.pending_bytes);
@@ -854,6 +868,15 @@ impl<'a> InsertSink<'a> {
     }
 
     fn finish(mut self) -> Result<u64> {
+        if std::env::var("QSDB_INSERT_PROF").is_ok() {
+            eprintln!(
+                "[insert-prof] batches={} align={:.3}s append={:.3}s total_rows={}",
+                self.prof_batches,
+                self.prof_align_ns as f64 / 1e9,
+                self.prof_append_ns as f64 / 1e9,
+                self.total
+            );
+        }
         if self.overwrite {
             let (db, table, def) = (self.db, self.table, self.def);
             for (vals, batches) in std::mem::take(&mut self.buckets) {
