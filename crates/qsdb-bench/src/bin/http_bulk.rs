@@ -28,7 +28,7 @@ fn post_ct(addr: &str, path: &str, ct: &str, body: &[u8]) -> (u16, String) {
     // 于是 "         Content-Type: …" 成了非法头行（axum 的 JSON 提取器
     // 直接报 "Expected request with Content-Type: application/json"，很难看出）。
     let req = format!(
-        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Type: {ct}\r\nContent-Length: {}\r\n\r\n",
         body.len()
     );
     s.write_all(req.as_bytes()).unwrap();
