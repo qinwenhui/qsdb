@@ -64,6 +64,21 @@ pub enum QsdbError {
     #[error("already exists: {0}")]
     AlreadyExists(String),
 
+    /// **乐观并发冲突（CAS）**：分区已被他人改写，`generation` 与调用方期望不符。
+    ///
+    /// 与 [`Self::AlreadyExists`] 分开：那个是"你要**建**的东西已存在"（改名或加
+    /// `IF NOT EXISTS`），这个是"你要**改**的东西已被别人改过"——客户端动作是
+    /// **重读最新状态再决定**（重试/换分区/人工介入），盲目重试无用。
+    ///
+    /// 只在调用方显式传了期望 `generation` 时才可能出现（qsdb-sync F24：
+    /// 同分区并发 overwrite 原本是**静默 last-writer-wins**——先写者的数据无声消失）。
+    #[error("write conflict: partition {partition} generation is {actual}, expected {expected}")]
+    WriteConflict {
+        partition: String,
+        expected: u64,
+        actual: u64,
+    },
+
     /// 查询被取消（kill / 客户端断连）
     #[error("query cancelled: {0}")]
     QueryCancelled(String),

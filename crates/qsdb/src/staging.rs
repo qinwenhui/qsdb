@@ -36,6 +36,11 @@ pub(crate) struct StagedRecord {
     pub partition_values: Vec<Literal>,
     /// true = overwrite（替换分区）；false = append（追加）
     pub overwrite: bool,
+    /// overwrite 的 **CAS 期望 generation**（F24）：写盘即 ACK，提交在 `flush_staged`，
+    /// 故期望值随记录落盘、由提交处校验。`None` = 无条件覆盖。
+    /// `serde(default)`：旧记录（无此字段）反序列化后即 None（向后兼容）。
+    #[serde(default)]
+    pub expected_generation: Option<u64>,
     pub entry: SegmentEntry,
 }
 
@@ -167,6 +172,7 @@ mod tests {
 
     fn rec(table: &str, seg: &str, rel: &str) -> StagedRecord {
         StagedRecord {
+            expected_generation: None,
             version: 1,
             table: table.into(),
             partition_rel: rel.into(),

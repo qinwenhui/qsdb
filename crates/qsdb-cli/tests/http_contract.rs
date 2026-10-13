@@ -19,7 +19,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::Int64Array;
+use arrow::array::{Date32Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -211,6 +211,187 @@ fn ipc_two_int_cols(n: usize) -> Vec<u8> {
         vec![
             Arc::new(Int64Array::from(vals.clone())),
             Arc::new(Int64Array::from(vals)),
+        ],
+    )
+    .expect("build batch");
+    let mut buf = Vec::new();
+    {
+        let mut w =
+            arrow::ipc::writer::StreamWriter::try_new(&mut buf, &schema).expect("ipc writer");
+        w.write(&batch).expect("write batch");
+        w.finish().expect("finish ipc");
+    }
+    buf
+}
+
+/// **回归**：HTTP `mode=overwrite` 本身要能用。
+///
+/// 长期存在的 bug：该分支先把批按分区**剥**好，再交给 `Qsdb::overwrite_partition`
+/// （而它的输入约定是**全列批**、库里自己剥）→ 库里再剥一次 → 400
+/// `batch lacks partition column`。embed 用户传全列批，所以从未暴露；
+/// **HTTP overwrite 一直是坏的**，而契约文档写着它可用。
+#[test]
+fn http_overwrite_mode_works() {
+    let srv = Server::start(&[]);
+    let p = srv.port;
+    assert_eq!(
+        query(
+            p,
+            "CREATE TABLE t (dt DATE, v BIGINT) PARTITIONED BY (dt)",
+            None
+        )
+        .status,
+        200
+    );
+
+    // 覆盖两次：第二次必须**替换**第一次（分区语义），不是追加
+    for v in [1, 2] {
+        let r = http(
+            p,
+            "POST",
+            "/api/v1/write?table=t&mode=overwrite",
+            &[("Content-Type", "application/octet-stream")],
+            &ipc_dt_v(20_454, v),
+        );
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    }
+    let r = query(p, "SELECT count(*), sum(v) FROM t", None);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let json = r.json();
+    assert_eq!(
+        json["rows"][0].to_string(),
+        "[1,2]",
+        "overwrite 应是替换语义（1 行、v=2）"
+    );
+}
+
+/// **F24 HTTP 面**：`mode=overwrite&expected_generation=N` 的 CAS 语义与拒绝边界。
+#[test]
+fn write_cas_over_http() {
+    let srv = Server::start(&[]);
+    let p = srv.port;
+    let q = |sql: &str| query(p, sql, None);
+    assert_eq!(
+        q("CREATE TABLE t (dt DATE, v BIGINT) PARTITIONED BY (dt)").status,
+        200
+    );
+
+    // 单分区覆盖（全列批：dt + v）——期望 0 = 首次写入
+    let body = ipc_dt_v(20_454, 1);
+    {
+        // 自检：IPC 往返后 schema 必须仍带 dt（否则测的是别的毛病）
+        let mut r =
+            arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(body.clone()), None)
+                .unwrap();
+        let b = r.next().unwrap().unwrap();
+        eprintln!("SELFTEST schema={:?}", b.schema());
+    }
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/write?table=t&mode=overwrite&expected_generation=0",
+        &[("Content-Type", "application/octet-stream")],
+        &body,
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+
+    // 同样的过期期望（分区已是 generation 1）→ 409 WRITE_CONFLICT
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/write?table=t&mode=overwrite&expected_generation=0",
+        &[("Content-Type", "application/octet-stream")],
+        &body,
+    );
+    assert_eq!(r.status, 409, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.code(), "WRITE_CONFLICT");
+    // SQLState 不在**错误响应体**里（响应体只带 error+code；驱动从
+    // `GET /api/v1/error-codes` 的目录取映射）——这里断言目录里的映射正确
+    let cat = http(p, "GET", "/api/v1/error-codes", &[], &[]);
+    let entry = cat.json()["codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["code"] == "WRITE_CONFLICT")
+        .cloned()
+        .expect("目录应含 WRITE_CONFLICT");
+    assert_eq!(entry["http"], 409);
+    assert_eq!(entry["retry"], false);
+    assert_eq!(entry["category"], "resource");
+    assert_eq!(entry["sqlState"], "40001");
+
+    // 取最新 generation 再写 → 200
+    let r = query(p, "SELECT 1", None);
+    assert_eq!(r.status, 200);
+    let parts = http(p, "GET", "/api/v1/tables/t/partitions", &[], &[]);
+    let g = parts.json()["detail"][0]["generation"].as_u64().unwrap();
+    let r = http(
+        p,
+        "POST",
+        &format!("/api/v1/write?table=t&mode=overwrite&expected_generation={g}"),
+        &[("Content-Type", "application/octet-stream")],
+        &body,
+    );
+    assert_eq!(r.status, 200, "拿最新 generation 应成功");
+
+    // append 带 CAS → 400（append 是锁内合并语义，没有"期望 generation"这回事）
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/write?table=t&mode=append&expected_generation=1",
+        &[("Content-Type", "application/octet-stream")],
+        &ipc_dt_v(20_454, 2),
+    );
+    assert_eq!(r.status, 400, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.code(), "INVALID_ARGUMENT");
+
+    // 一次命中多分区 + CAS → 400（"期望 generation"没有唯一所指，不许挑一个用）
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/write?table=t&mode=overwrite&expected_generation=1",
+        &[("Content-Type", "application/octet-stream")],
+        &ipc_two_partitions(),
+    );
+    assert_eq!(r.status, 400, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.code(), "INVALID_ARGUMENT");
+}
+
+/// 单分区全列批（dt + v）。
+fn ipc_dt_v(dt: i32, v: i64) -> Vec<u8> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("dt", DataType::Date32, true),
+        Field::new("v", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Date32Array::from(vec![dt])),
+            Arc::new(Int64Array::from(vec![v])),
+        ],
+    )
+    .expect("build batch");
+    let mut buf = Vec::new();
+    {
+        let mut w =
+            arrow::ipc::writer::StreamWriter::try_new(&mut buf, &schema).expect("ipc writer");
+        w.write(&batch).expect("write batch");
+        w.finish().expect("finish ipc");
+    }
+    buf
+}
+
+/// 两个分区的批（dt 两个值）。
+fn ipc_two_partitions() -> Vec<u8> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("dt", DataType::Date32, true),
+        Field::new("v", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Date32Array::from(vec![20_454, 20_455])),
+            Arc::new(Int64Array::from(vec![1, 2])),
         ],
     )
     .expect("build batch");
@@ -503,7 +684,7 @@ fn error_catalog_endpoint_and_no_off_catalog_codes() {
     assert_eq!(r.status, 200, "目录端点应免鉴权可读");
     let codes = r.json()["codes"].as_array().cloned().unwrap_or_default();
     // 条数与代码侧枚举一致（docs/error-codes.md ↔ enum 的逐字对账在单测里）
-    assert_eq!(codes.len(), 21, "目录应列出全部 21 个码");
+    assert_eq!(codes.len(), 22, "目录应列出全部 22 个码");
     for c in &codes {
         for k in ["code", "http", "retry", "category", "sqlState"] {
             assert!(c.get(k).is_some(), "目录条目缺字段 {k}: {c}");

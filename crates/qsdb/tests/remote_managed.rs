@@ -15,7 +15,7 @@ use object_store::path::Path as StorePath;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
 
 use qsdb::store::Store;
-use qsdb::{Qsdb, QsdbOptions};
+use qsdb::{Literal, Qsdb, QsdbOptions};
 
 fn tmp_root(tag: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir()
@@ -272,6 +272,103 @@ fn two_instances_concurrent_append_no_loss() {
         count(&db_over(mem.clone(), &root), "SELECT count(*) FROM t"),
         16
     );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **远端 overwrite 必须推进 generation**（与 append、与本地 `commit()` 同口径）。
+///
+/// 此前 `occ_replace_entries` 只写 `generation = cur`（不加一）——远端覆盖后
+/// generation **原地不动**。这既是 F24 的 CAS 在远端失效的原因，也意味着
+/// **生态侧以 generation 为增量判据的同步会漏掉远端 overwrite**（qsdb-sync 契约）。
+#[test]
+fn remote_overwrite_advances_generation() {
+    let root = tmp_root("gen");
+    let mem: Arc<InMemory> = Arc::new(InMemory::default());
+    let db = db_over(mem.clone(), &root);
+    db.sql("CREATE TABLE t (dt DATE, v BIGINT) PARTITIONED BY (dt)")
+        .unwrap();
+
+    let g = |db: &Qsdb| -> u64 {
+        db.partition_stats("t")
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name.contains("dt="))
+            .map(|s| s.generation)
+            .expect("分区应存在")
+    };
+
+    db.overwrite_partition(
+        "t",
+        &[("dt", Literal::Date(19_000))],
+        &[batch(19_000, vec![1])],
+    )
+    .unwrap();
+    let g1 = g(&db);
+    assert_eq!(g1, 1, "首次写入 → generation 1");
+
+    db.overwrite_partition(
+        "t",
+        &[("dt", Literal::Date(19_000))],
+        &[batch(19_000, vec![2])],
+    )
+    .unwrap();
+    let g2 = g(&db);
+    assert_eq!(
+        g2,
+        g1 + 1,
+        "远端 overwrite 必须推进 generation（否则同步工具视为未变、漏掉这次覆盖）"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **F24 远端路径**：CAS 校验在 **OCC 闭包内**（不是"先读后写"的假 CAS）——
+/// 两个实例并发覆盖同一分区，拿旧 generation 的那个必须冲突，且**不覆盖别人的数据**。
+#[test]
+fn remote_overwrite_cas_detects_concurrent_write() {
+    let root = tmp_root("cas");
+    let mem: Arc<InMemory> = Arc::new(InMemory::default());
+    let db = db_over(mem.clone(), &root);
+    db.sql("CREATE TABLE t (dt DATE, v BIGINT) PARTITIONED BY (dt)")
+        .unwrap();
+
+    // 实例 A 先写（分区不存在 → generation 0）
+    db.overwrite_partition_cas(
+        "t",
+        &[("dt", Literal::Date(19_000))],
+        &[batch(19_000, vec![1])],
+        0,
+    )
+    .unwrap();
+
+    // 实例 B 拿过期 generation 覆盖 → 冲突
+    let err = db
+        .overwrite_partition_cas(
+            "t",
+            &[("dt", Literal::Date(19_000))],
+            &[batch(19_000, vec![9])],
+            0,
+        )
+        .expect_err("远端过期 generation 必须冲突");
+    assert!(
+        matches!(err, qsdb::error::QsdbError::WriteConflict { .. }),
+        "实得 {err:?}"
+    );
+
+    // A 的数据仍在（不是被无声替换）
+    assert_eq!(
+        count(&db_over(mem.clone(), &root), "SELECT count(*) FROM t"),
+        1
+    );
+    assert_eq!(
+        count(
+            &db_over(mem.clone(), &root),
+            "SELECT count(*) FROM t WHERE v = 1"
+        ),
+        1,
+        "先写者的数据必须完好"
+    );
+
     std::fs::remove_dir_all(&root).ok();
 }
 

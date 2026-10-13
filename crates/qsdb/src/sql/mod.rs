@@ -879,10 +879,15 @@ fn partition_row_masks(
         .partition_keys
         .iter()
         .map(|k| {
-            batch
-                .schema()
-                .index_of(k)
-                .map_err(|_| QsdbError::invalid(format!("batch lacks partition column '{k}'")))
+            batch.schema().index_of(k).map_err(|_| {
+                // 报出**实际收到的列**——只说"缺列"没法排障（实践：客户端列名/列序
+                // 不对时，这句话是唯一线索）
+                let sch = batch.schema();
+                let have: Vec<&str> = sch.fields().iter().map(|f| f.name().as_str()).collect();
+                QsdbError::invalid(format!(
+                    "batch lacks partition column '{k}' (batch columns: {have:?})"
+                ))
+            })
         })
         .collect::<Result<_>>()?;
     let mut out: Vec<(Vec<Literal>, Vec<bool>)> = Vec::new();

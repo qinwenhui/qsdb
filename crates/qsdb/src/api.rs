@@ -539,11 +539,42 @@ impl Qsdb {
     }
 
     /// 分区原子替换（幂等回写）；空输入 = 清空该分区。
+    ///
+    /// **无条件覆盖**：并发写同一分区时后者胜、前者数据无声消失。需要冲突检测就用
+    /// [`Self::overwrite_partition_cas`]（qsdb-sync F24）。
     pub fn overwrite_partition(
         &self,
         table: &str,
         values: &[(&str, Literal)],
         batches: &[RecordBatch],
+    ) -> Result<WriteResult> {
+        self.overwrite_partition_inner(table, values, batches, None)
+    }
+
+    /// 分区原子替换 + **乐观并发（CAS）**：仅当该分区当前 `generation` == `expected_generation`
+    /// 时才覆盖，否则 [`QsdbError::WriteConflict`]（HTTP `WRITE_CONFLICT` / 409，SQLState `40001`）。
+    ///
+    /// `generation` 是分区提交计数器（每次 append/overwrite/clear +1），从
+    /// `partition_stats()` 读当前值。首次写入不存在的分区传 `0`。
+    ///
+    /// 用途：两个写者并发覆盖同一分区时，"静默 last-writer-wins"变成**显式冲突**，
+    /// 由调用方裁决（重读最新 generation 再试 / 换分区 / 人工介入）。
+    pub fn overwrite_partition_cas(
+        &self,
+        table: &str,
+        values: &[(&str, Literal)],
+        batches: &[RecordBatch],
+        expected_generation: u64,
+    ) -> Result<WriteResult> {
+        self.overwrite_partition_inner(table, values, batches, Some(expected_generation))
+    }
+
+    fn overwrite_partition_inner(
+        &self,
+        table: &str,
+        values: &[(&str, Literal)],
+        batches: &[RecordBatch],
+        expected_generation: Option<u64>,
     ) -> Result<WriteResult> {
         self.ensure_writable()?;
         let def = self.def(None, table)?;
@@ -596,6 +627,7 @@ impl Qsdb {
             &def,
             &ordered,
             &data_batches,
+            expected_generation,
         )
     }
 
@@ -1305,12 +1337,15 @@ impl Qsdb {
                 self.store
                     .put_object(&dir.join(&rec.entry.file_name), &bytes)?;
                 if rec.overwrite {
+                    // F24：CAS 期望值随暂存记录落盘，**在这里**校验——写盘即 ACK 的
+                    // 路径上，冲突只能推迟到提交时刻暴露（届时数据仍一致：报错则不提交）
                     crate::write::occ_replace_entries(
                         &self.store,
                         &dir,
                         &def,
                         &rec.partition_values,
                         std::slice::from_ref(&rec.entry),
+                        rec.expected_generation,
                     )?;
                 } else {
                     crate::write::occ_append_entry(

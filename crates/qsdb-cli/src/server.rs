@@ -778,6 +778,11 @@ struct WriteParams {
     mode: Option<String>,
     #[serde(default)]
     flush: Option<bool>,
+    /// `mode=overwrite` 的 **CAS 期望分区 generation**（F24）。
+    /// 只支持**单分区**覆盖；不传 = 现状（无条件覆盖）。
+    /// 同时接受 `expectedGeneration`（camelCase 别名，兼容生态客户端习惯）。
+    #[serde(default, alias = "expectedGeneration")]
+    expected_generation: Option<u64>,
 }
 
 async fn write(
@@ -805,6 +810,13 @@ async fn write(
                 .response(format!("invalid mode: expect append|overwrite (got {m:?})"));
         }
     };
+    // CAS 只对 overwrite 有意义（append 是锁内 read-merge-write，天然合并语义）
+    if p.expected_generation.is_some() && mode != "overwrite" {
+        s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+        return ErrorCode::InvalidArgument.response(
+            "expected_generation only applies to mode=overwrite (append merges under the lock)",
+        );
+    }
     // IPC 解码（同步 CPU 工作，直接做）
     let batches = match ipc_to_batches(&body) {
         Ok(b) => b,
@@ -817,12 +829,23 @@ async fn write(
     let st = Arc::clone(&s);
     let table = p.table.clone();
     let flush = p.flush.unwrap_or(true);
+    let expected_generation = p.expected_generation;
     let result = tokio::task::spawn_blocking(move || -> Result<u64, QsdbError> {
         match mode.as_str() {
             "overwrite" => {
                 let def = st.db.table_def(&table)?;
                 let batch = concat_batches(&batches)?;
                 let groups = qsdb::partition::split_by_partition(&batch, &def)?;
+                // CAS 是**单分区**语义：一次请求命中多个分区时，"期望 generation"
+                // 没有唯一所指 —— 显式拒绝而不是挑一个用（拼错就报错，不静默兜底）
+                if let Some(_exp) = expected_generation {
+                    if groups.len() > 1 {
+                        return Err(QsdbError::invalid(format!(
+                            "expected_generation requires a single-partition overwrite, but this request targets {} partitions",
+                            groups.len()
+                        )));
+                    }
+                }
                 let mut rows = 0u64;
                 for (vals, data) in groups {
                     let names: Vec<(&str, qsdb::Literal)> = def
@@ -831,7 +854,18 @@ async fn write(
                         .zip(vals.iter())
                         .map(|(k, v)| (k.as_str(), v.clone()))
                         .collect();
-                    let r = st.db.overwrite_partition(&table, &names, &[data])?;
+                    // **把分区列补回**：`Qsdb::overwrite_partition` 的约定是**全列批**
+                    // （库里自己按分区列路由并剥离）——直接把上面剥过的 `data` 喂进去，
+                    // 库里会再剥一次 → `batch lacks partition column`。
+                    // 这个坑是本分支长期存在的：**HTTP `mode=overwrite` 一直 400**
+                    // （embed 用户传全列批所以从未暴露；先前的契约测试也没覆盖 overwrite）。
+                    let full = qsdb::partition::attach_partition_columns(&def, &names, &data)?;
+                    let r = match expected_generation {
+                        Some(exp) => {
+                            st.db.overwrite_partition_cas(&table, &names, &[full], exp)?
+                        }
+                        None => st.db.overwrite_partition(&table, &names, &[full])?,
+                    };
                     rows += r.rows;
                 }
                 Ok(rows)

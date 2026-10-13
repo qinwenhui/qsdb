@@ -212,10 +212,15 @@ pub fn split_by_partition(
     let pidx: Vec<usize> = pkeys
         .iter()
         .map(|k| {
-            batch
-                .schema()
-                .index_of(k)
-                .map_err(|_| QsdbError::invalid(format!("batch lacks partition column '{k}'")))
+            batch.schema().index_of(k).map_err(|_| {
+                // 报出**实际收到的列**——只说"缺列"没法排障（实践：客户端列名/列序
+                // 不对时，这句话是唯一线索）
+                let sch = batch.schema();
+                let have: Vec<&str> = sch.fields().iter().map(|f| f.name().as_str()).collect();
+                QsdbError::invalid(format!(
+                    "batch lacks partition column '{k}' (batch columns: {have:?})"
+                ))
+            })
         })
         .collect::<Result<_>>()?;
 
@@ -289,6 +294,117 @@ fn strip_partition_columns(batch: &RecordBatch, def: &TableDef) -> Result<Record
 fn projected_schema(schema: &SchemaRef, indices: &[usize]) -> SchemaRef {
     let fields: Vec<_> = indices.iter().map(|&i| schema.field(i).clone()).collect();
     Arc::new(arrow::datatypes::Schema::new(fields))
+}
+
+/// 把分区列（按 `values` 常量）**补回**数据批 —— [`split_by_partition`] 的逆操作。
+///
+/// 用途：`Qsdb::overwrite_partition` / `append` 的输入约定是**全列批**（库里自己
+/// 按分区列路由并剥离）。已经自行按分区切过、只想写某一个分区的客户端，需要把批
+/// 恢复成全列形状——**别把剥过的批直接喂进去**（库里会再剥一次 → 报
+/// `batch lacks partition column`）。HTTP `/write?mode=overwrite` 就踩过这个坑
+/// （长期不可用），修法即本函数。
+///
+/// 输出列序 = `def.columns` 序；`values` 是 `(列名, 值)` 对（与 `overwrite_partition`
+/// 同形），必须覆盖该表全部分区键。
+pub fn attach_partition_columns(
+    def: &TableDef,
+    values: &[(&str, crate::types::Literal)],
+    data: &RecordBatch,
+) -> Result<RecordBatch> {
+    let n = data.num_rows();
+    let mut cols: Vec<arrow::array::ArrayRef> = Vec::with_capacity(def.columns.len());
+    let mut fields: Vec<arrow::datatypes::Field> = Vec::with_capacity(def.columns.len());
+    for c in &def.columns {
+        match values.iter().find(|(k, _)| k.eq_ignore_ascii_case(&c.name)) {
+            Some((_, lit)) => {
+                let dt = c.logical_type.arrow_type();
+                cols.push(constant_array(lit, &dt, n)?);
+            }
+            None => {
+                let idx = data.schema().index_of(&c.name).map_err(|_| {
+                    QsdbError::invalid(format!(
+                        "data batch lacks column '{}' (needed to rebuild the full-column batch)",
+                        c.name
+                    ))
+                })?;
+                cols.push(Arc::clone(data.column(idx)));
+            }
+        }
+        fields.push(arrow::datatypes::Field::new(
+            c.name.clone(),
+            c.logical_type.arrow_type(),
+            true,
+        ));
+    }
+    let schema = Arc::new(arrow::datatypes::Schema::new(fields));
+    RecordBatch::try_new_with_options(
+        schema,
+        cols,
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(n)),
+    )
+    .map_err(|e| QsdbError::invalid(format!("attach partition columns failed: {e}")))
+}
+
+/// `Literal` → 长度 `n` 的常量数组（分区列重建用）。
+fn constant_array(
+    lit: &crate::types::Literal,
+    dt: &arrow::datatypes::DataType,
+    n: usize,
+) -> Result<arrow::array::ArrayRef> {
+    use arrow::array::{
+        BooleanArray, Date32Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+        Int64Array, StringArray,
+    };
+    Ok(match (lit, dt) {
+        (crate::types::Literal::Boolean(v), arrow::datatypes::DataType::Boolean) => {
+            Arc::new(BooleanArray::from(vec![*v; n]))
+        }
+        (crate::types::Literal::Int8(v), arrow::datatypes::DataType::Int8) => {
+            Arc::new(Int8Array::from(vec![*v; n]))
+        }
+        (crate::types::Literal::Int16(v), arrow::datatypes::DataType::Int16) => {
+            Arc::new(Int16Array::from(vec![*v; n]))
+        }
+        (crate::types::Literal::Int32(v), arrow::datatypes::DataType::Int32) => {
+            Arc::new(Int32Array::from(vec![*v; n]))
+        }
+        (crate::types::Literal::Int64(v), arrow::datatypes::DataType::Int64) => {
+            Arc::new(Int64Array::from(vec![*v; n]))
+        }
+        (crate::types::Literal::Float32(v), arrow::datatypes::DataType::Float32) => {
+            Arc::new(Float32Array::from(vec![*v; n]))
+        }
+        (crate::types::Literal::Float64(v), arrow::datatypes::DataType::Float64) => {
+            Arc::new(Float64Array::from(vec![*v; n]))
+        }
+        (crate::types::Literal::Utf8(v), arrow::datatypes::DataType::Utf8) => {
+            Arc::new(StringArray::from(vec![v.as_str(); n]))
+        }
+        (crate::types::Literal::Date(v), arrow::datatypes::DataType::Date32) => {
+            Arc::new(Date32Array::from(vec![*v; n]))
+        }
+        (
+            crate::types::Literal::Time(v),
+            arrow::datatypes::DataType::Time64(arrow::datatypes::TimeUnit::Nanosecond),
+        ) => Arc::new(arrow::array::Time64NanosecondArray::from(vec![*v; n])),
+        (
+            crate::types::Literal::Timestamp(v),
+            arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _),
+        ) => Arc::new(
+            arrow::array::TimestampNanosecondArray::from(vec![*v; n]).with_data_type(dt.clone()),
+        ),
+        (
+            crate::types::Literal::Decimal { unscaled, .. },
+            arrow::datatypes::DataType::Decimal128(_, _),
+        ) => Arc::new(
+            arrow::array::Decimal128Array::from(vec![*unscaled; n]).with_data_type(dt.clone()),
+        ),
+        (l, dt) => {
+            return Err(QsdbError::type_err(format!(
+                "cannot build scalar of {dt:?} from {l:?}"
+            )));
+        }
+    })
 }
 
 /// 分区值字符串 → 该列逻辑类型的 Literal（扫描裁剪用）。

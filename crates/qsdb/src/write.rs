@@ -500,6 +500,15 @@ fn sync_index(store: &Store, table_dir: &Path, partition_dir: &Path, manifest: &
 }
 
 /// overwrite（单分区原子替换；空输入 = 清空分区）。
+///
+/// `expected` = **乐观并发（CAS）**：只在该分区当前 `generation` 恰好等于它时才覆盖，
+/// 否则报 [`QsdbError::WriteConflict`]。`None` = 现状行为（无条件覆盖）。
+///
+/// 为什么要这个：两个写者对同一分区各发 overwrite 时，锁保证"每次替换原子、清单
+/// 完整"（不会坏数据），但语义上是**静默 last-writer-wins**——先写者整批数据无声
+/// 消失。Delta/Iceberg 对同分区并发 overwrite 都是**冲突报错让调用方裁决**。
+/// 机制现成：`generation` 是分区提交计数器（`PartitionManifest::commit` 每次 +1），
+/// 比对放在**锁内**（读到旧 manifest 之后、写新段之前）才是真 CAS。
 pub(crate) fn overwrite_partition(
     store: &Store,
     staging: Option<&crate::staging::Staging>,
@@ -507,6 +516,7 @@ pub(crate) fn overwrite_partition(
     def: &TableDef,
     values: &[crate::types::Literal],
     batches: &[RecordBatch],
+    expected: Option<u64>,
 ) -> Result<WriteResult> {
     let schema = data_schema(def);
     let batches = pad_loose_batches(def, batches, &schema)?;
@@ -528,6 +538,7 @@ pub(crate) fn overwrite_partition(
             batches,
             &schema,
             &file_schema,
+            expected,
         );
         #[cfg(not(feature = "remote"))]
         {
@@ -539,6 +550,11 @@ pub(crate) fn overwrite_partition(
 
     // 旧 manifest（不存在 = 新分区）
     let old = PartitionManifest::read(store, &dir)?;
+
+    // ★ CAS 检查：**锁内、写段之前**——写段之后再拒会把新段留成孤儿
+    if let Some(exp) = expected {
+        check_expected_generation(&dir, old.as_ref(), exp)?;
+    }
 
     let mut result = WriteResult::default();
     let mut new_segments: Vec<SegmentEntry> = Vec::new();
@@ -661,6 +677,7 @@ fn append_partition_remote(
             file_schema,
             col_names,
             false,
+            None, // append 无 CAS（锁内 read-merge-write，天然合并语义）
         )?,
         None => put_segment_remote(
             store,
@@ -696,6 +713,7 @@ fn stage_segment(
     file_schema: &SchemaRef,
     col_names: Vec<String>,
     overwrite: bool,
+    expected_generation: Option<u64>,
 ) -> Result<SegmentEntry> {
     let seg_name = format!("seg_{}.parquet", uuid::Uuid::now_v7().simple());
     let rel = dir
@@ -709,6 +727,7 @@ fn stage_segment(
         partition_rel: rel,
         partition_values: values.to_vec(),
         overwrite,
+        expected_generation,
         entry: SegmentEntry {
             file_name: seg_name,
             row_count: 0,
@@ -755,12 +774,25 @@ pub(crate) fn occ_replace_entries(
     def: &TableDef,
     values: &[crate::types::Literal],
     entries: &[SegmentEntry],
+    expected: Option<u64>,
 ) -> Result<()> {
     let mpath = PartitionManifest::manifest_path(dir);
     crate::remote::with_partition_mutex(dir, || {
         crate::remote::occ_commit(store, &mpath, |cur| {
+            // CAS 在 **OCC 闭包内**校验：每次重试都拿最新 manifest，故并发写者
+            // 之间的窗口被 etag 条件写兜住（不是"先读后写"那种假 CAS）
+            if let Some(exp) = expected {
+                check_expected_generation(dir, cur.as_ref(), exp)?;
+            }
             let mut m = PartitionManifest::new(named_values(def, values), def.schema_fingerprint());
-            m.generation = cur.map_or(0, |c| c.generation);
+            // **generation += 1（与 append 及本地 `commit()` 同口径）**：
+            // 此前只写 `= cur.generation` 而不加一 —— 远端 overwrite **根本不推进
+            // generation**。后果有两个，都很难看：
+            //   ① F24 的 CAS 在远端形同虚设（覆盖后 generation 不变 → 过期写者检测不到）；
+            //   ② 生态侧以 generation 为增量判据（qsdb-sync 契约）→ **远端 overwrite
+            //      会被同步工具当成"没变"而漏掉**。
+            // 本地路径无此问题：那边走 `PartitionManifest::commit()`，它自带 +1。
+            m.generation = cur.as_ref().map_or(1, |c| c.generation + 1);
             m.segments = entries.to_vec();
             Ok(m)
         })
@@ -782,6 +814,7 @@ fn overwrite_partition_remote(
     batches: &[RecordBatch],
     schema: &SchemaRef,
     file_schema: &Option<SchemaRef>,
+    expected: Option<u64>,
 ) -> Result<WriteResult> {
     let col_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
     let mut result = WriteResult::default();
@@ -800,6 +833,7 @@ fn overwrite_partition_remote(
                 fs,
                 col_names,
                 true,
+                expected,
             )?,
             None => put_segment_remote(store, dir, batches, fs, writer_props(def)?, &col_names)?,
         };
@@ -811,9 +845,31 @@ fn overwrite_partition_remote(
         new_segments.push(entry);
     }
     if staging.is_none() {
-        occ_replace_entries(store, dir, def, values, &new_segments)?;
+        occ_replace_entries(store, dir, def, values, &new_segments, expected)?;
     }
+    // staging 路径：写盘即 ACK，提交在 `flush_staged` —— 期望值随暂存记录一起落盘，
+    // 由 flush 提交时校验（见 `StagedRecord::expected_generation`）
     Ok(result)
+}
+
+/// CAS 校验：分区当前 `generation` 必须等于期望值（不存在 = 0 —— 首次写入传 0 即合法）。
+fn check_expected_generation(
+    dir: &Path,
+    old: Option<&PartitionManifest>,
+    expected: u64,
+) -> Result<()> {
+    let actual = old.map_or(0, |m| m.generation);
+    if actual != expected {
+        return Err(QsdbError::WriteConflict {
+            partition: dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| dir.to_string_lossy().into_owned()),
+            expected,
+            actual,
+        });
+    }
+    Ok(())
 }
 
 fn named_values(
@@ -941,6 +997,7 @@ mod tests {
             &d,
             &vals,
             &[data_batch(vec![Some(7), Some(8)])],
+            None,
         )
         .unwrap();
         let m = PartitionManifest::read(&store, &pdir).unwrap().unwrap();
@@ -950,7 +1007,7 @@ mod tests {
         // 延迟回收语义：旧文件留原地（不被 manifest 引用 = 孤儿），
         // GC 安全期后清理——不再立即进 trash（保护在途扫描）
         // 空 overwrite = 清空分区
-        overwrite_partition(&store, None, &tdir, &d, &vals, &[]).unwrap();
+        overwrite_partition(&store, None, &tdir, &d, &vals, &[], None).unwrap();
         let m = PartitionManifest::read(&store, &pdir).unwrap().unwrap();
         assert_eq!(m.total_rows(), 0);
         assert!(m.segments.is_empty());
