@@ -843,6 +843,11 @@ fn main() {
         .unwrap_or(3_000_000);
     let per: i64 = arg("--per").and_then(|v| v.parse().ok()).unwrap_or(65_536);
     let rounds: usize = arg("--rounds").and_then(|v| v.parse().ok()).unwrap_or(3);
+    // 每用例耗时上限（秒）：超过即判 FAIL。**默认 10s**——"明显不对劲"的阈值，
+    // 免得每次都要人肉看数字（口径：同一台机上 DuckDB 同级操作 ≈ 1-3s）。
+    let max_secs: f64 = arg("--max-seconds")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10.0);
     std::fs::create_dir_all(&dir).expect("mkdir");
 
     if has("--list") {
@@ -922,7 +927,8 @@ fn main() {
     let out_dir = dir.join("results");
     std::fs::create_dir_all(&out_dir).unwrap();
     let tag = arg("--tag").unwrap_or_else(|| "qsdb".into());
-    let mut lines = vec!["case,group,median_s,spread_pct,produced,rss_kb".to_string()];
+    let mut lines = vec!["case,group,median_s,spread_pct,produced,rss_kb,verdict".to_string()];
+    let mut failures: Vec<String> = Vec::new();
     println!(
         "{:<20} {:<6} {:>10} {:>8} {:>12} {:>10}",
         "用例", "分组", "中位(s)", "离散", "产出", "峰值RSS(MB)"
@@ -964,12 +970,16 @@ fn main() {
         let spread: f64 = get("spread").trim_end_matches('%').parse().unwrap_or(0.0);
         let produced: u64 = get("produced").parse().unwrap_or(0);
         let rss: u64 = get("rss_kb").parse().unwrap_or(0);
+        let verdict = if med <= max_secs { "PASS" } else { "FAIL" };
         println!(
-            "{name:<20} {group:<6} {med:>10.4} {spread:>7.1}% {produced:>12} {:>10.1}",
+            "{name:<20} {group:<6} {med:>10.4} {spread:>7.1}% {produced:>12} {:>10.1}  {verdict}",
             rss as f64 / 1024.0
         );
+        if med > max_secs {
+            failures.push(format!("{name}({med:.2}s)"));
+        }
         lines.push(format!(
-            "{name},{group},{med:.4},{spread:.1},{produced},{rss}"
+            "{name},{group},{med:.4},{spread:.1},{produced},{rss},{verdict}"
         ));
     }
     let f = out_dir.join(format!("{tag}-results.csv"));
