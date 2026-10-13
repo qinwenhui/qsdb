@@ -933,7 +933,7 @@ fn main() {
                     peak_rss_kb() as f64 / 1024.0
                 );
             }
-            Ok(qsdb::sql::SqlResult::Ok { message }) => println!(
+            Ok(qsdb::sql::SqlResult::Ok { message, .. }) => println!(
                 "SQL ok: {:.3}s [{}] rss_mb={:.1}",
                 t0.elapsed().as_secs_f64(),
                 message,
