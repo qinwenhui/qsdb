@@ -140,6 +140,15 @@ curl -X POST 'http://host:9430/api/v1/query' -H 'Content-Type: application/json'
 | 可流式（内存恒定） | 否（整批） | 否（整批） | **是（逐块）** | 是 |
 | 嵌套类型 | 支持 | 暂不支持（显式拒绝） | 暂不支持（显式拒绝） | 不支持 |
 
-内核侧的权威实现：`crates/qsdb/src/rows.rs`（`encode` / `decode` / `decode_with_schema`），
-HTTP 契约测试在 `crates/qsdb-cli/tests/http_contract.rs`（`rows_channel_both_directions`
-的写侧 body 是**照本文手写**的，不调用内核 `encode`）。
+## 六、互操作已验证（2026-10-13）
+
+三份**互相独立**的实现已按本文对死：
+
+| 实现 | 语言 | 验证方式 |
+|---|---|---|
+| 内核编码器/解码器 | Rust | 单测（全类型往返 + 截断/坏 tag 显式报错） |
+| 内核 HTTP 写侧契约测试 | Rust | body **照本文手写**（不调用内核 `encode`），喂真 server |
+| **qsdb-jdbc 的 `QsdbBulkWriter`** | Java | `RowsEncoderTest` 用 §三.3 的 85 字节向量**逐字节**锁定；`BulkChannelIntegrationTest`（对真 server）**6/6 绿**：全类型往返（含 DECIMAL/BINARY/TIMESTAMP 与 NULL）、分块跨多次请求、并发装载、空写 no-op、缺表与类型不符的清晰报错 |
+
+内核侧的权威实现：`crates/qsdb/src/rows.rs`（`encode` / `encode_values` / `decode` /
+`decode_with_schema`），HTTP 契约测试在 `crates/qsdb-cli/tests/http_contract.rs`。
