@@ -11,6 +11,11 @@ repository.workspace = true
 name = "qsdb-bench"
 path = "src/main.rs"
 
+# 综合基准套件（导入四路 / 导出 / 分析 SQL / 峰值 RSS / DuckDB 对照）
+[[bin]]
+name = "bench_suite"
+path = "src/bin/bench_suite.rs"
+
 [dependencies]
 qsdb = { workspace = true }
 arrow = { workspace = true }
