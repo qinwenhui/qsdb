@@ -314,68 +314,22 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
         }
         translate::ParsedStatement::Insert {
             table,
-            rows,
+            source,
             column_order,
             overwrite,
         } => {
             let def = db.table_def(&table)?;
-            let rows = reorder_rows(&def, rows, column_order)?;
-            if overwrite {
-                // INSERT OVERWRITE：按分区列值在行层面分桶，逐分区原子替换
-                // （overwrite_partition 的契约是全列批，内部自行剥离分区列）
-                let pidx: Vec<usize> = def
-                    .partition_keys
-                    .iter()
-                    .map(|k| def.columns.iter().position(|c| &c.name == k).unwrap())
-                    .collect();
-                let mut buckets: Vec<(Vec<Literal>, Vec<Vec<Literal>>)> = Vec::new();
-                for row in rows {
-                    let key: Vec<Literal> = pidx
-                        .iter()
-                        .map(|&p| {
-                            let lit = &row[p];
-                            let col = &def.columns[p];
-                            if lit.is_null() {
-                                return Err(QsdbError::invalid("partition value cannot be NULL"));
-                            }
-                            if lit.logical_type().as_ref() == Some(&col.logical_type) {
-                                Ok(lit.clone())
-                            } else {
-                                cast_literal(lit, &col.logical_type)
-                            }
-                        })
-                        .collect::<Result<_>>()?;
-                    match buckets.iter_mut().find(|(k, _)| {
-                        k.iter().zip(key.iter()).all(|(a, b)| {
-                            matches!(
-                                a.partial_cmp_literal(b),
-                                Ok(Some(std::cmp::Ordering::Equal))
-                            )
-                        })
-                    }) {
-                        Some((_, rows)) => rows.push(row),
-                        None => buckets.push((key, vec![row])),
-                    }
+            match source {
+                translate::InsertSource::Values(rows) => {
+                    // VALUES 源：列清单必须覆盖全部表列（既有契约）
+                    let perm = insert_column_perm(&def, column_order.as_deref(), true)?;
+                    insert_values(db, &table, &def, &perm, rows, overwrite, ctx)
                 }
-                let mut total = 0u64;
-                for (vals, sub_rows) in buckets {
-                    let mut names: Vec<(&str, Literal)> = Vec::new();
-                    for (k, v) in def.partition_keys.iter().zip(vals.iter()) {
-                        names.push((k.as_str(), v.clone()));
-                    }
-                    let batch = build_insert_batch(&def, &sub_rows)?;
-                    let r = db.overwrite_partition(&table, &names, &[batch])?;
-                    total += r.rows;
+                translate::InsertSource::Select(q) => {
+                    // SELECT 源：允许只给部分列（未列出的列补 NULL）
+                    let perm = insert_column_perm(&def, column_order.as_deref(), false)?;
+                    insert_select(db, &table, &def, &perm, *q, overwrite, ctx)
                 }
-                Ok(SqlResult::Ok {
-                    message: format!("{total} rows overwritten"),
-                })
-            } else {
-                let batch = build_insert_batch(&def, &rows)?;
-                let r: WriteResult = db.append(&table, &[batch])?;
-                Ok(SqlResult::Ok {
-                    message: format!("{} rows inserted", r.rows),
-                })
             }
         }
         translate::ParsedStatement::Delete { table, selection } => {
@@ -421,30 +375,8 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
                 views: crate::views::ViewStore::read_all(db.store())?,
             };
             let (plan, cte_defs) = translate::translate_select_full_with_ctes(*q, &resolver)?;
-            // CTE 物化：按定义序执行每个 CTE 子计划 → 批缓存（cte_id → Vec<RecordBatch>）。
-            // 增量装入：链式 CTE（引用先定义者）物化时缓存已可读。
-            //
-            // 两处硬伤（2026-10-13 修）：
-            // ① 子计划此前用 `QueryContext::benign()` 执行——**内存闸/超时/取消
-            //    三条隔离全绕过**；现用外层真 ctx。
-            // ② 物化批此前只在"下一条 WITH 查询开始时"才被替换 → **跨查询驻留**
-            //    在这条线程上（注释自称"无跨查询泄漏"并不成立）。现由 `CteScope`
-            //    在查询结束（含提前 return / panic 展开）时清空并归还预留。
             let _cte_scope = exec_builder::CteScope::new();
-            for cte in &cte_defs {
-                if cte.cte_id == u32::MAX {
-                    continue; // 防御：translate 已过滤 dead CTE
-                }
-                let mut exec = exec_builder::build(db, &cte.plan, ctx)?;
-                let mut batches = Vec::new();
-                let mut res = ctx.try_reserve(0)?;
-                while let Some(b) = exec.next() {
-                    let b = b?;
-                    res.grow(b.get_array_memory_size() as u64)?;
-                    batches.push(b);
-                }
-                exec_builder::add_cte_batches(cte.cte_id, batches, res);
-            }
+            materialize_ctes(db, &cte_defs, ctx)?;
             ctx.check()?;
             // M4-4 元数据短路：count(*) + 纯分区列谓词 → manifest O(1) 应答
             if let Some(n) = metadata_shortcut_count(db, &plan)? {
@@ -476,6 +408,41 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
             Ok(SqlResult::Query { schema, batches })
         }
     }
+}
+
+/// CTE 物化：按定义序执行每个 CTE 子计划 → 批缓存（cte_id → Vec<RecordBatch>）。
+/// 增量装入：链式 CTE（引用先定义者）物化时缓存已可读。
+///
+/// 两处硬伤（2026-10-13 修）：
+/// ① 子计划此前用 `QueryContext::benign()` 执行——**内存闸/超时/取消
+///    三条隔离全绕过**；现用外层真 ctx。
+/// ② 物化批此前只在"下一条 WITH 查询开始时"才被替换 → **跨查询驻留**
+///    在这条线程上（注释自称"无跨查询泄漏"并不成立）。现由 `CteScope`
+///    在查询结束（含提前 return / panic 展开）时清空并归还预留。
+///
+/// SELECT 与 `INSERT … SELECT` 共用——两条路的 CTE 语义必须一致，否则
+/// `INSERT INTO t WITH x AS (…) SELECT …` 会与查询版走不同实现。
+/// 调用方负责持住 `CteScope`（物化批活到查询结束）。
+fn materialize_ctes(
+    db: &Qsdb,
+    cte_defs: &[translate::CteDef],
+    ctx: &Arc<crate::query::QueryContext>,
+) -> Result<()> {
+    for cte in cte_defs {
+        if cte.cte_id == u32::MAX {
+            continue; // 防御：translate 已过滤 dead CTE
+        }
+        let mut exec = exec_builder::build(db, &cte.plan, ctx)?;
+        let mut batches = Vec::new();
+        let mut res = ctx.try_reserve(0)?;
+        while let Some(b) = exec.next() {
+            let b = b?;
+            res.grow(b.get_array_memory_size() as u64)?;
+            batches.push(b);
+        }
+        exec_builder::add_cte_batches(cte.cte_id, batches, res);
+    }
+    Ok(())
 }
 
 /// 检测可元数据应答的形态：Project? → Aggregate(count(*), 无 group) → Scan(predicate 仅分区列)。
@@ -529,7 +496,94 @@ fn metadata_shortcut_count(
     db.scan_metadata_count(&def.name, predicate.as_ref())
 }
 
-/// INSERT 行 → RecordBatch（按表列序 cast）。
+// ---------------------------------------------------------------------------
+// INSERT（VALUES / SELECT 两条源，共用列映射与写入端）
+// ---------------------------------------------------------------------------
+
+/// 目标列映射：源第 `i` 列 → 表第 `perm[i]` 列。
+///
+/// `column_order` 是**位置语义**（标准 SQL：INSERT…VALUES 与 INSERT…SELECT 都按
+/// 位置对齐列清单，不按名匹配），所以这里只把列名翻译成表列下标。
+///
+/// `require_full`：列清单是否必须覆盖全部表列——
+/// - VALUES 源传 `true`：SQL-0 起的既有契约（`INSERT INTO events (dt, tenant)
+///   VALUES …` 必须报错，而不是补 NULL 写进半行），已被 e2e 测试锁定；
+/// - SELECT 源传 `false`：导入场景常只给部分列（缺的列补 NULL，真正的
+///   NOT NULL/CHECK 判定是写入端的事，见 `write::check_constraints`）。
+fn insert_column_perm(
+    def: &crate::catalog::TableDef,
+    column_order: Option<&[String]>,
+    require_full: bool,
+) -> Result<Vec<usize>> {
+    let Some(order) = column_order else {
+        return Ok((0..def.columns.len()).collect());
+    };
+    if require_full && order.len() != def.columns.len() {
+        return Err(QsdbError::invalid(format!(
+            "INSERT column list has {} entries, table {} has {}",
+            order.len(),
+            def.name,
+            def.columns.len()
+        )));
+    }
+    let perm: Vec<usize> = order
+        .iter()
+        .map(|n| {
+            def.columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(n))
+                .ok_or_else(|| QsdbError::column_not_found(format!("column '{n}'")))
+        })
+        .collect::<Result<_>>()?;
+    let mut seen = vec![false; def.columns.len()];
+    for &p in &perm {
+        if seen[p] {
+            return Err(QsdbError::invalid("duplicate column in INSERT list"));
+        }
+        seen[p] = true;
+    }
+    Ok(perm)
+}
+
+/// `perm` 的逆映射：表第 j 列取自源第 `src_of[j]` 列（`usize::MAX` = 未提供 → NULL）。
+fn invert_perm(perm: &[usize], width: usize) -> Vec<usize> {
+    let mut src_of = vec![usize::MAX; width];
+    for (i, &p) in perm.iter().enumerate() {
+        src_of[p] = i;
+    }
+    src_of
+}
+
+/// VALUES 行集 → 表列序（列清单未覆盖的列补 NULL——VALUES 源要求列清单覆盖
+/// 全表，故实际不会有这种列；SELECT 源的部分列由 `align_insert_batch` 同样处理）。
+/// 恒等映射（无列清单）直接返回原行集，不做拷贝。
+fn reorder_rows(
+    def: &crate::catalog::TableDef,
+    rows: Vec<Vec<Literal>>,
+    perm: &[usize],
+) -> Vec<Vec<Literal>> {
+    if perm.iter().enumerate().all(|(i, &p)| i == p) {
+        return rows;
+    }
+    let src_of = invert_perm(perm, def.columns.len());
+    rows.into_iter()
+        .map(|row| {
+            src_of
+                .iter()
+                .map(|&s| {
+                    if s == usize::MAX || s >= row.len() {
+                        Literal::Null
+                    } else {
+                        row[s].clone()
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// VALUES 行 → RecordBatch（按表列序 cast）。行宽已由调用方按列清单校验，
+/// 这里再判一次是廉价防线（宽度不符时下面的列取用会错位）。
 fn build_insert_batch(
     def: &crate::catalog::TableDef,
     rows: &[Vec<Literal>],
@@ -581,53 +635,365 @@ fn build_insert_batch(
     .map_err(|e| QsdbError::invalid(format!("insert batch: {e}")))
 }
 
-/// INSERT 列序重排/校验：Some(order) 必须覆盖全部列（可乱序）。
-fn reorder_rows(
+/// SELECT 结果批 → 表列序全宽批：按 `perm` 重排列 + cast 到目标列类型 +
+/// 未列出的列补 NULL。
+///
+/// 类型校验走**同一张** `cast_rule` 矩阵（VALUES 路径的 `cast_literal` 也用它）：
+/// `Impossible` 在这里就报错（如 BOOLEAN → BIGINT），其余交给 arrow 的数组 cast
+/// 执行——窄化溢出、字符串转数字失败等运行时问题由 arrow 报错，语义与逐值
+/// cast 一致（不会静默截断）。
+fn align_insert_batch(
     def: &crate::catalog::TableDef,
-    rows: Vec<Vec<Literal>>,
-    column_order: Option<Vec<String>>,
-) -> Result<Vec<Vec<Literal>>> {
-    let Some(order) = column_order else {
-        return Ok(rows);
-    };
-    if order.len() != def.columns.len() {
+    perm: &[usize],
+    batch: &RecordBatch,
+) -> Result<RecordBatch> {
+    if batch.num_columns() != perm.len() {
         return Err(QsdbError::invalid(format!(
-            "INSERT column list has {} entries, table has {}",
-            order.len(),
-            def.columns.len()
+            "INSERT ... SELECT produces {} columns, target column list has {}",
+            batch.num_columns(),
+            perm.len()
         )));
     }
-    let perm: Vec<usize> = order
+    let n = batch.num_rows();
+    let src_of = invert_perm(perm, def.columns.len());
+    let mut fields: Vec<arrow::datatypes::FieldRef> = Vec::with_capacity(def.columns.len());
+    let mut cols: Vec<arrow::array::ArrayRef> = Vec::with_capacity(def.columns.len());
+    for (j, col) in def.columns.iter().enumerate() {
+        let want = col.logical_type.arrow_type();
+        fields.push(Arc::new(arrow::datatypes::Field::new(
+            &col.name,
+            want.clone(),
+            true,
+        )));
+        let s = src_of[j];
+        if s == usize::MAX {
+            cols.push(arrow::array::new_null_array(&want, n));
+            continue;
+        }
+        let src = batch.column(s);
+        if src.data_type() == &want {
+            cols.push(Arc::clone(src)); // 同类型（含 DECIMAL 元数据一致）零拷贝
+            continue;
+        }
+        check_insert_cast(src.data_type(), &col.logical_type, &col.name)?;
+        let casted = arrow::compute::cast(src.as_ref(), &want).map_err(|e| {
+            QsdbError::type_err(format!(
+                "INSERT column '{}': cast {:#?} → {} failed: {e}",
+                col.name,
+                src.data_type(),
+                col.logical_type
+            ))
+        })?;
+        // arrow 的 cast 默认 safe=true：转换不了的值（'abc' → BIGINT、溢出……）
+        // **静默变 NULL**。对 INSERT 而言那是静默写脏数据——宁可报错。
+        // 源本来就 NULL 的行不在此列（null 数不变即合法）。
+        if casted.null_count() > src.null_count() {
+            return Err(QsdbError::type_err(format!(
+                "INSERT column '{}': {} 个非 NULL 值无法转换为 {}（源类型 {:#?}）",
+                col.name,
+                casted.null_count() - src.null_count(),
+                col.logical_type,
+                src.data_type()
+            )));
+        }
+        cols.push(casted);
+    }
+    RecordBatch::try_new_with_options(
+        Arc::new(arrow::datatypes::Schema::new(fields)),
+        cols,
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(n)),
+    )
+    .map_err(|e| QsdbError::invalid(format!("INSERT ... SELECT batch: {e}")))
+}
+
+/// 数组 cast 的类型规则检查（与 `cast_literal` 同源）。
+/// arrow 层没有对应 QSDB 逻辑类型的表示（Utf8View / LargeUtf8 / Date64…）时
+/// 放行给 arrow 尝试——它们不是 QSDB 类型系统的成员，规则矩阵无话可说。
+fn check_insert_cast(from: &arrow::datatypes::DataType, to: &LogicalType, col: &str) -> Result<()> {
+    let Ok(from_lt) = LogicalType::try_from_arrow(from) else {
+        return Ok(());
+    };
+    if crate::types::cast::cast_rule(&from_lt, to) == crate::types::cast::CastRule::Impossible {
+        return Err(QsdbError::type_err(format!(
+            "INSERT column '{col}': cannot cast {from_lt} to {to}"
+        )));
+    }
+    Ok(())
+}
+
+/// APPEND 攒批阈值（批数 / 字节）。
+///
+/// 与 `write_buffer` 同一动机：逐批 `db.append` 会一批一个 segment，万级小批下
+/// manifest/索引重写放大到 O(n²)。阈值取 write_buffer 默认档的 1/4——这里是
+/// 单次导入的临时缓冲，没必要按常驻写缓冲的预算驻留。
+const INSERT_FLUSH_BATCHES: usize = 16;
+const INSERT_FLUSH_BYTES: u64 = 32 * 1024 * 1024;
+
+/// INSERT 写入端（两条源共用）。
+///
+/// - APPEND：攒够阈值即 `db.append`（自动分区路由），**流式**不物化全量；
+/// - OVERWRITE：按分区值聚齐后逐分区 `overwrite_partition`（整分区原子替换）。
+///
+/// OVERWRITE 为什么必须先聚齐：替换语义要求"整分区一次提交"，而 SELECT 源的
+/// 同一分区可能跨多批出现（甚至跨文件），不聚齐就会互相覆盖成"最后一批赢"。
+/// 代价是该路径把数据留在内存——与 VALUES 路径同口径（那条路本来就全量在
+/// 内存）；大数据集导入走 APPEND，或先落表再 `DELETE` + 插入。
+struct InsertSink<'a> {
+    db: &'a Qsdb,
+    table: &'a str,
+    def: &'a crate::catalog::TableDef,
+    perm: &'a [usize],
+    overwrite: bool,
+    /// 缓冲批的内存预留（引擎内存闸/配额对这条路径同样生效）
+    res: crate::memory::Reservation,
+    pending: Vec<RecordBatch>,
+    pending_bytes: u64,
+    /// OVERWRITE：分区值 → 该分区全宽批
+    buckets: Vec<(Vec<Literal>, Vec<RecordBatch>)>,
+    total: u64,
+}
+
+impl<'a> InsertSink<'a> {
+    fn new(
+        db: &'a Qsdb,
+        table: &'a str,
+        def: &'a crate::catalog::TableDef,
+        perm: &'a [usize],
+        overwrite: bool,
+        ctx: &Arc<crate::query::QueryContext>,
+    ) -> Result<Self> {
+        Ok(Self {
+            db,
+            table,
+            def,
+            perm,
+            overwrite,
+            res: ctx.try_reserve(0)?,
+            pending: Vec::new(),
+            pending_bytes: 0,
+            buckets: Vec::new(),
+            total: 0,
+        })
+    }
+
+    /// 推入一批**源列序**的批（SELECT 结果），内部先按 `perm` 对齐到表列序。
+    fn push(&mut self, batch: &RecordBatch) -> Result<()> {
+        let aligned = align_insert_batch(self.def, self.perm, batch)?;
+        self.push_aligned(aligned)
+    }
+
+    /// 推入一批**已对齐到表列序、且类型已就位**的批。
+    ///
+    /// VALUES 路径走这里而不是 `push`：`build_insert_batch` 产出的是表列序批，
+    /// 再经一次"源列序 → 表列序"的对齐就会被按列清单语义**再排一次**（列序错乱
+    /// 后 cast 才报错，报的还是"无法转换"这种二手信息）。
+    fn push_aligned(&mut self, aligned: RecordBatch) -> Result<()> {
+        if aligned.num_rows() == 0 {
+            return Ok(());
+        }
+        let bytes = aligned.get_array_memory_size() as u64;
+        self.res.grow(bytes)?;
+        if self.overwrite {
+            for (vals, mask) in partition_row_masks(self.def, &aligned)? {
+                let sub = arrow::compute::filter_record_batch(&aligned, &mask)
+                    .map_err(|e| QsdbError::invalid(format!("INSERT 分区切分失败: {e}")))?;
+                match self
+                    .buckets
+                    .iter_mut()
+                    .find(|(v, _)| same_partition(v, &vals))
+                {
+                    Some((_, list)) => list.push(sub),
+                    None => self.buckets.push((vals, vec![sub])),
+                }
+            }
+        } else {
+            self.pending.push(aligned);
+            self.pending_bytes += bytes;
+            if self.pending.len() >= INSERT_FLUSH_BATCHES
+                || self.pending_bytes >= INSERT_FLUSH_BYTES
+            {
+                self.flush_pending()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_pending(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let r: WriteResult = self.db.append(self.table, &self.pending)?;
+        self.total += r.rows;
+        self.pending.clear();
+        self.res.shrink(self.pending_bytes);
+        self.pending_bytes = 0;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<u64> {
+        if self.overwrite {
+            let (db, table, def) = (self.db, self.table, self.def);
+            for (vals, batches) in std::mem::take(&mut self.buckets) {
+                let names: Vec<(&str, Literal)> = def
+                    .partition_keys
+                    .iter()
+                    .zip(vals.iter())
+                    .map(|(k, v)| (k.as_str(), v.clone()))
+                    .collect();
+                let r = db.overwrite_partition(table, &names, &batches)?;
+                self.total += r.rows;
+            }
+        } else {
+            self.flush_pending()?;
+        }
+        Ok(self.total)
+    }
+}
+
+/// 分区值序列等价（比较用写入端同一套规范化：`partition_value_string`）。
+fn same_partition(a: &[Literal], b: &[Literal]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|(x, y)| {
+            crate::partition::partition_value_string(x)
+                == crate::partition::partition_value_string(y)
+        })
+}
+
+/// 批 → (分区值, 行掩码)。OVERWRITE 要的是"每个分区的行子集"，
+/// 而 `partition::split_by_partition` 返回的是**剥掉分区列**的批（replace 原语
+/// 要全宽批，内部自己剥）——所以这里只借它的取值原语（value_at /
+/// partition_value_string 保证与写入端的划分口径一致），子集由 arrow 的
+/// `filter_record_batch` 切。
+fn partition_row_masks(
+    def: &crate::catalog::TableDef,
+    batch: &RecordBatch,
+) -> Result<Vec<(Vec<Literal>, arrow::array::BooleanArray)>> {
+    if def.partition_keys.is_empty() {
+        // 无分区键：整批一个"桶"（与 split_by_partition 的空键组对应）
+        return Ok(vec![(
+            Vec::new(),
+            arrow::array::BooleanArray::from(vec![true; batch.num_rows()]),
+        )]);
+    }
+    let pidx: Vec<usize> = def
+        .partition_keys
         .iter()
-        .map(|n| {
-            def.columns
-                .iter()
-                .position(|c| c.name.eq_ignore_ascii_case(n))
-                .ok_or_else(|| QsdbError::column_not_found(format!("column '{n}'")))
+        .map(|k| {
+            batch
+                .schema()
+                .index_of(k)
+                .map_err(|_| QsdbError::invalid(format!("batch lacks partition column '{k}'")))
         })
         .collect::<Result<_>>()?;
-    let mut seen = vec![false; def.columns.len()];
-    for &p in &perm {
-        if seen[p] {
-            return Err(QsdbError::invalid("duplicate column in INSERT list"));
-        }
-        seen[p] = true;
-    }
-    if !seen.iter().all(|&x| x) {
-        return Err(QsdbError::invalid(
-            "INSERT column list must cover all table columns",
-        ));
-    }
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            let mut out = vec![Literal::Null; def.columns.len()];
-            for (i, &p) in perm.iter().enumerate() {
-                out[p] = row[i].clone();
+    let mut out: Vec<(Vec<Literal>, Vec<bool>)> = Vec::new();
+    let mut index: std::collections::HashMap<Vec<String>, usize> = std::collections::HashMap::new();
+    for row in 0..batch.num_rows() {
+        let vals: Vec<Literal> = pidx
+            .iter()
+            .map(|&c| crate::partition::value_at(batch.column(c).as_ref(), row))
+            .collect::<Result<_>>()?;
+        let key: Vec<String> = vals
+            .iter()
+            .map(crate::partition::partition_value_string)
+            .collect();
+        let id = match index.get(&key) {
+            Some(&id) => id,
+            None => {
+                let id = out.len();
+                out.push((vals, vec![false; batch.num_rows()]));
+                index.insert(key, id);
+                id
             }
-            out
-        })
+        };
+        out[id].1[row] = true;
+    }
+    Ok(out
+        .into_iter()
+        .map(|(v, m)| (v, arrow::array::BooleanArray::from(m)))
         .collect())
+}
+
+/// `INSERT [OVERWRITE] INTO t [(cols)] VALUES …`。
+fn insert_values(
+    db: &Qsdb,
+    table: &str,
+    def: &crate::catalog::TableDef,
+    perm: &[usize],
+    rows: Vec<Vec<Literal>>,
+    overwrite: bool,
+    ctx: &Arc<crate::query::QueryContext>,
+) -> Result<SqlResult> {
+    // 行宽按**列清单**宽度校验（不是表列数）：列清单是位置语义的基准
+    if let Some(w) = rows.first().map(Vec::len) {
+        if w != perm.len() {
+            return Err(QsdbError::invalid(format!(
+                "VALUES rows have {w} entries, INSERT column list has {}",
+                perm.len()
+            )));
+        }
+    }
+    let rows = reorder_rows(def, rows, perm);
+    let mut sink = InsertSink::new(db, table, def, perm, overwrite, ctx)?;
+    if !rows.is_empty() {
+        sink.push_aligned(build_insert_batch(def, &rows)?)?;
+    }
+    let total = sink.finish()?;
+    Ok(SqlResult::Ok {
+        message: if overwrite {
+            format!("{total} rows overwritten")
+        } else {
+            format!("{total} rows inserted")
+        },
+    })
+}
+
+/// `INSERT [OVERWRITE] INTO t [(cols)] SELECT …`：源走**同一条** SELECT 链路
+/// （translate → exec_builder::build），再逐批对齐写入。
+///
+/// 两条源的列映射/类型校验/约束/分区路由完全共用（`InsertSink`），差别只有
+/// "批从哪来"。反过来说：**不**为 INSERT 单独走一套"简化版"执行——那样
+/// CTE / 子查询 / 集合操作 / 窗口会一个个漏掉。
+///
+/// 已知边界：SELECT 返回 0 行时 OVERWRITE 是**无操作**（没有行 → 推不出要替换
+/// 哪个分区）；`INSERT OVERWRITE t SELECT … WHERE false` 不会清空目标分区。
+fn insert_select(
+    db: &Qsdb,
+    table: &str,
+    def: &crate::catalog::TableDef,
+    perm: &[usize],
+    q: sqlparser::ast::Query,
+    overwrite: bool,
+    ctx: &Arc<crate::query::QueryContext>,
+) -> Result<SqlResult> {
+    let resolver = translate::TableResolver {
+        resolve: Box::new(|name: &str| db.table_def(name)),
+        views: crate::views::ViewStore::read_all(db.store())?,
+    };
+    let (plan, cte_defs) = translate::translate_select_full_with_ctes(q, &resolver)?;
+    let _cte_scope = exec_builder::CteScope::new();
+    materialize_ctes(db, &cte_defs, ctx)?;
+    let mut exec = exec_builder::build(db, &plan, ctx)?;
+    // 列数在第一批之前就能判：报错比"写了一半才炸"干净
+    let src_width = exec.schema().fields().len();
+    if src_width != perm.len() {
+        return Err(QsdbError::invalid(format!(
+            "INSERT ... SELECT produces {src_width} columns, target column list has {}",
+            perm.len()
+        )));
+    }
+    let mut sink = InsertSink::new(db, table, def, perm, overwrite, ctx)?;
+    while let Some(b) = exec.next() {
+        ctx.check()?;
+        sink.push(&b?)?;
+    }
+    let total = sink.finish()?;
+    Ok(SqlResult::Ok {
+        message: if overwrite {
+            format!("{total} rows overwritten")
+        } else {
+            format!("{total} rows inserted")
+        },
+    })
 }
 
 /// ScanRequest 便捷构造（测试用）。

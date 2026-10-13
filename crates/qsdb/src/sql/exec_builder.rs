@@ -183,6 +183,8 @@ fn collect_plan_columns(plan: &LogicalPlan, out: &mut Vec<String>) {
             // INNER/LEFT 多表计划不走列裁剪下推（build 的 count_scans guard 兜底）
         }
         LogicalPlan::Values { .. } | LogicalPlan::Window { .. } | LogicalPlan::OneRow => {} // 内存/窗口源无需裁剪
+        // CSV 外表：叶节点且无谓词字段（谓词不下推进扫描，见 CsvScan 注释）
+        LogicalPlan::CsvScan { .. } => {}
         LogicalPlan::SetOp { left, right, .. } => {
             collect_plan_columns(left, out);
             collect_plan_columns(right, out);
@@ -244,9 +246,9 @@ fn has_window_node(plan: &LogicalPlan) -> bool {
 /// 计划根到叶的 Scan 表定义。
 fn plan_scan_def(plan: &LogicalPlan) -> Option<Arc<crate::catalog::TableDef>> {
     match plan {
-        LogicalPlan::Scan { def, .. } | LogicalPlan::ExternalScan { def, .. } => {
-            Some(Arc::clone(def))
-        }
+        LogicalPlan::Scan { def, .. }
+        | LogicalPlan::ExternalScan { def, .. }
+        | LogicalPlan::CsvScan { def, .. } => Some(Arc::clone(def)),
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Project { input, .. }
         | LogicalPlan::Aggregate { input, .. }
@@ -305,6 +307,12 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
             def: Arc::clone(def),
             files: Arc::clone(files),
             predicate: predicate.clone(),
+        },
+        // CSV 外表：同 ExternalScan——裁剪只重排上层表达式的列 idx，
+        // 扫描节点自身保持全表 def（schema 由 def 决定）
+        LogicalPlan::CsvScan { def, files } => LogicalPlan::CsvScan {
+            def: Arc::clone(def),
+            files: Arc::clone(files),
         },
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(rewrite_plan(input, mapping, all)),
@@ -504,6 +512,12 @@ fn build_inner(
             )?;
             Ok(crate::exec::par_scan::make_scan(scan, ctx))
         }
+        LogicalPlan::CsvScan { def, files } => Ok(Box::new(crate::csv::CsvScanExec::new(
+            Arc::clone(def),
+            files.as_ref().clone(),
+            scan_proj,
+            Arc::clone(ctx),
+        )?)),
         LogicalPlan::Filter { input, predicate } => Ok(Box::new(FilterExec::new(
             build_inner(db, input, scan_proj.clone(), ctx)?,
             predicate.clone(),

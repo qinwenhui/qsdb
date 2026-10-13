@@ -401,11 +401,15 @@ impl FileLoc {
 pub(crate) fn extract_hive_partitions(files: &[FileLoc]) -> Option<HashMap<String, Vec<Literal>>> {
     let mut hive: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new(); // (name, [(value, base)])
     for loc in files {
-        let p = match loc {
-            FileLoc::Local(p) => p,
+        // 统一成 owned：`Local`/`Managed` 是**借用**、`S3` 是 owned URL——两臂
+        // 类型不一致会让 **`feature s3` 直接编不过**（默认构建不含 S3 臂，故一直
+        // 没暴露；与 F23 的 hdfs 那条同类：加分支时没跑该 feature 组合）。
+        // 每文件一次 clone，代价可忽略。
+        let p: PathBuf = match loc {
+            FileLoc::Local(p) => p.clone(),
             #[cfg(feature = "s3")]
             FileLoc::S3(u) => PathBuf::from(u),
-            FileLoc::Managed(p) => p,
+            FileLoc::Managed(p) => p.clone(),
         };
         // 逐段找 k=v
         for anc in p.ancestors().skip(1) {
@@ -531,8 +535,10 @@ pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
     m(&p, &t)
 }
 
-/// 解析 read_parquet 路径模式 → 数据文件位置列表（glob 展开；无匹配报错）。
-pub(crate) fn resolve_file_locs(pattern: &str) -> Result<Vec<FileLoc>> {
+/// 解析外表路径模式 → 数据文件位置列表（glob 展开；无匹配报错）。
+/// `what` = 调用方函数名（错误文案前缀，如 `read_parquet`/`read_csv`）——
+/// 同一套定位逻辑被多个表函数复用，错误里必须点明是哪个函数。
+pub(crate) fn resolve_file_locs(pattern: &str, what: &str) -> Result<Vec<FileLoc>> {
     #[cfg(feature = "s3")]
     if pattern.starts_with("s3://") {
         return crate::remote::expand_s3_glob(pattern)
@@ -551,7 +557,7 @@ pub(crate) fn resolve_file_locs(pattern: &str) -> Result<Vec<FileLoc>> {
             return Ok(vec![FileLoc::Local(p)]);
         }
         return Err(QsdbError::file_not_found(format!(
-            "read_parquet: file not found: {norm}"
+            "{what}: file not found: {norm}"
         )));
     }
     // 常量前缀目录 → 递归枚举 → 相对路径 glob 匹配
@@ -564,7 +570,7 @@ pub(crate) fn resolve_file_locs(pattern: &str) -> Result<Vec<FileLoc>> {
     let base = PathBuf::from(&base_str);
     if !base.is_dir() {
         return Err(QsdbError::file_not_found(format!(
-            "read_parquet: directory not found: {base_str}"
+            "{what}: directory not found: {base_str}"
         )));
     }
     let mut all = Vec::new();
@@ -584,7 +590,7 @@ pub(crate) fn resolve_file_locs(pattern: &str) -> Result<Vec<FileLoc>> {
     out.sort_by_key(FileLoc::display_path);
     if out.is_empty() {
         return Err(QsdbError::file_not_found(format!(
-            "read_parquet: no file matches {norm}"
+            "{what}: no file matches {norm}"
         )));
     }
     Ok(out)

@@ -32,6 +32,14 @@ pub enum LogicalPlan {
         files: Arc<Vec<crate::scan::FileLoc>>,
         predicate: Option<Predicate>,
     },
+    /// 外表 CSV 扫描（read_csv）：文件列表 + 表头/类型在绑定期确定（推断一次，
+    /// 全批稳定）。刻意不做谓词下推——CSV 无 footer/RG 元数据，谓词留在
+    /// FilterExec（少一层"扫描内过滤"的特殊分支）；列裁剪由 exec_builder 的
+    /// 通用投影下推覆盖（见 `plan_scan_def`）。
+    CsvScan {
+        def: Arc<TableDef>,
+        files: Arc<Vec<crate::scan::FileLoc>>,
+    },
     Filter {
         input: Box<LogicalPlan>,
         predicate: PhysExpr,
@@ -108,6 +116,17 @@ pub enum UserAlterAction {
 /// INSERT VALUES 行集（每行按给定列序的字面量）
 pub type InsertRows = Vec<Vec<Literal>>;
 
+/// INSERT 的源：字面量行集（VALUES）或一条完整 SELECT（含 CTE/集合操作）。
+///
+/// 为什么把源做成 enum 而不是"两条语句"：解析期已能判别源形态
+/// （`SetExpr::Values` vs 其余），此后 VALUES 与 SELECT 除"取值"外
+/// 完全同路（列序映射 / 类型校验 / 约束 / 分区路由）——执行侧只需换
+/// 取批来源，见 `sql::insert_rows_into_batches` 与 `insert_select_into`。
+pub enum InsertSource {
+    Values(InsertRows),
+    Select(Box<sqlparser::ast::Query>),
+}
+
 pub enum ParsedStatement {
     CreateTable {
         def: TableDef,
@@ -134,7 +153,7 @@ pub enum ParsedStatement {
     },
     Insert {
         table: String,
-        rows: Vec<Vec<Literal>>,
+        source: InsertSource,
         /// Some(列名顺序) = INSERT INTO t (a, b, …)；None = 表全列序
         column_order: Option<Vec<String>>,
         overwrite: bool,
@@ -478,10 +497,10 @@ fn translate_statement(stmt: SqlStatement, raw: &str) -> Result<ParsedStatement>
                         .collect(),
                 )
             };
-            let (rows, _) = extract_insert_rows(ins.source)?;
+            let source = extract_insert_source(ins.source)?;
             Ok(ParsedStatement::Insert {
                 table,
-                rows,
+                source,
                 column_order,
                 overwrite: ins.overwrite,
             })
@@ -711,39 +730,41 @@ fn cast_target_to_logical(dt: &sqlparser::ast::DataType) -> Result<LogicalType> 
 }
 
 // ---------------------------------------------------------------------------
-// INSERT VALUES
+// INSERT 源（VALUES / SELECT）
 // ---------------------------------------------------------------------------
 
-fn extract_insert_rows(
-    query: Option<Box<sqlparser::ast::Query>>,
-) -> Result<(InsertRows, Option<Vec<String>>)> {
+/// INSERT 的源形态判别：`VALUES (…)` 走字面量路径；其余（SELECT / WITH … SELECT /
+/// 集合操作）整体交给既有 SELECT 链路。**不在这里展开 SELECT**——解析层只分类，
+/// 计划/执行层（`sql::mod`）才有 catalog 与执行器可用。
+fn extract_insert_source(query: Option<Box<sqlparser::ast::Query>>) -> Result<InsertSource> {
     let Some(query) = query else {
-        return Err(QsdbError::invalid("INSERT requires VALUES source"));
+        return Err(QsdbError::invalid(
+            "INSERT requires VALUES or SELECT source",
+        ));
     };
-    match *query.body {
-        SetExpr::Values(values) => {
-            let mut rows = Vec::with_capacity(values.rows.len());
-            let mut width = None;
-            for row in values.rows {
-                let mut lits = Vec::with_capacity(row.content.len());
-                for e in row.content {
-                    lits.push(constant_expr(&e)?);
-                }
-                match width {
-                    None => width = Some(lits.len()),
-                    Some(w) if w != lits.len() => {
-                        return Err(QsdbError::invalid("VALUES rows have different widths"));
-                    }
-                    Some(_) => {}
-                }
-                rows.push(lits);
-            }
-            Ok((rows, None))
-        }
-        other => Err(QsdbError::unsupported(format!(
-            "INSERT source {other:?} not supported (use VALUES)"
-        ))),
+    if !matches!(query.body.as_ref(), SetExpr::Values(_)) {
+        return Ok(InsertSource::Select(query));
     }
+    let SetExpr::Values(values) = *query.body else {
+        unreachable!("body 已由上面的 matches! 判定为 Values")
+    };
+    let mut rows = Vec::with_capacity(values.rows.len());
+    let mut width = None;
+    for row in values.rows {
+        let mut lits = Vec::with_capacity(row.content.len());
+        for e in row.content {
+            lits.push(constant_expr(&e)?);
+        }
+        match width {
+            None => width = Some(lits.len()),
+            Some(w) if w != lits.len() => {
+                return Err(QsdbError::invalid("VALUES rows have different widths"));
+            }
+            Some(_) => {}
+        }
+        rows.push(lits);
+    }
+    Ok(InsertSource::Values(rows))
 }
 
 /// 常量表达式 → Literal（INSERT/比较常量侧）。
@@ -930,7 +951,9 @@ fn next_cte_id() -> u32 {
 /// 计划输出列（名字 + 类型）——CTE 内联绑定的列序来源。
 pub fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<(String, LogicalType)>> {
     Ok(match plan {
-        LogicalPlan::Scan { def, .. } | LogicalPlan::ExternalScan { def, .. } => def
+        LogicalPlan::Scan { def, .. }
+        | LogicalPlan::ExternalScan { def, .. }
+        | LogicalPlan::CsvScan { def, .. } => def
             .columns
             .iter()
             .map(|c| (c.name.clone(), c.logical_type.clone()))
@@ -1068,35 +1091,47 @@ fn resolve_view(vsql: &str, resolver: &TableResolver) -> Result<(LogicalPlan, Sc
     Ok((plan, SchemaCtx { cols }))
 }
 
-/// 表函数（FROM 子句）：当前仅 `read_parquet('<路径/glob>')`。
-/// 返回（计划, 列上下文）；文件列表绑定期展开，schema 取首文件 footer。
+/// 表函数（FROM 子句）：`read_parquet('<路径/glob>')` / `read_csv('<路径/glob>')`。
+/// 返回（计划, 列上下文）；文件列表绑定期展开。
+///
+/// 两个函数刻意共用一个参数解析（都是「恰好一个字符串字面量」）与一个
+/// "建表定义" 骨架：差别只在扫描器（footer vs 逐行解析）与 schema 来源
+/// （文件元数据 vs 表头+类型推断）——**不做成 table function 注册表**，
+/// 因为差异点不可配置化（参数形态、schema 来源、执行器全不同）。
 fn resolve_table_function(
     name: &str,
     args: &[sqlparser::ast::FunctionArg],
 ) -> Result<(LogicalPlan, SchemaCtx)> {
-    if !name.eq_ignore_ascii_case("read_parquet") {
-        return Err(QsdbError::unsupported(format!(
-            "table function '{name}' not supported (read_parquet only)"
-        )));
+    let path = table_fn_path_arg(name, args)?;
+    match name.to_ascii_lowercase().as_str() {
+        "read_parquet" => resolve_read_parquet(&path),
+        "read_csv" => resolve_read_csv(&path),
+        _ => Err(QsdbError::unsupported(format!(
+            "table function '{name}' not supported (read_parquet / read_csv only)"
+        ))),
     }
+}
+
+/// 表函数唯一支持的参数形态：一个字符串字面量路径/glob。
+fn table_fn_path_arg(name: &str, args: &[sqlparser::ast::FunctionArg]) -> Result<String> {
     use sqlparser::ast::{Expr as E, FunctionArg, FunctionArgExpr};
-    let path = match args {
+    match args {
         [FunctionArg::Unnamed(FunctionArgExpr::Expr(E::Value(v)))] => match &v.value {
             sqlparser::ast::Value::SingleQuotedString(s)
-            | sqlparser::ast::Value::DoubleQuotedString(s) => s.clone(),
-            other => {
-                return Err(QsdbError::invalid(format!(
-                    "read_parquet path must be a string literal, got {other:?}"
-                )));
-            }
+            | sqlparser::ast::Value::DoubleQuotedString(s) => Ok(s.clone()),
+            other => Err(QsdbError::invalid(format!(
+                "{name} path must be a string literal, got {other:?}"
+            ))),
         },
-        other => {
-            return Err(QsdbError::invalid(format!(
-                "read_parquet takes exactly one string literal, got {other:?} args"
-            )));
-        }
-    };
-    let files = crate::scan::resolve_file_locs(&path)?;
+        other => Err(QsdbError::invalid(format!(
+            "{name} takes exactly one string literal, got {other:?} args"
+        ))),
+    }
+}
+
+/// `read_parquet`：schema 取首文件 footer（parquet 自带列名/类型）。
+fn resolve_read_parquet(path: &str) -> Result<(LogicalPlan, SchemaCtx)> {
+    let files = crate::scan::resolve_file_locs(path, "read_parquet")?;
     let Some(first) = files.first() else {
         return Err(QsdbError::file_not_found(format!("read_parquet: {path}")));
     };
@@ -1160,6 +1195,24 @@ fn resolve_table_function(
             def,
             files: Arc::new(files),
             predicate: None,
+        },
+        SchemaCtx { cols },
+    ))
+}
+
+/// `read_csv`：schema = 表头 + 前 N 行类型推断（推断一次，全批稳定）。
+/// 列裁剪复用 exec_builder 的通用投影下推；谓词不做扫描级下推（见 CsvScan 注释）。
+fn resolve_read_csv(path: &str) -> Result<(LogicalPlan, SchemaCtx)> {
+    let (files, def) = crate::csv::resolve_csv_table(path)?;
+    let cols: Vec<(String, LogicalType)> = def
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), c.logical_type.clone()))
+        .collect();
+    Ok((
+        LogicalPlan::CsvScan {
+            def,
+            files: Arc::new(files),
         },
         SchemaCtx { cols },
     ))
@@ -1664,7 +1717,10 @@ fn filter_reachable_ctes(defs: Vec<CteDef>, main: &LogicalPlan) -> Vec<CteDef> {
                 collect_refs(left, out);
                 collect_refs(right, out);
             }
-            LogicalPlan::Scan { .. } | LogicalPlan::ExternalScan { .. } | LogicalPlan::OneRow => {}
+            LogicalPlan::Scan { .. }
+            | LogicalPlan::ExternalScan { .. }
+            | LogicalPlan::CsvScan { .. }
+            | LogicalPlan::OneRow => {}
         }
     }
     let mut keep = std::collections::HashSet::new();

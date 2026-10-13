@@ -219,8 +219,10 @@ fn error_paths() {
         db.sql("SELECT * FROM read_parquet('Z:/no/such/file.parquet')")
             .is_err()
     );
-    // 未知表函数
+    // read_csv 已是合法表函数，但该文件不存在 → 仍是错误（错误路径归 read_csv 自己的用例）
     assert!(db.sql("SELECT * FROM read_csv('x.csv')").is_err());
+    // 未知表函数
+    assert!(db.sql("SELECT * FROM read_orc('x.orc')").is_err());
     // 非 parquet 文件（坏魔数）
     let bad = root.join("bad.parquet");
     std::fs::write(&bad, b"not a parquet file").unwrap();

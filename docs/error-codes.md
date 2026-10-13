@@ -86,7 +86,7 @@ retry, category, sqlState}` 全表——驱动冷启动即可自配置映射，�
 - **400 与 404 的分工**：**查询端点**的 SQL 语义错误（表/列不存在）→ **400**
   （`TABLE_NOT_FOUND`/`COLUMN_NOT_FOUND`），避免网关把 SQL 错判成路由错；
   **资源端点**的对象不存在 → **404**（`NOT_FOUND`），保住 HTTP 语义。
-  查询端点上的**其它**对象不存在（外表文件 `read_parquet('x')`、视图、函数名写错）
+  查询端点上的**其它**对象不存在（外表文件 `read_parquet('x')` / `read_csv('x')`、视图、函数名写错）
   → `INVALID_ARGUMENT`（400）——它们是"请求指向了不存在的东西"，不是"表/列不存在"，
   硬套 `TABLE_NOT_FOUND` 反而会让驱动报错报错地方。
   这条判定靠内核错误自带的**结构化类别**（`QsdbError::NotFoundKind`），

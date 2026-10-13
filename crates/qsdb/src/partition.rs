@@ -133,7 +133,11 @@ pub fn parse_partition_dir(dir: &Path, depth: usize) -> Result<Vec<(String, Stri
 // ---------------------------------------------------------------------------
 
 /// 从数组第 i 行取 Literal（NULL → Err：分区值不允许 NULL）。
-fn value_at(arr: &dyn Array, i: usize) -> Result<Literal> {
+///
+/// `pub(crate)`：INSERT…SELECT 的 OVERWRITE 路径要按分区值切批，
+/// 取值口径必须与写入端（`split_by_partition`）逐字一致——两处实现
+/// 漂移会表现为"桶里混着别的分区的行"，是很难查的静默错写。
+pub(crate) fn value_at(arr: &dyn Array, i: usize) -> Result<Literal> {
     if arr.is_null(i) {
         return Err(QsdbError::invalid("partition column value is NULL"));
     }

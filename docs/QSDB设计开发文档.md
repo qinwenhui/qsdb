@@ -363,7 +363,7 @@ trait PhysExpr: Send + Sync {
 
 | 级别 | 里程碑 | 语法范围 |
 |------|--------|---------|
-| SQL-0 | M2 | `CREATE/DROP TABLE`、`DESCRIBE`、`SHOW TABLES/PARTITIONS`、`SELECT … FROM … WHERE … LIMIT`（投影/过滤/字面量/比较/逻辑）、`INSERT INTO … VALUES`（小批量） |
+| SQL-0 | M2 | `CREATE/DROP TABLE`、`DESCRIBE`、`SHOW TABLES/PARTITIONS`、`SELECT … FROM … WHERE … LIMIT`（投影/过滤/字面量/比较/逻辑）、`INSERT INTO … VALUES`（小批量）；2026-10-13 起 `INSERT INTO … SELECT …`（源可为任意 SELECT） |
 | SQL-1 | M2 末–M3 | `GROUP BY` + count/sum/avg/min/max、`ORDER BY`、`DISTINCT`、隐式/显式 cast、标量函数 v1 集 |
 | SQL-2 | M4 | `INNER/LEFT JOIN`（等值 hash join）、`IN`/`EXISTS`（相关子查询受限形态）、`HAVING` |
 | SQL-3 | M5+ | 嵌套子查询、CTE、窗口函数、UDF/UDAF 注册、完整优化器规则集 |
@@ -735,6 +735,38 @@ M6-4 staging 写 → M6-5 HDFS → M6-6 可选租约；每阶段独立 gate。
   宽表冷读）仍是 filter 1.6-1.8x / agg 5.3-6.7x / group by 2.4-3.0x
   反超——本形态差距在扫描底座（2 列窄形态缓存聚合 0.04x），非 semi 本身。
 - 191 默认 / 204 s3 / 208 hdfs / 207 s3+hdfs 全绿；clippy 0；24.64MB。
+
+### 导入能力两条查询面原语：INSERT … SELECT + read_csv（2026-10-13）✅
+- **`INSERT INTO t [(cols)] SELECT …`**：源从"仅字面量列表"扩到**整条 SELECT**
+  （含 CTE / 子查询 / 集合操作 / 窗口——不是简化版 SELECT，走
+  `translate_select_full_with_ctes` + `exec_builder::build` 同一条链路）。
+  两条源（VALUES / SELECT）共用一份列映射、类型校验、约束与分区路由：
+  `insert_column_perm`（列名 → 表列下标）+ `InsertSink`（APPEND 攒批 /
+  OVERWRITE 按分区聚齐）。**真正的价值**：`INSERT INTO t SELECT * FROM
+  read_parquet('…')` 此前直接报 not supported——「从数据湖灌进管理表」这条
+  最省事的路现在通了（生态导入工具的前置）。
+- 列清单是**位置语义**（标准 SQL：源第 i 列 → 清单第 i 个名字）。VALUES 源
+  保持既有契约（清单必须覆盖全部表列，已有测试锁定）；SELECT 源允许部分列
+  （未列出的列补 NULL，NOT NULL/CHECK 由写入端拦）。
+- 类型校验**复用 `cast_rule` 矩阵**（与 VALUES 的 `cast_literal` 同一张表）：
+  `Impossible`（如 BOOLEAN → BIGINT）在 cast 前就拒；其余走 arrow 数组 cast，
+  并额外守一条——**cast 不得把非 NULL 变成 NULL**（arrow 的 safe=true 会把
+  转不了的值静默变 NULL，对 INSERT 而言那是静默写脏数据）。
+- 流式：APPEND 每 16 批 / 32MB 落盘一次（避免万级小批的 manifest O(n²) 写
+  放大），不物化全量；OVERWRITE 必须按分区聚齐（整分区一次提交的契约），
+  与 VALUES 路径同口径——大数据集导入用 APPEND。
+- **`read_csv('路径/glob')` 外表**：自研 RFC4180 子集（引号包裹字段内的
+  分隔符/换行/`""` 转义、CRLF/LF、BOM、空字段 → NULL），零新依赖。首行表头
+  + 前 1000 行类型推断（int64/float64/boolean/utf8，拿不准回落 utf8），
+  推断结果**绑定期定死**（全批稳定）；每个文件各自的表头各自跳过。
+  实现 = 新 `LogicalPlan::CsvScan` + `csv::CsvScanExec`（流式 8192 行/批），
+  **不动 parquet 扫描热路径**。
+- 刻意不做（写在 `src/csv.rs` 模块头与《对接契约》§3.6）：s3:// 远端 CSV、
+  压缩、`HEADER=false`、自定义分隔符/nullstr、谓词下推到扫描内；列裁剪**有**
+  （由 exec_builder 通用投影下推驱动，省下未选列的类型解析与数组构建）。
+- 验收：新增 `tests/insert_select.rs`（6 例）+ `tests/read_csv.rs`（7 例）
+  + `csv.rs` 单测 7 例；`cargo test -p qsdb -p qsdb-cli` 全绿、clippy 0
+  警告、`cargo fmt --all` 干净、无新依赖。
 
 ### 生态契约交付 + soak 实测修复（2026-10-11）✅
 - **read_only 模式**（`QsdbOptions.read_only` + CLI `--read-only`）：写路径
