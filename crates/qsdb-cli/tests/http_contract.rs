@@ -556,13 +556,20 @@ fn zero_row_result_survives_every_format() {
         );
         assert!(v["rows"].as_array().unwrap().is_empty());
 
-        // ipc：schema 消息 + 无批
+        // ipc：schema 消息必在；**批可有可无，但读了必须是零行**。
+        // 2026-10-13：库层零行结果改为携带一个空批（schema 协商契约，见
+        // `tests/agg_contract.rs`），ipc 流随之从"零个批"变成"一个空批"——
+        // 两者都是合法流、都读不出行，故断言落在**行数**上而不是批数上。
         let r = q(sql, "ipc");
         assert_eq!(r.status, 200);
         let mut rd = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(r.body), None)
             .expect("ipc stream 应能解析（零行也是合法流）");
         assert_eq!(rd.schema().field(0).name(), "a");
-        assert!(rd.next().is_none(), "零行不该有批");
+        let mut read_rows = 0usize;
+        while let Some(b) = rd.next() {
+            read_rows += b.expect("零行批应可解").num_rows();
+        }
+        assert_eq!(read_rows, 0, "ipc 流读出来必须是零行");
 
         // bulk：列描述照写、n_rows = 0
         let r = q(sql, "bulk");

@@ -1172,19 +1172,23 @@ fn build_aggregate(
                         merged.merge_subset(t, ogs, aggs_ref.len());
                     }
                 }
-                if merged.is_empty() {
-                    return Ok(None);
-                }
-                crate::exec::agg::finalize_table(&merged, aggs_ref, group_ref, schema_ref).map(Some)
+                // 本片空 → 本片无输出（含无 GROUP BY 的空输入：那一行由外层补，
+                // 见下面 `some_batches.is_empty()` 分支）。
+                crate::exec::agg::finalize_or_none(&merged, aggs_ref, group_ref, schema_ref)
             })
             .collect::<Result<Vec<_>>>()?
     };
     let some_batches: Vec<RecordBatch> = batches.into_iter().flatten().collect();
     if some_batches.is_empty() {
-        return Ok(Box::new(OneShotExec {
-            batch: None,
-            schema,
-        }));
+        // 全分片都空：无 GROUP BY 时**在这里补唯一那一行**——不能放到分片内补，
+        // 全局聚合只落在一个分片上，各片各补一行会拼出 P 行（P = 分片数）；
+        // 有 GROUP BY 才是真的零行。
+        let batch = if group.is_empty() {
+            Some(crate::exec::agg::finalize_global_empty(&aggs, &schema)?)
+        } else {
+            None
+        };
+        return Ok(Box::new(OneShotExec { batch, schema }));
     }
     let batch = if some_batches.len() == 1 {
         some_batches.into_iter().next().expect("len checked")
@@ -1379,10 +1383,15 @@ fn finish_partitioned_merge(
         .collect::<Result<Vec<_>>>()?;
     let some_batches: Vec<RecordBatch> = batches.into_iter().flatten().collect();
     if some_batches.is_empty() {
-        return Ok(Box::new(OneShotExec {
-            batch: None,
-            schema,
-        }));
+        // 全分片都空：无 GROUP BY 时**在这里补唯一那一行**——不能放到分片内补，
+        // 全局聚合只落在一个分片上，各片各补一行会拼出 P 行（P = 分片数）；
+        // 有 GROUP BY 才是真的零行。
+        let batch = if group.is_empty() {
+            Some(crate::exec::agg::finalize_global_empty(&aggs, &schema)?)
+        } else {
+            None
+        };
+        return Ok(Box::new(OneShotExec { batch, schema }));
     }
     let batch = if some_batches.len() == 1 {
         some_batches.into_iter().next().expect("len checked")

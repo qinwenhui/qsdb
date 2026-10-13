@@ -443,6 +443,22 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
             while let Some(b) = exec.next() {
                 batches.push(b?);
             }
+            // **零行结果也给一个空批 + 完整 schema**（`对接契约.md` §二 的
+            // schema 协商承诺，`LIMIT 0` 是它的标准姿势——BI 工具/DBeaver
+            // 探测元数据就这么写）。
+            //
+            // 此前零行 = **零个批**：schema 只在 `SqlResult::Query.schema` 里，
+            // 逐批消费的调用方（含网线各格式）拿不到列名，得靠 server 侧特判
+            // 补一个空批（J15 那批就是这么修的）。收到这里，库层即兑现契约。
+            //
+            // 注意**不掩盖聚合**：无 `GROUP BY` 的聚合恰好一行由 exec 保证
+            // （`agg::finalize_agg` 补"空组"，见 `tests/agg.rs` 回归）；
+            // 走到这里还空说明该查询本来就零行。
+            if batches.is_empty() {
+                batches.push(arrow::record_batch::RecordBatch::new_empty(Arc::clone(
+                    &schema,
+                )));
+            }
             Ok(SqlResult::Query { schema, batches })
         }
     }

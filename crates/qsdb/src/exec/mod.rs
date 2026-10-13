@@ -1098,12 +1098,7 @@ impl HashAggExec {
         if let Err(e) = r {
             return Some(Err(e));
         }
-        Some(agg::finalize_table(
-            &t,
-            &self.aggs,
-            &self.group,
-            &self.schema,
-        ))
+        Some(agg::finalize_agg(&t, &self.aggs, &self.group, &self.schema))
     }
 
     /// 取走组表 + 它的内存预留（分片路径用：表要交给 merge，预留也得跟着走，
@@ -1198,10 +1193,12 @@ impl ExecNode for HashAggExec {
             return self.spill_next();
         }
         self.emitted = true;
-        if self.state.is_empty() {
+        // 有 GROUP BY 且零组 = 真·零行（`SELECT a, count(*) FROM t WHERE false GROUP BY a`）。
+        // 无 GROUP BY 则**必须回一行**——零输入时由 `finalize_agg` 补的「空组」产出。
+        if self.state.is_empty() && !self.group.is_empty() {
             return None;
         }
-        let out = match agg::finalize_table(&self.state, &self.aggs, &self.group, &self.schema()) {
+        let out = match agg::finalize_agg(&self.state, &self.aggs, &self.group, &self.schema()) {
             Ok(o) => o,
             Err(e) => return Some(Err(e)),
         };

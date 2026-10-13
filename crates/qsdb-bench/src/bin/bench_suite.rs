@@ -156,7 +156,17 @@ fn cases() -> Vec<(&'static str, &'static str, &'static str)> {
             "GROUP BY g（10 万组，count/sum/avg）",
         ),
         ("simple_topn", "简单", "ORDER BY v DESC LIMIT 100"),
-        ("simple_distinct", "简单", "COUNT(DISTINCT gs)（高基数）"),
+        (
+            "simple_distinct",
+            "简单",
+            // ⚠️ 2026-10-13：本仓的**聚合参数 DISTINCT 未实现**（此前被静默当成
+            // `count(gs)` 执行——错值，现已在绑定层显式拒绝）。故本仓侧跑的是
+            // **语义等价的改写**（`SELECT DISTINCT` + `count(*)`，去重是对的），
+            // DuckDB 侧仍是原生 `count(DISTINCT gs)`。**这是能力对照，不是同
+            // 实现对照**；且旧数据里"4× 领先"是拿我们的 `count(gs)` 比对方的
+            // `count(DISTINCT gs)` 得来的，**那个数字无效，已撤回**。
+            "COUNT(DISTINCT gs) 等价改写：SELECT DISTINCT 子查询 + count(*)（原生聚合 DISTINCT 未实现）",
+        ),
         (
             "complex_join_group",
             "复杂",
@@ -239,6 +249,8 @@ CREATE TABLE t_pq AS SELECT * FROM read_parquet('{pq}');"
         ),
         (
             "simple_distinct",
+            // DuckDB 侧保持**原生**写法：本仓侧跑的是等价改写（见 case 列表注释），
+            // 故这一格是**能力对照**——同一条等价查询，谁快谁慢。
             format!("SELECT count(DISTINCT gs) FROM read_parquet('{pq}');"),
         ),
         (
@@ -611,6 +623,12 @@ fn rows_of(db: &Qsdb, sql: &str) -> u64 {
     }
 }
 
+/// 造数分布下 `g < 1000` 的精确行数（`g = i % 100_000`，i ∈ [0, rows)）：
+/// 每 100_000 行命中 1000 行，余段里 `i % 100_000 == i` 故最多再命中 1000。
+fn expected_g_lt_1000(rows: i64) -> i64 {
+    (rows / 100_000) * 1000 + (rows % 100_000).min(1000)
+}
+
 /// 跑一个用例一轮（返回"产出规模"用于自检：防止用例空转）。
 fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
     let db = open(dir);
@@ -711,14 +729,31 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
             (n, dt.as_millis() as u64)
         }
         // ---- 简单分析 ----
+        //
+        // ⚠️ **聚合用例必须校验"值"，不能只看结果行数**。`rows_of` 对聚合恒回 1
+        // （聚合只有一行），所以只数行数时**值算错也全绿**——`count(DISTINCT gs)`
+        // 被静默执行成 `count(gs)`（错值）在 bench 里活了很久，正是这个原因。
+        // 期望值由造数分布直接推出（见 `for_each_batch`）：`g = i % 100_000`、
+        // `gs = "k-{i}"`（**全局唯一**）、`x = i * 0.25`。
         "simple_count" => {
             let t0 = Instant::now();
             let n = rows_of(&db, "SELECT count(*) FROM t");
+            assert_eq!(
+                scalar_i64(&db, "SELECT count(*) FROM t"),
+                rows,
+                "行数必须对"
+            );
             (n, t0.elapsed().as_millis() as u64)
         }
         "simple_filter" => {
             let t0 = Instant::now();
             let n = rows_of(&db, "SELECT count(*), sum(v) FROM t WHERE g < 1000");
+            let want = expected_g_lt_1000(rows);
+            assert_eq!(
+                scalar_i64(&db, "SELECT count(*) FROM t WHERE g < 1000"),
+                want,
+                "过滤行数必须对（g = i % 100_000，故每 100_000 行命中 1000）"
+            );
             (n, t0.elapsed().as_millis() as u64)
         }
         "simple_group" => {
@@ -726,6 +761,20 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
             let n = rows_of(
                 &db,
                 "SELECT g, count(*) c, sum(v) s, avg(x) a FROM t GROUP BY g",
+            );
+            // 组数 = min(rows, 100_000)（g ∈ [0, 100_000)）——这一条同时防
+            // "聚合只吐了头几个组"这类静默截断。
+            assert_eq!(
+                n,
+                rows.min(100_000) as u64,
+                "组数必须等于 min(行数, 100000)"
+            );
+            // 抽样校一个组的值：g=0 只来自 i ∈ {0, 100000, …}
+            let per_group = (rows + 99_999) / 100_000;
+            assert_eq!(
+                scalar_i64(&db, "SELECT count(*) FROM t WHERE g = 0"),
+                per_group,
+                "单组行数必须对"
             );
             (n, t0.elapsed().as_millis() as u64)
         }
@@ -736,7 +785,18 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
         }
         "simple_distinct" => {
             let t0 = Instant::now();
-            let n = rows_of(&db, "SELECT count(DISTINCT gs) FROM t");
+            // 等价改写（原生 `count(DISTINCT gs)` 在绑定层显式拒绝，见 case 列表注释）
+            let n = rows_of(&db, "SELECT count(*) FROM (SELECT DISTINCT gs FROM t)");
+            // `gs` 全局唯一 ⇒ 去重结果 = 总行数。**注意这条断言区分不出
+            // `count(gs)` 与 `count(DISTINCT gs)`**——造数里 gs 无重复，两者
+            // 数值相同（这也是那个 bug 在数据上隐形的原因）；真正拦住它的是
+            // 绑定层的显式拒绝。要让本用例变成**真正的去重压测**，需给 gs 造重复
+            // （那会改变基数、使既有数字不可比，故单独一轮做，见待办）。
+            assert_eq!(
+                scalar_i64(&db, "SELECT count(*) FROM (SELECT DISTINCT gs FROM t)"),
+                rows,
+                "去重结果必须等于总行数（gs 全局唯一）"
+            );
             (n, t0.elapsed().as_millis() as u64)
         }
         // ---- 复杂分析 ----

@@ -267,15 +267,16 @@ fn in_subquery_with_local_filter() {
 #[test]
 fn not_in_null_semantics() {
     let (db, root) = setup_semi("notin-null");
-    // build 含 NULL → NOT IN 恒空（SQL 三值）。引擎既有语义：空输入的
-    // count(*) 返回 0 行（而非一行 "0"）——按现状断言，空输入聚合单行
-    // 化是已记录的后置项
+    // build 含 NULL → NOT IN 恒空（SQL 三值）。空输入的无 GROUP BY 聚合
+    // **恰好一行、值为 0**——此前返回零行，本用例按现状断言并把"单行化"
+    // 记为后置项；2026-10-13 已实现（`exec::agg::finalize_agg` 补"空组"），
+    // 故这里改为断言正确语义。
     db.sql("INSERT INTO dims VALUES (NULL, 'nil')").unwrap();
     let r = q(
         &db,
         "SELECT count(*) FROM t WHERE g NOT IN (SELECT g FROM dims)",
     );
-    assert_eq!(r, Vec::<String>::new());
+    assert_eq!(r, vec!["0"]);
     // IN 不受 build NULL 影响（NULL 键不命中）
     let r = q(
         &db,

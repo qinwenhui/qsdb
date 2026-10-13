@@ -75,6 +75,34 @@ impl TableDef {
         if self.columns.is_empty() {
             return Err(QsdbError::invalid("table needs at least one column"));
         }
+        // **至少一个非分区列**（2026-10-13 补）。
+        //
+        // 上面那条只数了"总列数"，而分区列的值存在**目录名**里、数据文件内
+        // 不存储（见下面 NOT NULL 的说明）——所以"所有列都是分区列"的表，
+        // 数据文件是**零列**的。零列 parquet 的三重后果，实测都成立：
+        //   ① 参考实现根本读不了它（DuckDB：`Need at least one non-root column
+        //      in the file`）——与本仓「格式冻结、跨工具可读」的承诺正面冲突；
+        //   ② arrow 批靠列承载行数（`RecordBatch::num_rows`），我们读不回
+        //      "N 行 × 0 列"，于是**除 `count(*)` 外每个查询都静默回空**
+        //      （`SELECT p`、`DISTINCT`、`GROUP BY` 全是 0 行）；
+        //   ③ 主流一律在 DDL 层拒：DuckDB 解析层 `Table must have at least one
+        //      column!`；Hive「at least one column must be specified」；Spark
+        //      **SPARK-38216 专门为"所有列都是分区列"加早失败**；Delta
+        //      `TABLE_NO_COLUMNS`。PostgreSQL 是唯一例外，理由是"别让
+        //      `DROP COLUMN` 卡在最后一列"——本仓没有 `DROP COLUMN`，不适用。
+        if self
+            .columns
+            .iter()
+            .all(|c| self.partition_keys.iter().any(|k| k == &c.name))
+        {
+            return Err(QsdbError::invalid(format!(
+                "table '{}' needs at least one non-partition column: partition columns' \
+                 values live in directory names and are not stored in the data files, so \
+                 a table partitioned only by them would have zero-column data files \
+                 (unreadable by other engines, and row counts would be unrepresentable)",
+                self.name
+            )));
+        }
         let mut seen = std::collections::HashSet::new();
         for col in &self.columns {
             validate_ident(&col.name, "column")?;

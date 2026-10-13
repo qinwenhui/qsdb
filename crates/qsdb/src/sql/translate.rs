@@ -4030,6 +4030,22 @@ fn fn_args(f: &sqlparser::ast::Function) -> &[sqlparser::ast::FunctionArg] {
     }
 }
 
+/// 函数参数列表里写了 `DISTINCT`（`count(DISTINCT x)` 这类）。
+///
+/// **单独成函数是为了"让这件事可见"**：此前绑定聚合时压根没读这个字段，
+/// 于是 `DISTINCT` 被静默丢弃成 `count(x)`（见 `try_bind_agg` 的说明）。
+/// 任何新加的聚合绑定路径都该先问一句 `has_duplicate_treatment`。
+fn has_duplicate_treatment(f: &sqlparser::ast::Function) -> bool {
+    matches!(
+        &f.args,
+        sqlparser::ast::FunctionArguments::List(list)
+            if matches!(
+                list.duplicate_treatment,
+                Some(sqlparser::ast::DuplicateTreatment::Distinct)
+            )
+    )
+}
+
 /// 函数参数解包为表达式（命名参数/通配符不参与普通函数求值）。
 fn arg_exprs(f: &sqlparser::ast::Function) -> Result<Vec<&sqlparser::ast::Expr>> {
     fn_args(f)
@@ -4080,6 +4096,25 @@ fn try_bind_agg(f: &sqlparser::ast::Function, ctx: &SchemaCtx) -> Result<Option<
     }
     if f.over.is_some() {
         return Ok(None); // 窗口函数不作为聚合处理（由 collect_window_calls / 投影置换接管）
+    }
+    // **聚合参数上的 `DISTINCT`：显式拒绝，绝不静默丢弃**。
+    //
+    // 此前这里从不读 `duplicate_treatment`，于是 `count(DISTINCT a)` 被当成
+    // `count(a)` 执行——回的是**错的数字**（`{1,1,2}` 上回 3 而非 2），
+    // 而且是"完全合法的 SQL、悄悄给错值"这一类。宁可报错。
+    //
+    // 等价写法（**今天就能用**，`SELECT DISTINCT` 的去重是对的）：
+    //   `SELECT count(DISTINCT a) FROM t`
+    // → `SELECT count(*) FROM (SELECT DISTINCT a FROM t)`
+    // 带分组：`SELECT g, count(DISTINCT a) FROM t GROUP BY g`
+    // → `SELECT g, count(*) FROM (SELECT DISTINCT g, a FROM t) GROUP BY g`
+    // 原生实现（真值去重、可与其它聚合混用、走溢出）在路线图上另立。
+    if has_duplicate_treatment(f) {
+        return Err(QsdbError::unsupported(format!(
+            "{name}(DISTINCT …) is not implemented yet — it used to be silently executed as \
+             {name}(…), returning a WRONG number, so it is now rejected outright. \
+             Equivalent query: `SELECT count(*) FROM (SELECT DISTINCT … FROM …)`"
+        )));
     }
     let func = match name.as_str() {
         "count" => AggFunc::Count,

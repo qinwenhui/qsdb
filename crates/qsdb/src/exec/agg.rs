@@ -470,6 +470,30 @@ impl GroupTable {
         gid
     }
 
+    /// **补「空组」：无 `GROUP BY` 的聚合必须恰好一行**（SQL 契约）。
+    ///
+    /// 零输入时组表是空的——`ingest` 对零行批直接 early-return，`try_global_fast`
+    /// 也只在**有行**时 `push_group`，于是 `init_cols`/`push_group` 一次都没跑过。
+    /// 调用方看到 `is_empty()` 就吐零个批 ⇒ `SELECT sum(v) FROM t WHERE false`
+    /// 返回**空结果集**而不是"一行 NULL"。
+    ///
+    /// 类型信息必须从**计划**取（`agg.arg` 的 Arrow 类型）：空的实参批拿不到
+    /// 类型，而 `init_cols` 就靠它分派 `SumCol::Int/Flt/Dec`。
+    fn seed_global_group(&mut self, aggs: &[AggExpr]) {
+        let args: Vec<Option<ArrayRef>> = aggs
+            .iter()
+            .map(|a| {
+                a.arg
+                    .as_ref()
+                    .map(|e| arrow::array::new_empty_array(&e.data_type().arrow_type()))
+            })
+            .collect();
+        self.init_cols(&[], aggs, &args);
+        if self.key_off.is_empty() {
+            self.push_group(&[], &[]);
+        }
+    }
+
     /// 首批初始化：分组列数 + 各聚合列状态种类。
     fn init_cols(&mut self, group: &[PhysExpr], aggs: &[AggExpr], arrays: &[Option<ArrayRef>]) {
         if !self.kinds.is_empty() {
@@ -1481,6 +1505,55 @@ fn int64_group_columns(arrays: &[ArrayRef]) -> Option<Vec<&Int64Array>> {
 // ---------------------------------------------------------------------------
 
 /// 组键 + 状态 → 输出批。
+/// **无 `GROUP BY` 且整条输入为空**时的那唯一一行（`count`→0，其余→NULL）。
+///
+/// 分片并行收尾必须用这个函数在**外层补一次**，不能在每个分片里各补一次：
+/// 全局聚合只有一个组，它按 `group_hash` 只落在一个分片上，其余分片是空的——
+/// 各补一行就会拼出 P 行（P = 分片数）。
+pub fn finalize_global_empty(
+    aggs: &[AggExpr],
+    schema: &arrow::datatypes::SchemaRef,
+) -> Result<RecordBatch> {
+    let mut t = GroupTable::new();
+    t.seed_global_group(aggs);
+    finalize_table(&t, aggs, &[], schema)
+}
+
+/// 聚合收尾统一入口：**无 `GROUP BY` 恰好一行**（SQL 契约）。
+///
+/// 空输入时组表里一个组都没有，但无 `GROUP BY` 的聚合仍必须回一行
+/// （`count`→0、`sum`/`avg`/`min`/`max`→NULL）——由 [`finalize_global_empty`]
+/// 补的那个「空组」产出。**所有聚合收尾点都该走这里**，别直接调
+/// [`finalize_table`]：直接调会把"零输入"变成零行、再被调用方当成"没有结果"丢掉。
+pub fn finalize_agg(
+    table: &GroupTable,
+    aggs: &[AggExpr],
+    group: &[PhysExpr],
+    schema: &arrow::datatypes::SchemaRef,
+) -> Result<RecordBatch> {
+    if table.is_empty() && group.is_empty() {
+        return finalize_global_empty(aggs, schema);
+    }
+    finalize_table(table, aggs, group, schema)
+}
+
+/// 分片/分区收尾：`None` = 该片没有输出。
+///
+/// 只判"**有 `GROUP BY`** 且零组"（那才是真·零行，如
+/// `SELECT a, count(*) FROM t WHERE false GROUP BY a`）；无 `GROUP BY` 的
+/// 空输入**不能在这里各补一行**，见 [`finalize_global_empty`]。
+pub fn finalize_or_none(
+    table: &GroupTable,
+    aggs: &[AggExpr],
+    group: &[PhysExpr],
+    schema: &arrow::datatypes::SchemaRef,
+) -> Result<Option<RecordBatch>> {
+    if table.is_empty() {
+        return Ok(None);
+    }
+    finalize_agg(table, aggs, group, schema).map(Some)
+}
+
 pub fn finalize_table(
     table: &GroupTable,
     aggs: &[AggExpr],
