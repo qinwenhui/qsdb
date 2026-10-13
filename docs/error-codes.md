@@ -53,7 +53,7 @@ retry, category, sqlState}` 全表——驱动冷启动即可自配置映射，�
 | Code | HTTP | Retry | 类别 | 触发条件 | 客户端动作 | SQLState |
 |---|---|---|---|---|---|---|
 | `QUERY_TIMEOUT` | 408 | no | query | 查询超时（`X-QSDB-Timeout-Ms` 头或运行期默认） | 上报超时；长查询请显式调大 | `57014` |
-| `QUERY_CANCELLED` | 400 | no | query | 被 `/queries/{id}/cancel` 或客户端断连取消 | 视为用户主动取消，不重试 | `57014` |
+| `QUERY_CANCELLED` | 400 | no | query | 被 `/queries/{id}/cancel` 或客户端断连取消 | 视为用户主动取消，不重试 | `HY008` |
 | `QUERY_MEMORY_LIMIT` | 400 | no | query | 单查询执行内存超限（物化算子记账） | 报错；调大 `--query-memory-limit-mb` 或改查询 | `53200` |
 | `QUERY_PANIC` | 500 | no | query | 算子 panic，被隔离边界捕获（进程无恙） | **上报内核 bug**；该查询不可重试 | `XX000` |
 | `TABLE_NOT_FOUND` | 400 | no | query | 查询端点：表不存在（SQL 语义错，**非** HTTP 404） | 表名/DB 名写错？ | `42P01` |
@@ -94,6 +94,11 @@ retry, category, sqlState}` 全表——驱动冷启动即可自配置映射，�
 - **401 与 403**：401 = 你是谁不知道（重登）；403 = 知道你是谁但不够格（重试无用）。
 - **`QUERY_PANIC` 与 `INTERNAL`**：都是内核 bug、都上报，但前者**进程无恙、
   只这一条查询挂了**——驱动可据此提示"该查询异常终止"而非"服务不可用"。
+- **超时与取消的 SQLState 建议刻意不同**：`QUERY_TIMEOUT` → `57014`（Postgres 惯例），
+  `QUERY_CANCELLED` → **`HY008`**（JDBC 标准 "operation canceled"）。
+  早先两者都给 `57014`，qsdb-jdbc 反馈这在监控告警里必须分开算（"超时"是容量/性能
+  问题，"取消"是用户/编排主动行为），驱动侧已改用 `HY008`——**内核的建议值随之对齐**，
+  免得每个驱动各自去纠一次。语义上 57014 本就是"查询被终止"的合集，单独表示超时更准。
 
 ## 五、客户端动作矩阵
 

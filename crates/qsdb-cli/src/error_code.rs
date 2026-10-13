@@ -165,7 +165,11 @@ impl ErrorCode {
     /// SQLState **建议**映射（JDBC 用；最终归驱动所有）。
     pub fn sqlstate(self) -> &'static str {
         match self {
-            Self::QueryTimeout | Self::QueryCancelled => "57014",
+            // 超时与取消**刻意分开**：57014 是 Postgres 把"查询被终止"合在一起的码，
+            // 而"超时"（容量/性能）与"取消"（用户/编排主动）在监控告警里要分开算。
+            // HY008 = JDBC 标准 "operation canceled"——qsdb-jdbc 已采用，内核建议值对齐。
+            Self::QueryTimeout => "57014",
+            Self::QueryCancelled => "HY008",
             Self::QueryMemoryLimit => "53200",
             Self::QueryPanic | Self::MetadataError | Self::Internal => "XX000",
             Self::TableNotFound => "42P01",
