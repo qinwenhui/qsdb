@@ -11,6 +11,11 @@ repository.workspace = true
 name = "qsdb-bench"
 path = "src/main.rs"
 
+# HTTP 批量写通道实测（生态工具 / ODBC·JDBC 桥走的那条路）
+[[bin]]
+name = "http_bulk"
+path = "src/bin/http_bulk.rs"
+
 # 综合基准套件（导入四路 / 导出 / 分析 SQL / 峰值 RSS / DuckDB 对照）
 [[bin]]
 name = "bench_suite"
