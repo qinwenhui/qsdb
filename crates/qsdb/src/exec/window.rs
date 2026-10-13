@@ -10,6 +10,22 @@
 //! 输出列序：输入列 ++ 窗口列（按 SELECT 中出现顺序）。
 //! 输出行序：(PARTITION BY, ORDER BY) 排序后（窗口函数语义允许）。
 //!
+//! **溢出（P3）**：物化输入要不到额度时，按 `PARTITION BY` 键分区落盘
+//! （`enter_spill`）→ 逐分区取回 → 分区内排序 + 窗口计算 → emit 一个批。
+//!
+//! 为什么按分区键路由就够：窗口函数**只在同一个 `PARTITION BY` 分区内**计算
+//! （`compute_window_fn` 里的 `partition_start` 判边界；无 `PARTITION BY` 时
+//! 全表就是一个分区），故按分区键路由后每个分区可**独立**算——分区内的排序与
+//! 窗口逻辑与内存路径**逐字相同**（都走 `run_window` 那段代码，溢出只改
+//! "什么时候读"，不改"怎么算"）。路由口径 = `agg_spill::route_by_lits`
+//! （`Literal` 规范形态）：窗口这边两侧都是原始行批（没有聚合那样的"已聚合表"），
+//! 故全程用同一个函数即天然一致（同一逻辑键必然算出同一个分区）。
+//!
+//! **明确不覆盖**：`PARTITION BY` 为空的查询（`OVER ()` / `OVER (ORDER BY ...)`）
+//! ——整个输入就是一个分区，**无键可分区**，故保持现状：要不到额度如实报错
+//! （`QUERY_MEMORY_LIMIT` / `MEMORY_PRESSURE`），不硬做。
+//! 这是设计边界，见 `docs/内存预算与溢出设计.md` §四 4.2。
+//!
 //! 已知后置：全 NULL 分区的 SUM/MIN/MAX 返回 0、AVG 返回 NaN（应为 NULL）；
 //! SUM/AVG 不支持 Decimal 参数（显式报错）。
 
@@ -119,7 +135,14 @@ pub struct WindowExec {
     window_fns: Vec<WindowFn>,
     schema: SchemaRef,
     ctx: Arc<QueryContext>,
+    /// `Some` = 已产出（内存路径一批；溢出路径逐分区到最后一批）
     output: Option<RecordBatch>,
+    // ── 溢出态（物化输入要不到额度时启用）：按 PARTITION BY 键分区落盘 → 逐分区产出 ──
+    /// 输入行按 `PARTITION BY` 键分区落盘（内存 → 缓冲，超界 → 临时 parquet）。
+    /// **缓冲区为 `None` 直到真正转入溢出**（内存路径不付任何代价）。
+    spill: Option<crate::exec::agg_spill::PartSpill>,
+    /// 溢出模式下正在产出的分区游标
+    spill_part: usize,
 }
 
 impl WindowExec {
@@ -152,26 +175,98 @@ impl WindowExec {
             schema,
             ctx,
             output: None,
+            spill: None,
+            spill_part: 0,
         }
     }
 
+    /// 转入**分区溢出**：已物化的批 + 剩余输入全部按 `PARTITION BY` 键路由落盘，
+    /// 之后由 `spill_next` 逐分区取回、分区内计算。
+    ///
+    /// 调用前提（`execute_all` 保证）：`PARTITION BY` 非空——否则无键可分区。
+    ///
+    /// 内存：缓冲与分区表走 `PartSpill` 的 `reserve_spill`（**只受全局预算约束**，
+    /// 不吃每查询配额）——溢出是配额不够时的逃生通道，若逃生通道自己也吃配额，
+    /// 小配额下溢出永远启动不了（P1/P2 同一个坑，实测复现）。硬上界是全局预算。
+    fn enter_spill(&mut self, collected: Vec<RecordBatch>) -> Result<()> {
+        let schema = self.input.schema();
+        let ctx = Arc::clone(&self.ctx);
+        let nparts = crate::exec::agg_spill::default_nparts();
+        let cap = crate::exec::agg_spill::PartSpill::part_cap_for(&ctx, nparts);
+        let mut sp = crate::exec::agg_spill::PartSpill::new(schema, &ctx, cap)?;
+        let n = sp.nparts();
+        // ① 已物化的批：**含触发失败的那一批**（坑见 `execute_all`）
+        for b in collected {
+            let parts = crate::exec::agg_spill::route_by_lits(&b, &self.partition_by, n)?;
+            sp.push_routed(&b, &parts)?;
+        }
+        // ② 剩余输入
+        while let Some(b) = self.input.next() {
+            self.ctx.check()?;
+            let b = b?;
+            let parts = crate::exec::agg_spill::route_by_lits(&b, &self.partition_by, n)?;
+            sp.push_routed(&b, &parts)?;
+        }
+        self.spill = Some(sp);
+        self.spill_part = 0;
+        Ok(())
+    }
+
+    /// 物化输入 → [`Self::run_window`]。
+    ///
+    /// **要不到额度 → 转分区溢出**（`enter_spill`）：返回空批，由 `spill_next`
+    /// 逐分区产出（调用方据 `self.spill.is_some()` 分辨）。
     fn execute_all(&mut self) -> Result<RecordBatch> {
-        // 物化输入
         // 物化输入：预留随函数内数据存活（RAII），函数返回即归还
         let mut res = self.ctx.try_reserve(0)?;
         let mut batches = Vec::new();
         while let Some(b) = self.input.next() {
             self.ctx.check()?;
             let x = b?;
-            res.grow(x.get_array_memory_size() as u64)?;
+            if let Err(e) = res.grow(x.get_array_memory_size() as u64) {
+                // **要不到额度 → 按 PARTITION BY 键分区落盘**（而不是把查询打死）。
+                if self.partition_by.is_empty() {
+                    // 边界：无 PARTITION BY → 整个输入就是一个分区，**无键可分区**
+                    // → 保持现状（如实报错：QUERY_MEMORY_LIMIT / MEMORY_PRESSURE）。
+                    return Err(e);
+                }
+                // 注意：**本批也要进分区**——它就是压垮内存的那一批，只交已收集的
+                // `batches` 会静默少一批的行（P2 踩过：INNER 少 2000 行正好一个批）。
+                batches.push(x);
+                // 让出内存路径的账：溢出缓冲的额度来自**全局预算**，两份同时挂着
+                // 会把预算占满、把逃生通道自己掐死。已收集的批随后会被 take 出
+                // 副本进分区缓冲（那一份由溢出预留自己记）。
+                drop(res);
+                self.enter_spill(batches)?;
+                return Ok(RecordBatch::new_empty(Arc::clone(&self.schema)));
+            }
             batches.push(x);
         }
 
         if batches.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::clone(&self.schema)));
         }
-        // concat
-        res.grow(res.bytes())?; // concat 期间瞬时双份（峰值真实存在，就该记账）
+        // concat 期间瞬时双份（峰值真实存在，就该记账）
+        if let Err(e) = res.grow(res.bytes()) {
+            if self.partition_by.is_empty() {
+                return Err(e); // 同上：无键可分区，保持现状
+            }
+            drop(res);
+            self.enter_spill(batches)?;
+            return Ok(RecordBatch::new_empty(Arc::clone(&self.schema)));
+        }
+        self.run_window(&batches)
+    }
+
+    /// 排序 + 窗口计算 + 组装输出——**内存路径与溢出路径共用的那一段**。
+    ///
+    /// `batches` = 要算的全部输入行：内存路径是**全部输入**；溢出路径是
+    /// **一个 `PARTITION BY` 分区的全部行**。窗口函数只在同一分区内计算，
+    /// 故分区可独立算，两条路径的排序与窗口逻辑因此逐字相同。
+    fn run_window(&self, batches: &[RecordBatch]) -> Result<RecordBatch> {
+        if batches.is_empty() {
+            return self.assemble_empty();
+        }
         let input_schema = batches[0].schema();
         let mut cols: Vec<ArrayRef> = Vec::with_capacity(input_schema.fields().len());
         for c in 0..input_schema.fields().len() {
@@ -276,6 +371,51 @@ impl WindowExec {
             &RecordBatchOptions::new().with_row_count(Some(n)),
         )
         .map_err(|e| QsdbError::invalid(format!("window output: {e}")))
+    }
+
+    /// 溢出态：逐分区取回 → 分区内 [`Self::run_window`] → 产出一个批。
+    ///
+    /// 记账随分区走：分区的缓冲账在取回时归还（`PartSpill::take_partition` 会把
+    /// 上一分区的行账一并归还），本分区 concat 的瞬时双份由 `part_res` 记，
+    /// 出作用域即还；整个溢出器在最后一个分区后 `Drop`（溢出目录一并删除）。
+    fn spill_next(&mut self) -> Option<Result<RecordBatch>> {
+        loop {
+            let nparts = self.spill.as_ref()?.nparts();
+            if self.spill_part >= nparts {
+                self.spill = None; // 落盘的 run 与缓冲的账随 Drop 释放
+                self.output = Some(RecordBatch::new_empty(Arc::clone(&self.schema)));
+                return None;
+            }
+            let pi = self.spill_part;
+            self.spill_part += 1;
+            let rows = match self.spill.as_mut().unwrap().take_partition(pi) {
+                Ok(r) => r,
+                Err(e) => return Some(Err(e)),
+            };
+            if rows.is_empty() {
+                continue; // 该分区没有行 → 无输出
+            }
+            // 本分区 concat 的瞬时双份记账。走 `reserve_spill`（**只受全局预算
+            // 约束**）：溢出路径的记账不吃每查询配额——否则小配额下逃生通道
+            // 自己先被配额掐死（P1/P2 同一个坑，实测复现）。
+            let bytes: u64 = rows.iter().map(|b| b.get_array_memory_size() as u64).sum();
+            let mut part_res = match self.ctx.reserve_spill(0) {
+                Ok(r) => r,
+                Err(e) => return Some(Err(e)),
+            };
+            if let Err(e) = part_res.grow(bytes) {
+                return Some(Err(e));
+            }
+            let out = match self.run_window(&rows) {
+                Ok(b) => b,
+                Err(e) => return Some(Err(e)),
+            };
+            drop(part_res); // 本分区的记账到此为止
+            if out.num_rows() == 0 {
+                continue;
+            }
+            return Some(Ok(out));
+        }
     }
 
     fn assemble_empty(&self) -> Result<RecordBatch> {
@@ -680,6 +820,10 @@ impl ExecNode for WindowExec {
     }
 
     fn next(&mut self) -> Option<Result<RecordBatch>> {
+        // 溢出态：逐分区产出（每分区一个批）
+        if self.spill.is_some() {
+            return self.spill_next();
+        }
         if self.output.is_some() {
             return None;
         }
@@ -687,6 +831,10 @@ impl ExecNode for WindowExec {
             Ok(b) => b,
             Err(e) => return Some(Err(e)),
         };
+        // `execute_all` 可能刚转入溢出（物化时就要不到额度）→ 逐分区产出
+        if self.spill.is_some() {
+            return self.spill_next();
+        }
         self.output = Some(RecordBatch::new_empty(Arc::clone(&self.schema)));
         if batch.num_rows() == 0 {
             return None;
