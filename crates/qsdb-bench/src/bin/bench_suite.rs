@@ -393,7 +393,10 @@ fn civil_from_days(days: i32) -> (i32, u32, u32) {
 fn write_dims(dir: &Path) -> std::io::Result<()> {
     let src = dir.join("src");
     std::fs::create_dir_all(&src)?;
-    for (name, rows, is_d2) in [("d", 200_000i64, false), ("d2", 1_000i64, true)] {
+    // d2 **每个 cat 恰好一行**（20 行）：多行会让 `JOIN d2 ON d.cat = d2.cat`
+    // 变成多对多扇出——实测把三表 join 的中间结果撑到 5 亿行，.14 上烧掉 30 分钟 CPU。
+    // 基准用例要测"正常分析查询"，不是病态 join。
+    for (name, rows, is_d2) in [("d", 200_000i64, false), ("d2", 20i64, true)] {
         let (schema, batch) = if is_d2 {
             let schema = std::sync::Arc::new(Schema::new(vec![
                 Field::new("cat", DataType::Utf8, true),
@@ -506,12 +509,12 @@ fn generate(dir: &Path, rows: i64, per: i64) {
             db.append("d", &[b.slice(off as usize, n)]).unwrap();
         }
         let cats = StringArray::from(
-            (0..1_000i64)
-                .map(|i| format!("cat-{:02}", i % 20))
+            (0..20i64)
+                .map(|i| format!("cat-{i:02}"))
                 .collect::<Vec<String>>(),
         );
         let alias = StringArray::from(
-            (0..1_000i64)
+            (0..20i64)
                 .map(|i| format!("alias-{i}"))
                 .collect::<Vec<String>>(),
         );
