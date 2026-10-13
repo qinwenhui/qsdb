@@ -496,7 +496,7 @@ impl Qsdb {
     pub fn table_schema(&self, table: &str) -> Result<arrow::datatypes::SchemaRef> {
         match self.sql(&format!("SELECT * FROM {table} LIMIT 0"))? {
             crate::sql::SqlResult::Query { schema, .. } => Ok(schema),
-            crate::sql::SqlResult::Ok { message } => {
+            crate::sql::SqlResult::Ok { message, .. } => {
                 Err(QsdbError::invalid(format!("not a table: {message}")))
             }
         }
@@ -1019,7 +1019,7 @@ impl Qsdb {
         let ctx = self.new_query_context(None);
         match self.sql_with_context(sql, &ctx)? {
             crate::sql::SqlResult::Query { batches, .. } => Ok(batches),
-            crate::sql::SqlResult::Ok { message } => {
+            crate::sql::SqlResult::Ok { message, .. } => {
                 Err(QsdbError::invalid(format!("not a query: {message}")))
             }
         }

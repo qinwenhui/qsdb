@@ -682,7 +682,7 @@ fn delete_partitions_and_truncate() {
     let (db, root) = setup_events("del");
     // 分区级 DELETE：清空 dt=2026-01-01
     match db.sql("DELETE FROM events WHERE dt = DATE '2026-01-01'") {
-        Ok(qsdb::sql::SqlResult::Ok { message }) => {
+        Ok(qsdb::sql::SqlResult::Ok { message, .. }) => {
             assert!(message.starts_with("3 rows"), "{message}")
         }
         _ => panic!("expected Ok"),
@@ -694,7 +694,7 @@ fn delete_partitions_and_truncate() {
     assert!(r.is_err());
     // TRUNCATE：清全部
     match db.sql("TRUNCATE TABLE events") {
-        Ok(qsdb::sql::SqlResult::Ok { message }) => {
+        Ok(qsdb::sql::SqlResult::Ok { message, .. }) => {
             assert!(message.starts_with("3 rows"), "{message}")
         }
         _ => panic!("expected Ok"),

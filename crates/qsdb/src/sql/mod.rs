@@ -26,8 +26,18 @@ pub enum SqlResult {
         schema: Arc<arrow::datatypes::Schema>,
         batches: Vec<RecordBatch>,
     },
-    /// DDL/DML 文本回执
-    Ok { message: String },
+    /// DDL/DML 回执。
+    ///
+    /// `message` 是**给人看的文案**（码表文档明确"文案不做兼容承诺"），
+    /// 机器消费请用 `rows_affected` / `command`（J12：qsdb-jdbc 的
+    /// `executeUpdate` 此前只能解析文案拿行数，是契约面上的脆弱点）。
+    Ok {
+        message: String,
+        /// DML 影响行数；DDL 无意义（`None`）
+        rows_affected: Option<u64>,
+        /// 机器可读命令名（`INSERT` / `DELETE` / `CREATE_TABLE` …）；未归类为 `None`
+        command: Option<&'static str>,
+    },
 }
 
 /// 执行一条 SQL（panic 隔离边界 + 良性上下文）。
@@ -135,6 +145,8 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
         translate::ParsedStatement::CreateTable { def } => {
             db.create_table(def)?;
             Ok(SqlResult::Ok {
+                rows_affected: None,
+                command: None,
                 message: "table created".into(),
             })
         }
@@ -142,14 +154,20 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
             let name = column.name.clone();
             db.alter_add_column(&table, column)?;
             Ok(SqlResult::Ok {
+                rows_affected: None,
+                command: None,
                 message: format!("column '{name}' added"),
             })
         }
         translate::ParsedStatement::DropTable { name, if_exists } => match db.drop_table(&name) {
             Ok(()) => Ok(SqlResult::Ok {
+                rows_affected: None,
+                command: None,
                 message: "table dropped".into(),
             }),
             Err(e) if if_exists && matches!(e, QsdbError::NotFound { .. }) => Ok(SqlResult::Ok {
+                rows_affected: None,
+                command: None,
                 message: "table dropped".into(),
             }),
             Err(e) => Err(e),
@@ -251,16 +269,22 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
         } => {
             crate::users::UserStore::add(db.store(), &name, &password, role)?;
             Ok(SqlResult::Ok {
+                rows_affected: None,
+                command: None,
                 message: format!("user '{name}' created ({})", role.name()),
             })
         }
         translate::ParsedStatement::DropUser { name, if_exists } => {
             match crate::users::UserStore::drop_user(db.store(), &name) {
                 Ok(()) => Ok(SqlResult::Ok {
+                    rows_affected: None,
+                    command: None,
                     message: format!("user '{name}' dropped"),
                 }),
                 Err(e) if if_exists && matches!(e, QsdbError::NotFound { .. }) => {
                     Ok(SqlResult::Ok {
+                        rows_affected: None,
+                        command: None,
                         message: format!("user '{name}' dropped"),
                     })
                 }
@@ -273,12 +297,16 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
                 UserAlterAction::SetPassword(pw) => {
                     crate::users::UserStore::set_password(db.store(), &name, &pw)?;
                     Ok(SqlResult::Ok {
+                        rows_affected: None,
+                        command: None,
                         message: format!("password updated for '{name}'"),
                     })
                 }
                 UserAlterAction::SetRole(r) => {
                     crate::users::UserStore::set_role(db.store(), &name, r)?;
                     Ok(SqlResult::Ok {
+                        rows_affected: None,
+                        command: None,
                         message: format!("role updated to {} for '{name}'", r.name()),
                     })
                 }
@@ -340,6 +368,8 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
         translate::ParsedStatement::Delete { table, selection } => {
             let rows = db.delete_partitions_where(&table, selection.as_deref())?;
             Ok(SqlResult::Ok {
+                rows_affected: Some(rows),
+                command: Some("DELETE"),
                 message: format!("{rows} rows deleted"),
             })
         }
@@ -359,18 +389,24 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
             }
             crate::views::ViewStore::create(db.store(), &name, &sql, or_replace)?;
             Ok(SqlResult::Ok {
+                rows_affected: None,
+                command: None,
                 message: format!("view '{name}' created"),
             })
         }
         translate::ParsedStatement::DropView { name, if_exists } => {
             crate::views::ViewStore::drop_view(db.store(), &name, if_exists)?;
             Ok(SqlResult::Ok {
+                rows_affected: None,
+                command: None,
                 message: format!("view '{name}' dropped"),
             })
         }
         translate::ParsedStatement::Truncate { table } => {
             let rows = db.truncate_table(&table)?;
             Ok(SqlResult::Ok {
+                rows_affected: None,
+                command: None,
                 message: format!("{rows} rows truncated"),
             })
         }
@@ -1009,6 +1045,8 @@ fn insert_values(
     }
     let total = sink.finish()?;
     Ok(SqlResult::Ok {
+        rows_affected: Some(total),
+        command: Some("INSERT"),
         message: if overwrite {
             format!("{total} rows overwritten")
         } else {
@@ -1058,6 +1096,8 @@ fn insert_select(
     }
     let total = sink.finish()?;
     Ok(SqlResult::Ok {
+        rows_affected: Some(total),
+        command: Some("INSERT"),
         message: if overwrite {
             format!("{total} rows overwritten")
         } else {

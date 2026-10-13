@@ -41,7 +41,9 @@ fn post(addr: &str, path: &str, body: &[u8]) -> (u16, String) {
 fn main() {
     let addr = arg("--addr").unwrap_or_else(|| "127.0.0.1:9430".into());
     let pq = arg("--parquet").expect("--parquet");
-    let rows: usize = arg("--rows").and_then(|v| v.parse().ok()).unwrap_or(5_000_000);
+    let rows: usize = arg("--rows")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5_000_000);
 
     let batches: Vec<RecordBatch> = {
         let f = std::fs::File::open(&pq).expect("open parquet");
@@ -63,7 +65,11 @@ fn main() {
         }
         w.finish().unwrap();
     }
-    println!("IPC body = {:.1} MB / {} 批", whole.len() as f64 / 1e6, batches.len());
+    println!(
+        "IPC body = {:.1} MB / {} 批",
+        whole.len() as f64 / 1e6,
+        batches.len()
+    );
 
     let t0 = Instant::now();
     let (st, resp) = post(&addr, "/api/v1/write?table=t_http&mode=append", &whole);

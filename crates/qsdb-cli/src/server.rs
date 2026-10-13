@@ -747,12 +747,27 @@ async fn query(
                     }
                 }
             }
-            SqlResult::Ok { message } => Json(serde_json::json!({
-                "queryId": query_id,
-                "message": message,
-                "elapsedMs": elapsed as f64 / 1e6,
-            }))
-            .into_response(),
+            SqlResult::Ok {
+                message,
+                rows_affected,
+                command,
+            } => {
+                // **结构化回执**（J12）：`command` + `rowsAffected` 让驱动不必解析
+                // `message` 文案（码表文档明确"文案不做兼容承诺"）。
+                // 字段只在有意义时出现（DDL 无行数）——老客户端读 `message` 不受影响。
+                let mut body = serde_json::json!({
+                    "queryId": query_id,
+                    "message": message,
+                    "elapsedMs": elapsed as f64 / 1e6,
+                });
+                if let Some(c) = command {
+                    body["command"] = serde_json::json!(c);
+                }
+                if let Some(n) = rows_affected {
+                    body["rowsAffected"] = serde_json::json!(n);
+                }
+                Json(body).into_response()
+            }
         },
         Ok(Err(e)) => {
             s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);

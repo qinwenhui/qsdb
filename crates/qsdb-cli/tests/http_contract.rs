@@ -224,6 +224,59 @@ fn ipc_two_int_cols(n: usize) -> Vec<u8> {
     buf
 }
 
+/// **J12**：DML 回执要有**结构化字段**（`command` + `rowsAffected`），
+/// 驱动不该解析 `message` 文案（码表文档明确"文案不做兼容承诺"）。
+#[test]
+fn dml_receipt_has_structured_fields() {
+    let srv = Server::start(&[]);
+    let p = srv.port;
+    assert_eq!(
+        query(p, "CREATE TABLE t (a BIGINT, b STRING)", None).status,
+        200
+    );
+
+    let r = query(p, "INSERT INTO t VALUES (1,'x'),(2,'y'),(3,'z')", None);
+    assert_eq!(r.status, 200);
+    assert_eq!(r.json()["command"], "INSERT");
+    assert_eq!(r.json()["rowsAffected"], 3);
+    assert!(r.json()["message"].is_string(), "人读文案仍要保留");
+
+    // DELETE：**只支持分区键谓词**（行级删除未做 → 501，已知边界）
+    assert_eq!(
+        query(
+            p,
+            "CREATE TABLE pt (dt DATE, v BIGINT) PARTITIONED BY (dt)",
+            None
+        )
+        .status,
+        200
+    );
+    assert_eq!(
+        query(
+            p,
+            "INSERT INTO pt VALUES (DATE '2026-01-01', 1), (DATE '2026-01-02', 2)",
+            None
+        )
+        .status,
+        200
+    );
+    let r = query(p, "DELETE FROM pt WHERE dt = DATE '2026-01-01'", None);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["command"], "DELETE");
+    assert_eq!(r.json()["rowsAffected"], 1);
+    // 非分区键谓词 → 501（行级删除未做）
+    assert_eq!(query(p, "DELETE FROM pt WHERE v = 1", None).status, 501);
+
+    // DDL 无行数：不出现这两个字段（不是 0——"没有行数概念"与"影响 0 行"不同）
+    let r = query(p, "CREATE TABLE t2 (a BIGINT)", None);
+    assert_eq!(r.status, 200);
+    assert!(
+        r.json().get("rowsAffected").is_none(),
+        "DDL 不该有 rowsAffected"
+    );
+    assert!(r.json().get("command").is_none());
+}
+
 /// **回归**：HTTP `mode=overwrite` 本身要能用。
 ///
 /// 长期存在的 bug：该分支先把批按分区**剥**好，再交给 `Qsdb::overwrite_partition`

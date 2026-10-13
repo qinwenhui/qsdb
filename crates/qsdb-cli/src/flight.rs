@@ -149,7 +149,7 @@ impl FlightService for QsdbFlightService {
             qsdb::sql::SqlResult::Query { schema, batches } => {
                 (schema, batches.iter().map(|b| b.num_rows()).sum::<usize>())
             }
-            qsdb::sql::SqlResult::Ok { message } => {
+            qsdb::sql::SqlResult::Ok { message, .. } => {
                 return Err(Status::invalid_argument(format!("not a query: {message}")));
             }
         };
@@ -187,7 +187,7 @@ impl FlightService for QsdbFlightService {
         let (_, res) = self.run_registered(&meta, &sql).await?;
         let schema = match res {
             qsdb::sql::SqlResult::Query { schema, .. } => schema,
-            qsdb::sql::SqlResult::Ok { message } => {
+            qsdb::sql::SqlResult::Ok { message, .. } => {
                 return Err(Status::invalid_argument(format!("not a query: {message}")));
             }
         };
@@ -216,7 +216,7 @@ impl FlightService for QsdbFlightService {
         let (query_id, res) = self.run_registered(&meta, &sql).await?;
         let batches = match res {
             qsdb::sql::SqlResult::Query { batches, .. } => batches,
-            qsdb::sql::SqlResult::Ok { message } => {
+            qsdb::sql::SqlResult::Ok { message, .. } => {
                 return Err(Status::invalid_argument(format!("not a query: {message}")));
             }
         };

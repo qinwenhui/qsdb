@@ -573,7 +573,7 @@ fn run(db: &Qsdb, sql: &str) {
 /// 结果打印：表格对齐（宽度上限截断）。
 fn print_result(r: &SqlResult, elapsed: std::time::Duration) {
     match r {
-        SqlResult::Ok { message } => println!("{message} ({elapsed:?})"),
+        SqlResult::Ok { message, .. } => println!("{message} ({elapsed:?})"),
         SqlResult::Query { schema, batches } => {
             let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             if rows == 0 {
