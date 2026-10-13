@@ -24,9 +24,11 @@ fn post(addr: &str, path: &str, body: &[u8]) -> (u16, String) {
 
 fn post_ct(addr: &str, path: &str, ct: &str, body: &[u8]) -> (u16, String) {
     let mut s = TcpStream::connect(addr).expect("connect");
+    // 注意：**不要**用续行反斜杠拼 HTTP 头——续行会把缩进空格带进头部，
+    // 于是 "         Content-Type: …" 成了非法头行（axum 的 JSON 提取器
+    // 直接报 "Expected request with Content-Type: application/json"，很难看出）。
     let req = format!(
-        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
-         Content-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
         body.len()
     );
     s.write_all(req.as_bytes()).unwrap();
