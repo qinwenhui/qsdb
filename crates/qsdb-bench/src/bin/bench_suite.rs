@@ -286,6 +286,14 @@ CREATE TABLE t_pq AS SELECT * FROM read_parquet('{pq}');"
 // 峰值 RSS（Linux VmHWM；其他平台恒 0——本工具的真身跑在 Linux）
 // ---------------------------------------------------------------------------
 
+/// 批的切片感知字节（仅用于打印产出规模）。
+fn nb(b: &RecordBatch) -> u64 {
+    b.columns()
+        .iter()
+        .map(|c| c.to_data().get_slice_memory_size().unwrap_or(0) as u64)
+        .sum()
+}
+
 fn peak_rss_kb() -> u64 {
     if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
         for line in s.lines() {
@@ -799,15 +807,34 @@ fn str_at(b: &RecordBatch, c: usize, i: usize) -> String {
 fn scan_to_parquet(
     db: &Qsdb,
     out: &Path,
-    sql: &str,
+    _sql: &str,
     _cols: &str,
     schema: arrow::datatypes::SchemaRef,
 ) -> (u64, u64) {
     let f = std::fs::File::create(out).expect("create out");
-    let mut w = ArrowWriter::try_new(f, schema, None).expect("writer");
+    let mut w = ArrowWriter::try_new(f, schema.clone(), None).expect("writer");
     let mut n = 0u64;
     let mut bytes = 0u64;
-    for b in db.sql_collect(sql).expect("scan") {
+    // **流式**：走 `scan()`（流式迭代器）而不是 `sql_collect`——后者会把 5M 行
+    // 全部物化后再返回（实测峰值 1.9GB，导出因此慢 3-8 倍）；导出工具要的就是流式读。
+    let req = qsdb::ScanRequest {
+        table: "t".into(),
+        db: None,
+        projection: None,
+        predicate: None,
+        limit: None,
+    };
+    let mut it = db.scan(req).expect("scan");
+    while let Some(b) = it.next() {
+        let b = b.expect("scan batch");
+        n += b.num_rows() as u64;
+        bytes += crate::nb(&b);
+        w.write(&b).expect("write");
+    }
+    w.close().expect("close");
+    return (n, bytes);
+    #[allow(unreachable_code)]
+    for b in db.sql_collect(_sql).expect("scan") {
         n += b.num_rows() as u64;
         bytes += b.get_array_memory_size() as u64;
         w.write(&b).expect("write");
@@ -817,10 +844,37 @@ fn scan_to_parquet(
 }
 
 /// 全表扫描 → CSV（同上；文本形态另算一路）。
-fn scan_to_csv(db: &Qsdb, out: &Path, sql: &str) -> u64 {
+fn scan_to_csv(db: &Qsdb, out: &Path, _sql: &str) -> u64 {
     let mut f = std::io::BufWriter::new(std::fs::File::create(out).expect("create out"));
     let mut n = 0u64;
-    for b in db.sql_collect(sql).expect("scan") {
+    // 同 `scan_to_parquet`：**流式**（`scan()` 而非 `sql_collect`）
+    let req = qsdb::ScanRequest {
+        table: "t".into(),
+        db: None,
+        projection: None,
+        predicate: None,
+        limit: None,
+    };
+    let mut it = db.scan(req).expect("scan");
+    while let Some(b) = it.next() {
+        let b = b.expect("scan batch");
+        for i in 0..b.num_rows() {
+            let mut cells: Vec<String> = Vec::with_capacity(b.num_columns());
+            for c in 0..b.num_columns() {
+                let a = b.column(c);
+                cells.push(if a.is_null(i) {
+                    String::new()
+                } else {
+                    arrow::util::display::array_value_to_string(a.as_ref(), i).unwrap()
+                });
+            }
+            writeln!(f, "{}", cells.join(",")).unwrap();
+        }
+        n += b.num_rows() as u64;
+    }
+    return n;
+    #[allow(unreachable_code)]
+    for b in db.sql_collect(_sql).expect("scan") {
         for i in 0..b.num_rows() {
             let mut cells: Vec<String> = Vec::with_capacity(b.num_columns());
             for c in 0..b.num_columns() {
