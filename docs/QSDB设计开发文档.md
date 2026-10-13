@@ -655,8 +655,12 @@ M6-4 staging 写 → M6-5 HDFS → M6-6 可选租约；每阶段独立 gate。
 - **ProtocolOCC（§7.2 定案落地）**：OCC 原语 `get_with_etag` +
   `put_if_etag`（PutMode::Create/Update，Precondition/AlreadyExists →
   冲突 false）；`occ_commit` 重放循环 ≤8 轮（每轮基于最新 cur 重建，
-  天然无 ABA 丢写）；manifest 新增 `writer_epoch`（`serde(default)`，
-  本地恒 0 兼容）。写路径：segment 内存缓冲整体 PUT（不可变无协议）
+  天然无 ABA 丢写）；manifest 新增 `writer_epoch`（本地恒 0）。
+  ⚠️ **更正（2026-10-14）**：此处原写「`serde(default)` 即可兼容旧文件」——**那是错的**。
+  postcard 不是自描述格式，尾部加字段会让旧文件「读穿」，`serde(default)` 只在 JSON
+  这类自描述格式上生效。规则是**加字段 = 同时 bump `manifest.version`**，
+  且读者要保留旧版本的读路径（见 `docs/format-spec.md` §7）。
+  写路径：segment 内存缓冲整体 PUT（不可变无协议）
   → OCC 提交；compaction/overwrite/clear 同协议（替换语义重放）。
 - catalog/table.json 远端 = 单对象 OCC（`occ_update_bytes`）；drop =
   清单 OCC 去名 + 前缀尽力删除；**远端 GC（§12）**= 引用扫描式
