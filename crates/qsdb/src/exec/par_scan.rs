@@ -28,6 +28,21 @@ use super::{ExecNode, ScanExec};
 /// 独立池让「扫描生产」与「查询自身的并行」（聚合分片、UDAF 组求值）互不占位，
 /// 从结构上消除该类死锁，而不是靠调大 channel 容量去躲。池**懒创建**
 /// （首次并行扫描才起线程，空闲即挂起），符合"无后台常驻线程"的既有约定。
+/// **懒启动 + 专用池的已知代价**（2026-10-13 gate 实测，A/B 交替、最小口径）：
+/// 纯扫描用例 B 反而快 2~7%；`join_count` ±2%；但**宽物化 join + LIMIT**
+/// （`SELECT t.v, d.name FROM t JOIN dim d ON t.g=d.g LIMIT 1000`）慢 **5~15%**。
+///
+/// 原因不是池、是**预取窗口**：改动前两侧生产端都在计划构建期启动 —— 探测侧在
+/// 构建阶段**期间**就把通道填满了（重叠预热）；现在懒启动 + 在构建**之后**才
+/// `prefetch`（见 [`ExecNode::prefetch`]），少掉这段重叠。
+///
+/// 为什么不干脆在构建**之前**预取探测侧：那正是**互锁的成因**——未被抽的那一侧
+/// 占满池线程阻塞在 `send`，被抽的一侧排不上线程。本设计的正确性就建立在
+/// "一条流同时最多一个活跃生产端"上，预取只能保守地放在"当前生产端已退出"之后。
+/// 要拿回全部预取又不引入互锁，得让生产端**阻塞时不占池线程**（独立线程池/每分片
+/// 独立线程/可让出的任务），那是另一个量级的设计（P3 记录，未做）。
+/// 测量口径另见 `target/bench-release` 的 `fair_vs`（本机负载波动可达 ±50%，
+/// 绝对值不可比，只看同一窗口内的 A/B 比）。
 fn scan_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
@@ -79,6 +94,12 @@ impl ParScanExec {
         })
     }
 
+    /// 预取：提前提交分片任务（父算子确认"另一侧已不再需要池"时调，
+    /// 见 [`ExecNode::prefetch`]——懒启动会丢预取，这里把它补回来）。
+    pub fn prefetch(&mut self) {
+        self.start();
+    }
+
     /// 首次取数才提交分片任务。
     fn start(&mut self) {
         let Some(Pending { shards, tx }) = self.pending.take() else {
@@ -123,6 +144,10 @@ impl ExecNode for ParScanExec {
         }
         self.start();
         self.rx.recv().ok()
+    }
+
+    fn prefetch(&mut self) {
+        self.start();
     }
 }
 

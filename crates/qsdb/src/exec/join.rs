@@ -107,6 +107,9 @@ impl CrossJoinExec {
         res.shrink(total); // 源批已随 Vec 释放
         self.build_res = Some(res);
         self.build_state = Some(table);
+        // build 侧生产端已退出 → 此刻预取 probe 侧是安全的（不会互锁），
+        // 且把懒启动丢掉的"重叠预取"补回来（实测宽 join 物化 ~10%）
+        self.probe.prefetch();
         Ok(())
     }
 }
@@ -384,6 +387,7 @@ impl HashJoinExec {
         res.grow(table.num_rows() as u64 * 16)?;
         self.build_res = Some(res);
         self.build_state = Some(BuildState { table, index });
+        self.probe.prefetch(); // 见 CrossJoinExec：build 侧已退出，预取 probe
         Ok(())
     }
 }

@@ -30,6 +30,15 @@ pub trait ExecNode: Send {
     fn schema(&self) -> SchemaRef;
     /// 拉取下一批；None = 结束
     fn next(&mut self) -> Option<Result<RecordBatch>>;
+
+    /// 预取钩子（默认无操作）：让**后面才被抽到的**子节点提前开跑生产端。
+    ///
+    /// 这是**性能**钩子不是正确性钩子：`ParScanExec` 的生产端是**懒启动**的
+    /// （早启动会与另一侧扫描互锁——见 `exec/par_scan.rs`），代价是丢掉
+    /// "计划构建期就开始填通道"的重叠预取（实测宽 join 物化因此慢 ~10%）。
+    /// 父算子在自己**不再需要另一侧**的时刻（如 hash join 建完 build 侧）调它，
+    /// 就能把预取拿回来，且此时对方的生产端已退出、不会互锁。
+    fn prefetch(&mut self) {}
 }
 
 /// 布尔掩码过滤。
@@ -60,6 +69,13 @@ impl ExecNode for FilterExec {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
+
+    /// 透传预取（见 [`ExecNode::prefetch`]）：本节点 1:1 转发输入，
+    /// 预取请求要一路传到真正的数据源（`ParScanExec`）才有效。
+    fn prefetch(&mut self) {
+        self.input.prefetch();
+    }
+
     fn next(&mut self) -> Option<Result<RecordBatch>> {
         loop {
             if let Err(e) = self.ctx.check() {
@@ -112,6 +128,13 @@ impl ExecNode for ProjectExec {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
+
+    /// 透传预取（见 [`ExecNode::prefetch`]）：本节点 1:1 转发输入，
+    /// 预取请求要一路传到真正的数据源（`ParScanExec`）才有效。
+    fn prefetch(&mut self) {
+        self.input.prefetch();
+    }
+
     fn next(&mut self) -> Option<Result<RecordBatch>> {
         let batch = self.input.next()?;
         let batch = match batch {
@@ -534,6 +557,13 @@ impl ExecNode for LimitExec {
     fn schema(&self) -> SchemaRef {
         self.input.schema()
     }
+
+    /// 透传预取（见 [`ExecNode::prefetch`]）：本节点 1:1 转发输入，
+    /// 预取请求要一路传到真正的数据源（`ParScanExec`）才有效。
+    fn prefetch(&mut self) {
+        self.input.prefetch();
+    }
+
     fn next(&mut self) -> Option<Result<RecordBatch>> {
         if self.remaining == 0 {
             return None;
