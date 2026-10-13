@@ -870,6 +870,14 @@ impl<'a> InsertSink<'a> {
         if self.pending.is_empty() {
             return Ok(());
         }
+        if std::env::var("QSDB_INSERT_PROF").is_ok() {
+            eprintln!(
+                "[insert-flush] batches={} rows={} bytes={}",
+                self.pending.len(),
+                self.pending_rows,
+                self.pending_bytes
+            );
+        }
         let t0 = std::time::Instant::now();
         let r: WriteResult = self.db.append(self.table, &self.pending)?;
         self.prof_append_ns += t0.elapsed().as_nanos();
@@ -910,13 +918,10 @@ impl<'a> InsertSink<'a> {
     }
 }
 
-/// 分区值序列等价（比较用写入端同一套规范化：`partition_value_string`）。
+/// 分区值序列等价——转发 [`crate::partition::same_partition_values`]
+/// （与写入端划分口径同源；`api.rs` 的 append 归并也用同一个）。
 fn same_partition(a: &[Literal], b: &[Literal]) -> bool {
-    a.len() == b.len()
-        && a.iter().zip(b.iter()).all(|(x, y)| {
-            crate::partition::partition_value_string(x)
-                == crate::partition::partition_value_string(y)
-        })
+    crate::partition::same_partition_values(a, b)
 }
 
 /// 批 → (分区值, 行掩码)。OVERWRITE 要的是"每个分区的行子集"，

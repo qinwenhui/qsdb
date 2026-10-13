@@ -296,6 +296,19 @@ fn projected_schema(schema: &SchemaRef, indices: &[usize]) -> SchemaRef {
     Arc::new(arrow::datatypes::Schema::new(fields))
 }
 
+/// 两个分区值序列是否指同一分区——**口径与写入端划分一致**
+/// （`partition_value_string` 规范化后比较；NULL 由它归一，不会漏判）。
+///
+/// 用途：`Qsdb::append` 把同一次调用里落到同一分区的批归并成一个段（`api.rs`），
+/// `InsertSink` 的 OVERWRITE 分桶（`sql/mod.rs`）——两处都必须与"分区是怎么形成的"
+/// 用同一把尺子，否则同一次调用会被拆成两个段、甚至拆错分区。
+pub fn same_partition_values(a: &[crate::types::Literal], b: &[crate::types::Literal]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| partition_value_string(x) == partition_value_string(y))
+}
+
 /// 把分区列（按 `values` 常量）**补回**数据批 —— [`split_by_partition`] 的逆操作。
 ///
 /// 用途：`Qsdb::overwrite_partition` / `append` 的输入约定是**全列批**（库里自己

@@ -205,6 +205,13 @@ pub struct ScanRequest {
     pub limit: Option<u64>,
 }
 
+/// 单次 `append` 调用内、同一分区的归并上限：超过就切成多个段提交。
+///
+/// 取 256MB——段大小与内存峰值的折中（再大，单段的元数据/校验/后续 GC 成本上升）。
+/// 见 `Qsdb::append` 的文档：**一次调用 = 一次提交**，这是让调用方不必关心
+/// "批该多大"的关键（此前每批一次提交，在慢盘上是几十倍的差距）。
+const APPEND_MERGE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
 /// 分区统计（`Qsdb::partition_stats`；qsdb-sync 轮询契约）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionStat {
@@ -515,13 +522,50 @@ impl Qsdb {
     // -- 写 ------------------------------------------------------------------
 
     /// 批量追加：自动按分区列路由（跨分区自动拆分）。
+    ///
+    /// **粒度语义：一次调用 = 一次提交（每个分区一个段）**。
+    ///
+    /// 此前是「每个入参批一次提交」——传 13 个批就写 13 个段、13 次 manifest 提交、
+    /// 13 次索引更新。在 fsync 贵的盘上（`.14` 实测 45ms/次）这是**几十倍的导入差距**：
+    /// `INSERT … SELECT` 的源按 8192 行一批扫出，5M 行 → 610 次提交 ≈ 60s，
+    /// 而同样的数据按 65536 行一批传进来只要 10s。
+    ///
+    /// 调用方**不需要知道**批该多大——批大小是它自己的内存/流水线选择，
+    /// 与"我要在这台盘上提交几次"无关。故这里按分区**归并**后再提交：
+    /// 内存峰值 = 该次调用里同一分区的数据（调用方本就持有这些批），
+    /// 超过 `APPEND_MERGE_MAX_BYTES` 时切块，避免一次 concat 过大。
     pub fn append(&self, table: &str, batches: &[RecordBatch]) -> Result<WriteResult> {
         self.ensure_writable()?;
         let def = self.def(None, table)?;
         let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
         let mut total = WriteResult::default();
+        // ① 按分区值归并（保持首次出现序；分区数通常远小于批数）
+        let mut groups: Vec<(Vec<Literal>, Vec<RecordBatch>)> = Vec::new();
         for batch in batches {
             for (values, data) in split_by_partition(batch, &def)? {
+                if data.num_rows() == 0 {
+                    continue;
+                }
+                match groups
+                    .iter_mut()
+                    .find(|(v, _)| super::partition::same_partition_values(v, &values))
+                {
+                    Some((_, list)) => list.push(data),
+                    None => groups.push((values, vec![data])),
+                }
+            }
+        }
+        // ② 每分区：concat 成一个段提交（超大则切块——一次调用里同一分区
+        //    超过阈值的情况只出现在"单次传入极大量数据"，此时切成多个段）
+        for (values, parts) in groups {
+            let schema = parts[0].schema();
+            let mut cur: Vec<RecordBatch> = Vec::new();
+            let mut cur_bytes = 0u64;
+            let mut flush = |cur: &mut Vec<RecordBatch>, cur_bytes: &mut u64| -> Result<()> {
+                if cur.is_empty() {
+                    return Ok(());
+                }
+                let merged = crate::exec::spill::concat_batches(cur, &schema)?;
                 total = merge_write(
                     total,
                     write::append_partition(
@@ -530,10 +574,21 @@ impl Qsdb {
                         &tdir,
                         &def,
                         &values,
-                        &[data],
+                        &[merged],
                     )?,
                 );
+                cur.clear();
+                *cur_bytes = 0;
+                Ok(())
+            };
+            for p in parts {
+                cur_bytes += crate::memory::batch_bytes(&p);
+                cur.push(p);
+                if cur_bytes >= APPEND_MERGE_MAX_BYTES {
+                    flush(&mut cur, &mut cur_bytes)?;
+                }
             }
+            flush(&mut cur, &mut cur_bytes)?;
         }
         Ok(total)
     }
