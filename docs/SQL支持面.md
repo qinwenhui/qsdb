@@ -30,12 +30,13 @@
 | `GROUP BY ROLLUP/CUBE/GROUPING SETS` | ✋ | |
 | `GROUP BY ALL` | ✋ | |
 | `ORDER BY` 位置序号 / 输出别名 | ✅ | |
-| `ORDER BY … NULLS FIRST/LAST` | ✋ | **默认放置**：`ASC ⇒ NULLS LAST`、`DESC ⇒ NULLS FIRST`（与 PG 一致）。写了非默认的那种此前被**静默忽略** ⇒ 顺序错 |
+| `ORDER BY … NULLS FIRST/LAST` | ✅ | **默认放置**：`ASC ⇒ NULLS LAST`、`DESC ⇒ NULLS FIRST`（与 PG 一致）；显式值覆盖默认。此前被**静默忽略** ⇒ 顺序错 |
 | `ORDER BY ALL` / `ORDER BY … USING` | ✋ / ⛔ | |
 | `TOP n`（SQL Server 形） | ✋ | 用 `LIMIT` |
 | `LIMIT n` | ✅ | |
-| `OFFSET n`（含 `LIMIT n OFFSET m`、`LIMIT n, m`、`OFFSET n ROWS`） | ✋ | 此前**静默丢掉 offset** ⇒ 少翻页/多返回行。实现排期中 |
-| `FETCH FIRST n ROWS ONLY` | ✋ | 同上（用 `LIMIT`）；`PERCENT`/`WITH TIES` 语义务必别当 `LIMIT` 处理 |
+| `OFFSET n`（含 `LIMIT n OFFSET m`、`LIMIT n, m`、`OFFSET n ROWS`） | ✅ | 此前**静默丢掉 offset** ⇒ 少翻页，2026-10-13 实现 |
+| `FETCH FIRST n ROWS ONLY` | ✅ | 等价 `LIMIT n` |
+| `FETCH FIRST … PERCENT ROWS` / `… WITH TIES` | ✋ | **语义与 LIMIT 不同**（按比例 / 含并列），故不实现即拒绝——绝不当 LIMIT 执行 |
 | `QUALIFY` / `PREWHERE` / `CLUSTER BY` / `DISTRIBUTE BY` / `SORT BY` | ✋ | |
 | `SELECT … INTO` | ✋ | |
 | `FOR UPDATE` / `FOR SHARE` | ✋ | |
@@ -57,6 +58,7 @@
 | 非等值 `ON`（INNER） | ✅ | 走 cross join + 过滤 |
 | `CROSS JOIN` | ✅ | |
 | 派生表列别名 `… AS d(a,b)` | ✋ | 此前**别名被丢掉**，之后报"列不存在"（误导） |
+| 表因子列别名 `FROM t AS x(a,b)` | ✋ | 同样被静默丢掉。⚠️ 真实踩坑：`SELECT * FROM t EXCLUDE (b)` 会被解析成「别名 `exclude` + 列清单」⇒ 拿到**全列**（Snowflake 用户会中招） |
 | `TABLESAMPLE` | ✋ | |
 | 表 PARTITION 选择器 / `AT VERSION`（时间旅行） | ⛔ | 本方言不解析；**静默忽略会读到别的数据**，故一旦能解析必须拦 |
 | **裸列的解析范围** | ⚠️ | **裸名 = 左侧输入**；JOIN 右表的列**必须限定**（`u.c`）。与标准 SQL 不同（标准是"全输入搜索 + 歧义报错"），但本仓规则**确定性**且报错会指路（提示写成 `u.c`）。歧义不会静默二选一 |
@@ -86,7 +88,7 @@
 | `row_number` / `rank` / `dense_rank` / `lag` / `lead` / `sum`/`avg`/`count`/`min`/`max` `OVER (…)` | ✅ | 支持清单以报错文案为准（`support: …`） |
 | `PARTITION BY` / `ORDER BY`（多列、混合方向） | ✅ | |
 | **帧边界** `ROWS/RANGE BETWEEN …` | ✋ | 此前**静默用默认帧** ⇒ 换一个数字（累计）而不报错 |
-| 窗口内 `ORDER BY … NULLS FIRST/LAST` | ✋ | 同 §一 |
+| 窗口内 `ORDER BY … NULLS FIRST/LAST` | ✅ | 与外部 `ORDER BY` **同一套**规则（共用 `SortKey`）|
 | `ntile` / `first_value` / `last_value` / `percent_rank` / `cume_dist` | ✋ | 未实现（报错列支持清单） |
 | 命名窗口 | ✋ | 见 §一 |
 
@@ -117,5 +119,9 @@
 1. **加新语法**：要么在绑定器里真读那个字段，要么在四个 `audit_*` 里拒绝。
 2. **闸门有回归**：`crates/qsdb/tests/sql_silent_drop.rs` 每条拒绝都配**对照组**
    （正例），防止"一刀切"把正常查询也拒了。
-3. **别信"没人会这么写"**：这份清单里 11 条静默丢弃中，有 5 条是**常见写法**
-   （`FILTER`、窗口帧、`OFFSET`、`NULLS FIRST`、`ON CONFLICT`）。
+3. **别信"没人会这么写"**：这份清单里 **12 条**静默丢弃中，有 **5 条是常见写法**
+   （`FILTER`、窗口帧、`OFFSET`、`NULLS FIRST`、`ON CONFLICT`）——其中 3 条
+   （`OFFSET`/`FETCH`/`NULLS`）在 2026-10-13 已从"拒"实现为"能"。
+4. **顺手挖到的真实踩坑**：`SELECT * FROM t EXCLUDE (b)` 会被解析成「表别名
+   `exclude` + 列清单 `(b)`」⇒ **静默拿到全列**（Snowflake 用户会中招）。同类
+   写法 `FROM t AS x(a,b)` 一并拦。

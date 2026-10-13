@@ -161,7 +161,7 @@ pub fn sort_batch(batch: &RecordBatch, keys: &[SortKey]) -> Result<RecordBatch> 
             values: arr,
             options: Some(arrow::compute::SortOptions {
                 descending: k.descending,
-                nulls_first: k.descending,
+                nulls_first: k.nulls_first_or_default(),
             }),
         });
     }
@@ -411,12 +411,14 @@ impl RunMerger {
             let a_arr = &a.key_cols[a.batch_idx][ki];
             let b_arr = &b.key_cols[b.batch_idx][ki];
             let ord = cmp_cell(a_arr.as_ref(), a.row_idx, b_arr.as_ref(), b.row_idx);
-            // pg 序：ASC NULLS LAST / DESC NULLS FIRST（与 SortExec 一致）
+            // NULL 放置：显式 `NULLS FIRST/LAST` 优先，否则 pg 默认
+            // （ASC ⇒ NULLS LAST / DESC ⇒ NULLS FIRST，与 `sort_batch` 一致）。
+            let nf = k.nulls_first_or_default();
             let ord = match (ord, k.descending) {
-                (CellOrd::NullVsVal, false) => Ordering::Greater, // NULL LAST
-                (CellOrd::NullVsVal, true) => Ordering::Less,     // NULL FIRST
-                (CellOrd::ValVsNull, false) => Ordering::Less,
-                (CellOrd::ValVsNull, true) => Ordering::Greater,
+                (CellOrd::NullVsVal, _) if nf => Ordering::Less, // NULL FIRST
+                (CellOrd::NullVsVal, _) => Ordering::Greater,    // NULL LAST
+                (CellOrd::ValVsNull, _) if nf => Ordering::Greater,
+                (CellOrd::ValVsNull, _) => Ordering::Less,
                 (CellOrd::BothNull, _) => Ordering::Equal,
                 (CellOrd::Vals(o), false) => o,
                 (CellOrd::Vals(o), true) => o.reverse(),

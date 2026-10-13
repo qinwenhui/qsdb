@@ -116,56 +116,45 @@ fn window_frame_is_rejected() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// ③ 限制子句：`OFFSET`（三种写法）此前被**静默丢掉** → 少翻页、多返回行。
+/// ③ 限制子句：`OFFSET` / `FETCH FIRST n ROWS ONLY` 此前被**静默丢掉**——
+/// 现已**实现**（语义回归在 `tests/limit_offset_nulls.rs`）；
+/// 这里只钉住**语义不同**、必须继续拒的两种形态。
 #[test]
-fn offset_and_fetch_are_rejected() {
-    let (db, root) = setup("offset");
-    rejected(&db, "SELECT a FROM t ORDER BY a LIMIT 2 OFFSET 1", "OFFSET");
-    rejected(&db, "SELECT a FROM t ORDER BY a OFFSET 2 ROWS", "OFFSET");
-    rejected(&db, "SELECT a FROM t ORDER BY a LIMIT 1, 2", "OFFSET");
+fn fetch_variants_with_different_semantics_are_rejected() {
+    let (db, root) = setup("fetch");
     rejected(
         &db,
-        "SELECT a FROM t FETCH FIRST 2 ROWS ONLY",
+        "SELECT a FROM t FETCH FIRST 10 PERCENT ROWS ONLY",
         "FETCH FIRST",
     );
-    // 对照组：OFFSET 为 0 / 不写 OFFSET 时照常
+    rejected(
+        &db,
+        "SELECT a FROM t FETCH FIRST 2 ROWS WITH TIES",
+        "FETCH FIRST",
+    );
+    // 对照：等价形态照常（`FETCH FIRST n ROWS ONLY` ≡ `LIMIT n`）
     assert_eq!(
         scalar(
             &db,
-            "SELECT count(*) FROM (SELECT a FROM t ORDER BY a LIMIT 2) x"
+            "SELECT count(*) FROM (SELECT a FROM t FETCH FIRST 2 ROWS ONLY) x"
         ),
         "2"
     );
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// ④ 排序选项：`NULLS FIRST/LAST` 此前被忽略 → 恒用默认，**顺序静默不对**。
+/// ④ 排序选项：`NULLS FIRST/LAST` 此前被忽略——现已**实现**
+/// （语义回归在 `tests/limit_offset_nulls.rs`）；`WITH FILL` 仍未实现，继续拒。
 #[test]
-fn nulls_first_last_is_rejected() {
-    let (db, root) = setup("nulls");
-    rejected(
-        &db,
-        "SELECT b FROM t ORDER BY b ASC NULLS FIRST",
-        "NULLS FIRST/LAST",
-    );
-    rejected(
-        &db,
-        "SELECT b FROM t ORDER BY b DESC NULLS LAST",
-        "NULLS FIRST/LAST",
-    );
-    // 窗口内 ORDER BY 同一选项
-    rejected(
-        &db,
-        "SELECT sum(b) OVER (ORDER BY b ASC NULLS FIRST) FROM t",
-        "NULLS FIRST/LAST",
-    );
-    // 对照组：默认放置（ASC ⇒ NULLS LAST / DESC ⇒ NULLS FIRST）是对的
-    let bs = db.sql_collect("SELECT b FROM t ORDER BY b ASC").unwrap();
-    let last = (0..bs[0].num_rows())
-        .map(|i| arrow::util::display::array_value_to_string(bs[0].column(0).as_ref(), i).unwrap())
-        .next_back()
+fn order_by_with_fill_is_rejected() {
+    let (db, root) = setup("orderby");
+    rejected(&db, "SELECT b FROM t ORDER BY b ASC WITH FILL", "WITH FILL");
+    // 对照：NULLS 已可用
+    let bs = db
+        .sql_collect("SELECT b FROM t ORDER BY b ASC NULLS FIRST")
         .unwrap();
-    assert_eq!(last, "", "ASC 默认把 NULL 放最后（渲染成空串）");
+    let first = arrow::util::display::array_value_to_string(bs[0].column(0).as_ref(), 0).unwrap();
+    assert_eq!(first, "", "NULLS FIRST ⇒ 首行是 NULL（渲染成空串）");
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -259,13 +248,15 @@ fn right_side_bare_column_error_points_at_the_fix() {
 }
 
 /// ⑧ 闸门必须**覆盖嵌套**：子查询/派生表/CTE 体里的静默子句同样要拦。
+///
+/// （用**仍未实现**的子句探路——已实现的 `OFFSET`/`NULLS`/`FETCH` 不再拒。）
 #[test]
 fn gates_cover_nested_queries() {
     let (db, root) = setup("nested");
     rejected(
         &db,
-        "SELECT count(*) FROM (SELECT a FROM t FETCH FIRST 1 ROWS ONLY) x",
-        "FETCH FIRST",
+        "SELECT count(*) FROM (SELECT a FROM t TABLESAMPLE (10 PERCENT)) x",
+        "TABLESAMPLE",
     );
     rejected(
         &db,
@@ -274,13 +265,20 @@ fn gates_cover_nested_queries() {
     );
     rejected(
         &db,
-        "WITH w AS (SELECT a FROM t ORDER BY a NULLS FIRST) SELECT count(*) FROM w",
-        "NULLS FIRST/LAST",
+        "WITH w AS (SELECT a FROM t QUALIFY a > 1) SELECT count(*) FROM w",
+        "QUALIFY",
     );
     rejected(
         &db,
         "SELECT (SELECT count(*) FILTER (WHERE a > 1) FROM t) FROM t LIMIT 1",
         "FILTER",
     );
+    rejected(
+        &db,
+        "SELECT count(*) FROM (SELECT * FROM t EXCLUDE (b)) x",
+        "EXCLUDE",
+    );
+    // 对照：同样的嵌套形状，去掉静默子句就照常
+    assert_eq!(scalar(&db, "SELECT count(*) FROM (SELECT a FROM t) x"), "4");
     std::fs::remove_dir_all(&root).ok();
 }

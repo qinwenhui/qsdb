@@ -547,10 +547,14 @@ impl ExecNode for SetOpExec {
     }
 }
 
-/// LIMIT。
+/// LIMIT / OFFSET。
+///
+/// `remaining = None` = 不限行数（`OFFSET n` 不带 `LIMIT` 的形态）；
+/// `skip` = 先丢掉的起始行数（`OFFSET n`）。
 pub struct LimitExec {
     pub input: Box<dyn ExecNode>,
-    pub remaining: usize,
+    pub remaining: Option<usize>,
+    pub skip: usize,
 }
 
 impl ExecNode for LimitExec {
@@ -565,21 +569,36 @@ impl ExecNode for LimitExec {
     }
 
     fn next(&mut self) -> Option<Result<RecordBatch>> {
-        if self.remaining == 0 {
-            return None;
+        loop {
+            if self.remaining == Some(0) {
+                return None;
+            }
+            let batch = self.input.next()?;
+            let mut batch = match batch {
+                Ok(b) => b,
+                Err(e) => return Some(Err(e)),
+            };
+            // **先跳 OFFSET**：整批落在跳过区就丢掉继续取；部分落进则切片。
+            if self.skip > 0 {
+                let n = batch.num_rows();
+                if self.skip >= n {
+                    self.skip -= n;
+                    continue;
+                }
+                batch = batch.slice(self.skip, n - self.skip);
+                self.skip = 0;
+            }
+            let Some(lim) = self.remaining else {
+                return Some(Ok(batch)); // 无 LIMIT：跳过之后全给
+            };
+            if batch.num_rows() > lim {
+                let sliced = batch.slice(0, lim);
+                self.remaining = Some(0);
+                return Some(Ok(sliced));
+            }
+            self.remaining = Some(lim - batch.num_rows());
+            return Some(Ok(batch));
         }
-        let batch = self.input.next()?;
-        let batch = match batch {
-            Ok(b) => b,
-            Err(e) => return Some(Err(e)),
-        };
-        if batch.num_rows() > self.remaining {
-            let sliced = batch.slice(0, self.remaining);
-            self.remaining = 0;
-            return Some(Ok(sliced));
-        }
-        self.remaining -= batch.num_rows();
-        Some(Ok(batch))
     }
 }
 
@@ -588,6 +607,20 @@ impl ExecNode for LimitExec {
 pub struct SortKey {
     pub expr: PhysExpr,
     pub descending: bool,
+    /// `NULLS FIRST/LAST`。`None` = 未写（用默认放置：`ASC ⇒ NULLS LAST`、
+    /// `DESC ⇒ NULLS FIRST`，与 PG 一致）。
+    ///
+    /// **为什么是 Option 而不是 bool**：要区分"没写"与"写了默认值"——前者是
+    /// 未指定语义，后者在更早的版本里曾**被静默忽略**（见 `docs/SQL支持面.md`）。
+    pub nulls_first: Option<bool>,
+}
+
+impl SortKey {
+    /// 该键的 NULL 放置：显式值优先，否则按方向取默认。
+    #[inline]
+    pub fn nulls_first_or_default(&self) -> bool {
+        self.nulls_first.unwrap_or(self.descending)
+    }
 }
 
 /// 排序 / TopN（物化 + lexsort；limit=Some 即 TopN）。
@@ -801,7 +834,7 @@ fn sort_with_limit(
             values: arr,
             options: Some(arrow::compute::SortOptions {
                 descending: k.descending,
-                nulls_first: k.descending,
+                nulls_first: k.nulls_first_or_default(),
             }),
         });
     }

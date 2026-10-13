@@ -60,7 +60,10 @@ pub enum LogicalPlan {
     },
     Limit {
         input: Box<LogicalPlan>,
-        n: usize,
+        /// `None` = 不限（只写 `OFFSET n` 的形态）。
+        n: Option<usize>,
+        /// `OFFSET n` 的起始行数（此前**被静默丢掉** ⇒ 少翻页）。
+        offset: usize,
     },
     Distinct {
         input: Box<LogicalPlan>,
@@ -69,7 +72,9 @@ pub enum LogicalPlan {
     Window {
         input: Box<LogicalPlan>,
         partition_by: Vec<PhysExpr>,
-        order_by: Vec<(PhysExpr, bool)>,
+        /// 窗口内 `ORDER BY`：与外部排序**共用 `SortKey`**（含 `NULLS FIRST/LAST`），
+        /// 免得两处各有一套 NULL 语义而慢慢漂移。
+        order_by: Vec<crate::exec::SortKey>,
         window_fns: Vec<crate::exec::window::WindowFn>,
     },
     /// 内存批源（CTE 物化；执行层持有批数据，binder 只带 schema 描述）
@@ -171,20 +176,9 @@ fn audit_query(q: &sqlparser::ast::Query) -> Result<()> {
     if !q.pipe_operators.is_empty() {
         return reject("pipe operators (|>)");
     }
-    // LIMIT/OFFSET：**本批先拒**（此前 offset 被静默丢掉 → 少翻页）。下批实现。
-    if let Some(lc) = &q.limit_clause {
-        use sqlparser::ast::LimitClause;
-        let has_offset = match lc {
-            LimitClause::LimitOffset { offset, .. } => offset.is_some(),
-            LimitClause::OffsetCommaLimit { .. } => true, // `LIMIT n, m` = 偏移 m
-        };
-        if has_offset {
-            return reject("OFFSET (also `LIMIT n, m`)");
-        }
-    }
-    if q.fetch.is_some() {
-        return reject("FETCH FIRST … ROWS ONLY (use LIMIT)");
-    }
+    // `LIMIT` / `OFFSET` / `FETCH FIRST n ROWS ONLY`：**已实现**（见
+    // `bind_limit_offset`），故不在此拒绝。`FETCH … PERCENT / WITH TIES`
+    // 语义不同，在那个助手内单独拒绝。
     // CTE 列别名：`WITH w(q) AS …`
     if let Some(w) = &q.with {
         for cte in &w.cte_tables {
@@ -209,12 +203,9 @@ fn audit_order_by(kind: &sqlparser::ast::OrderByKind) -> Result<()> {
         return Err(QsdbError::unsupported("ORDER BY ALL"));
     };
     for ob in es {
-        if ob.options.nulls_first.is_some() {
-            return Err(QsdbError::unsupported(
-                "ORDER BY … NULLS FIRST/LAST is not supported — refusing rather than \
-                 silently using the default placement (ASC ⇒ NULLS LAST, DESC ⇒ NULLS FIRST)",
-            ));
-        }
+        // `nulls_first` **已实现**：显式值优先，否则默认放置
+        // （ASC ⇒ NULLS LAST / DESC ⇒ NULLS FIRST，见 `exec::SortKey::nulls_first_or_default`）。
+        // 这里只审仍未实现的 `with_fill`。
         if ob.with_fill.is_some() {
             return Err(QsdbError::unsupported("ORDER BY … WITH FILL"));
         }
@@ -310,6 +301,7 @@ fn audit_table_factor(tf: &sqlparser::ast::TableFactor) -> Result<()> {
     };
     match tf {
         TableFactor::Table {
+            alias,
             sample,
             version,
             partitions,
@@ -317,6 +309,17 @@ fn audit_table_factor(tf: &sqlparser::ast::TableFactor) -> Result<()> {
             args,
             ..
         } => {
+            // **表别名上的列清单**（`FROM t AS x(a,b)`）——同样被静默丢掉。
+            // 顺带提醒一个真实的踩坑：`SELECT * FROM t EXCLUDE (b)` 会被解析成
+            // 「别名 `exclude` + 列清单 `(b)`」，于是用户以为在写 Snowflake 的
+            // EXCLUDE，实际拿到了**全列**（静默多列）。故这里必须拦。
+            if let Some(a) = alias {
+                if !a.columns.is_empty() {
+                    return reject(
+                        "column alias list on a table factor (… AS x(a,b)) — note                          `SELECT * FROM t EXCLUDE (b)` parses as an alias `exclude`                          with a dropped column list, not as EXCLUDE",
+                    );
+                }
+            }
             if sample.is_some() {
                 return reject("TABLESAMPLE");
             }
@@ -2031,7 +2034,8 @@ fn attach_scalar_subqueries(
             left: Box::new(plan),
             right: Box::new(LogicalPlan::Limit {
                 input: Box::new(sub),
-                n: 1,
+                n: Some(1),
+                offset: 0,
             }),
             predicate: PhysExpr::Lit(Literal::Boolean(true)),
         };
@@ -2217,6 +2221,7 @@ fn translate_set_operation(
         let mut keys = Vec::with_capacity(exprs.len());
         for ob in &exprs {
             let desc = matches!(&ob.options.sort, Some(sqlparser::ast::OrderBySort::Desc));
+            let nulls_first = ob.options.nulls_first;
             let idx = match &ob.expr {
                 sqlparser::ast::Expr::Identifier(id) => lc
                     .iter()
@@ -2243,6 +2248,7 @@ fn translate_set_operation(
                     ty: lc[i].1.clone(),
                 },
                 descending: desc,
+                nulls_first,
             });
         }
         plan = LogicalPlan::Sort {
@@ -2250,25 +2256,78 @@ fn translate_set_operation(
             keys,
         };
     }
-    // LIMIT（沿用普通路径的常量要求）
-    if let Some(limit_clause) = &q.limit_clause {
-        let limit_expr: Option<&sqlparser::ast::Expr> = match limit_clause {
-            sqlparser::ast::LimitClause::LimitOffset { limit: Some(l), .. } => Some(l),
-            sqlparser::ast::LimitClause::OffsetCommaLimit { limit, .. } => Some(limit),
-            _ => None,
+    // LIMIT / OFFSET / FETCH（统一走助手：五种写法一处处理）
+    let (n, offset) = bind_limit_offset(q.limit_clause.as_ref(), q.fetch.as_ref())?;
+    if n.is_some() || offset > 0 {
+        plan = LogicalPlan::Limit {
+            input: Box::new(plan),
+            n,
+            offset,
         };
-        if let Some(e) = limit_expr {
-            let n = match bind_expr(e, &SchemaCtx { cols: vec![] })? {
-                PhysExpr::Lit(Literal::Int64(n)) if n >= 0 => n as usize,
-                _ => return Err(QsdbError::invalid("LIMIT requires a non-negative integer")),
-            };
-            plan = LogicalPlan::Limit {
-                input: Box::new(plan),
-                n,
-            };
-        }
     }
     Ok((plan, cte_defs))
+}
+
+/// 绑定 `LIMIT n [OFFSET m]` / 各变体 → `(limit, offset)`。
+///
+/// 覆盖五种写法：`LIMIT n` / `LIMIT n OFFSET m` / `OFFSET m`（无 LIMIT）/
+/// `LIMIT m, n`（MySQL 形，offset 在前）/ `FETCH FIRST n ROWS ONLY`。
+///
+/// ⚠️ `FETCH FIRST n PERCENT ROWS` 与 `… WITH TIES` **语义不同**（按比例 / 带并列），
+/// **不能当 LIMIT 处理**——显式拒绝。
+///
+/// 收 `(limit_clause, fetch)` 而不是 `&Query`：调用点在 `*q.body` 被部分移动之后，
+/// 那时整借 `&q` 不成立（`limit_clause`/`fetch` 是别的字段，可单独借/克隆）。
+fn bind_limit_offset(
+    limit_clause: Option<&sqlparser::ast::LimitClause>,
+    fetch: Option<&sqlparser::ast::Fetch>,
+) -> Result<(Option<usize>, usize)> {
+    use sqlparser::ast::LimitClause;
+    let mut limit: Option<usize> = None;
+    let mut offset = 0usize;
+    let bind_const = |e: &sqlparser::ast::Expr, what: &str| -> Result<usize> {
+        match bind_expr(e, &SchemaCtx { cols: vec![] })? {
+            PhysExpr::Lit(Literal::Int64(n)) if n >= 0 => Ok(n as usize),
+            _ => Err(QsdbError::invalid(format!(
+                "{what} requires a non-negative integer"
+            ))),
+        }
+    };
+    if let Some(lc) = limit_clause {
+        match lc {
+            LimitClause::LimitOffset {
+                limit: l,
+                offset: o,
+                ..
+            } => {
+                if let Some(l) = l {
+                    limit = Some(bind_const(l, "LIMIT")?);
+                }
+                if let Some(o) = o {
+                    offset = bind_const(&o.value, "OFFSET")?;
+                }
+            }
+            // `LIMIT <offset>, <count>`（MySQL 形——offset 在前）
+            LimitClause::OffsetCommaLimit {
+                offset: o,
+                limit: l,
+            } => {
+                offset = bind_const(o, "LIMIT offset")?;
+                limit = Some(bind_const(l, "LIMIT")?);
+            }
+        }
+    }
+    if let Some(f) = fetch {
+        if f.percent || f.with_ties {
+            return Err(QsdbError::unsupported(
+                "FETCH FIRST … PERCENT ROWS / WITH TIES is not supported: semantics differ                  from LIMIT (proportional / ties included), so it must not be executed as LIMIT",
+            ));
+        }
+        if let Some(e) = &f.quantity {
+            limit = Some(bind_const(e, "FETCH FIRST")?);
+        }
+    }
+    Ok((limit, offset))
 }
 
 /// 集合操作一侧 cast 到公共类型（包 Project；列名沿用）。
@@ -2303,6 +2362,9 @@ fn translate_select_inner(
 
     // **静默丢弃闸门**（见 `audit_query`）：每个 Query 的必经点，嵌套子查询自动被审。
     audit_query(&q)?;
+    // LIMIT/OFFSET/FETCH 在 `*q.body` 被部分移动之前取出（都是小 AST）
+    let limit_clause = q.limit_clause.clone();
+    let fetch = q.fetch.clone();
 
     // 集合操作分支（借用判别，避免 body 部分移动）
     if let SetExpr::SetOperation {
@@ -2802,9 +2864,9 @@ fn translate_select_inner(
             }
         };
         for ob in &order_exprs {
-            let (key_expr, descending) = {
+            let (key_expr, descending, nulls_first) = {
                 let desc = matches!(&ob.options.sort, Some(sqlparser::ast::OrderBySort::Desc));
-                (&ob.expr, desc)
+                (&ob.expr, desc, ob.options.nulls_first)
             };
             // 别名/输出名优先：Identifier 查输出名；纯数字字面量 = 输出序号
             //（1-based，SQL 标准）；其他表达式按 display 匹配投影
@@ -2830,6 +2892,7 @@ fn translate_select_inner(
                         ty: LogicalType::Int64, // 占位；exec 用实际 schema 列
                     },
                     descending,
+                    nulls_first,
                 }),
                 None => {
                     if is_agg {
@@ -2853,6 +2916,7 @@ fn translate_select_inner(
                             ty: LogicalType::Int64,
                         },
                         descending,
+                        nulls_first,
                     });
                 }
             }
@@ -2889,23 +2953,14 @@ fn translate_select_inner(
         }
     }
 
-    // LIMIT
-    if let Some(limit_clause) = &q.limit_clause {
-        let limit_expr: Option<&sqlparser::ast::Expr> = match limit_clause {
-            sqlparser::ast::LimitClause::LimitOffset { limit, .. } => limit.as_ref(),
-            sqlparser::ast::LimitClause::OffsetCommaLimit { limit, .. } => Some(limit),
+    // LIMIT / OFFSET / FETCH（CTE 物化路径同样走助手）
+    let (n, offset) = bind_limit_offset(limit_clause.as_ref(), fetch.as_ref())?;
+    if n.is_some() || offset > 0 {
+        plan = LogicalPlan::Limit {
+            input: Box::new(plan),
+            n,
+            offset,
         };
-        if let Some(limit_expr) = limit_expr {
-            let lit = constant_expr(limit_expr)?;
-            let n = match lit {
-                Literal::Int64(v) if v >= 0 => v as usize,
-                _ => return Err(QsdbError::invalid("LIMIT expects a non-negative integer")),
-            };
-            plan = LogicalPlan::Limit {
-                input: Box::new(plan),
-                n,
-            };
-        }
     }
 
     let defs = filter_reachable_ctes(cte_defs, &plan);
@@ -3215,8 +3270,11 @@ fn parse_window_spec(
         }
         let mut order_by = Vec::new();
         for ob in &spec.order_by {
-            let desc = matches!(&ob.options.sort, Some(sqlparser::ast::OrderBySort::Desc));
-            order_by.push((bind(&ob.expr)?, desc));
+            order_by.push(crate::exec::SortKey {
+                expr: bind(&ob.expr)?,
+                descending: matches!(&ob.options.sort, Some(sqlparser::ast::OrderBySort::Desc)),
+                nulls_first: ob.options.nulls_first,
+            });
         }
         Ok(crate::exec::window::WindowSpec {
             partition_by,

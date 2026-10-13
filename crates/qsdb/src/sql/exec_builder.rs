@@ -358,9 +358,10 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
             // 回归：`tests/order_by_prune.rs`。
             keys: keys.clone(),
         },
-        LogicalPlan::Limit { input, n } => LogicalPlan::Limit {
+        LogicalPlan::Limit { input, n, offset } => LogicalPlan::Limit {
             input: Box::new(rewrite_plan(input, mapping, all)),
             n: *n,
+            offset: *offset,
         },
         LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
             input: Box::new(rewrite_plan(input, mapping, all)),
@@ -393,7 +394,11 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
                 .collect(),
             order_by: order_by
                 .iter()
-                .map(|(e, d)| (rewrite_expr(e, mapping, all), *d))
+                .map(|k| crate::exec::SortKey {
+                    expr: rewrite_expr(&k.expr, mapping, all),
+                    descending: k.descending,
+                    nulls_first: k.nulls_first,
+                })
                 .collect(),
             window_fns: window_fns.clone(),
         },
@@ -560,24 +565,40 @@ fn build_inner(
             None,
             Arc::clone(ctx),
         ))),
-        LogicalPlan::Limit { input, n } => {
-            // `ORDER BY … LIMIT n` → **TopN 接线**：把 n 交给 `SortExec`。
+        LogicalPlan::Limit { input, n, offset } => {
+            // `ORDER BY … LIMIT n [OFFSET m]` → **TopN 接线**：把 `n + m` 交给 `SortExec`
+            // （前 m 行反正要丢掉，故上界是 n+m 而非 n），再由 `LimitExec` 跳过 m。
             // 此前恒传 `None`（见上面 Sort 分支）→ 全量物化 + 全排序后才截断，
             // 而 `SortExec` 的 limit 一直有能力做"部分排序 + 有界缓冲"（早先没人接）。
-            // 语义等价：`Limit n` 就是排序后的前 n 行（Limit 节点因此不再需要）。
             //
             // 两种形状都要认：`Sort`，以及 `Project{Sort}`——后者是 ORDER BY 引用了
             // **未投影**列时，translate 在 Sort 之上补的"收回隐藏排序列"投影
-            // （`SELECT v FROM t ORDER BY w`）。投影逐行 1:1，且**放在 TopN 之后反而
-            // 更好**（只对出网的 n 行做投影）。
+            // （`SELECT v FROM t ORDER BY w`）。
+            //
+            // ⚠️ **offset 非 0 时不能省掉 Limit 节点**（那会多返回前 m 行——
+            // 这正是"OFFSET 被静默丢掉"那个 bug 的形态）；`n` 为 `None`（只写
+            // `OFFSET m`）时 TopN 没有上界，退化为全排序 + 跳过。
+            let (n, offset) = (*n, *offset);
+            let topn = n.map(|k| k.saturating_add(offset));
+            let wrap = |sorted: Box<dyn ExecNode>| -> Box<dyn ExecNode> {
+                if offset == 0 {
+                    sorted
+                } else {
+                    Box::new(LimitExec {
+                        input: sorted,
+                        remaining: n,
+                        skip: offset,
+                    })
+                }
+            };
             match input.as_ref() {
                 LogicalPlan::Sort { input: inner, keys } => {
-                    return Ok(Box::new(SortExec::new(
+                    return Ok(wrap(Box::new(SortExec::new(
                         build_inner(db, inner, scan_proj.clone(), ctx)?,
                         keys.clone(),
-                        Some(*n),
+                        topn,
                         Arc::clone(ctx),
-                    )));
+                    ))));
                 }
                 LogicalPlan::Project {
                     input: p_in,
@@ -588,21 +609,22 @@ fn build_inner(
                         let sorted = SortExec::new(
                             build_inner(db, inner, scan_proj.clone(), ctx)?,
                             keys.clone(),
-                            Some(*n),
+                            topn,
                             Arc::clone(ctx),
                         );
-                        return Ok(Box::new(ProjectExec::new(
+                        return Ok(wrap(Box::new(ProjectExec::new(
                             Box::new(sorted),
                             exprs.clone(),
                             names.clone(),
-                        )));
+                        ))));
                     }
                 }
                 _ => {}
             }
             Ok(Box::new(LimitExec {
                 input: build_inner(db, input, scan_proj.clone(), ctx)?,
-                remaining: *n,
+                remaining: n,
+                skip: offset,
             }))
         }
         LogicalPlan::Distinct { input } => Ok(Box::new(crate::exec::DistinctExec::new(

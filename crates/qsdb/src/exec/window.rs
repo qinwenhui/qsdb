@@ -52,7 +52,7 @@ use super::ExecNode;
 #[derive(Debug, Clone, Default)]
 pub struct WindowSpec {
     pub partition_by: Vec<PhysExpr>,
-    pub order_by: Vec<(PhysExpr, bool)>,
+    pub order_by: Vec<crate::exec::SortKey>,
 }
 
 impl WindowSpec {
@@ -62,7 +62,14 @@ impl WindowSpec {
         let o: Vec<String> = self
             .order_by
             .iter()
-            .map(|(e, d)| format!("{}:{d}", e.display()))
+            .map(|k| {
+                format!(
+                    "{}:{}:{}",
+                    k.expr.display(),
+                    k.descending,
+                    k.nulls_first.map_or('d', |b| if b { 'f' } else { 'l' })
+                )
+            })
             .collect();
         format!("{}|{}", p.join(","), o.join(","))
     }
@@ -130,7 +137,7 @@ pub struct WindowExec {
     /// PARTITION BY 表达式
     partition_by: Vec<PhysExpr>,
     /// ORDER BY 表达式 + 方向
-    order_by: Vec<(PhysExpr, bool)>, // (expr, descending)
+    order_by: Vec<crate::exec::SortKey>,
     /// 窗口函数（与输出列一一对应）
     window_fns: Vec<WindowFn>,
     schema: SchemaRef,
@@ -150,7 +157,7 @@ impl WindowExec {
     pub fn new(
         input: Box<dyn ExecNode>,
         partition_by: Vec<PhysExpr>,
-        order_by: Vec<(PhysExpr, bool)>,
+        order_by: Vec<crate::exec::SortKey>,
         window_fns: Vec<WindowFn>,
         ctx: Arc<QueryContext>,
     ) -> Self {
@@ -296,14 +303,15 @@ impl WindowExec {
             });
         }
         let mut order_arrs: Vec<ArrayRef> = Vec::new();
-        for (e, desc) in &self.order_by {
-            let arr = eval::eval(e, &input_batch)?;
+        for k in &self.order_by {
+            let arr = eval::eval(&k.expr, &input_batch)?;
             order_arrs.push(Arc::clone(&arr));
             sort_cols.push(SortColumn {
                 values: arr,
                 options: Some(arrow::compute::SortOptions {
-                    descending: *desc,
-                    nulls_first: *desc,
+                    descending: k.descending,
+                    // 窗口内 ORDER BY 的 NULL 放置与外部 ORDER BY 同一套规则
+                    nulls_first: k.nulls_first_or_default(),
                 }),
             });
         }
