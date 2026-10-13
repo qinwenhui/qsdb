@@ -69,10 +69,7 @@ pub fn add_cte_batches(cte_id: u32, batches: Vec<RecordBatch>, res: crate::memor
 
 /// 当前 CTE 批占用的内存（估算：批的 Arrow buffer 字节）。
 pub fn cte_bytes(map: &std::collections::HashMap<u32, Vec<RecordBatch>>) -> u64 {
-    map.values()
-        .flatten()
-        .map(|b| b.get_array_memory_size() as u64)
-        .sum()
+    map.values().flatten().map(crate::memory::batch_bytes).sum()
 }
 
 /// 一次性批执行节点（并行聚合结果）。

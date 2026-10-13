@@ -395,7 +395,7 @@ impl PartSpill {
                 .collect::<Result<_>>()?;
             let sub = RecordBatch::try_new(Arc::clone(&self.schema), cols)
                 .map_err(|e| QsdbError::invalid(format!("part spill batch: {e}")))?;
-            let bytes = sub.get_array_memory_size() as u64;
+            let bytes = crate::memory::batch_bytes(&sub);
             if self.res.grow(bytes).is_err() {
                 // **额度不够也不能失败**：`part_cap` 只是"想攒多大再落盘"的期望
                 // 上界，不是硬要求。先把这个分区已缓冲的行落盘腾地方，再试一次；
@@ -448,7 +448,7 @@ impl PartSpill {
         out.append(&mut self.bufs[p]);
         self.buf_bytes[p] = 0;
         self.res.shrink(freed);
-        let bytes: u64 = out.iter().map(|b| b.get_array_memory_size() as u64).sum();
+        let bytes: u64 = out.iter().map(crate::memory::batch_bytes).sum();
         self.res.grow(bytes)?;
         self.live = bytes;
         Ok(out)
@@ -476,7 +476,7 @@ impl PartSpill {
         self.live = 0;
         for path in std::mem::take(&mut self.runs[p]) {
             for b in spill::read_run(&path)? {
-                let bytes = b.get_array_memory_size() as u64;
+                let bytes = crate::memory::batch_bytes(&b);
                 let accounted = self.res.grow(bytes).is_ok();
                 f(&b)?;
                 if accounted {

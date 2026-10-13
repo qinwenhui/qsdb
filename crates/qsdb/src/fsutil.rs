@@ -77,11 +77,15 @@ pub fn write_atomic_opts<D: AsRef<Path>>(dest: D, data: &[u8], sync: bool) -> Re
         use std::io::Write;
         f.write_all(data)
             .map_err(|e| QsdbError::meta(format!("write tmp failed: {e}")))?;
+        // **默认档（`sync = false`）不做 fsync**：`Durability::ProcessCrash` 的承诺是
+        // 「页缓存即持久——kill -9 后数据完好」，页缓存本来就够；这里再 sync 一次的
+        // 后果是**每次元数据写都强制落盘**（实测 45ms/次，见 `docs/真机基准对账.md`：
+        // 一次 `db.append` = 段 + manifest + idx 三次 fsync ≈ 112ms，导入因此慢几十倍）。
+        // 原先写的是 `f.sync_all().ok()`（"尽力而为"）——既付了代价，又因为吞错
+        // 没有任何语义收益；与文档承诺也不一致。掉电安全请显式选 `PowerLoss`。
         if sync {
             f.sync_all()
                 .map_err(|e| QsdbError::meta(format!("fsync tmp failed: {e}")))?;
-        } else {
-            f.sync_all().ok(); // 尽力而为；提交点语义由 rename 保证
         }
     }
     atomic_replace(&tmp, dest)?;

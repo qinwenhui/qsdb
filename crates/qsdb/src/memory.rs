@@ -48,6 +48,48 @@ impl Yielder {
     }
 }
 
+/// `RecordBatch` 的**切片感知**字节估算——记账与攒批阈值都用它。
+///
+/// **不要**用 `RecordBatch::get_array_memory_size()` 做这两件事：它按**底层缓冲区
+/// 容量**算，而扫描出来的每一批几乎都是大缓冲的**切片**——父缓冲多大就报多大。
+/// 实测：500k 行父批切成 8192 行，`get_array_memory_size()` 仍报 4,000,096 字节，
+/// 逻辑只有 65,536（**虚高 61 倍**）。后果两类，都是实打实的：
+///
+/// 1. **记账虚高** → 配额下过早落盘 / 过早 `MEMORY_PRESSURE`（"明明装得下"）；
+/// 2. **阈值虚高** → 攒批逻辑退化：`INSERT … SELECT` 曾因此**每批提交一次**
+///    （5M 行 610 次提交），每次提交 3 次 fsync ≈ 112ms → 导入慢到 60-100s。
+///
+/// 取 arrow 的切片口径 `ArrayData::get_slice_memory_size()`（缓存的容量按切片折算）；
+/// 个别类型算不出来时退回按**逻辑长度**估（行数 × 列宽），再兜底老口径。
+pub fn batch_bytes(b: &arrow::record_batch::RecordBatch) -> u64 {
+    let mut total = 0u64;
+    for c in b.columns() {
+        match c.to_data().get_slice_memory_size() {
+            Ok(n) => total += n as u64,
+            Err(_) => {
+                // 兜底：按行数 × 该列的逻辑宽度（不碰父缓冲）
+                total += logical_width(c.data_type()) * b.num_rows() as u64;
+            }
+        }
+    }
+    total.max(1)
+}
+
+/// 单行的逻辑宽度下界（string/binary 只算 offset，数据段另计；够记账用）。
+fn logical_width(dt: &arrow::datatypes::DataType) -> u64 {
+    use arrow::datatypes::DataType as D;
+    match dt {
+        D::Boolean | D::Int8 | D::UInt8 => 1,
+        D::Int16 | D::UInt16 | D::Float16 => 2,
+        D::Int32 | D::UInt32 | D::Float32 | D::Date32 | D::Time32(_) => 4,
+        D::Int64 | D::UInt64 | D::Float64 | D::Date64 | D::Time64(_) | D::Timestamp(..) => 8,
+        D::Decimal128(..) | D::Interval(..) => 16,
+        D::Utf8 | D::Binary => 8,
+        D::LargeUtf8 | D::LargeBinary => 16,
+        _ => 16,
+    }
+}
+
 /// 进程内（严格说：一个 `Qsdb` 句柄内）共享的内存预算。
 pub struct MemoryPool {
     /// 0 = 不限（嵌入方自控；server 会给兜底默认值）。

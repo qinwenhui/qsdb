@@ -655,7 +655,7 @@ impl SortExec {
         while let Some(b) = self.input.next() {
             self.ctx.check()?;
             let x = b?;
-            let bytes = x.get_array_memory_size() as u64;
+            let bytes = crate::memory::batch_bytes(&x);
             // 要不到额度（自己的配额满 **或** 全库吃紧）→ 当前 chunk 落盘，
             // 之后受磁盘而非内存约束（**溢出只改完成 vs 拒绝的边界**）
             if res.grow(bytes).is_err() {
@@ -686,7 +686,7 @@ impl SortExec {
                     let cut = sort_with_limit(&merged, &self.keys, self.limit, &self.schema)?;
                     let back = chunk_bytes;
                     res.shrink(back);
-                    chunk_bytes = cut.get_array_memory_size() as u64;
+                    chunk_bytes = crate::memory::batch_bytes(&cut);
                     buffered_rows = cut.num_rows();
                     // 截断后必然更小（≤ 前 n 行）；拿不回额度也不影响正确性，
                     // 只影响记账精度——同溢出路径的口径（不因额度打死可完成的查询）

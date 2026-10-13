@@ -81,7 +81,10 @@ impl WriteBuffer {
         if groups.is_empty() {
             return Ok(());
         }
-        let bytes: usize = groups.iter().map(|(_, b)| b.get_array_memory_size()).sum();
+        let bytes: usize = groups
+            .iter()
+            .map(|(_, b)| crate::memory::batch_bytes(b) as usize)
+            .sum();
         let batches_n = groups.len();
 
         let should_flush = {

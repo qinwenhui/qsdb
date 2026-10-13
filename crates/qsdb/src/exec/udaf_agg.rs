@@ -76,7 +76,7 @@ impl UdafAggExec {
         while let Some(b) = self.input.next() {
             self.ctx.check()?;
             let x = b?;
-            res.grow(x.get_array_memory_size() as u64)?;
+            res.grow(crate::memory::batch_bytes(&x))?;
             batches.push(x);
         }
 

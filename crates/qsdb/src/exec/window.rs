@@ -222,7 +222,7 @@ impl WindowExec {
         while let Some(b) = self.input.next() {
             self.ctx.check()?;
             let x = b?;
-            if let Err(e) = res.grow(x.get_array_memory_size() as u64) {
+            if let Err(e) = res.grow(crate::memory::batch_bytes(&x)) {
                 // **要不到额度 → 按 PARTITION BY 键分区落盘**（而不是把查询打死）。
                 if self.partition_by.is_empty() {
                     // 边界：无 PARTITION BY → 整个输入就是一个分区，**无键可分区**
@@ -397,7 +397,7 @@ impl WindowExec {
             // 本分区 concat 的瞬时双份记账。走 `reserve_spill`（**只受全局预算
             // 约束**）：溢出路径的记账不吃每查询配额——否则小配额下逃生通道
             // 自己先被配额掐死（P1/P2 同一个坑，实测复现）。
-            let bytes: u64 = rows.iter().map(|b| b.get_array_memory_size() as u64).sum();
+            let bytes: u64 = rows.iter().map(crate::memory::batch_bytes).sum();
             let mut part_res = match self.ctx.reserve_spill(0) {
                 Ok(r) => r,
                 Err(e) => return Some(Err(e)),

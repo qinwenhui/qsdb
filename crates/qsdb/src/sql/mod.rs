@@ -439,7 +439,7 @@ fn materialize_ctes(
         let mut res = ctx.try_reserve(0)?;
         while let Some(b) = exec.next() {
             let b = b?;
-            res.grow(b.get_array_memory_size() as u64)?;
+            res.grow(crate::memory::batch_bytes(&b))?;
             batches.push(b);
         }
         exec_builder::add_cte_batches(cte.cte_id, batches, res);
@@ -755,8 +755,12 @@ fn check_insert_cast(from: &arrow::datatypes::DataType, to: &LogicalType, col: &
 /// 与 `write_buffer` 同一动机：逐批 `db.append` 会一批一个 segment，万级小批下
 /// manifest/索引重写放大到 O(n²)。阈值取 write_buffer 默认档的 1/4——这里是
 /// 单次导入的临时缓冲，没必要按常驻写缓冲的预算驻留。
-const INSERT_FLUSH_BATCHES: usize = 16;
 const INSERT_FLUSH_BYTES: u64 = 32 * 1024 * 1024;
+/// **行数**阈值：字节阈值在切片批上曾经失灵（见 `memory::batch_bytes` 的注释——
+/// `get_array_memory_size()` 报父缓冲大小，8192 行切片报 4MB，于是"每批都超 32MB"
+/// → 每批提交一次 → 5M 行 610 次提交 × 3 次 fsync = 60s）。行数不受切片影响，
+/// 作为主判据；字节判据（切片感知口径）只用于"宽行"兜底。
+const INSERT_FLUSH_ROWS: u64 = 512 * 1024;
 
 /// INSERT 写入端（两条源共用）。
 ///
@@ -777,6 +781,7 @@ struct InsertSink<'a> {
     res: crate::memory::Reservation,
     pending: Vec<RecordBatch>,
     pending_bytes: u64,
+    pending_rows: u64,
     /// OVERWRITE：分区值 → 该分区全宽批
     buckets: Vec<(Vec<Literal>, Vec<RecordBatch>)>,
     total: u64,
@@ -806,6 +811,7 @@ impl<'a> InsertSink<'a> {
             res: ctx.try_reserve(0)?,
             pending: Vec::new(),
             pending_bytes: 0,
+            pending_rows: 0,
             buckets: Vec::new(),
             total: 0,
             prof_align_ns: 0,
@@ -832,7 +838,7 @@ impl<'a> InsertSink<'a> {
         if aligned.num_rows() == 0 {
             return Ok(());
         }
-        let bytes = aligned.get_array_memory_size() as u64;
+        let bytes = crate::memory::batch_bytes(&aligned);
         self.res.grow(bytes)?;
         if self.overwrite {
             for (vals, mask) in partition_row_masks(self.def, &aligned)? {
@@ -848,11 +854,12 @@ impl<'a> InsertSink<'a> {
                 }
             }
         } else {
+            self.pending_rows += aligned.num_rows() as u64;
             self.pending.push(aligned);
             self.pending_bytes += bytes;
-            if self.pending.len() >= INSERT_FLUSH_BATCHES
-                || self.pending_bytes >= INSERT_FLUSH_BYTES
-            {
+            if self.pending_rows >= INSERT_FLUSH_ROWS || self.pending_bytes >= INSERT_FLUSH_BYTES {
+                // 行数为主（切片无关），字节为辅
+
                 self.flush_pending()?;
             }
         }
@@ -870,6 +877,7 @@ impl<'a> InsertSink<'a> {
         self.pending.clear();
         self.res.shrink(self.pending_bytes);
         self.pending_bytes = 0;
+        self.pending_rows = 0;
         Ok(())
     }
 

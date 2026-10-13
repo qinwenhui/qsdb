@@ -95,7 +95,7 @@ impl CrossJoinExec {
         while let Some(b) = build.next() {
             self.ctx.check()?;
             let x = b?;
-            res.grow(x.get_array_memory_size() as u64)?;
+            res.grow(crate::memory::batch_bytes(&x))?;
             batches.push(x);
         }
         let total = res.bytes();
@@ -369,7 +369,7 @@ impl HashJoinExec {
         while let Some(b) = self.build.next() {
             self.ctx.check()?;
             let x = b?;
-            if res.grow(x.get_array_memory_size() as u64).is_err() {
+            if res.grow(crate::memory::batch_bytes(&x)).is_err() {
                 // **要不到额度 → 转分区块 hash join**（而不是把查询打死）。
                 // 注意：**本批也要进分区**——它就是压垮内存的那一批，
                 // 只交已收集的 `batches` 会静默少一个批的行（实测丢 2000 行）。
@@ -723,7 +723,7 @@ impl HashJoinExec {
                     Ok(r) => r,
                     Err(e) => return Some(Err(e)),
                 };
-                let est = table.get_array_memory_size() as u64 + table.num_rows() as u64 * 16;
+                let est = crate::memory::batch_bytes(&table) + table.num_rows() as u64 * 16;
                 if let Err(e) = r.grow(est) {
                     return Some(Err(e));
                 }
