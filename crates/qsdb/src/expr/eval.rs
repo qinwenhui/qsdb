@@ -719,7 +719,10 @@ pub fn literal_array(lit: &Literal) -> Result<ArrayRef> {
                 .with_data_type(DataType::Decimal128(meta.precision, meta.scale)),
         ),
         Literal::Utf8(s) => Arc::new(StringArray::from(vec![Some(s.as_str())])),
-        Literal::Binary(_) => return Err(QsdbError::unsupported("binary literals in expressions")),
+        // BINARY 字面量**可以**当常量：`INSERT … VALUES (X'6162')` 与
+        // `CAST(… AS BINARY)` 都落到这里。此前一律拒绝，等于 BINARY 列
+        // 经 SQL 无法写入（qsdb-jdbc 实测踩到）。
+        Literal::Binary(b) => Arc::new(arrow::array::BinaryArray::from(vec![Some(b.as_slice())])),
         Literal::Date(v) => Arc::new(Date32Array::from(vec![Some(*v)])),
         Literal::Time(v) => Arc::new(Time64NanosecondArray::from(vec![Some(*v)])),
         Literal::Timestamp(v) => Arc::new(TimestampNanosecondArray::from(vec![Some(*v)])),

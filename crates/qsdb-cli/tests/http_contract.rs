@@ -251,7 +251,7 @@ fn bulk_and_csv_channels_both_directions() {
         ],
     )
     .unwrap();
-    let bulk = qsdb::bulk::encode(&[batch]).unwrap();
+    let bulk = qsdb::bulk::encode(&schema, &[batch]).unwrap();
     let r = http(
         p,
         "POST",
@@ -450,6 +450,100 @@ fn rows_body_without_schema() -> Vec<u8> {
     b.extend_from_slice("中文".as_bytes());
     b.extend_from_slice(&19_001i32.to_le_bytes());
     b
+}
+
+/// **J15：零行结果在每种 format 下都要读得回来**（`WHERE false` / `LIMIT 0`）。
+///
+/// 这是 BI 工具探测元数据的标准姿势（DBeaver 之类先 `LIMIT 0` 拿列名/类型）。
+/// 原状：`rows` 与 `bulk` 的编码器以"首批"取 schema，零批就报 `empty batches`
+/// → 501；`csv` 更阴——返回 200 但 **0 字节 body**（arrow 的 CSV writer 在第一次
+/// write 时才吐表头），客户端把列名丢了。三种都在这条用例里钉住。
+#[test]
+fn zero_row_result_survives_every_format() {
+    let srv = Server::start(&[]);
+    let p = srv.port;
+    assert_eq!(
+        query(p, "CREATE TABLE t (a BIGINT, s STRING)", None).status,
+        200
+    );
+    assert_eq!(query(p, "INSERT INTO t VALUES (1, 'x')", None).status, 200);
+
+    let q = |sql: &str, fmt: &str| {
+        let body = serde_json::json!({"sql": sql, "format": fmt}).to_string();
+        http(
+            p,
+            "POST",
+            "/api/v1/query",
+            &[("Content-Type", "application/json")],
+            body.as_bytes(),
+        )
+    };
+    for sql in [
+        "SELECT a, s FROM t WHERE false",
+        "SELECT a, s FROM t LIMIT 0",
+    ] {
+        // json：schema 在，rows 为空
+        let r = q(sql, "json");
+        assert_eq!(
+            r.status,
+            200,
+            "{sql} json: {}",
+            String::from_utf8_lossy(&r.body)
+        );
+        let v = r.json();
+        assert_eq!(v["rowCount"], 0);
+        assert_eq!(
+            v["schema"][0]["name"], "a",
+            "列名仍要透出（探测元数据就靠它）"
+        );
+        assert!(v["rows"].as_array().unwrap().is_empty());
+
+        // ipc：schema 消息 + 无批
+        let r = q(sql, "ipc");
+        assert_eq!(r.status, 200);
+        let mut rd = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(r.body), None)
+            .expect("ipc stream 应能解析（零行也是合法流）");
+        assert_eq!(rd.schema().field(0).name(), "a");
+        assert!(rd.next().is_none(), "零行不该有批");
+
+        // bulk：列描述照写、n_rows = 0
+        let r = q(sql, "bulk");
+        assert_eq!(
+            r.status,
+            200,
+            "{sql} bulk: {}",
+            String::from_utf8_lossy(&r.body)
+        );
+        let back = qsdb::bulk::decode(&r.body).expect("零行 bulk 应可解码");
+        assert_eq!(back.num_rows(), 0);
+        assert_eq!(back.schema().field(0).name(), "a");
+
+        // rows：头 + 零个块
+        let r = q(sql, "rows");
+        assert_eq!(
+            r.status,
+            200,
+            "{sql} rows: {}",
+            String::from_utf8_lossy(&r.body)
+        );
+        let back = qsdb::rows::decode(&r.body).expect("零行 rows 应可解码");
+        let total: usize = back.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 0);
+        // 列描述从**头**里读（没有块可依）
+        assert!(
+            !r.body.is_empty() && r.body.len() > 13,
+            "头里必须带列描述（否则客户端拿不到列名）"
+        );
+
+        // csv：至少要给表头（否则列名丢了）
+        let r = q(sql, "csv");
+        assert_eq!(r.status, 200);
+        assert_eq!(
+            String::from_utf8_lossy(&r.body).trim(),
+            "a,s",
+            "零行也要表头"
+        );
+    }
 }
 
 /// **J12**：DML 回执要有**结构化字段**（`command` + `rowsAffected`），

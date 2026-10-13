@@ -795,6 +795,19 @@ pub(crate) fn constant_expr(e: &sqlparser::ast::Expr) -> Result<Literal> {
             }
             _ => Err(QsdbError::invalid("unsupported unary in constant")),
         },
+        // `CAST(常量 AS 类型)`：**在绑定期折成常量**。
+        //
+        // 为什么必须支持：VALUES 是**无表达式**的字面量通道，而 BINARY 列在 SQL 里
+        // 没有任何"裸字面量"形态——`CAST('ab' AS BINARY)` / `X'6162'` 是唯一写法。
+        // 不收 CAST 等于"BINARY 列经 SQL 写不进去"（qsdb-jdbc 实测踩到）。
+        // 折常量是安全的：CAST 的另一侧也是常量，不引入求值时机问题。
+        E::Cast {
+            expr, data_type, ..
+        } => {
+            let lit = constant_expr(expr)?;
+            let to = cast_target_to_logical(data_type)?;
+            crate::types::cast::cast_literal(&lit, &to)
+        }
         E::Nested(inner) => constant_expr(inner),
         other => Err(QsdbError::invalid(format!(
             "constant expression expected, got {other:?}"
@@ -828,12 +841,40 @@ pub(crate) fn value_to_literal(v: &sqlparser::ast::Value) -> Result<Literal> {
         V::SingleQuotedString(s) | V::DoubleQuotedString(s) | V::EscapedStringLiteral(s) => {
             Ok(Literal::Utf8(s.clone()))
         }
+        // `X'6162'` = 标准 SQL 的字节串字面量（唯一能"裸写" BINARY 的形态）
+        V::HexStringLiteral(s) => Ok(Literal::Binary(hex_bytes(s)?)),
         V::Boolean(b) => Ok(Literal::Boolean(*b)),
         V::Null => Ok(Literal::Null),
         other => Err(QsdbError::unsupported(format!(
             "literal {other:?} not supported"
         ))),
     }
+}
+
+/// `X'6162'` → 字节（标准 SQL 字节串；**奇数位/非十六进制字符一律报错**，
+/// 不猜、不截断——写进 BINARY 列的值必须与用户写的一模一样）。
+fn hex_bytes(s: &str) -> Result<Vec<u8>> {
+    let t = s.trim();
+    if t.len() % 2 != 0 {
+        return Err(QsdbError::invalid(format!(
+            "hex literal X'{t}' has an odd number of digits"
+        )));
+    }
+    let mut out = Vec::with_capacity(t.len() / 2);
+    let b = t.as_bytes();
+    for i in (0..b.len()).step_by(2) {
+        let hi = (b[i] as char).to_digit(16);
+        let lo = (b[i + 1] as char).to_digit(16);
+        match (hi, lo) {
+            (Some(h), Some(l)) => out.push((h * 16 + l) as u8),
+            _ => {
+                return Err(QsdbError::invalid(format!(
+                    "hex literal X'{t}' has a non-hex digit"
+                )));
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn number_literal(s: &str) -> Result<Literal> {

@@ -739,7 +739,7 @@ async fn query(
                     }
                 } else if fmt.eq_ignore_ascii_case("bulk") {
                     // **无依赖二进制**（读侧；与写侧同一格式）
-                    match qsdb::bulk::encode(&batches) {
+                    match qsdb::bulk::encode(&schema, &batches) {
                         Ok(bytes) => (
                             [(
                                 axum::http::header::CONTENT_TYPE,
@@ -755,7 +755,7 @@ async fn query(
                     }
                 } else if fmt.eq_ignore_ascii_case("rows") {
                     // **无依赖行式**（读侧；列名/类型随头一起发，客户端逐块消费）
-                    match qsdb::rows::encode(&batches) {
+                    match qsdb::rows::encode(&schema, &batches) {
                         Ok(bytes) => (
                             [(
                                 axum::http::header::CONTENT_TYPE,
@@ -1462,12 +1462,24 @@ fn concat_batches(batches: &[RecordBatch]) -> Result<RecordBatch, QsdbError> {
 
 /// 结果批 → CSV 文本（读侧 `format=csv`）：列序 = schema，首行表头。
 ///
-/// 给"零依赖客户端"用（Java 拼 CSV 谁都会）。批量场景仍建议 `bulk`/`ipc`。
+/// 给"零依赖客户端"用（Java 拼 CSV 谁都会）。批量场景仍建议 `bulk`/`rows`。
+///
+/// **零行结果也要有表头**（J15 同族）：arrow 的 CSV writer 在**第一次 write** 时
+/// 才吐表头，一批都没有就一个字节都不写 —— 客户端拿到 0 字节 body 就丢了列名。
+/// `LIMIT 0` / `WHERE false` 是 BI 工具探测元数据的标准姿势，故这里补一个空批
+/// 把表头逼出来（转义交给 arrow，不自写一套）。
 fn batches_to_csv(
     schema: &arrow::datatypes::SchemaRef,
     batches: &[RecordBatch],
 ) -> Result<Vec<u8>, QsdbError> {
     let mut out = Vec::with_capacity(1024);
+    let empty;
+    let batches = if batches.iter().any(|b| b.num_rows() > 0) {
+        batches
+    } else {
+        empty = [RecordBatch::new_empty(Arc::clone(schema))];
+        &empty[..]
+    };
     {
         let mut w = arrow::csv::WriterBuilder::new()
             .with_header(true)
@@ -1477,7 +1489,6 @@ fn batches_to_csv(
                 .map_err(|e| QsdbError::invalid(format!("csv write: {e}")))?;
         }
     }
-    let _ = schema;
     Ok(out)
 }
 

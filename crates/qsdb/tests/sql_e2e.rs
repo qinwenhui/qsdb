@@ -197,11 +197,23 @@ fn insert_values_semantics() {
     // 列序重排
     db.sql("INSERT INTO events (cnt, score, amount, tenant, dt) VALUES (99, 9.9, 1.0000, 'z', DATE '2026-01-06')").unwrap();
     assert!(q(&db, "SELECT tenant FROM events WHERE cnt = 99") == vec!["z"]);
-    // 列数不匹配
+    // **部分列清单合法**（2026-10-13 起与 SELECT 源一致：未列出的列补 NULL）——
+    // 此前这条被写成"必须报错"，它当年之所以"绿"，靠的正是 `reorder_rows`
+    // 把 `(dt, tenant)` 误判成恒等映射的那个 bug（见 tests/insert_partial.rs）。
+    db.sql("INSERT INTO events (dt, tenant) VALUES (DATE '2026-01-07', 'p')")
+        .unwrap();
     assert!(
-        db.sql("INSERT INTO events (dt, tenant) VALUES (DATE '2026-01-01', 'a')")
+        q(
+            &db,
+            "SELECT tenant FROM events WHERE dt = DATE '2026-01-07' AND amount IS NULL AND cnt IS NULL"
+        ) == vec!["p"]
+    );
+    // 真正的"不匹配"是**值的个数 ≠ 列清单宽度**
+    assert!(
+        db.sql("INSERT INTO events (dt, tenant) VALUES (DATE '2026-01-01')")
             .is_err()
     );
+    // 无列清单时值数必须等于表列数
     assert!(
         db.sql("INSERT INTO events VALUES (DATE '2026-01-01', 'a')")
             .is_err()
@@ -226,7 +238,8 @@ fn insert_values_semantics() {
         .unwrap();
     let n: usize = q(&db, "SELECT cnt FROM events WHERE dt = DATE '2026-01-01'").len();
     assert_eq!(n, 1);
-    assert_eq!(q(&db, "SELECT cnt FROM events").len(), 7); // 1+1+1+1+1+1 = 7（原 6 - 3 + 1 + 负数十 1 + big 1 + z 1）
+    // 原 6 行 - 被 overwrite 换掉的 3 行 + 负数十 1 + big 1 + z 1 + 部分列 1 + overwrite 1 = 8
+    assert_eq!(q(&db, "SELECT cnt FROM events").len(), 8);
     std::fs::remove_dir_all(&root).ok();
 }
 

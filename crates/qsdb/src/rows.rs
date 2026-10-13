@@ -256,15 +256,13 @@ fn expect_empty(meta: &[u8], t: RowType, name: &str, dt: DataType) -> Result<Dat
 
 /// 批 → `qsdb-rows` 负载。**每批一个块**（保留输入的自然分帧；客户端可逐块消费）。
 ///
-/// 头里带列描述（`HAS_SCHEMA=1`）——读侧的列名/类型不是客户端能自己知道的。
-pub fn encode(batches: &[RecordBatch]) -> Result<Vec<u8>> {
-    let Some(first) = batches.first() else {
-        return Err(QsdbError::invalid("rows: empty batches"));
-    };
-    let schema = first.schema();
-    check(batches, &schema)?;
+/// `schema` **必须由调用方给出**：读侧的列名/类型不是客户端能自己知道的。
+/// 因此**零行结果 = 头 + 零个块**（列描述照发）——`LIMIT 0` / `WHERE false`
+/// 是 BI 工具探测元数据的标准姿势，不能让它变成一个错误。
+pub fn encode(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<Vec<u8>> {
+    check(batches, schema)?;
     let mut out: Vec<u8> = Vec::with_capacity(64 + batches.len() * 64);
-    write_header(&mut out, schema.fields().len(), Some(&schema))?;
+    write_header(&mut out, schema.fields().len(), Some(schema))?;
     for b in batches {
         encode_chunk(&mut out, b)?;
     }
@@ -860,7 +858,7 @@ mod tests {
     #[test]
     fn roundtrip_all_types_with_nulls() {
         let b = every_type();
-        let bytes = encode(std::slice::from_ref(&b)).unwrap();
+        let bytes = encode(&b.schema(), std::slice::from_ref(&b)).unwrap();
         assert_eq!(&bytes[..8], MAGIC);
         let back = decode(&bytes).unwrap();
         assert_eq!(back.len(), 1);
@@ -871,7 +869,7 @@ mod tests {
     #[test]
     fn external_schema_write_path_roundtrip() {
         let b = every_type();
-        let bytes = encode(std::slice::from_ref(&b)).unwrap();
+        let bytes = encode(&b.schema(), std::slice::from_ref(&b)).unwrap();
         let schema_with = decode(&bytes).unwrap()[0].schema();
         // 手工剥掉列描述：重编一份 flags=0 的负载（模拟驱动行为）
         let no_schema = strip_schema(&bytes, &schema_with);
@@ -903,7 +901,7 @@ mod tests {
     #[test]
     fn schema_block_is_rejected_on_the_write_path() {
         let b = every_type();
-        let bytes = encode(std::slice::from_ref(&b)).unwrap();
+        let bytes = encode(&b.schema(), std::slice::from_ref(&b)).unwrap();
         let e = decode_with_schema(&bytes, &b.schema()).unwrap_err();
         assert!(format!("{e}").contains("schema block"), "实得 {e}");
     }
@@ -911,7 +909,10 @@ mod tests {
     #[test]
     fn column_count_mismatch_is_rejected() {
         let b = every_type();
-        let bytes = strip_schema(&encode(std::slice::from_ref(&b)).unwrap(), &b.schema());
+        let bytes = strip_schema(
+            &encode(&b.schema(), std::slice::from_ref(&b)).unwrap(),
+            &b.schema(),
+        );
         let narrow = Arc::new(Schema::new(vec![Field::new("i64", DataType::Int64, true)]));
         let e = decode_with_schema(&bytes, &narrow).unwrap_err();
         assert!(format!("{e}").contains("columns"), "实得 {e}");
@@ -921,7 +922,7 @@ mod tests {
     fn multi_chunk_framing_preserved() {
         let b = every_type();
         let b2 = b.slice(0, 2);
-        let bytes = encode(&[b.clone(), b2.clone()]).unwrap();
+        let bytes = encode(&b.schema(), &[b.clone(), b2.clone()]).unwrap();
         let back = decode(&bytes).unwrap();
         assert_eq!(back.len(), 2, "每批一个块");
         assert_same(&b, &back[0]);
@@ -931,7 +932,7 @@ mod tests {
     #[test]
     fn truncated_payload_errors_not_panic() {
         let b = every_type();
-        let bytes = encode(std::slice::from_ref(&b)).unwrap();
+        let bytes = encode(&b.schema(), std::slice::from_ref(&b)).unwrap();
         for cut in 1..8 {
             let e = decode(&bytes[..bytes.len() - cut]).unwrap_err();
             assert!(format!("{e}").contains("rows:"), "实得 {e}");
@@ -947,7 +948,7 @@ mod tests {
             vec![Arc::new(arrow::array::StringViewArray::from(vec!["a"]))],
         )
         .unwrap();
-        let e = encode(std::slice::from_ref(&b)).unwrap_err();
+        let e = encode(&b.schema(), std::slice::from_ref(&b)).unwrap_err();
         assert!(format!("{e}").contains("not supported"), "实得 {e}");
     }
 
@@ -996,11 +997,38 @@ mod tests {
         assert_eq!(col(&chunks[1], 2, 0), "2022-01-09");
     }
 
+    /// **J15：零行结果必须读得回来**（`SELECT … LIMIT 0` / `WHERE false`）。
+    ///
+    /// 读侧形态 = **头 + 零个块**：列描述照发（列名/类型是结果的元数据，
+    /// BI 工具探测表结构走的正是这条路），客户端据此建空结果集。
+    #[test]
+    fn zero_row_result_is_a_header_with_no_chunks() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let bytes = encode(&schema, &[]).unwrap();
+        let back = decode(&bytes).unwrap();
+        assert!(back.is_empty(), "零行结果不该凭空造出块");
+        // 列描述仍在（否则客户端拿不到列名/类型）
+        let mut r = Reader { b: &bytes, p: 0 };
+        let (flags, n_cols) = read_header(&mut r).unwrap();
+        assert_eq!(flags, FLAG_HAS_SCHEMA);
+        assert_eq!(n_cols, 2);
+        let got = read_schema(&mut r, n_cols).unwrap();
+        assert_eq!(got.as_ref(), schema.as_ref());
+        assert!(r.done(), "头之后不该还有字节");
+
+        // 写侧形态（flags=0）同样接受零行
+        let no_schema = encode_values(&schema, &[]).unwrap();
+        assert!(decode_with_schema(&no_schema, &schema).unwrap().is_empty());
+    }
+
     #[test]
     fn decimal_scale_survives_the_roundtrip() {
         // scale=4 的 1234567 → 123.4567（若把 meta 读错成 i8 无符号会整体换值）
         let b = every_type();
-        let back = decode(&encode(std::slice::from_ref(&b)).unwrap()).unwrap();
+        let back = decode(&encode(&b.schema(), std::slice::from_ref(&b)).unwrap()).unwrap();
         let s = arrow::util::display::array_value_to_string(back[0].column(12), 0).unwrap();
         assert_eq!(s, "123.4567", "实得 {s}");
     }

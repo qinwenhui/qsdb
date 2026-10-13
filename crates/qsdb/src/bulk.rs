@@ -117,12 +117,11 @@ impl ColType {
 // 编码
 // ---------------------------------------------------------------------------
 
-/// 全部批编码成一份 `qsdb-bulk` 负载（schema 取首批；各批必须同 schema）。
-pub fn encode(batches: &[RecordBatch]) -> Result<Vec<u8>> {
-    let Some(first) = batches.first() else {
-        return Err(QsdbError::invalid("bulk: empty batches"));
-    };
-    let schema = first.schema();
+/// 全部批编码成一份 `qsdb-bulk` 负载（各批必须同 schema）。
+///
+/// `schema` 由调用方给出（**零行结果**也是合法输入：列描述照写、`n_rows = 0`）——
+/// 与 [`crate::rows::encode`] 同一口径，见那里的说明。
+pub fn encode(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<Vec<u8>> {
     let n_cols = schema.fields().len();
     let n_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
@@ -141,7 +140,7 @@ pub fn encode(batches: &[RecordBatch]) -> Result<Vec<u8>> {
         })
         .collect::<Result<_>>()?;
     for b in batches {
-        if b.schema() != schema {
+        if b.schema() != *schema {
             return Err(QsdbError::invalid("bulk: batches have different schemas"));
         }
     }
@@ -494,7 +493,7 @@ mod tests {
     #[test]
     fn roundtrip_preserves_values_and_nulls() {
         let b = sample();
-        let bytes = encode(std::slice::from_ref(&b)).unwrap();
+        let bytes = encode(&b.schema(), std::slice::from_ref(&b)).unwrap();
         assert_eq!(&bytes[..8], MAGIC);
         let back = decode(&bytes).unwrap();
         assert_eq!(back.num_rows(), 3);
@@ -524,14 +523,33 @@ mod tests {
             vec![Arc::new(arrow::array::Float32Array::from(vec![1.0f32]))],
         )
         .unwrap();
-        let e = encode(std::slice::from_ref(&b)).unwrap_err();
+        let e = encode(&b.schema(), std::slice::from_ref(&b)).unwrap_err();
         assert!(format!("{e}").contains("not supported"), "实得 {e}");
+    }
+
+    /// **J15 同族**：零行结果（列描述照写、`n_rows = 0`）必须能往返。
+    #[test]
+    fn zero_row_result_roundtrip() {
+        let b = sample();
+        let schema = b.schema();
+        let bytes = encode(&schema, &[]).unwrap();
+        let back = decode(&bytes).unwrap();
+        assert_eq!(back.num_rows(), 0);
+        assert_eq!(back.schema().fields().len(), schema.fields().len());
+        assert_eq!(
+            back.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name())
+                .collect::<Vec<_>>(),
+            schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn truncated_payload_errors_not_panic() {
         let b = sample();
-        let bytes = encode(std::slice::from_ref(&b)).unwrap();
+        let bytes = encode(&b.schema(), std::slice::from_ref(&b)).unwrap();
         let e = decode(&bytes[..bytes.len() - 3]).unwrap_err();
         assert!(format!("{e}").contains("bulk:"), "实得 {e}");
         assert!(decode(b"NOTBULK!!").is_err());

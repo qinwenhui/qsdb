@@ -123,7 +123,7 @@ fn whole_body(fmt: &str, batches: &[RecordBatch]) -> Vec<u8> {
             w.finish().unwrap();
             buf
         }
-        "bulk" => qsdb::bulk::encode(batches).expect("bulk encode"),
+        "bulk" => qsdb::bulk::encode(&batches[0].schema(), batches).expect("bulk encode"),
         // 行式**写侧形态**：flags=0，schema 由端点按 table= 查表定义给
         "rows" => qsdb::rows::encode_values(&batches[0].schema(), batches).expect("rows encode"),
         "csv" => {

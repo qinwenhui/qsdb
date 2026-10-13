@@ -123,3 +123,25 @@ fn values_and_select_sources_agree() {
         "VALUES 与 SELECT 两条源的部分列语义必须一致（此前一边拒一边收）"
     );
 }
+
+/// **表列前缀**的部分列清单（`(id)`、`(id, name)`）此前被静默当成"恒等映射"。
+///
+/// 根因：`reorder_rows` 的快速路径判据是 `perm` 逐位等于自己的下标——它对
+/// **全宽**恒等是对的，但 `perm = [0]`（单列、正好是表的第 0 列）也满足该判据，
+/// 于是行保持"列清单宽度"没有补 NULL，下游 `build_insert_batch` 报
+/// `VALUES rows have 1 entries, table t has 3 columns`。
+///
+/// 为什么此前没抓到：既有用例给的是 `(name)`（perm = [1]）与 `(id, v)`（perm = [0,2]），
+/// **都不是前缀**。前缀恰好是驱动按 `setXxx` 顺序填前几列时最常见的形态。
+#[test]
+fn leading_prefix_column_list_is_not_identity() {
+    let (db, _root) = setup("prefix");
+    db.sql("INSERT INTO t (id) VALUES (1)").unwrap();
+    db.sql("INSERT INTO t (id, name) VALUES (2, 'b')").unwrap();
+    db.sql("INSERT INTO t (id, name, v) VALUES (3, 'c', 30)")
+        .unwrap(); // 全宽：仍走恒等快路径
+    assert_eq!(
+        rows(&db, "SELECT id, name, v FROM t ORDER BY id"),
+        vec!["1|NULL|NULL", "2|b|NULL", "3|c|30"]
+    );
+}

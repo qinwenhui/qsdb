@@ -627,7 +627,11 @@ fn reorder_rows(
     rows: Vec<Vec<Literal>>,
     perm: &[usize],
 ) -> Vec<Vec<Literal>> {
-    if perm.iter().enumerate().all(|(i, &p)| i == p) {
+    // 只有**全宽恒等**才是 no-op。`perm = [0]`（"表列前缀"的部分列清单）看着
+    // 像恒等（第 0 位对第 0 列），其实是一次**投影**——直接返回会让行宽停在
+    // 列清单宽度上，下面 `build_insert_batch` 就报"行宽 ≠ 表列数"。
+    // 症状：`INSERT INTO t (a) VALUES (…)` 400，而 `(a, c)` 这种非前缀清单正常。
+    if perm.len() == def.columns.len() && perm.iter().enumerate().all(|(i, &p)| i == p) {
         return rows;
     }
     let src_of = invert_perm(perm, def.columns.len());
