@@ -843,11 +843,15 @@ fn scan_to_parquet(
     (n, bytes)
 }
 
-/// 全表扫描 → CSV（同上；文本形态另算一路）。
+/// 全表扫描 → CSV（**流式** + arrow 的批量 CSV writer）。
+///
+/// 别自己逐值 `array_value_to_string`：那是每个值一次 `String` 分配（5M 行 × 7 列
+/// = 3500 万次，实测 6.4s）——**测出来的是写这段代码的手艺，不是内核**。
+/// arrow 的 `csv::Writer` 走批量格式化，才是"一个正常导出工具"的水平。
 fn scan_to_csv(db: &Qsdb, out: &Path, _sql: &str) -> u64 {
-    let mut f = std::io::BufWriter::new(std::fs::File::create(out).expect("create out"));
+    let f = std::fs::File::create(out).expect("create out");
+    let mut w = arrow::csv::WriterBuilder::new().with_header(true).build(f);
     let mut n = 0u64;
-    // 同 `scan_to_parquet`：**流式**（`scan()` 而非 `sql_collect`）
     let req = qsdb::ScanRequest {
         table: "t".into(),
         db: None,
@@ -858,36 +862,8 @@ fn scan_to_csv(db: &Qsdb, out: &Path, _sql: &str) -> u64 {
     let mut it = db.scan(req).expect("scan");
     while let Some(b) = it.next() {
         let b = b.expect("scan batch");
-        for i in 0..b.num_rows() {
-            let mut cells: Vec<String> = Vec::with_capacity(b.num_columns());
-            for c in 0..b.num_columns() {
-                let a = b.column(c);
-                cells.push(if a.is_null(i) {
-                    String::new()
-                } else {
-                    arrow::util::display::array_value_to_string(a.as_ref(), i).unwrap()
-                });
-            }
-            writeln!(f, "{}", cells.join(",")).unwrap();
-        }
         n += b.num_rows() as u64;
-    }
-    return n;
-    #[allow(unreachable_code)]
-    for b in db.sql_collect(_sql).expect("scan") {
-        for i in 0..b.num_rows() {
-            let mut cells: Vec<String> = Vec::with_capacity(b.num_columns());
-            for c in 0..b.num_columns() {
-                let a = b.column(c);
-                cells.push(if a.is_null(i) {
-                    String::new()
-                } else {
-                    arrow::util::display::array_value_to_string(a.as_ref(), i).unwrap()
-                });
-            }
-            writeln!(f, "{}", cells.join(",")).unwrap();
-        }
-        n += b.num_rows() as u64;
+        w.write(&b).expect("csv write");
     }
     n
 }
