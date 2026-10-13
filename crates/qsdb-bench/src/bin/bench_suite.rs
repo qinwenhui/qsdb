@@ -665,10 +665,12 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
         "export_parquet" => {
             let out = dir.join("out_qsdb.parquet");
             let t0 = Instant::now();
-            let (n, bytes) =
+            // 返回值的第二项是**毫秒**（`run_once` 的约定）。写错过一次——把"写入字节数"
+            // 当成耗时返回，报出 577330s（160 小时）这种一眼假的数；顺手去掉那个误导量。
+            let (n, _bytes) =
                 scan_to_parquet(&db, &out, "SELECT * FROM t", FACT_COLS, fact_schema());
             let dt = t0.elapsed();
-            (n, bytes.max(dt.as_millis() as u64))
+            (n, dt.as_millis() as u64)
         }
         "export_csv" => {
             let out = dir.join("out_qsdb.csv");
