@@ -42,7 +42,7 @@ DuckDB 是 morsel 驱动的**全算子并行**流水线；我们除"并行聚合
 |---|---|---|---|
 | ① | **并行扫描** | ✅ 已落地（公开 `scan` API 透明并行；`QSDB_SCAN_SERIAL=1` 可关） | 导出 3.48→2.96s |
 | ② | **并行写段** | 段编码（parquet+zstd）单线程 —— **现在是导出/导入的共同天花板** | 多 row-group 并行编码；导出 → ~1s 量级 |
-| ③ | **并行 join** | build 单线程建索引；probe 逐行 | build 分区并行 + probe 分片并行 |
+| ③ | **并行 join** | build 单线程建索引；probe 逐行。**★ 2026-10-14 已定位到具体缺口：INNER/LEFT join 之后整条管线退回单线程**——`exec_builder::try_shard_source` 只穿透 **semi 族** join（INNER 即返回 `None` ⇒ 单节点 `HashAggExec`）。`complex_three_way` 9.9× 与 `complex_join_group` 5.8× **同源于此**（扫描本身是 rayon 并行的，**join 之后的聚合不是**）。做法：把"分片源"推广成**分片源 + 一串 join 阶段**（`SemiStage` 已有雏形）——右键各建一次索引、`Arc` 全分片共享，每分片 `扫描 → 逐阶段 join → partial 聚合`，再走既有的分区 merge。⚠️ **别用 RSS 当这块的收益论据**：bench 报的 1.05GB 里约 300MB 是**热段缓存**（`--cache-mb` 可调、可挤兑），剔除后工作集是 215MB vs 对手 36–42MB（见 `docs/真机基准对账.md` §二之二） | build 分区并行 + probe 分片并行 |
 | ④ | **并行 window** | 整分区物化 + 单线程 | 分区级并行（分区之间天然独立） |
 | ⑤ | **并行 sort/归并** | `RunMerger` k 路归并单线程 | 并行排序 + 并行归并 |
 
@@ -54,7 +54,7 @@ DuckDB 是 morsel 驱动的**全算子并行**流水线；我们除"并行聚合
 | ⑦ | window 流式帧 | 整分区物化 | 有序输入下可流式累积 |
 | ⑧ | **CSV 解析并行** | 单线程（5M 行 3.0s） | 按字节段切分 + 段内独立解析；**import_csv 的 1.75× 全在这** |
 | ⑨ | `VALUES` 快路径 | 每格一个 `Literal` 再翻成数组（12ms/1000 行） | 直接从 AST 值构造列式数组 |
-| ⑩ | **聚合参数 `DISTINCT`**（`count/sum/avg(DISTINCT x)`） | **未实现**（2026-10-13 前被静默当成不带 DISTINCT 执行 = 回错数字；现已绑定层显式拒绝） | 高价值算子，**我们对外宣称过**。原生实现要真值去重 + 与其它聚合混用 + 走溢出；`count(DISTINCT x)` 是主战场 |
+| ⑩ | **聚合参数 `DISTINCT`**（`count/sum/avg(DISTINCT x)`） | **未实现**（2026-10-13 前被静默当成不带 DISTINCT 执行 = 回错数字；现已绑定层显式拒绝）。**★ 2026-10-14 复测：这是当前最大的一格（30×）**——基准里我们跑的是**等价改写** `SELECT count(*) FROM (SELECT DISTINCT gs FROM t)`（全量物化 250 万行再数），DuckDB 跑的是原生单遍哈希计数，**结构性吃亏**。（`SELECT DISTINCT` 本身这一轮已修掉两处 O(n) 退化：4.4GB/9.0s → 588MB/6.2s，但"物化再数"终究打不过"边数边去重"，而且它的内存是 DuckDB 的 2×） | 高价值算子，**我们对外宣称过**。原生实现要真值去重 + 与其它聚合混用 + 走溢出；`count(DISTINCT x)` 是主战场 |
 
 ### P2 把"少干活"的优势再扩大（我们已赢的领域）
 

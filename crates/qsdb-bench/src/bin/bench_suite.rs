@@ -134,7 +134,6 @@ fn fact_schema() -> arrow::datatypes::SchemaRef {
 // 用例清单
 // ---------------------------------------------------------------------------
 
-/// (名字, 简单/复杂分组, 说明)
 /// **非达标项**：照测照印，但**不进闸门**。
 ///
 /// 为什么必须有这个名单：闸门的价值全在"绿 = 没退步"。若某个用例**恒定超时**
@@ -759,26 +758,35 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
         // 被静默执行成 `count(gs)`（错值）在 bench 里活了很久，正是这个原因。
         // 期望值由造数分布直接推出（见 `for_each_batch`）：`g = i % 100_000`、
         // `gs = "k-{i}"`（**全局唯一**）、`x = i * 0.25`。
+        //
+        // ⚠️⚠️ **断言查询一律放在计时区间之外**。校验用的都是一条**同形状的真实查询**
+        // （`SELECT count(*) FROM t WHERE g < 1000` 之类），跑在 `t0` 与 `elapsed()`
+        // 之间就等于把"查询 + 校验"一起计时。2026-10-14 实测：`simple_distinct`
+        // 报 12.12s，而同一查询单独跑是 6.0s——**正好是两倍**，因为校验又跑了一遍
+        // 完整的 `SELECT DISTINCT`。这不是小事：断言越多、越重，数字偏得越离谱，
+        // 而它偏的方向**永远是把我们自己说慢**（`docs/超越DuckDB路线.md` §三.5 的同族）。
+        // 尺子歪了比被测物歪更危险。
         "simple_count" => {
             let t0 = Instant::now();
             let n = rows_of(&db, "SELECT count(*) FROM t");
+            let ms = t0.elapsed().as_millis() as u64;
             assert_eq!(
                 scalar_i64(&db, "SELECT count(*) FROM t"),
                 rows,
                 "行数必须对"
             );
-            (n, t0.elapsed().as_millis() as u64)
+            (n, ms)
         }
         "simple_filter" => {
             let t0 = Instant::now();
             let n = rows_of(&db, "SELECT count(*), sum(v) FROM t WHERE g < 1000");
-            let want = expected_g_lt_1000(rows);
+            let ms = t0.elapsed().as_millis() as u64;
             assert_eq!(
                 scalar_i64(&db, "SELECT count(*) FROM t WHERE g < 1000"),
-                want,
+                expected_g_lt_1000(rows),
                 "过滤行数必须对（g = i % 100_000，故每 100_000 行命中 1000）"
             );
-            (n, t0.elapsed().as_millis() as u64)
+            (n, ms)
         }
         "simple_group" => {
             let t0 = Instant::now();
@@ -786,6 +794,7 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
                 &db,
                 "SELECT g, count(*) c, sum(v) s, avg(x) a FROM t GROUP BY g",
             );
+            let ms = t0.elapsed().as_millis() as u64;
             // 组数 = min(rows, 100_000)（g ∈ [0, 100_000)）——这一条同时防
             // "聚合只吐了头几个组"这类静默截断。
             assert_eq!(
@@ -794,13 +803,12 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
                 "组数必须等于 min(行数, 100000)"
             );
             // 抽样校一个组的值：g=0 只来自 i ∈ {0, 100000, …}
-            let per_group = (rows + 99_999) / 100_000;
             assert_eq!(
                 scalar_i64(&db, "SELECT count(*) FROM t WHERE g = 0"),
-                per_group,
+                (rows + 99_999) / 100_000,
                 "单组行数必须对"
             );
-            (n, t0.elapsed().as_millis() as u64)
+            (n, ms)
         }
         "simple_topn" => {
             let t0 = Instant::now();
@@ -811,6 +819,11 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
             let t0 = Instant::now();
             // 等价改写（原生 `count(DISTINCT gs)` 在绑定层显式拒绝，见 case 列表注释）
             let n = rows_of(&db, "SELECT count(*) FROM (SELECT DISTINCT gs FROM t)");
+            let ms = t0.elapsed().as_millis() as u64; // ← 计时到此为止（下面全是校验）
+            // ⚠️ `rows_of` 对聚合**恒回 1**（结果只有一行），所以"去重结果对不对"
+            // 必须另查一条标量——**而这条查询自己就是一次完整的 `SELECT DISTINCT`**，
+            // 放在 `t0`/`elapsed()` 之间会把这个用例的读数**整整翻倍**
+            // （2026-10-14 实测：报 12.12s，单独跑是 6.0s）。这正是上面那段注释的由来。
             // `gs = k-{i % (rows/2)}` ⇒ 恰好半数重复。**两条断言一起才有效**：
             // 去重后 = rows/2、不去重 = rows——`count(gs)` 与 `count(DISTINCT gs)`
             // **必须能分开**（这正是 2026-10-13 改数据的原因：原先 gs 全局唯一，
@@ -820,7 +833,7 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
             assert_eq!(distinct, rows / 2, "去重结果 = 基数（半数为重复）");
             assert_eq!(plain, rows, "不去重 = 总行数");
             assert_ne!(distinct, plain, "本用例的数据必须能区分去重与否");
-            (n, t0.elapsed().as_millis() as u64)
+            (n, ms)
         }
         // ---- 复杂分析 ----
         "complex_join_group" => {
