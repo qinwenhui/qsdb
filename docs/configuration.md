@@ -18,6 +18,7 @@
 | `query_timeout_ms` | Option\<u64\> / None | 默认查询超时（毫秒）。**这是运行期同名配置的初值**——open 后可经 [`Qsdb::runtime()`] 热更，见下节。 |
 | `query_memory_limit_bytes` | Option\<u64\> / None | 默认单查询内存上限（字节）；**None/0 = 不限**（库默认不限——嵌入方自控内存策略）。同为运行期配置的初值。**`qsdb server` 兜底 4GB**（`--query-memory-limit-mb`）：server 是唯一会叠加多查询的部署面，不给默认即「N 个查询各自无界」。只约束**物化算子**记账（join build / sort spill / window / udaf），流式扫描/聚合不记账——见内存模型一节。 |
 | `memory_budget_bytes` | Option\<u64\> / None | **全局内存预算**（字节）：本句柄内**所有**查询共享的执行内存 + 解码缓存总上界；**None/0 = 不限**（库默认不限，嵌入方自控）。与上一行的分工：那个是「单查询配额」（400 `QUERY_MEMORY_LIMIT`），这个是「整个句柄的天花板」（超了是 503 `MEMORY_PRESSURE`，可退避重试）。压力下**先挤兑缓存**再拒查询。**只约束记账到的内存**（物化算子 + 解码缓存；流式在途批的残留上界见设计文档 §七）。`qsdb server` 兜底 4GB（`--memory-budget-mb`）。 |
+| `spill_dir` | Option\<PathBuf\> / None | **溢出目录根**（排序/聚合/join 落盘用）；None = 系统临时目录。溢出量可以很大（5M 行排序就是几十上百 MB）——**生产建议与数据同盘**（`qsdb server` 默认 `<库根>/_spill`）。每次查询在其下开 `qsdb_spill_<uuid>/`，查询结束即删；`open` 时清理**超过静默期未动过**的残留子目录（崩溃遗留）。只读句柄不写库根（回落系统 temp）。CLI：`--spill-dir`。 |
 | `storage`（HDFS 形态） | `StorageConfig::Hdfs { url, prefix }` | HDFS 管理表（M6-5，feature `hdfs`）：`url` 如 `hdfs://192.168.1.12:9000`；CAS 由锁对象模拟（`hdfs_backend`）；身份走 `HADOOP_USER_NAME` 环境变量。CLI：`--storage-type hdfs --storage-hdfs-url hdfs://host:9000`。 |
 | `staging_dir` | Option\<PathBuf\> / None | 远端写 staging 目录（M6-4）：Some = 启用——远端写先落本地盘（**写盘即 ACK**，写延迟与网络解耦），`flush_staged()` 批量 PUT + OCC 提交。需 S3 后端。**可见性语义**：未 flush 的数据对查询不可见（manifest 唯一真值），可见性延迟 = 上传周期；读己之写先 flush。崩溃恢复：残留对下次 flush 幂等补传（segment PUT 幂等 + manifest file_name 去重）。 |
 | `file_cache_bytes` | u64 / 0 | 远端外表（`read_parquet('s3://…')`）段文件本地磁盘缓存预算，布局 `{root}/_filecache/{url_hash}/{etag}/…`（ETag 键控，对象覆盖自动失效；预算内按 mtime LRU 驱逐）。**0 = 关闭（默认）**。仅整读（无 row group 裁剪命中）的对象入缓存；选择性查询走 range GET 不占预算。需编译 feature `s3`。 |
@@ -64,6 +65,7 @@
 | 热缓存预算 | `--cache-mb` / 256 | ❌（open 期定死） | 0 = 关闭；守恒低占用，宽投影可显式调大 |
 | 单查询内存上限 | `--query-memory-limit-mb` / 4096 | ✅（`PUT /api/v1/config`） | 0 = 不限；超限该查询被终止（**防 OOM 双闸之二**） |
 | 自动 compaction 周期 | `--auto-compact-secs` / 关 | ❌ | 周期遍历全表 compact |
+| 溢出目录 | `--spill-dir` / **`<库根>/_spill`** | ❌（open 期定死） | 排序/聚合/join 落盘位置。默认与数据同盘；**不设就是系统临时目录** |
 | 全局内存预算 | `--memory-budget-mb` / **4096** | ❌（open 期定死） | 全库执行内存 + 缓存总上界；0 = 不限。超预算 → 503 `MEMORY_PRESSURE`（**可退避重试**）。**这是「进程内存上界」的承诺落点** |
 | 单查询内存上限 | `--query-memory-limit-mb` / **4096** | ✅（`PUT /api/v1/config`） | 单查询自己的配额；0 = 不限。超限 → 400 `QUERY_MEMORY_LIMIT`（改查询才有用） |
 | 并发查询上限 | `--max-concurrent-queries` / **0（不限）** | ❌（当前版） | 0 = 不限；超限直接 503 `TOO_MANY_QUERIES`（不排队，可退避重试）。**只管条数、不承担内存职责**（内存归预算管）——先前默认 16 是因为"它是唯一的系统级内存上界"，预算落地后该理由不成立，且按条数限流会误伤轻查询 |

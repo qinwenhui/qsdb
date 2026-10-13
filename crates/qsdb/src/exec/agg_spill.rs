@@ -103,7 +103,7 @@ impl PartSpill {
         let nparts = default_nparts();
         let res = ctx.reserve_spill(0)?;
         Ok(Self {
-            dir: SpillDir::new(),
+            dir: SpillDir::new_in(ctx.spill_base()),
             nparts,
             bufs: (0..nparts).map(|_| Vec::new()).collect(),
             buf_bytes: vec![0; nparts],

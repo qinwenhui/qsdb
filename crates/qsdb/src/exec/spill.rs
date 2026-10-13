@@ -33,6 +33,20 @@ pub struct SpillDir {
 }
 
 impl SpillDir {
+    /// 在**配置的溢出根目录**下开一个本次查询专用的子目录（`<base>/qsdb_spill_<uuid>/`）。
+    ///
+    /// `base = None` → 系统临时目录（**库默认**：嵌入方不配置就不改变既有行为）。
+    /// `qsdb server` 默认给 `<库根>/_spill`——溢出量可以很大（5M 行排序就是几十上百
+    /// MB），落系统盘可能把小分区写满（生产上踩过）。
+    pub fn new_in(base: Option<&std::path::Path>) -> Self {
+        let path = match base {
+            Some(b) => b.join(format!("qsdb_spill_{}", uuid::Uuid::now_v7().simple())),
+            None => std::env::temp_dir().join(format!("qsdb_spill_{}", uuid::Uuid::now_v7().simple())),
+        };
+        let _ = std::fs::create_dir_all(&path);
+        Self { path, counter: 0 }
+    }
+
     pub fn new() -> Self {
         let path =
             std::env::temp_dir().join(format!("qsdb_spill_{}", uuid::Uuid::now_v7().simple()));

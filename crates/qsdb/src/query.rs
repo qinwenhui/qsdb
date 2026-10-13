@@ -24,6 +24,8 @@ pub struct QueryContext {
     pub memory_limit: Option<u64>,
     /// 全局预算（`None` = 无池：仅每查询配额生效，嵌入方自控场景）。
     pool: Option<Arc<MemoryPool>>,
+    /// 溢出目录根（`None` = 系统临时目录）。见 `QsdbOptions::spill_dir`。
+    spill_base: Option<std::path::PathBuf>,
 }
 
 impl QueryContext {
@@ -43,7 +45,19 @@ impl QueryContext {
         memory_limit: Option<u64>,
         pool: Option<Arc<MemoryPool>>,
     ) -> Arc<Self> {
+        Self::new_full(query_id, timeout_ms, memory_limit, pool, None)
+    }
+
+    /// 全参构造：内存池 + **溢出目录根**（见 [`Self::spill_base`]）。
+    pub fn new_full(
+        query_id: impl Into<String>,
+        timeout_ms: Option<u64>,
+        memory_limit: Option<u64>,
+        pool: Option<Arc<MemoryPool>>,
+        spill_base: Option<std::path::PathBuf>,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            spill_base,
             query_id: query_id.into(),
             started_at: Instant::now(),
             deadline: timeout_ms
@@ -133,6 +147,12 @@ impl QueryContext {
         if let Some(limit) = self.memory_limit {
             let used = self.memory_used.load(Ordering::Relaxed);
             if used.saturating_add(bytes) > limit {
+                if std::env::var("QSDB_TRACE_QUOTA").is_ok() {
+                    eprintln!(
+                        "QUOTA FAIL used={used} bytes={bytes} limit={limit}\n{}",
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
                 return Err(QsdbError::QueryMemoryLimit(format!(
                     "query {} at {}MB would exceed its {}MB limit",
                     self.query_id,
@@ -162,6 +182,11 @@ impl QueryContext {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 Some(cur.saturating_sub(bytes))
             });
+    }
+
+    /// 溢出目录根（`None` = 系统临时目录）。
+    pub fn spill_base(&self) -> Option<&std::path::Path> {
+        self.spill_base.as_deref()
     }
 
     pub fn memory_used(&self) -> u64 {

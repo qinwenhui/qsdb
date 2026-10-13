@@ -550,7 +550,7 @@ async fn download_file(
     if rel.contains("..") || rel.starts_with('/') {
         return ErrorCode::InvalidArgument.response("invalid path");
     }
-    if rel.starts_with("_trash/") || rel.starts_with("_filecache/") {
+    if rel.starts_with("_trash/") || rel.starts_with("_filecache/") || rel.starts_with("_spill/") {
         return ErrorCode::Forbidden.response("internal paths not downloadable");
     }
     let full = s.db.root().join(&rel);
@@ -1030,6 +1030,7 @@ async fn get_config(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         "startup": {
             "scanCacheBytes": opts.scan_cache_bytes,
             "trashGraceMs": opts.trash_grace_ms,
+            "spillDir": s.db.spill_dir().map(|p| p.display().to_string()).unwrap_or_default(),
         },
         // 全局内存账本（实时）
         "memory": {

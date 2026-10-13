@@ -121,6 +121,16 @@ pub struct QsdbOptions {
     /// （`--memory-budget-mb`）。只约束**记账到的**内存：物化算子 + 解码缓存；
     /// 流式在途批的残留上界见 `docs/内存预算与溢出设计.md` §七。
     pub memory_budget_bytes: Option<u64>,
+    /// **溢出目录根**（`None` = 系统临时目录）。
+    ///
+    /// 溢出（排序/聚合/join 落盘）体量可以很大——5M 行排序就是几十上百 MB，
+    /// 落在系统盘上可能把小分区写满。生产建议指向**与数据同盘**的目录
+    /// （`qsdb server` 默认 `<库根>/_spill`）：
+    /// - 目录不存在会自动创建；
+    /// - 每次查询在其下开 `qsdb_spill_<uuid>/` 子目录，查询结束即删；
+    /// - `open` 时清理**超过 `trash_grace_ms` 未动过**的残留子目录（崩溃遗留），
+    ///   不动近期活跃的（同目录可能有多进程）。
+    pub spill_dir: Option<PathBuf>,
     /// 远端外表（read_parquet s3://）段文件本地缓存预算（字节）；0 = 关闭。
     /// 布局 `{root}/_filecache/{url_hash}/{etag}/…`，ETag 键控自动失效。
     pub file_cache_bytes: u64,
@@ -146,6 +156,7 @@ impl Default for QsdbOptions {
             query_timeout_ms: None,
             query_memory_limit_bytes: None,
             memory_budget_bytes: None,
+            spill_dir: None,
             file_cache_bytes: 0,
             staging_dir: None,
             durability: Durability::ProcessCrash,
@@ -249,6 +260,34 @@ impl QsdbRuntime {
     }
 }
 
+/// 清理溢出目录里**陈旧**的残留（`qsdb_spill_*` 子目录）。
+///
+/// 崩溃/被杀会留下子目录；但同一目录可能有多进程在用，故只清**超过静默期
+/// 未被动过**的（`trash_grace_ms`，与 `_trash` 同一个"安全期"概念）。
+fn purge_stale_spills(dir: &Path, grace_ms: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("qsdb_spill_") {
+            continue;
+        }
+        let stale = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .map(|age| age.as_millis() as u64 > grace_ms)
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
 /// QSDB 句柄。
 pub struct Qsdb {
     root: PathBuf,
@@ -258,6 +297,8 @@ pub struct Qsdb {
     cache: Arc<crate::cache::SegmentCache>,
     /// 全局内存账本（一键共享：执行内存 + 可挤兑的缓存）
     pool: Arc<crate::memory::MemoryPool>,
+    /// 溢出目录根（`None` = 系统临时目录；只读句柄恒 None）
+    spill_dir: Option<PathBuf>,
     runtime: Arc<QsdbRuntime>,
     /// 远端外表段文件缓存（预算 0 = 禁用实例，API 全 no-op）
     file_cache: Arc<crate::filecache::FileCache>,
@@ -340,6 +381,13 @@ impl Qsdb {
             opts.file_cache_bytes,
         ));
         let read_only = opts.read_only;
+        // 溢出目录：只读句柄不写库根（回落系统 temp），并清理崩溃残留
+        let spill_dir = if read_only { None } else { opts.spill_dir.clone() };
+        if let Some(dir) = &spill_dir {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| QsdbError::meta(format!("init spill dir {} failed: {e}", dir.display())))?;
+            purge_stale_spills(dir, opts.trash_grace_ms);
+        }
         // staging（M6-4）：仅远端后端 + feature s3
         let staging = match &opts.staging_dir {
             None => None,
@@ -366,6 +414,7 @@ impl Qsdb {
             defs: TableDefCache::default(),
             cache,
             pool,
+            spill_dir,
             runtime,
             file_cache,
             staging,
@@ -799,16 +848,22 @@ impl Qsdb {
         query_id: Option<String>,
         timeout_ms: Option<u64>,
     ) -> Arc<crate::query::QueryContext> {
-        // 每查询配额（本查询自己的上限）+ 全局预算（本句柄所有查询共享）
-        crate::query::QueryContext::new_with_pool(
+        // 每查询配额（本查询自己的上限）+ 全局预算（本句柄所有查询共享）+ 溢出目录
+        crate::query::QueryContext::new_full(
             query_id.unwrap_or_else(|| format!("q{}", uuid::Uuid::now_v7().simple())),
             timeout_ms.or_else(|| self.runtime.query_timeout_ms()),
             self.runtime.query_memory_limit_bytes(),
             Some(Arc::clone(&self.pool)),
+            self.spill_dir.clone(),
         )
     }
 
     /// 全局内存账本（观测/运维：`exec_used` / `cache_used` / `budget`）。
+    /// 溢出目录根（`None` = 系统临时目录）。
+    pub fn spill_dir(&self) -> Option<&std::path::Path> {
+        self.spill_dir.as_deref()
+    }
+
     pub fn memory_pool(&self) -> Arc<crate::memory::MemoryPool> {
         Arc::clone(&self.pool)
     }

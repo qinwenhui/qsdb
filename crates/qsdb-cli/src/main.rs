@@ -77,6 +77,14 @@ enum Cmd {
         /// 公平性）时按机器容量显式给。
         #[arg(long, default_value_t = 0)]
         max_concurrent_queries: usize,
+        /// **溢出目录**（排序/聚合/join 落盘用；默认 `<库根>/_spill`）。
+        ///
+        /// 溢出量可以很大（5M 行排序就是几十上百 MB）——**默认与数据同盘**，
+        /// 避免写满系统盘（`/` 这种小分区在生产上踩过）。只读句柄不写库根，
+        /// 回落系统临时目录。每次查询在其下开 `qsdb_spill_<uuid>/`，结束即删；
+        /// 启动时清理崩溃残留（超过静默期未动过的子目录）。
+        #[arg(long)]
+        spill_dir: Option<PathBuf>,
         /// **全局内存预算**（MB；0 = 不限；默认 4096 = 4GB）。
         ///
         /// 本进程内**所有**查询共享的执行内存上界 + 解码缓存的总上界
@@ -362,6 +370,7 @@ fn main() {
             auto_compact_secs,
             cache_mb,
             max_concurrent_queries,
+            spill_dir,
             memory_budget_mb,
             query_memory_limit_mb,
             flight_bind,
@@ -450,6 +459,12 @@ fn main() {
                 // MB → 字节；0 = 不限（嵌入方/部署方自控）
                 memory_budget_bytes: (memory_budget_mb > 0)
                     .then(|| memory_budget_mb.saturating_mul(1024 * 1024)),
+                // 溢出目录：默认与数据同盘；只读句柄回落系统 temp
+                spill_dir: if read_only {
+                    None
+                } else {
+                    Some(spill_dir.clone().unwrap_or_else(|| path.join("_spill")))
+                },
                 scan_cache_bytes: cache_mb * 1024 * 1024,
                 file_cache_bytes: file_cache_mb * 1024 * 1024,
                 staging_dir: staging_dir.clone(),

@@ -27,62 +27,71 @@ use arrow::record_batch::RecordBatch;
 use qsdb::query::QueryContext;
 use qsdb::{Qsdb, QsdbOptions};
 
-/// 用例：`(名字, SQL, 是否用极小配额跑)`。
+/// 用例：`(名字, SQL, 每查询配额 MB；0 = 不限)`。
 ///
-/// 最后一个标记是**内存溢出**专用：用 `--limit-mb` 给该查询一个远小于工作集的
-/// 每查询配额，验证它**落盘完成**（而不是被拒/OOM）——P1 的承诺在大数据上的复现。
-fn cases() -> Vec<(&'static str, String, bool)> {
+/// 配额非 0 的是**内存溢出**专用：给该查询一个远小于工作集的配额，验证它
+/// **落盘完成**（而不是被拒/OOM）——P1/P2 的承诺在大数据上的复现。
+fn cases() -> Vec<(&'static str, String, u64)> {
     vec![
         (
             "agg",
             "SELECT count(*), sum(v), min(v), max(v) FROM t".into(),
-            false,
+            0,
         ),
         (
             "filter_num",
             "SELECT count(*) FROM t WHERE v < 100".into(),
-            false,
+            0,
         ),
         (
             "filter_str",
             "SELECT count(*) FROM t WHERE s LIKE 's-1%'".into(),
-            false,
+            0,
         ),
         (
             "join_count",
             "SELECT count(*) FROM t JOIN dim d ON t.g = d.g".into(),
-            false,
+            0,
         ),
         (
             "join_mat",
             "SELECT t.v, d.name FROM t JOIN dim d ON t.g = d.g LIMIT 1000".into(),
-            false,
+            0,
         ),
-        ("point", "SELECT count(*) FROM t WHERE dp = 7".into(), false),
+        ("point", "SELECT count(*) FROM t WHERE dp = 7".into(), 0),
         (
             "union_all",
             "SELECT count(*) FROM (SELECT v FROM t UNION ALL SELECT v FROM t)".into(),
-            false,
+            0,
         ),
         // ↓ 内存侧重点：高基数分组（组表是内存大头）、去重、排序
         (
             "group_by_hi",
             "SELECT g, count(*) AS c, sum(v) AS s FROM t GROUP BY g".into(),
-            false,
+            0,
         ),
-        ("distinct_s", "SELECT DISTINCT s FROM t".into(), false),
+        ("distinct_s", "SELECT DISTINCT s FROM t".into(), 0),
         (
             "order_topn",
             "SELECT v FROM t ORDER BY v LIMIT 10".into(),
-            false,
+            0,
         ),
         // 极小配额：**必须落盘完成**（P1 的溢出承诺）
         (
             "spill_group_by",
             "SELECT g, count(*) AS c, sum(v) AS s FROM t GROUP BY g".into(),
-            true,
+            64,
         ),
-        ("spill_order_by", "SELECT v FROM t ORDER BY v".into(), true),
+        ("spill_order_by", "SELECT v FROM t ORDER BY v".into(), 64),
+        // P2：分区块 hash join——**build 侧是整张大表**（5M 行），64MB 配额下必然
+        // 走两侧分区落盘；LIMIT 只是别让结果集本身爆掉
+        (
+            "spill_join",
+            "SELECT a.v, b.v FROM t a JOIN t b ON a.g = b.g LIMIT 200".into(),
+            64,
+        ),
+        // P1：去重溢出（去重表 = 全部列，这里键域大）
+        ("spill_distinct", "SELECT DISTINCT g, v FROM t".into(), 16),
     ]
 }
 
@@ -208,9 +217,10 @@ fn prepare(data: &str, rows: i64) {
 /// 单用例：R 轮取中位数，报「中位秒数 / 离散度 / 峰值 RSS」。
 fn run_case(idx: usize, data: &str, rounds: usize, limit_mb: u64) {
     let cs = cases();
-    let (name, sql, constrained) = &cs[idx];
+    let (name, sql, quota_mb) = &cs[idx];
     let db = open(data);
-    let limit = if *constrained {
+    // `--limit-mb` 是"约束用例"的统一档位；用例自带 0 表示不约束
+    let limit = if *quota_mb > 0 {
         Some(limit_mb.max(1) * 1024 * 1024)
     } else {
         None
@@ -259,11 +269,11 @@ fn main() {
         None => {
             let cs = cases();
             println!("用例清单（用 --case N 逐个跑，独立子进程隔离）:");
-            for (i, (n, _, c)) in cs.iter().enumerate() {
+            for (i, (n, _, q)) in cs.iter().enumerate() {
                 println!(
                     "  {i:>2} {n}{}",
-                    if *c {
-                        "  [极小配额：验证溢出]"
+                    if *q > 0 {
+                        "  [极小配额：验证溢出落盘完成]"
                     } else {
                         ""
                     }
