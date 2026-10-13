@@ -2510,13 +2510,35 @@ fn translate_select_inner(
             }
         }
         // 仅当追加了隐藏排序列时才替换顶层投影（DISTINCT 无隐藏列时保持原样）
-        if extra_exprs.len() > proj_exprs_len_before(&plan) {
+        let n_client = proj_names.len();
+        let added_hidden = extra_exprs.len() > proj_exprs_len_before(&plan);
+        if added_hidden {
             plan = replace_top_project(plan, extra_exprs, extra_names);
         }
         plan = LogicalPlan::Sort {
             input: Box::new(plan),
             keys: sort_keys,
         };
+        // 隐藏排序列（`__sort_N`）**只服务于排序，不是查询结果的一部分**：在 Sort 之上
+        // 补一层投影，把结果收回到客户端要的那几列。（此前隐藏列直接跟着结果出网——
+        // `SELECT v FROM t ORDER BY w` 会回**两列**，多出一个 `__sort_1`；对 JDBC 这类
+        // 按列数/列名解析的客户端是"凭据错位"。）
+        if added_hidden && n_client > 0 {
+            let keep: Vec<PhysExpr> = (0..n_client)
+                .map(|i| PhysExpr::Column {
+                    idx: i,
+                    name: proj_names[i].clone(),
+                    // 类型取原投影表达式（`Column{ty}` 会被 `ProjectExec` 拿去做 schema，
+                    // 占位 Int64 会让字符串列声明成整数）
+                    ty: proj_exprs[i].data_type(),
+                })
+                .collect();
+            plan = LogicalPlan::Project {
+                input: Box::new(plan),
+                exprs: keep,
+                names: proj_names.clone(),
+            };
+        }
     }
 
     // LIMIT

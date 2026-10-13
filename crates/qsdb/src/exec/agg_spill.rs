@@ -8,10 +8,9 @@
 //! 路由的**一致性**是这里的命门：内存里已经聚合出的那张表（`GroupTable`）的组，
 //! 与后续落盘的原始行，必须算出同一个分区。两者可用的信息不同——
 //! 表里只有组的 `Literal`（`group_lits`），行上是 Arrow 数组。故统一走
-//! `array_value_to_literal`（组表的键正是由它构造）+ `Literal::to_sql_string()`
-//! 这条**两边同源**的规范形态。不能用 `GroupTable` 内部的 arena 字节：
-//! 那是快/慢路径各写各的（单 Int64 键只存 8 字节 LE、其余带 tag），照抄会随
-//! 内部实现漂移。
+//! **规范字节编码**（`enc_literal` / `enc_value`，两侧逐字节等价）这条**两边同源**
+//! 的形态。不能用 `GroupTable` 内部的 arena 字节：那是快/慢路径各写各的
+//! （单 Int64 键只存 8 字节 LE、其余带 tag），照抄会随内部实现漂移。
 //!
 //! 为什么不是"溢出中间聚合状态"：那要给 `GroupTable` 的 SoA 状态定义一套可合并的
 //! 序列化格式（AVG 之类还得拆成 sum/count 才可合并），正确性代价高——本仓
@@ -37,7 +36,6 @@ use crate::expr::PhysExpr;
 use crate::memory::Reservation;
 use crate::types::Literal;
 
-use super::agg::array_value_to_literal;
 use super::spill::{self, SpillDir};
 
 /// 单个分区的内存缓冲上界缺省值（超界即落盘）。刻意取小：在途缓冲吃的是
@@ -52,20 +50,244 @@ pub fn max_nparts() -> usize {
     rayon::current_num_threads().clamp(2, 16)
 }
 
-/// 一组分组键 → 分区号。**规范形态**：各列 `Literal` 的 SQL 显示串拼接。
-///
-/// 不同键撞到同一分区是允许的（只是分区大小不均）；**同一个键必须落同一分区**——
-/// 这条由"两侧都经 `array_value_to_literal` → `to_sql_string`"保证。
-pub fn partition_of_lits(lits: &[Literal], nparts: usize) -> usize {
-    let mut h: u64 = 1_469_598_103_934_665_603;
-    for l in lits {
-        let s = l.to_sql_string();
-        for b in s.as_bytes() {
-            h = (h ^ u64::from(*b)).wrapping_mul(1_099_511_628_211);
+// ---------------------------------------------------------------------------
+// 路由的**规范字节编码**（零分配）
+//
+// 路由的命门是"同一个键在**两侧**算出同一串字节"：组表侧只有 `Literal`
+// （[`enc_literal`]），行侧是 Arrow 数组（[`enc_value`]）。两者必须逐字节相等——
+// 由 `enc_value_matches_enc_literal` 逐类型钉住（漏一个类型就会让同组被拆到两个
+// 分区，表现为"同组出现两次、计数各半"，SQL 级用例
+// `group_by_results_identical_with_and_without_spill` 也兜着）。
+//
+// 为什么不复用 `Literal::to_sql_string()`：那是**展示**用途，`format!` 分配 +
+// 字符串键 `replace('\'', "''")` 整串扫描，每行每列一次分配。路由只关心"等值即等编码"，
+// 数字统一升到 i64/f64（Int32(5) 与 Int64(5) 同编码，与旧串形态的宽松度一致）。
+// ---------------------------------------------------------------------------
+
+const TAG_NULL: u8 = 0;
+const TAG_BOOL: u8 = 1;
+const TAG_INT: u8 = 2; // + i64 LE（含 Boolean 之外的整型族升位）
+const TAG_FLOAT: u8 = 3; // + f64 位模式 LE
+const TAG_UTF8: u8 = 4; // + u32 LE 长度 + 字节
+const TAG_BIN: u8 = 5; // + u32 LE 长度 + 字节
+const TAG_DATE: u8 = 6; // + i32 LE
+const TAG_TIME: u8 = 7; // + i64 LE
+const TAG_TS: u8 = 8; // + i64 LE
+const TAG_DEC: u8 = 9; // + i128 LE + i8 scale
+const TAG_INTERVAL: u8 = 10; // + i32 + i32 + i64
+
+#[inline]
+fn enc_int(buf: &mut Vec<u8>, v: i64) {
+    buf.push(TAG_INT);
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+#[inline]
+fn enc_float(buf: &mut Vec<u8>, v: f64) {
+    buf.push(TAG_FLOAT);
+    buf.extend_from_slice(&v.to_bits().to_le_bytes());
+}
+
+#[inline]
+fn enc_bytes(buf: &mut Vec<u8>, tag: u8, b: &[u8]) {
+    buf.push(tag);
+    buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+    buf.extend_from_slice(b);
+}
+
+/// `Literal` → 规范字节（**组表侧**）。
+pub(crate) fn enc_literal(l: &Literal, buf: &mut Vec<u8>) {
+    match l {
+        Literal::Null => buf.push(TAG_NULL),
+        Literal::Boolean(b) => {
+            buf.push(TAG_BOOL);
+            buf.push(u8::from(*b));
         }
-        h = h.wrapping_mul(0x100_0000_01b3); // 列分隔
+        Literal::Int8(v) => enc_int(buf, i64::from(*v)),
+        Literal::Int16(v) => enc_int(buf, i64::from(*v)),
+        Literal::Int32(v) => enc_int(buf, i64::from(*v)),
+        Literal::Int64(v) => enc_int(buf, *v),
+        Literal::Float32(v) => enc_float(buf, f64::from(*v)),
+        Literal::Float64(v) => enc_float(buf, *v),
+        Literal::Decimal { unscaled, meta } => {
+            buf.push(TAG_DEC);
+            buf.extend_from_slice(&unscaled.to_le_bytes());
+            buf.push(meta.scale as u8);
+        }
+        Literal::Utf8(s) => enc_bytes(buf, TAG_UTF8, s.as_bytes()),
+        Literal::Binary(b) => enc_bytes(buf, TAG_BIN, b),
+        Literal::Date(d) => {
+            buf.push(TAG_DATE);
+            buf.extend_from_slice(&d.to_le_bytes());
+        }
+        Literal::Time(ns) => {
+            buf.push(TAG_TIME);
+            buf.extend_from_slice(&ns.to_le_bytes());
+        }
+        Literal::Timestamp(ns) => {
+            buf.push(TAG_TS);
+            buf.extend_from_slice(&ns.to_le_bytes());
+        }
+        Literal::Interval {
+            months,
+            days,
+            nanos,
+        } => {
+            buf.push(TAG_INTERVAL);
+            buf.extend_from_slice(&months.to_le_bytes());
+            buf.extend_from_slice(&days.to_le_bytes());
+            buf.extend_from_slice(&nanos.to_le_bytes());
+        }
+    }
+}
+
+/// `(数组, 行号)` → 规范字节（**行侧**，不经 `Literal`，无任何分配）。
+///
+/// 类型覆盖**必须**与 `agg::array_value_to_literal` 一致（那边认不出的一律
+/// `Literal::Null` → 这里也走 `TAG_NULL`，保持两边同编码：整列落同一分区是
+/// 允许的，只是分布差）。
+pub(crate) fn enc_value(a: &dyn arrow::array::Array, row: usize, buf: &mut Vec<u8>) {
+    use arrow::datatypes::*;
+    if a.is_null(row) {
+        buf.push(TAG_NULL);
+        return;
+    }
+    match a.data_type() {
+        DataType::Int8 => enc_int(
+            buf,
+            i64::from(
+                a.as_any()
+                    .downcast_ref::<arrow::array::Int8Array>()
+                    .unwrap()
+                    .value(row),
+            ),
+        ),
+        DataType::Int16 => enc_int(
+            buf,
+            i64::from(
+                a.as_any()
+                    .downcast_ref::<arrow::array::Int16Array>()
+                    .unwrap()
+                    .value(row),
+            ),
+        ),
+        DataType::Int32 => enc_int(
+            buf,
+            i64::from(
+                a.as_any()
+                    .downcast_ref::<arrow::array::Int32Array>()
+                    .unwrap()
+                    .value(row),
+            ),
+        ),
+        DataType::Int64 => enc_int(
+            buf,
+            a.as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap()
+                .value(row),
+        ),
+        DataType::Float32 => enc_float(
+            buf,
+            f64::from(
+                a.as_any()
+                    .downcast_ref::<arrow::array::Float32Array>()
+                    .unwrap()
+                    .value(row),
+            ),
+        ),
+        DataType::Float64 => enc_float(
+            buf,
+            a.as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .unwrap()
+                .value(row),
+        ),
+        DataType::Date32 => {
+            buf.push(TAG_DATE);
+            let v = a
+                .as_any()
+                .downcast_ref::<arrow::array::Date32Array>()
+                .unwrap()
+                .value(row);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        DataType::Time64(TimeUnit::Nanosecond) => {
+            buf.push(TAG_TIME);
+            let v = a
+                .as_any()
+                .downcast_ref::<arrow::array::Time64NanosecondArray>()
+                .unwrap()
+                .value(row);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            buf.push(TAG_TS);
+            let v = a
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+                .unwrap()
+                .value(row);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        DataType::Boolean => {
+            buf.push(TAG_BOOL);
+            let v = a
+                .as_any()
+                .downcast_ref::<arrow::array::BooleanArray>()
+                .unwrap()
+                .value(row);
+            buf.push(u8::from(v));
+        }
+        DataType::Decimal128(p, s) => {
+            buf.push(TAG_DEC);
+            let v = a
+                .as_any()
+                .downcast_ref::<arrow::array::Decimal128Array>()
+                .unwrap()
+                .value(row);
+            buf.extend_from_slice(&v.to_le_bytes());
+            // 与 `enc_literal` 同口径：`DecimalMeta::try_new` 失败时退 (38, 0)
+            let scale = crate::types::DecimalMeta::try_new(*p, *s)
+                .unwrap_or(crate::types::DecimalMeta::new(38, 0))
+                .scale;
+            buf.push(scale as u8);
+        }
+        DataType::Utf8 => {
+            let s = a
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap()
+                .value(row);
+            enc_bytes(buf, TAG_UTF8, s.as_bytes());
+        }
+        // 认不出的类型：与 `array_value_to_literal` 的 `_ => Literal::Null` 对齐
+        _ => buf.push(TAG_NULL),
+    }
+}
+
+/// 规范字节 → 分区号（FNV 变体，与旧实现同一形状；**只在两侧之间要求一致**）。
+fn hash_canon(bytes: &[u8], nparts: usize) -> usize {
+    let mut h: u64 = 1_469_598_103_934_665_603;
+    for &b in bytes {
+        h = (h ^ u64::from(b)).wrapping_mul(1_099_511_628_211);
     }
     (h % nparts as u64) as usize
+}
+
+/// 一组分组键 → 分区号（**组表侧**；`buf` 由调用方复用，避免每组一次分配）。
+pub(crate) fn partition_of_lits_into(lits: &[Literal], nparts: usize, buf: &mut Vec<u8>) -> usize {
+    buf.clear();
+    for l in lits {
+        enc_literal(l, buf);
+        buf.push(0xFF); // 列分隔（TAG 里不出现 0xFF）
+    }
+    hash_canon(buf, nparts)
+}
+
+pub fn partition_of_lits(lits: &[Literal], nparts: usize) -> usize {
+    let mut buf = Vec::with_capacity(64);
+    partition_of_lits_into(lits, nparts, &mut buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -274,23 +496,25 @@ impl PartSpill {
     }
 }
 
-/// 路由口径①：聚合/去重——分组键的 `Literal` 规范形态（**与组表的键同源**：
-/// 组表的键就是 `array_value_to_literal` 造出来的）。
+/// 路由口径①：聚合/去重——分组键的**规范字节**（与组表侧的 [`enc_literal`] 逐字节
+/// 等价，见 `enc_value_matches_enc_literal`）。
+///
+/// 这里是**每行一次**的热路径（大表溢出时动辄千万行），故：不构造 `Literal`、
+/// 不生成 SQL 串、不分配——一个缓冲逐行复用。
 pub fn route_by_lits(batch: &RecordBatch, group: &[PhysExpr], nparts: usize) -> Result<Vec<u32>> {
     let group_arrays: Vec<arrow::array::ArrayRef> = group
         .iter()
         .map(|g| crate::expr::eval::eval(g, batch))
         .collect::<Result<_>>()?;
     let mut out = Vec::with_capacity(batch.num_rows());
-    let mut lits: Vec<Literal> = Vec::with_capacity(group_arrays.len());
+    let mut buf: Vec<u8> = Vec::with_capacity(group_arrays.len() * 16 + 16);
     for row in 0..batch.num_rows() {
-        lits.clear();
-        lits.extend(
-            group_arrays
-                .iter()
-                .map(|a| array_value_to_literal(a.as_ref(), row)),
-        );
-        out.push(partition_of_lits(&lits, nparts) as u32);
+        buf.clear();
+        for a in &group_arrays {
+            enc_value(a.as_ref(), row, &mut buf);
+            buf.push(0xFF); // 列分隔
+        }
+        out.push(hash_canon(&buf, nparts) as u32);
     }
     Ok(out)
 }
@@ -377,6 +601,7 @@ impl AggSpill {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec::agg::array_value_to_literal;
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
 
@@ -475,6 +700,75 @@ mod tests {
         assert_eq!(total, pushes * 64, "降级路径丢行了");
         assert_eq!(per_part.iter().sum::<usize>(), pushes * 64);
         drop(hog);
+    }
+
+    /// **路由两侧同源**：行侧（`enc_value`，直接读数组）与组表侧（`enc_literal`，
+    /// 读 `array_value_to_literal` 的产物）对同一个值必须产出**逐字节相同**的编码。
+    ///
+    /// 这是分区稳定性的**唯一**依据：漏一种类型（或某类型两边取值口径不同）就会让
+    /// 同一个键被拆到两个分区 → 同组出现两次、计数各半。逐类型钉住，别删。
+    #[test]
+    fn enc_value_matches_enc_literal() {
+        use arrow::array::*;
+        use arrow::datatypes::{DataType, TimeUnit};
+
+        fn check(arr: &dyn arrow::array::Array, tag: &str) {
+            for row in 0..arr.len() {
+                let mut a = Vec::new();
+                enc_value(arr, row, &mut a);
+                let mut b = Vec::new();
+                enc_literal(&array_value_to_literal(arr, row), &mut b);
+                assert_eq!(
+                    a, b,
+                    "{tag} 第 {row} 行两侧编码不一致：行侧 {a:?} vs 组表侧 {b:?}"
+                );
+            }
+        }
+
+        check(&Int8Array::from(vec![Some(-1), None, Some(7)]), "Int8");
+        check(&Int16Array::from(vec![Some(-300), None]), "Int16");
+        check(&Int32Array::from(vec![Some(123456), None]), "Int32");
+        check(
+            &Int64Array::from(vec![Some(i64::MIN), None, Some(42)]),
+            "Int64",
+        );
+        check(
+            &Float32Array::from(vec![Some(1.5), None, Some(-0.0)]),
+            "Float32",
+        );
+        check(
+            &Float64Array::from(vec![Some(f64::NAN), None, Some(2.25)]),
+            "Float64",
+        );
+        check(
+            &BooleanArray::from(vec![Some(true), Some(false), None]),
+            "Boolean",
+        );
+        check(&Date32Array::from(vec![Some(20_000), None]), "Date32");
+        check(
+            &Time64NanosecondArray::from(vec![Some(999), None]),
+            "Time64(ns)",
+        );
+        check(
+            &TimestampNanosecondArray::from(vec![Some(1_700_000_000_000_000_000), None]),
+            "Timestamp(ns)",
+        );
+        check(
+            &StringArray::from(vec![Some("a'b"), Some(""), None, Some("中文")]),
+            "Utf8",
+        );
+        let dec = Decimal128Array::from(vec![Some(12345i128), None])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        check(&dec, "Decimal128");
+
+        // 认不出的类型（`array_value_to_literal` 给 `Literal::Null`）：两侧同样退到
+        // TAG_NULL —— 整列落同一分区是允许的（分布差，不影响正确性）。
+        let big: Arc<dyn arrow::array::Array> =
+            Arc::new(LargeStringArray::from(vec![Some("x"), None]));
+        check(big.as_ref(), "LargeUtf8(未支持类型→NULL)");
+        assert_eq!(big.data_type(), &DataType::LargeUtf8);
+        let _ = TimeUnit::Nanosecond; // 类型引用保持 import 有效
     }
 
     /// 规范形态对 `Literal` 的等价性（组表侧与行侧同源）。

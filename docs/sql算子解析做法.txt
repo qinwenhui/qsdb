@@ -1,0 +1,228 @@
+
+---
+
+## 1. Scan / Source
+
+### 常规
+- 按行解析（CSV/JSON row-by-row）
+- 调用 `serde` / `nom` 逐行 deserialize
+
+### 极客
+- **批量列存 + zero-copy**：数据已经是 Parquet/ORC，直接 mmap 文件，按 batch（1024/4096 rows）零拷贝映射到 arrow array，不做任何中间 Row 结构
+- **SIMD 做谓词下推**：在 scan 阶段就把 `WHERE` 条件用 `packed_simd` / `std::simd` 做向量化过滤，生成 bitmap，后续算子直接跳过
+- **IO 合并 + io_uring**：Linux 上用 `io_uring` 做真正的异步预读，不用 `read()` 阻塞，让 CPU 和 IO 重叠
+- **列裁剪在 page 级别**：Parquet 的 row group 级别直接跳过不需要的列，连解压都不做
+
+```rust
+// 核心思路：scan 出来的不是 Vec<Row>，是 RecordBatch
+// 每个 batch 是 columnar arrow arrays，后续算子全部 batch-in, batch-out
+```
+
+---
+
+## 2. Filter
+
+### 常规
+- `iter().filter(|row| predicate(row)).collect()`
+
+### 极客
+- **完全向量化**：predicate 编译成 bitmap（`[u64; N]`），每个 bit 代表一行是否保留
+- **短路分支预测友好**：predicate 拆成多个独立 pass，每个 pass 生成临时 bitmap，最后 `bitand` 合并——这样每个 pass 内分支模式极规律，CPU 预测率 99%+
+- **Predicate 编译**：用 `cranelift` 或 `dynasm-rs` 把 SQL predicate JIT 编译成本地机器码，直接操作 arrow array 内存
+- **选择性驱动后续策略**：
+  - 选择性 < 5%：生成 gather/scatter 索引，后续算子只处理命中行
+  - 选择性 > 50%：直接原地标记 bitmap，不拷贝数据
+
+```rust
+// 核心：filter 的输出不是新 batch，是一个 bitmap + 原 batch 的 Arc
+// 下游算子自己决定是 gather 还是 skip
+```
+
+---
+
+## 3. Project / Map
+
+### 常规
+- 对每行调用 closure，写新列
+
+### 极客
+- **Arrow compute kernels**：直接用 `arrow::compute` 里的向量化 kernel，它们内部是 SIMD 的
+- **表达式编译**：用 `cranelift` 把表达式编译成函数，输入是 arrow array 指针，输出是 arrow array 指针
+- **Lazy materialization**：如果投影列后面没被用（比如只是中间计算），用 `Expr` 延迟到真正需要时才物化
+- **Column 复用**：如果 projection 只是重命名或类型 cast，不拷贝数据，只生成新的 `ArrayRef` 指向同一 buffer
+
+---
+
+## 4. Hash Aggregate (GROUP BY)
+
+### 常规
+- `HashMap<Key, Accumulator>` + 每次 `get_mut` + update
+
+### 极客（这里是重点）
+
+**4.1 Hash 表本身**
+- 不用 `std::collections::HashMap`，用 **`hashbrown`** 的 raw entry API 或直接用 **`indexmap`** 的 hash 表变体
+- 更极客：**open-addressing hash table + 自定义 allocator**，key 和 value 分开存（AoS → SoA），提高 cache line 利用率
+- 用 **xxh3** 或 **aHash** 做 hash，不要用 SipHash
+
+**4.2 聚合状态布局**
+- 每个 group 的 accumulator 状态用 **SoA** 而不是 AoS：
+  ```
+  // 常规
+  struct Group { sum: i64, count: i64, min: i64, max: i64 }
+  // 极客：三个独立数组
+  sums: Vec<i64>   // 连续内存，SIMD 友好
+  counts: Vec<i64>
+  mins: Vec<i64>
+  maxs: Vec<i64>
+  ```
+- 好处：update 时只写 `sums[slot] += val`，一条 cache line 只装 sum，不装其他字段
+
+**4.3 批量 probe + update**
+- 不要一行一行 probe hash table，而是 **batch probe**：一次对 64 个 key 做 hash，得到 64 个 slot 位置，然后批量 update
+- 如果 key 重复率高，先做 **local deduplication**：一个 batch 内先去重，每个 group 只 update 一次
+
+**4.4 两级聚合（你自己的 two-phase）**
+```
+Thread-local hash table (无锁) → merge 到全局 hash table → 输出
+```
+- 每个 worker thread 一个 thread-local hash table，完全无锁
+- 定期 merge 到共享 table（用 atomic 或 mutex 只锁一个 shard）
+
+**4.5 Spill 策略**
+- 不是 hash table 满了才 spill，而是 **主动 partition**：按 key hash 的高几位分成 N 个 partition，每个 partition 一个 hash table
+- 某个 partition 超内存 → 只 spill 那个 partition
+- 读回来时直接顺序 merge，不需要重新 hash
+
+---
+
+## 5. Join
+
+### 常规
+- Build 端建 hash table，Probe 端逐行 probe
+
+### 极客
+
+**5.1 Build 阶段**
+- 如果 build 端小：直接建 hash table，但 key 用 **radix partition** 按 hash 值高位分桶，后面 probe 时 cache 友好
+- 如果 build 端大：**radix hash join**
+  1. Build 端按 hash 高 8 位分成 256 个 partition，每个 partition 顺序写
+  2. Probe 端同样按 hash 高位分区
+  3. 每个 partition 单独做 hash join，hash table 大小 = partition 大小，cache 命中率极高
+
+**5.2 Hash Table 设计**
+- 不用链式冲突解决，用 **linear probing + prefetch**：probe 时先算 hash，prefetch 对应的 cache line，再做比较
+- Key 如果是字符串：存 hash + 前缀 8 字节，比较时先比前缀再比完整字符串
+
+**5.3 Probe 批量做**
+- 一次 probe 一个 batch（64/128 行），生成 match bitmap，然后批量输出
+- 如果 join 是 1:1 或 1:N 且 N 小：输出时直接 inline 到结果 batch
+- 如果 N 大：用 **late materialization**，先输出 (build_row_id, probe_row_id) 对，最后再 gather
+
+**5.4 非等值 Join**
+- Nested Loop Join：用 **blockwise nested loop**，两边都是 batch，内层用 SIMD 做谓词比较
+
+---
+
+## 6. Sort
+
+### 常规
+- `sort_by_key` 或 `sort_unstable`
+
+### 极客
+- **Radix sort**：如果 key 是整数/fixed-length，radix sort 比 `sort_unstable` 快 3-5x
+- **External merge sort**：
+  - 每个 run 用 **replacement selection** 生成变长 run（比普通 sort + spill 生成的 run 更长）
+  - merge 阶段用 **k-way merge** + **loser tree**，不是 priority queue
+  - 预取下一个 block：merge 到当前 buffer 一半时，异步读下一个 block
+- **Sort 和 Aggregate 结合**：如果后面紧跟 group by，先 sort 再 group by（sorted aggregate），避免 hash table 的 cache miss
+
+---
+
+## 7. Top-N / Limit
+
+### 常规
+- 全排序后取前 N
+
+### 极客
+- **Tournament tree / loser tree**：维护一个大小为 N 的 loser tree，每个元素只比较 log N 次
+- **Fallback to heap**：如果 N 小（< 10000），直接用 `BinaryHeap` 的 `push_pop` 模式
+- **分布式 Top-N**：每个节点先 local top-N，只传 N 行给 coordinator，coordinator 再做 global top-N
+
+---
+
+## 8. Distinct / Count Distinct
+
+### 常规
+- 全量 hash set
+
+### 极客
+- **HyperLogLog**：如果允许近似，HLL 内存 O(1)，update 是 SIMD 友好的 bit 操作
+- **精确 Distinct 小基数**：用 **bitmap** 或 **roaring bitmap** 存值
+- **精确 Distinct 大基数**：用 **recursive partitioning**——按 hash 值高位分区，每个分区内用 hash set，分区大小可控
+- **如果 distinct 后面紧跟 group by**：合并成一个算子，hash table 的 key 是 `(group_key, distinct_key)`
+
+---
+
+## 9. 内存管理 & 并发
+
+### 极客
+- **Arena allocator**：每个算子用 `bumpalo` 或自己写 arena，batch 结束或 spill 时整块释放，零碎片
+- **NUMA-aware**：大机器上，每个 NUMA node 绑一个 worker thread pool，数据本地化
+- **无锁 batch 传递**：算子之间用 `crossbeam-channel` 的 bounded channel，batch 是 `Arc<RecordBatch>`，零拷贝传递
+- **CPU pinning**：worker thread 绑 core，减少 cache line 迁移
+
+---
+
+## 10. 整体 Pipeline 设计
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Scan (mmap + simd filter)                              │
+│       ↓ batch (Arc<RecordBatch>)                        │
+│  Filter (bitmap, zero-copy)                             │
+│       ↓ batch + bitmap                                  │
+│  Project (arrow compute kernels / JIT)                   │
+│       ↓ batch                                           │
+│  HashAgg (thread-local → merge, SoA state)              │
+│       ↓ batch                                           │
+│  Spill if needed (partitioned, async write)             │
+│       ↓                                                 │
+│  Output                                                  │
+└─────────────────────────────────────────────────────────┘
+```
+
+**关键设计决策：**
+1. 所有算子 **batch-in, batch-out**，batch 大小 1024-4096
+2. batch 内部 **列存**，全程 arrow format，零拷贝
+3. 算子间用 channel 传 `Arc<RecordBatch>`，引用计数管理生命周期
+4. 每个算子有自己的 arena，batch 处理完统一释放
+5. 聚合和 join 的 hash table 用 SoA + 批量 probe
+6. Spill 是 partition-level，不是 table-level
+
+---
+
+## 11. 几个"偏门但暴力"的优化点
+
+| 点 | 做法 |
+|---|---|
+| Hash 函数 | 用 `ahash` 或自己写，key 短时用 FNV1a 展开成 unrolled loop |
+| 分支消除 | Filter bitmap 用 `bitmask` 操作，下游算子用 `likely/unlikely` hint |
+| Prefetch | Hash probe 前手动 `__builtin_prefetch` 下一行 |
+| 编译表达式 | `cranelift` 把 SQL expr 编译成机器码，比解释执行快 10x |
+| 内存布局 | Hash table 的 key 和 value 分开分配，value 按列存 |
+| 向量化 | 用 `std::simd` (nightly) 或 `wide` crate 做批量比较/计算 |
+| IO | `io_uring` + 直接 IO (O_DIRECT)，绕过 page cache |
+
+---
+
+## 总结优先级
+
+如果你时间有限，按 ROI 排序：
+
+1. **列存 batch + arrow format**（基础，所有后续优化依赖这个）
+2. **Hash aggregate 的 SoA + thread-local two-phase**（group by 是最大热点）
+3. **Join 的 radix partition + 批量 probe**（join 是第二热点）
+4. **Filter 向量化 + bitmap 传递**（让下游知道哪些行有效）
+5. **表达式 JIT**（cranelift，收益巨大但实现复杂）
+6. **io_uring + NUMA**（大机器上才明显）

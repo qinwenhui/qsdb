@@ -633,13 +633,24 @@ impl SortExec {
             if chunk.is_empty() {
                 return Ok(());
             }
-            let dir = spill_dir.get_or_insert_with(spill::SpillDir::new);
+            // 走**配置的溢出目录**（`QsdbOptions::spill_dir`）；此处曾是
+            // `SpillDir::new()`（系统临时目录）——全仓最后一个没走配置目录的溢出点。
+            let base = self.ctx.spill_base().map(|p| p.to_path_buf());
+            let dir = spill_dir.get_or_insert_with(|| spill::SpillDir::new_in(base.as_deref()));
             let path = spill::write_sorted_run(dir, chunk, &self.keys, &self.schema)?;
             run_paths.push(path);
             chunk.clear();
             *chunk_bytes = 0;
             Ok(())
         };
+
+        // TopN 的**有界缓冲**：带 limit 时缓冲没必要超过 n 行——攒到 `8n + 4096` 行就
+        // 排序截断到前 n 行（几何增长 → 总工作量仍是 O(N log n)，比分区内重复排序省），
+        // 内存从 O(输入) 降到 O(n)。`ORDER BY … LIMIT 10` 排全表是这类查询的常态。
+        let topn_keep = self
+            .limit
+            .map(|n| (n.saturating_mul(8)).saturating_add(4096));
+        let mut buffered_rows = 0usize;
 
         while let Some(b) = self.input.next() {
             self.ctx.check()?;
@@ -664,7 +675,28 @@ impl SortExec {
                 continue;
             }
             chunk_bytes += bytes;
+            buffered_rows += x.num_rows();
             chunk.push(x);
+
+            // TopN 有界缓冲（见 `topn_keep` 的注释）：攒够了就**就地截断**到前 n 行。
+            // 正确性：全体前 n = 「已见的全体前 n」的前 n，逐次截断因此不丢答案。
+            if let Some(keep) = topn_keep {
+                if buffered_rows > keep {
+                    let merged = sort_in_memory(std::mem::take(&mut chunk), &self.schema())?;
+                    let cut = sort_with_limit(&merged, &self.keys, self.limit, &self.schema)?;
+                    let back = chunk_bytes;
+                    res.shrink(back);
+                    chunk_bytes = cut.get_array_memory_size() as u64;
+                    buffered_rows = cut.num_rows();
+                    // 截断后必然更小（≤ 前 n 行）；拿不回额度也不影响正确性，
+                    // 只影响记账精度——同溢出路径的口径（不因额度打死可完成的查询）
+                    let _ = res.grow(chunk_bytes);
+                    chunk.clear();
+                    if cut.num_rows() > 0 {
+                        chunk.push(cut);
+                    }
+                }
+            }
         }
 
         if run_paths.is_empty() {
@@ -742,43 +774,49 @@ impl ExecNode for SortExec {
         if data.num_rows() == 0 {
             return None;
         }
-        // 排序列（表达式求值）
-        let mut sort_cols: Vec<SortColumn> = Vec::with_capacity(self.keys.len());
-        for k in &self.keys {
-            let arr = match eval::eval(&k.expr, &data) {
-                Ok(a) => a,
-                Err(e) => return Some(Err(e)),
-            };
-            // pg 语义：ASC NULLS LAST / DESC NULLS FIRST
-            sort_cols.push(SortColumn {
-                values: arr,
-                options: Some(arrow::compute::SortOptions {
-                    descending: k.descending,
-                    nulls_first: k.descending,
-                }),
-            });
-        }
-        let indices = lexsort_to_indices(&sort_cols, self.limit)
-            .map_err(|e| QsdbError::invalid(format!("sort failed: {e}")));
-        let indices = match indices {
-            Ok(i) => i,
-            Err(e) => return Some(Err(e)),
-        };
-        let mut cols = Vec::with_capacity(data.num_columns());
-        for c in data.columns() {
-            match take(c, &indices, None) {
-                Ok(t) => cols.push(t),
-                Err(e) => return Some(Err(QsdbError::invalid(format!("take: {e}")))),
-            }
-        }
-        let out = RecordBatch::try_new_with_options(
-            self.schema(),
-            cols,
-            &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(indices.len())),
-        )
-        .map_err(|e| QsdbError::invalid(format!("sort output: {e}")));
-        Some(out)
+        Some(sort_with_limit(
+            &data,
+            &self.keys,
+            self.limit,
+            &self.schema(),
+        ))
     }
+}
+
+/// 按 `keys` 排序 `data` 并（可选）截断到前 `limit` 行。
+///
+/// **两种情形共用同一份比较口径**（`SortOptions`：pg 语义 ASC NULLS LAST /
+/// DESC NULLS FIRST）：最终输出，以及 TopN 有界缓冲的**中间截断**——中间截断若
+/// 用了另一套比较规则，就会悄悄丢答案，所以这里是同一个函数。
+fn sort_with_limit(
+    data: &RecordBatch,
+    keys: &[SortKey],
+    limit: Option<usize>,
+    schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    let mut sort_cols: Vec<SortColumn> = Vec::with_capacity(keys.len());
+    for k in keys {
+        let arr = eval::eval(&k.expr, data)?;
+        sort_cols.push(SortColumn {
+            values: arr,
+            options: Some(arrow::compute::SortOptions {
+                descending: k.descending,
+                nulls_first: k.descending,
+            }),
+        });
+    }
+    let indices = lexsort_to_indices(&sort_cols, limit)
+        .map_err(|e| QsdbError::invalid(format!("sort failed: {e}")))?;
+    let mut cols = Vec::with_capacity(data.num_columns());
+    for c in data.columns() {
+        cols.push(take(c, &indices, None).map_err(|e| QsdbError::invalid(format!("take: {e}")))?);
+    }
+    RecordBatch::try_new_with_options(
+        Arc::clone(schema),
+        cols,
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(indices.len())),
+    )
+    .map_err(|e| QsdbError::invalid(format!("sort output: {e}")))
 }
 
 /// 去重（哈希；group = 全部列）。
