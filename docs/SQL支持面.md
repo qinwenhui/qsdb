@@ -1,0 +1,121 @@
+# SQL 支持面（对外声明 · 可执行）
+
+> 版本：v1（2026-10-13）——起因是一次**系统扫描**：绑定器是「逐字段读」的，
+> AST 里**没读的字段默认被忽略**，于是"语法合法但没实现"的子句会**安静地按没写执行**。
+> 这类 bug 不报错、不打日志，只能靠人撞见（`count(DISTINCT)` 那条就是手滑撞见的）。
+>
+> 本文 + `crates/qsdb/tests/sql_silent_drop.rs`（回归）一起构成声明：
+> **每条语法要么正确执行、要么显式拒绝——没有"静默忽略"这一档。**
+>
+> 判据落在 `sql::translate` 的 `audit_query` / `audit_select` / `audit_function` /
+> `audit_window_spec` 四个闸门里（新加能力时要么在绑定器里读那个字段，要么在闸门里拒绝）。
+> 读者：驱动/SDK 作者（不用猜"这条能不能写"）、生态工具、写 SQL 的人。
+
+**状态含义**：✅ 支持 · ✋ **显式拒绝**（给了话术清晰的报错）· ⛔ 解析期拒绝（sqlparser 不认这个语法）
+
+---
+
+## 一、`SELECT` 子句
+
+| 语法 | 状态 | 说明 |
+|---|---|---|
+| `SELECT` / 投影 / 别名 / 表达式 | ✅ | |
+| `SELECT DISTINCT` | ✅ | |
+| `SELECT DISTINCT ON (…)` | ✋ | 语义是"每键取一行"，与 `DISTINCT` 不同；静默当 `DISTINCT` 会**多返回行** |
+| `SELECT *` | ✅ | |
+| `SELECT t.*`（限定通配） | ✋ | |
+| `SELECT * EXCLUDE/EXCEPT/REPLACE/RENAME/ILIKE` | ✋ | |
+| `WHERE` / `HAVING` / `GROUP BY` / `ORDER BY` | ✅ | |
+| `GROUP BY` 位置序号（`GROUP BY 1`） | ✋ | 报错文案已明确（此前是"列不在 GROUP BY 里"，误导） |
+| `GROUP BY ROLLUP/CUBE/GROUPING SETS` | ✋ | |
+| `GROUP BY ALL` | ✋ | |
+| `ORDER BY` 位置序号 / 输出别名 | ✅ | |
+| `ORDER BY … NULLS FIRST/LAST` | ✋ | **默认放置**：`ASC ⇒ NULLS LAST`、`DESC ⇒ NULLS FIRST`（与 PG 一致）。写了非默认的那种此前被**静默忽略** ⇒ 顺序错 |
+| `ORDER BY ALL` / `ORDER BY … USING` | ✋ / ⛔ | |
+| `TOP n`（SQL Server 形） | ✋ | 用 `LIMIT` |
+| `LIMIT n` | ✅ | |
+| `OFFSET n`（含 `LIMIT n OFFSET m`、`LIMIT n, m`、`OFFSET n ROWS`） | ✋ | 此前**静默丢掉 offset** ⇒ 少翻页/多返回行。实现排期中 |
+| `FETCH FIRST n ROWS ONLY` | ✋ | 同上（用 `LIMIT`）；`PERCENT`/`WITH TIES` 语义务必别当 `LIMIT` 处理 |
+| `QUALIFY` / `PREWHERE` / `CLUSTER BY` / `DISTRIBUTE BY` / `SORT BY` | ✋ | |
+| `SELECT … INTO` | ✋ | |
+| `FOR UPDATE` / `FOR SHARE` | ✋ | |
+| `TABLESAMPLE` | ✋ | 此前**静默当全表** ⇒ 多返回 |
+| `LATERAL VIEW` / `CONNECT BY` | ✋ | |
+| `WINDOW w AS (…)`（命名窗口） | ✋ | |
+| CTE 列别名 `WITH w(q) AS …` | ✋ | 此前**别名被丢掉**，之后报"列不存在"（误导） |
+| `WITH w AS MATERIALIZED/NOT MATERIALIZED` | ⛔ | sqlparser 不认这个写法 |
+
+## 二、`FROM` / JOIN
+
+| 语法 | 状态 | 说明 |
+|---|---|---|
+| 单表 / 派生表 `/ CTE` 引用 / 表函数（`read_parquet` / `read_csv`） | ✅ | |
+| 多表逗号连接（`FROM a, b`） | ✋ | 用显式 `JOIN` |
+| `INNER JOIN` / `LEFT [OUTER] JOIN` + `ON <等值>` | ✅ | |
+| `RIGHT JOIN` / `FULL JOIN` / `SEMI` / `ANTI` | ✋ | |
+| `JOIN … USING (…)` / `NATURAL JOIN` | ✋ | 用 `ON`（静默当叉积会**炸行数**，故必须拒） |
+| 非等值 `ON`（INNER） | ✅ | 走 cross join + 过滤 |
+| `CROSS JOIN` | ✅ | |
+| 派生表列别名 `… AS d(a,b)` | ✋ | 此前**别名被丢掉**，之后报"列不存在"（误导） |
+| `TABLESAMPLE` | ✋ | |
+| 表 PARTITION 选择器 / `AT VERSION`（时间旅行） | ⛔ | 本方言不解析；**静默忽略会读到别的数据**，故一旦能解析必须拦 |
+| **裸列的解析范围** | ⚠️ | **裸名 = 左侧输入**；JOIN 右表的列**必须限定**（`u.c`）。与标准 SQL 不同（标准是"全输入搜索 + 歧义报错"），但本仓规则**确定性**且报错会指路（提示写成 `u.c`）。歧义不会静默二选一 |
+
+## 三、表达式与函数
+
+| 语法 | 状态 | 说明 |
+|---|---|---|
+| 算术 / 比较 / 布尔 / `IS [NOT] NULL` / `IS [NOT] DISTINCT FROM` | ✅ | |
+| `BETWEEN` / `IN (…)` / `IN (子查询)` / `EXISTS` / 标量子查询 | ✅ | |
+| `CASE` / `CAST` / `TRY_CAST` / `::` / 类型化字面量（`DATE '…'`） | ✅ | |
+| 聚合 `count/sum/avg/min/max`（含 `count(*)`） | ✅ | |
+| 聚合 `DISTINCT`（`count(DISTINCT x)`） | ✋ | 此前**静默当成不带 DISTINCT** ⇒ 回错数字。等价改写：`SELECT count(*) FROM (SELECT DISTINCT … )` |
+| 聚合 `FILTER (WHERE …)` | ✋ | 此前**静默忽略** ⇒ 回全量聚合（错值） |
+| 函数参数内的 `ORDER BY` / `LIMIT` / `SEPARATOR` | ✋ | |
+| `WITHIN GROUP (ORDER BY …)` | ✋ | |
+| `IGNORE/RESPECT NULLS` | ✋ | 静默忽略会改窗口函数结果 |
+| `INTERVAL` / `AT TIME ZONE` / `COLLATE` / `SIMILAR TO` / `= ANY(...)` / 行元组 `(a,b) IN (…)` | ✋ | |
+| 位置参数 `?` | ✋ | 本仓走 HTTP/API 层参数化，不做服务端占位符 |
+| 标量函数集 | ✅ | `SELECT abs(1)` 之类报错会**列出支持清单**，以之为准 |
+| `GREATEST` / `LEAST` / `array_agg` 等 | ✋ | 未实现（报错列清单） |
+
+## 四、窗口函数
+
+| 语法 | 状态 | 说明 |
+|---|---|---|
+| `row_number` / `rank` / `dense_rank` / `lag` / `lead` / `sum`/`avg`/`count`/`min`/`max` `OVER (…)` | ✅ | 支持清单以报错文案为准（`support: …`） |
+| `PARTITION BY` / `ORDER BY`（多列、混合方向） | ✅ | |
+| **帧边界** `ROWS/RANGE BETWEEN …` | ✋ | 此前**静默用默认帧** ⇒ 换一个数字（累计）而不报错 |
+| 窗口内 `ORDER BY … NULLS FIRST/LAST` | ✋ | 同 §一 |
+| `ntile` / `first_value` / `last_value` / `percent_rank` / `cume_dist` | ✋ | 未实现（报错列支持清单） |
+| 命名窗口 | ✋ | 见 §一 |
+
+## 五、DML / DDL
+
+| 语法 | 状态 | 说明 |
+|---|---|---|
+| `INSERT INTO t VALUES …` / `INSERT INTO t (列前缀) VALUES …` | ✅ | 缺列补 NULL（NOT NULL 列照拦） |
+| `INSERT INTO t SELECT …` / `INSERT OVERWRITE t SELECT …` | ✅ | |
+| `INSERT … ON CONFLICT` | ✋ | 此前**静默忽略** ⇒ 直接插重复行 |
+| `INSERT … RETURNING` / `IGNORE` / `REPLACE INTO` / `PARTITION (…)` | ✋ | |
+| `DELETE FROM t [WHERE …]` | ✅ | |
+| `UPDATE` | ✋ | |
+| `TRUNCATE TABLE` | ✅ | |
+| `CREATE TABLE`（含 `PARTITIONED BY`、`NOT NULL`、`CHECK`、`COMMENT`） | ✅ | **分区表至少要有一个非分区列**（否则数据文件零列，见 `docs/进度与待办.md` §三之四） |
+| 列 `DEFAULT` 值 | ✋ | 静默忽略会写入 NULL 而非默认值 |
+| `CREATE TABLE … AS SELECT`（CTAS） | ✋ | 报错文案已明确（此前是"table needs at least one column"，误导） |
+| `CREATE OR REPLACE TABLE` | ✋ | 目前报 `already exists`（已知误导，排期中改明确文案） |
+| `ALTER TABLE … ADD COLUMN` | ✅ | |
+| `ALTER TABLE … DROP COLUMN` | ✋ | |
+| `CREATE INDEX` / 视图 / 用户管理 | ✅ | 见 `docs/对接契约.md` §三 |
+| 多语句（分号分隔） | ✋ | 一次一条（防注入面） |
+
+---
+
+## 附：这份清单怎么维护
+
+1. **加新语法**：要么在绑定器里真读那个字段，要么在四个 `audit_*` 里拒绝。
+2. **闸门有回归**：`crates/qsdb/tests/sql_silent_drop.rs` 每条拒绝都配**对照组**
+   （正例），防止"一刀切"把正常查询也拒了。
+3. **别信"没人会这么写"**：这份清单里 11 条静默丢弃中，有 5 条是**常见写法**
+   （`FILTER`、窗口帧、`OFFSET`、`NULLS FIRST`、`ON CONFLICT`）。

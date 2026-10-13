@@ -272,7 +272,7 @@ fn bulk_and_csv_channels_both_directions() {
             body.as_bytes(),
         )
     };
-    let r = q("SELECT a, s FROM t ORDER BY a NULLS LAST", "bulk");
+    let r = q("SELECT a, s FROM t ORDER BY a", "bulk");
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     assert_eq!(r.header("content-type"), Some("application/vnd.qsdb.bulk"));
     let back = qsdb::bulk::decode(&r.body).unwrap();
@@ -292,7 +292,7 @@ fn bulk_and_csv_channels_both_directions() {
     assert_eq!(disp(&back, 1), vec!["x", "NULL", "y"]);
 
     // ③ 读：csv（文本，零依赖）
-    let r = q("SELECT a, s FROM t ORDER BY a NULLS LAST", "csv");
+    let r = q("SELECT a, s FROM t ORDER BY a", "csv");
     assert_eq!(r.status, 200);
     assert_eq!(r.header("content-type"), Some("text/csv"));
     let text = String::from_utf8_lossy(&r.body).to_string();
@@ -360,7 +360,7 @@ fn rows_channel_both_directions() {
             body.as_bytes(),
         )
     };
-    let r = q("SELECT id, name, dt FROM t ORDER BY id NULLS LAST", "rows");
+    let r = q("SELECT id, name, dt FROM t ORDER BY id", "rows");
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     assert_eq!(r.header("content-type"), Some("application/vnd.qsdb.rows"));
     let back = qsdb::rows::decode(&r.body).unwrap();

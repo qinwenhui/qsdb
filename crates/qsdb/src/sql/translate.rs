@@ -116,6 +116,281 @@ pub enum UserAlterAction {
 /// INSERT VALUES 行集（每行按给定列序的字面量）
 pub type InsertRows = Vec<Vec<Literal>>;
 
+// ---------------------------------------------------------------------------
+// 绑定前的「静默丢弃」闸门（2026-10-13 系统扫描）
+// ---------------------------------------------------------------------------
+
+/// **凡不实现的子句，一律显式报错——绝不无声丢弃。**
+///
+/// **为什么需要它**：绑定器是**逐字段读**的——它只读它认识的那些字段，AST 里其余
+/// 字段**默认被忽略**。于是"语法合法但没实现"的子句会安静地按"没写"执行。
+/// 2026-10-13 逐条实测（`tests/sql_silent_drop.rs` 就是这批的回归），全都不报错：
+///
+/// | 写了 | 实际执行成 | 后果 |
+/// |---|---|---|
+/// | `count(*) FILTER (WHERE a>1)` | `count(*)` | **错值**（80 而非 10） |
+/// | `sum(x) OVER (ORDER BY y ROWS BETWEEN …)` | 默认帧 | **错值** |
+/// | `INSERT … ON CONFLICT DO NOTHING` | 照插 | **重复数据** |
+/// | `LIMIT 10 OFFSET 20` / `OFFSET n ROWS` | 只 LIMIT | **错行** |
+/// | `ORDER BY x NULLS FIRST`（及窗口内） | 默认 NULLS LAST | **错序** |
+/// | `DISTINCT ON (a)` | 普通 `DISTINCT` | **错行** |
+/// | `TABLESAMPLE (10 PERCENT)` / `FETCH FIRST 10 ROWS ONLY` | 全表 | 多返回 |
+/// | `SELECT * EXCLUDE (b)` / `* REPLACE` / `* RENAME` | `SELECT *` | 多列/列名不对 |
+/// | `WITH w(q) AS …` / `… AS d(x)` | 列别名丢掉 | 之后"列不存在" |
+/// | `FROM t AT (VERSION => …)` / `PARTITION (…)` | 当普通表读 | **读了错的数据** |
+///
+/// 这类 bug **不报错、不打日志**，只能靠人撞见（`count(DISTINCT)` 那条就是手滑撞见的）。
+/// 所以这里反过来做：**枚举"我们不读的字段"，逐个判处置**。
+///
+/// **维护约定**：新增 SQL 能力时，要么在绑定器里读那个字段，要么在这里拒绝
+/// ——**没有第三条路**。本函数的检查表 = `docs/SQL支持面.md` 的"显式拒绝"列。
+/// 例外：**纯建议性**的东西（`optimizer_hints` 这类 hint）忽略掉是正确语义，不列。
+///
+/// 挂载点是绑定器自己的递归入口（见 `translate_select_inner`），所以**嵌套子查询
+/// / 派生表 / CTE 体自动一并被审**，不需要额外遍历表达式树。
+fn audit_query(q: &sqlparser::ast::Query) -> Result<()> {
+    // —— Query 级：这些子句我们都不读 ——
+    let reject = |what: &str| -> Result<()> {
+        Err(QsdbError::unsupported(format!(
+            "{what} is not supported — refusing rather than silently ignoring it \
+             (a silently-dropped clause returns wrong results without any error)"
+        )))
+    };
+    if !q.locks.is_empty() {
+        return reject("row locking (FOR UPDATE / FOR SHARE)");
+    }
+    if q.for_clause.is_some() {
+        return reject("FOR XML/JSON clause");
+    }
+    if q.settings.is_some() {
+        return reject("SETTINGS clause");
+    }
+    if q.format_clause.is_some() {
+        return reject("FORMAT clause");
+    }
+    if !q.pipe_operators.is_empty() {
+        return reject("pipe operators (|>)");
+    }
+    // LIMIT/OFFSET：**本批先拒**（此前 offset 被静默丢掉 → 少翻页）。下批实现。
+    if let Some(lc) = &q.limit_clause {
+        use sqlparser::ast::LimitClause;
+        let has_offset = match lc {
+            LimitClause::LimitOffset { offset, .. } => offset.is_some(),
+            LimitClause::OffsetCommaLimit { .. } => true, // `LIMIT n, m` = 偏移 m
+        };
+        if has_offset {
+            return reject("OFFSET (also `LIMIT n, m`)");
+        }
+    }
+    if q.fetch.is_some() {
+        return reject("FETCH FIRST … ROWS ONLY (use LIMIT)");
+    }
+    // CTE 列别名：`WITH w(q) AS …`
+    if let Some(w) = &q.with {
+        for cte in &w.cte_tables {
+            if !cte.alias.columns.is_empty() {
+                return reject("CTE column alias list (WITH w(a,b) AS …)");
+            }
+            if cte.from.is_some() {
+                return reject("CTE FROM clause");
+            }
+        }
+    }
+    // ORDER BY 的 NULLS FIRST/LAST 与 WITH FILL
+    if let Some(ob) = &q.order_by {
+        audit_order_by(&ob.kind)?;
+    }
+    Ok(())
+}
+
+/// `ORDER BY` 的选项位：只读 `sort`（方向），**`nulls_first` 与 `with_fill` 都没读**。
+fn audit_order_by(kind: &sqlparser::ast::OrderByKind) -> Result<()> {
+    let sqlparser::ast::OrderByKind::Expressions(es) = kind else {
+        return Err(QsdbError::unsupported("ORDER BY ALL"));
+    };
+    for ob in es {
+        if ob.options.nulls_first.is_some() {
+            return Err(QsdbError::unsupported(
+                "ORDER BY … NULLS FIRST/LAST is not supported — refusing rather than \
+                 silently using the default placement (ASC ⇒ NULLS LAST, DESC ⇒ NULLS FIRST)",
+            ));
+        }
+        if ob.with_fill.is_some() {
+            return Err(QsdbError::unsupported("ORDER BY … WITH FILL"));
+        }
+    }
+    Ok(())
+}
+
+/// `SELECT` 级闸门（见 [`audit_query`] 的说明）。
+fn audit_select(s: &sqlparser::ast::Select) -> Result<()> {
+    use sqlparser::ast::{Distinct, GroupByExpr};
+    let reject = |what: &str| -> Result<()> {
+        Err(QsdbError::unsupported(format!(
+            "{what} is not supported — refusing rather than silently ignoring it"
+        )))
+    };
+    // `DISTINCT ON (…)` ≠ `DISTINCT`：前者是"每键取一行"，静默当普通 DISTINCT
+    // 会**多返回行**（实测 `DISTINCT ON (s)` 与 `DISTINCT s, a` 结果一致）。
+    if let Some(Distinct::On(_)) = &s.distinct {
+        return reject("DISTINCT ON (…)");
+    }
+    if s.top.is_some() {
+        return reject("TOP n");
+    }
+    if s.into.is_some() {
+        return reject("SELECT … INTO");
+    }
+    if s.exclude.is_some() {
+        return reject("SELECT … EXCLUDE");
+    }
+    if s.qualify.is_some() {
+        return reject("QUALIFY");
+    }
+    if s.prewhere.is_some() {
+        return reject("PREWHERE");
+    }
+    if !s.lateral_views.is_empty() {
+        return reject("LATERAL VIEW");
+    }
+    if !s.connect_by.is_empty() {
+        return reject("CONNECT BY (hierarchical query)");
+    }
+    if !s.cluster_by.is_empty() {
+        return reject("CLUSTER BY");
+    }
+    if !s.distribute_by.is_empty() {
+        return reject("DISTRIBUTE BY");
+    }
+    if !s.sort_by.is_empty() {
+        return reject("SORT BY");
+    }
+    if s.select_modifiers.is_some() {
+        return reject("select modifiers");
+    }
+    if s.value_table_mode.is_some() {
+        return reject("value table mode");
+    }
+    if let GroupByExpr::Expressions(_, mods) = &s.group_by {
+        if !mods.is_empty() {
+            return reject("GROUP BY ROLLUP/CUBE/GROUPING SETS");
+        }
+    }
+    // 投影：通配符的附加选项（EXCLUDE/EXCEPT/REPLACE/RENAME/ILIKE/别名）
+    for item in &s.projection {
+        if let sqlparser::ast::SelectItem::Wildcard(opts) = item {
+            if opts.opt_exclude.is_some()
+                || opts.opt_except.is_some()
+                || opts.opt_replace.is_some()
+                || opts.opt_rename.is_some()
+                || opts.opt_ilike.is_some()
+                || opts.opt_alias.is_some()
+            {
+                return reject("SELECT * EXCLUDE/EXCEPT/REPLACE/RENAME/ILIKE");
+            }
+        }
+    }
+    // FROM：表因子的"我们没读的字段"
+    for twj in &s.from {
+        audit_table_factor(&twj.relation)?;
+        for j in &twj.joins {
+            audit_table_factor(&j.relation)?;
+        }
+    }
+    Ok(())
+}
+
+/// 表因子：派生表**列别名**、以及读错数据的几类表修饰（见 [`audit_query`]）。
+fn audit_table_factor(tf: &sqlparser::ast::TableFactor) -> Result<()> {
+    use sqlparser::ast::TableFactor;
+    let reject = |what: &str| -> Result<()> {
+        Err(QsdbError::unsupported(format!(
+            "{what} is not supported — refusing rather than silently ignoring it"
+        )))
+    };
+    match tf {
+        TableFactor::Table {
+            sample,
+            version,
+            partitions,
+            with_hints,
+            args,
+            ..
+        } => {
+            if sample.is_some() {
+                return reject("TABLESAMPLE");
+            }
+            // 时间旅行 / 分区选择：**静默忽略会读到别的数据**（最坏的一类）
+            if version.is_some() {
+                return reject("table version/time travel (AT VERSION / FOR SYSTEM_TIME)");
+            }
+            if !partitions.is_empty() {
+                return reject("table PARTITION (…) selector");
+            }
+            if !with_hints.is_empty() {
+                return reject("table hints (WITH (…))");
+            }
+            // 注意 `args` **不在**本闸门内：`read_parquet('…')` 这类表函数正是
+            // 经 `TableFactor::Table { args: Some(..) }` 表达，dpc 绑定器有专门分支
+            // （未知表函数会显式报错）——它不是"被忽略的字段"。
+            let _ = args;
+        }
+        TableFactor::Derived { alias: Some(a), .. } if !a.columns.is_empty() => {
+            return reject("derived-table column alias list (… AS d(a,b))");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// 函数调用上的子句：`FILTER (WHERE …)` / `IGNORE NULLS` / 参数内 `ORDER BY` 等。
+///
+/// 放在**绑定函数的必经点**（`bind_expr` 的 Function 臂与窗口绑定），因为表达式
+/// 树里函数可以出现在任何位置（投影 / WHERE / HAVING / ORDER BY），而这些位置
+/// 绑定器都会走到——不需要单独遍历表达式树。
+fn audit_function(f: &sqlparser::ast::Function) -> Result<()> {
+    let reject = |what: &str| -> Result<()> {
+        Err(QsdbError::unsupported(format!(
+            "{what} is not supported — refusing rather than silently ignoring it \
+             (a silently-dropped clause returns wrong results without any error)"
+        )))
+    };
+    if f.filter.is_some() {
+        return reject("aggregate FILTER (WHERE …)");
+    }
+    if f.null_treatment.is_some() {
+        return reject("IGNORE/RESPECT NULLS");
+    }
+    if !f.within_group.is_empty() {
+        return reject("WITHIN GROUP (ORDER BY …)");
+    }
+    if !matches!(f.parameters, sqlparser::ast::FunctionArguments::None) {
+        return reject("function parameters");
+    }
+    if let sqlparser::ast::FunctionArguments::List(l) = &f.args {
+        if !l.clauses.is_empty() {
+            return reject("clauses inside function arguments (ORDER BY / LIMIT / SEPARATOR)");
+        }
+    }
+    Ok(())
+}
+
+/// 窗口说明上的子句：**帧边界**（`ROWS/RANGE BETWEEN …`）与窗口内 `ORDER BY` 选项。
+///
+/// 帧静默忽略最阴：`ROWS BETWEEN 1 PRECEDING AND CURRENT ROW` 被当成默认帧
+/// （累计），结果**换个数字、不报错**。
+fn audit_window_spec(spec: &sqlparser::ast::WindowSpec) -> Result<()> {
+    if spec.window_frame.is_some() {
+        return Err(QsdbError::unsupported(
+            "window frame (ROWS/RANGE BETWEEN …) is not supported — refusing rather than \
+             silently using the default frame (which returns different numbers, not an error)",
+        ));
+    }
+    audit_order_by(&sqlparser::ast::OrderByKind::Expressions(
+        spec.order_by.clone(),
+    ))
+}
+
 /// INSERT 的源：字面量行集（VALUES）或一条完整 SELECT（含 CTE/集合操作）。
 ///
 /// 为什么把源做成 enum 而不是"两条语句"：解析期已能判别源形态
@@ -470,6 +745,32 @@ fn translate_statement(stmt: SqlStatement, raw: &str) -> Result<ParsedStatement>
             })
         }
         SqlStatement::Insert(ins) => {
+            // **静默丢弃闸门（DML 面）**：`ON CONFLICT` 此前被忽略 → 直接插进去
+            // （实测 u 表从 1 行变 2 行）。冲突处理不实现，就必须拒绝。
+            // 另有 `RETURNING` / `overwrite` / `partitioned` 等同类字段，一并拦。
+            if ins.on.is_some() {
+                return Err(QsdbError::unsupported(
+                    "INSERT … ON CONFLICT is not supported — refusing rather than silently                      inserting a duplicate row",
+                ));
+            }
+            if ins.returning.is_some() {
+                return Err(QsdbError::unsupported(
+                    "INSERT … RETURNING is not supported",
+                ));
+            }
+            // 注意 `overwrite` **不在**本闸门内：`INSERT OVERWRITE <t> SELECT …`
+            // 正是本仓支持的写法（`insert.overwrite == true` 就是它的解析结果）。
+            let _ = ins.overwrite;
+            if !ins.partitioned.is_none() {
+                return Err(QsdbError::unsupported(
+                    "INSERT … PARTITION (…) is not supported",
+                ));
+            }
+            if ins.ignore || ins.replace_into {
+                return Err(QsdbError::unsupported(
+                    "INSERT IGNORE / REPLACE INTO is not supported",
+                ));
+            }
             let table = match &ins.table {
                 sqlparser::ast::TableObject::TableName(name) => object_name_single(name.clone())?,
                 other => {
@@ -2000,6 +2301,9 @@ fn translate_select_inner(
 ) -> Result<(LogicalPlan, Vec<CteDef>)> {
     use sqlparser::ast::*;
 
+    // **静默丢弃闸门**（见 `audit_query`）：每个 Query 的必经点，嵌套子查询自动被审。
+    audit_query(&q)?;
+
     // 集合操作分支（借用判别，避免 body 部分移动）
     if let SetExpr::SetOperation {
         op,
@@ -2019,7 +2323,10 @@ fn translate_select_inner(
         );
     }
     let select = match *q.body {
-        SetExpr::Select(s) => s,
+        SetExpr::Select(s) => {
+            audit_select(&s)?;
+            s
+        }
         other => {
             return Err(QsdbError::unsupported(format!(
                 "query body {other:?} not supported (plain SELECT only)"
@@ -2897,7 +3204,11 @@ fn parse_window_spec(
     f: &sqlparser::ast::Function,
     bind: &mut dyn FnMut(&sqlparser::ast::Expr) -> Result<PhysExpr>,
 ) -> Result<crate::exec::window::WindowSpec> {
+    // 窗口函数**绕过 `bind_expr`**（重写遍就把调用换成合成列名了），所以
+    // 函数子句闸门（`IGNORE NULLS` 等）与帧闸门都在此处挂。
+    audit_function(f)?;
     if let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = &f.over {
+        audit_window_spec(spec)?;
         let mut partition_by = Vec::new();
         for p in &spec.partition_by {
             partition_by.push(bind(p)?);
@@ -3031,12 +3342,30 @@ fn expr_display(e: &sqlparser::ast::Expr) -> String {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<PhysExpr> {
+    // **函数子句闸门**（见 `audit_function`）：函数可以出现在任何表达式位置
+    // （投影/WHERE/HAVING/ORDER BY），而 `bind_expr` 是它们共同的门。
+    if let sqlparser::ast::Expr::Function(f) = e {
+        audit_function(f)?;
+    }
     use sqlparser::ast::Expr as E;
     match e {
         E::Identifier(id) => {
-            let idx = ctx
-                .index_of(&id.value)
-                .ok_or_else(|| QsdbError::column_not_found(format!("column '{}'", id.value)))?;
+            let idx = ctx.index_of(&id.value).ok_or_else(|| {
+                // **JOIN 右表的列只以限定名注册**（见 `translate_select_inner` 里
+                // ctx 扩展处的注释）：裸名恒解析到左表。所以"没找到"若其实是右侧的列，
+                // 直接说清该怎么写——否则用户只会看到"列不存在"而去怀疑列名拼错。
+                let hint = ctx
+                    .cols
+                    .iter()
+                    .find(|(n, _)| n.rsplit_once('.').is_some_and(|(_, c)| c == id.value))
+                    .map(|(n, _)| {
+                        format!(
+                            " (a JOIN right-side column with this name exists — qualify it as `{n}`:                              unqualified names resolve to the left input only)"
+                        )
+                    })
+                    .unwrap_or_default();
+                QsdbError::column_not_found(format!("column '{}'{hint}", id.value))
+            })?;
             Ok(PhysExpr::Column {
                 idx,
                 name: ctx.cols[idx].0.clone(),
@@ -4084,6 +4413,9 @@ fn try_bind_udaf(
 }
 
 fn try_bind_agg(f: &sqlparser::ast::Function, ctx: &SchemaCtx) -> Result<Option<AggExpr>> {
+    // 聚合**不经 `bind_expr` 的 Function 臂**（走 `collect_aggs` → 这里），
+    // 所以函数子句闸门要在这条路径上也挂一次——`count(*) FILTER (…)` 就是从这里漏的。
+    audit_function(f)?;
     let name = fn_name(f);
     if !is_agg_name(&name) {
         // UDAF 注册表（窗口形态的 UDAF 后置）

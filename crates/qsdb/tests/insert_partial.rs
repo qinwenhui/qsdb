@@ -62,8 +62,12 @@ fn partial_column_list_is_null_filled() {
     db.sql("INSERT INTO t (id, v) VALUES (4, 40), (5, 50)")
         .unwrap();
 
+    // 注：这里原写 `ORDER BY id NULLS LAST` ——**该子句当时是被静默忽略的**，
+    // 只是 ASC 的默认放置恰好就是 NULLS LAST，所以断言才一直成立。
+    // 2026-10-13 起 `NULLS FIRST/LAST` 未实现即显式拒绝（见
+    // `tests/sql_silent_drop.rs`），故去掉该子句；期望顺序不变（默认即 NULLS LAST）。
     assert_eq!(
-        rows(&db, "SELECT id, name, v FROM t ORDER BY id NULLS LAST, v"),
+        rows(&db, "SELECT id, name, v FROM t ORDER BY id, v"),
         vec![
             "1|NULL|10",
             "3|c|30",
