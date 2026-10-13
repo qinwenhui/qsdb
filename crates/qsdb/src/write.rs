@@ -32,6 +32,19 @@ pub struct WriteResult {
     pub segments: u32,
 }
 
+/// 表**全列**（含分区列）的 arrow schema。
+///
+/// 批量入口（`/write`、行式 `rows` 通道）按**表列序**收批——分区列的值也在批里，
+/// 由 `split_by_partition` 路由后剥离（与 CSV 通道同一约定）。
+pub fn full_schema(def: &TableDef) -> SchemaRef {
+    let fields: Vec<Field> = def
+        .columns
+        .iter()
+        .map(|c| Field::new(&c.name, c.logical_type.arrow_type(), true))
+        .collect();
+    Arc::new(Schema::new(fields))
+}
+
 /// 表数据列（不含分区列）的 arrow schema。
 pub fn data_schema(def: &TableDef) -> SchemaRef {
     let fields: Vec<Field> = def

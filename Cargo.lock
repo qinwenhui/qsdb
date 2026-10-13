@@ -2638,6 +2638,7 @@ dependencies = [
  "parquet",
  "qsdb",
  "rayon",
+ "serde_json",
  "windows-sys 0.60.2",
 ]
 

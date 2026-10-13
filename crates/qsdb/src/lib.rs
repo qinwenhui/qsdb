@@ -29,6 +29,7 @@ pub mod partition;
 pub mod query;
 #[cfg(any(feature = "s3", feature = "remote"))]
 pub mod remote;
+pub mod rows;
 pub mod scan;
 pub mod sql;
 #[cfg_attr(not(feature = "remote"), allow(dead_code))] // 仅远端写路径消费

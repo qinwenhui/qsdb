@@ -661,12 +661,14 @@ async fn query(
         Some(f) if f.eq_ignore_ascii_case("ipc") => "ipc".to_string(),
         // **无依赖二进制**（生态工具：Java 侧不想引 arrow-java）——见 docs/bulk-format.md
         Some(f) if f.eq_ignore_ascii_case("bulk") => "bulk".to_string(),
+        // **无依赖行式**（驱动向：JDBC/ODBC/Python 按行取值，可流式）——见 docs/rows-format.md
+        Some(f) if f.eq_ignore_ascii_case("rows") => "rows".to_string(),
         // 文本（任何语言零依赖）：列序 = 结果 schema，首行表头
         Some(f) if f.eq_ignore_ascii_case("csv") => "csv".to_string(),
         Some(f) => {
             s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
             return ErrorCode::InvalidArgument.response(format!(
-                "invalid format: expect json|ipc|bulk|csv (got {f:?})"
+                "invalid format: expect json|ipc|bulk|rows|csv (got {f:?})"
             ));
         }
     };
@@ -742,6 +744,22 @@ async fn query(
                             [(
                                 axum::http::header::CONTENT_TYPE,
                                 axum::http::HeaderValue::from_static("application/vnd.qsdb.bulk"),
+                            )],
+                            bytes,
+                        )
+                            .into_response(),
+                        Err(e) => {
+                            s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                            ErrorCode::Unsupported.response(e.to_string())
+                        }
+                    }
+                } else if fmt.eq_ignore_ascii_case("rows") {
+                    // **无依赖行式**（读侧；列名/类型随头一起发，客户端逐块消费）
+                    match qsdb::rows::encode(&batches) {
+                        Ok(bytes) => (
+                            [(
+                                axum::http::header::CONTENT_TYPE,
+                                axum::http::HeaderValue::from_static("application/vnd.qsdb.rows"),
                             )],
                             bytes,
                         )
@@ -836,8 +854,9 @@ struct WriteParams {
     #[serde(default, alias = "expectedGeneration")]
     expected_generation: Option<u64>,
     /// body 编码：`ipc`（默认，Arrow IPC 流）/ `bulk`（无依赖列式，见
-    /// `docs/bulk-format.md`）/ `csv`（文本，首行表头可选，列序 = **表列序**）。
-    /// 生态工具（Java 等不想引 arrow 库）用后两者。
+    /// `docs/bulk-format.md`）/ `rows`（无依赖**行式**，见 `docs/rows-format.md`；
+    /// 驱动按行取值、可流式，schema 由表定义给）/ `csv`（文本，首行表头可选）。
+    /// 四种的列序一律 = **表列序**。生态工具（Java 等不想引 arrow 库）用后三者。
     #[serde(default)]
     format: Option<String>,
 }
@@ -891,6 +910,25 @@ async fn write(
                 return ErrorCode::InvalidArgument.response(e.to_string());
             }
         },
+        "rows" => {
+            // 行式（驱动向）：**schema 由表定义给**（payload 只带值，`flags=0`）——
+            // 见 docs/rows-format.md §四。列序 = 表列序（与 /write 全列批约定一致）。
+            let def = match s.db.table_def(&p.table) {
+                Ok(d) => d,
+                Err(e) => {
+                    s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    return ErrorCode::from_qsdb(&e, true).response(e.to_string());
+                }
+            };
+            let schema = qsdb::write::full_schema(&def);
+            match qsdb::rows::decode_with_schema(&body, &schema) {
+                Ok(b) => b,
+                Err(e) => {
+                    s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    return ErrorCode::InvalidArgument.response(e.to_string());
+                }
+            }
+        }
         "csv" => {
             // CSV body：列序 = **表列序**（与 `/write` 的既有约定一致：全列批）。
             // 首行若是表头（与表列名一致）则跳过。
@@ -912,7 +950,7 @@ async fn write(
         other => {
             s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
             return ErrorCode::InvalidArgument.response(format!(
-                "invalid format: expect ipc|bulk|csv (got {other:?})"
+                "invalid format: expect ipc|bulk|rows|csv (got {other:?})"
             ));
         }
     };

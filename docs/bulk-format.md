@@ -74,11 +74,16 @@ curl -X POST 'http://host:9430/api/v1/query' -H 'Content-Type: application/json'
 
 ## 五、与 IPC 的关系
 
-| | `format=ipc` | `format=bulk` | `format=csv` |
-|---|---|---|---|
-| 客户端依赖 | Arrow 库（Java: arrow-java, JDK 11+） | **零** | **零** |
-| 速度 | 最快 | 与 IPC 同档（同为列式二进制） | 慢 1.5-2× |
-| 嵌套类型 | 支持 | 暂不支持（显式拒绝） | 不支持 |
+| | `format=ipc` | `format=bulk` | **[`format=rows`](rows-format.md)** | `format=csv` |
+|---|---|---|---|---|
+| 客户端依赖 | Arrow 库（Java: arrow-java, JDK 11+） | **零** | **零** | **零** |
+| 面向 | 列式生产者 | 列式生产者 | **驱动**（按行取值） | 人/脚本 |
+| 速度 | 最快 | 与 IPC 同档（同为列式二进制） | 略慢于 bulk（行主序逐值） | 慢 1.5-2× |
+| 可流式（内存恒定） | 否 | 否 | **是（逐块）** | 是 |
+| 嵌套类型 | 支持 | 暂不支持（显式拒绝） | 暂不支持（显式拒绝） | 不支持 |
+
+**该选哪个**：生产者手上是**列式**（Rust/Arrow、批量数组）→ `bulk`；
+客户端是**按行取值**的驱动（JDBC/ODBC/Python）→ `rows`（行式，零转置、内存恒定）。
 
 内核侧的权威实现：`crates/qsdb/src/bulk.rs`（`encode` / `decode`），
 协议测试在 `crates/qsdb-cli/tests/http_contract.rs`。

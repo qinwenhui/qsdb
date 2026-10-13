@@ -325,6 +325,133 @@ fn bulk_and_csv_channels_both_directions() {
     assert_eq!(r.code(), "INVALID_ARGUMENT");
 }
 
+/// **行式通道**（`format=rows`，读**与**写两个方向）——见 `docs/rows-format.md`。
+///
+/// 写侧的 body 是**照着规范手写**的（不调用内核的 `encode`）：这既是契约测试，
+/// 也是"第三方照文档能不能实现"的实证——驱动侧要做的正是这件事。
+#[test]
+fn rows_channel_both_directions() {
+    let srv = Server::start(&[]);
+    let p = srv.port;
+    assert_eq!(
+        query(p, "CREATE TABLE t (id BIGINT, name STRING, dt DATE)", None).status,
+        200
+    );
+
+    // ① 写：两个块（2 行含 NULL + 1 行无 NULL），flags=0（schema 由表定义给）
+    let body = rows_body_without_schema();
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/write?table=t&mode=append&format=rows",
+        &[("Content-Type", "application/vnd.qsdb.rows")],
+        &body,
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+
+    // ② 读：rows 往返（列名/类型随头一起发；NULL 保真）
+    let q = |sql: &str, fmt: &str| {
+        let body = serde_json::json!({"sql": sql, "format": fmt}).to_string();
+        http(
+            p,
+            "POST",
+            "/api/v1/query",
+            &[("Content-Type", "application/json")],
+            body.as_bytes(),
+        )
+    };
+    let r = q("SELECT id, name, dt FROM t ORDER BY id NULLS LAST", "rows");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.header("content-type"), Some("application/vnd.qsdb.rows"));
+    let back = qsdb::rows::decode(&r.body).unwrap();
+    let all: Vec<&RecordBatch> = back.iter().collect();
+    let rows: usize = all.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 3, "两块合计 3 行");
+    let disp = |c: usize| -> Vec<String> {
+        all.iter()
+            .flat_map(|b| {
+                (0..b.num_rows()).map(move |i| {
+                    if b.column(c).is_null(i) {
+                        "NULL".into()
+                    } else {
+                        arrow::util::display::array_value_to_string(b.column(c), i).unwrap()
+                    }
+                })
+            })
+            .collect()
+    };
+    assert_eq!(disp(0), vec!["1", "3", "NULL"]);
+    assert_eq!(disp(1), vec!["alice", "中文", "NULL"]);
+    assert_eq!(disp(2), vec!["2022-01-08", "2022-01-09", "NULL"]);
+
+    // ③ 自描述负载喂给 /write → 400（写侧 schema 由端点给，不静默忽略多余的头）
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/write?table=t&mode=append&format=rows",
+        &[],
+        &r.body,
+    );
+    assert_eq!(r.status, 400);
+    assert_eq!(r.code(), "INVALID_ARGUMENT");
+    assert!(
+        String::from_utf8_lossy(&r.body).contains("schema block"),
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+
+    // ④ 列数与表不符 → 400（不按前缀凑合）
+    let narrow = {
+        let mut b = b"QSDBROWS".to_vec();
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.push(0);
+        b.extend_from_slice(&2u16.to_le_bytes()); // 表有 3 列
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.push(0);
+        b
+    };
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/write?table=t&mode=append&format=rows",
+        &[],
+        &narrow,
+    );
+    assert_eq!(r.status, 400, "{}", String::from_utf8_lossy(&r.body));
+}
+
+/// 照 `docs/rows-format.md` **手写**的 rows 负载（flags=0，两个块）。
+///
+/// 列：`id BIGINT`(tag 3/8B) / `name STRING`(tag 5/变长) / `dt DATE`(tag 6/4B)。
+fn rows_body_without_schema() -> Vec<u8> {
+    let mut b: Vec<u8> = Vec::new();
+    b.extend_from_slice(b"QSDBROWS"); // magic
+    b.extend_from_slice(&1u16.to_le_bytes()); // version
+    b.push(0); // flags：无列描述（写侧 schema 由端点给）
+    b.extend_from_slice(&3u16.to_le_bytes()); // n_cols
+
+    // 块 1：2 行，第 1 行整行 NULL
+    b.extend_from_slice(&2u32.to_le_bytes()); // row_count
+    b.push(1); // chunk_flags：HAS_NULLS
+    b.extend_from_slice(&[0b10, 0b10, 0b10]); // 每列 1 字节位图，第 1 行置位
+    b.extend_from_slice(&1i64.to_le_bytes()); // id
+    b.extend_from_slice(&5u32.to_le_bytes()); // name 长度
+    b.extend_from_slice(b"alice");
+    b.extend_from_slice(&19_000i32.to_le_bytes()); // dt
+    b.extend_from_slice(&0i64.to_le_bytes()); // NULL 行占位
+    b.extend_from_slice(&0u32.to_le_bytes()); // NULL 变长 = 空
+    b.extend_from_slice(&0i32.to_le_bytes());
+
+    // 块 2：1 行，无 NULL（多块 = 驱动攒够一拨就发）
+    b.extend_from_slice(&1u32.to_le_bytes());
+    b.push(0); // 无位图
+    b.extend_from_slice(&3i64.to_le_bytes());
+    b.extend_from_slice(&6u32.to_le_bytes()); // "中文" = 6 字节 UTF-8
+    b.extend_from_slice("中文".as_bytes());
+    b.extend_from_slice(&19_001i32.to_le_bytes());
+    b
+}
+
 /// **J12**：DML 回执要有**结构化字段**（`command` + `rowsAffected`），
 /// 驱动不该解析 `message` 文案（码表文档明确"文案不做兼容承诺"）。
 #[test]

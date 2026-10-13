@@ -49,7 +49,7 @@ pub enum LogicalType {
     Timestamp {
         timezone: Option<String>,
     },
-    /// 12 字节 (months, days, nanos)
+    /// 16 字节 (months i32, days i32, nanos i64)
     Interval,
 }
 
