@@ -478,6 +478,7 @@ fn generate(dir: &Path, rows: i64, per: i64) {
     }
     // 维表灌入（分析用例用）
     let d_rows = 200_000i64;
+    // 逐表判断（**别用"d 有数据就跳过 d2"**：形状改过之后 d2 需要重建）
     if !has_rows(&db, "d") {
         let g = Int64Array::from((0..d_rows).map(|i| i % 100_000).collect::<Vec<i64>>());
         let nm = StringArray::from(
@@ -508,6 +509,8 @@ fn generate(dir: &Path, rows: i64, per: i64) {
             let n = 50_000.min(d_rows - off) as usize;
             db.append("d", &[b.slice(off as usize, n)]).unwrap();
         }
+    }
+    if !has_rows(&db, "d2") {
         let cats = StringArray::from(
             (0..20i64)
                 .map(|i| format!("cat-{i:02}"))
