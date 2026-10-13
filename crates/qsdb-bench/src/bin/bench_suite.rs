@@ -167,10 +167,11 @@ fn cases() -> Vec<(&'static str, &'static str, &'static str)> {
 
 /// DuckDB 对照 SQL（与上面逐条对应；读**同一份源文件**，公平）。
 fn duckdb_sql(dir: &Path) -> String {
-    let pq = dir.join("src/t.parquet");
-    let cs = dir.join("src/t.csv");
-    let pq = pq.to_string_lossy().replace('\\', "/");
-    let cs = cs.to_string_lossy().replace('\\', "/");
+    let pq = dir
+        .join("src/t.parquet")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let cs = dir.join("src/t.csv").to_string_lossy().replace('\\', "/");
     let d = dir
         .join("src/d.parquet")
         .to_string_lossy()
@@ -179,33 +180,99 @@ fn duckdb_sql(dir: &Path) -> String {
         .join("src/d2.parquet")
         .to_string_lossy()
         .replace('\\', "/");
-    // 注意：DuckDB 侧把"导入"记为「建表并物化」（CREATE TABLE AS SELECT），与本仓
-    // 「INSERT INTO ... SELECT」是同一件事（都没有真实外部表，都是物化）。
-    format!(
-        r#"-- DuckDB 对照（读同一份源文件；由 runner.py 逐语句计时 + 采峰值 RSS）
--- 导入
-CREATE TABLE t_csv AS SELECT * FROM read_csv_auto('{cs}');
-CREATE TABLE t_pq AS SELECT * FROM read_parquet('{pq}');
--- 导出
-COPY (SELECT * FROM t_pq) TO '{dir}/out_duckdb.parquet' (FORMAT PARQUET);
-COPY (SELECT * FROM t_pq) TO '{dir}/out_duckdb.csv' (FORMAT CSV, HEADER);
--- 简单
-SELECT count(*) FROM t_pq;
-SELECT count(*), sum(v) FROM t_pq WHERE g < 1000;
-SELECT g, count(*) c, sum(v) s, avg(x) a FROM t_pq GROUP BY g;
-SELECT id, v FROM t_pq ORDER BY v DESC LIMIT 100;
-SELECT count(DISTINCT gs) FROM t_pq;
--- 复杂
-SELECT d.cat, count(*) c, sum(t.v) s FROM t_pq t JOIN read_parquet('{d}') d ON t.g = d.g
-  GROUP BY d.cat ORDER BY s DESC LIMIT 20;
-WITH big AS (SELECT g, sum(v) s FROM t_pq GROUP BY g HAVING sum(v) > 1000)
-  SELECT count(*) FROM big JOIN read_parquet('{d}') d ON big.g = d.g;
-SELECT g, v, row_number() OVER (PARTITION BY g ORDER BY v DESC) rn FROM t_pq WHERE g < 50 LIMIT 200;
-SELECT d2.cat, count(*) c FROM t_pq t JOIN read_parquet('{d}') d ON t.g = d.g
-  JOIN read_parquet('{d2}') d2 ON d.cat = d2.cat GROUP BY d2.cat;
-"#,
-        dir = dir.to_string_lossy().replace('\\', "/")
-    )
+    let out_dir = dir.to_string_lossy().replace('\\', "/");
+    // 逐用例一个 `-- CASE <名> rounds=N` 块：runner.py 按块执行 + 计时 + 采峰值 RSS。
+    // 口径：DuckDB 侧**每次现读 parquet**（不建持久表）；本仓侧是「管理表 + 段缓存」。
+    // 这个口径对 DuckDB 更不利（它要重新解析/解码，本仓命中缓存），故下方结果里
+    // DuckDB 的数字偏保守——刻意如此，宁可低估自己。
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "import_csv",
+            format!(
+                "DROP TABLE IF EXISTS t_csv;
+CREATE TABLE t_csv AS SELECT * FROM read_csv_auto('{cs}');"
+            ),
+        ),
+        (
+            "import_parquet",
+            format!(
+                "DROP TABLE IF EXISTS t_pq;
+CREATE TABLE t_pq AS SELECT * FROM read_parquet('{pq}');"
+            ),
+        ),
+        (
+            "export_parquet",
+            format!(
+                "COPY (SELECT * FROM read_parquet('{pq}')) TO '{out_dir}/out_duckdb.parquet' (FORMAT PARQUET);"
+            ),
+        ),
+        (
+            "export_csv",
+            format!(
+                "COPY (SELECT * FROM read_parquet('{pq}')) TO '{out_dir}/out_duckdb.csv' (FORMAT CSV, HEADER);"
+            ),
+        ),
+        (
+            "simple_count",
+            format!("SELECT count(*) FROM read_parquet('{pq}');"),
+        ),
+        (
+            "simple_filter",
+            format!("SELECT count(*), sum(v) FROM read_parquet('{pq}') WHERE g < 1000;"),
+        ),
+        (
+            "simple_group",
+            format!(
+                "SELECT g, count(*) c, sum(v) s, avg(x) a FROM read_parquet('{pq}') GROUP BY g;"
+            ),
+        ),
+        (
+            "simple_topn",
+            format!("SELECT id, v FROM read_parquet('{pq}') ORDER BY v DESC LIMIT 100;"),
+        ),
+        (
+            "simple_distinct",
+            format!("SELECT count(DISTINCT gs) FROM read_parquet('{pq}');"),
+        ),
+        (
+            "complex_join_group",
+            format!(
+                "SELECT d.cat, count(*) c, sum(t.v) s FROM read_parquet('{pq}') t JOIN read_parquet('{d}') d ON t.g = d.g GROUP BY d.cat ORDER BY s DESC LIMIT 20;"
+            ),
+        ),
+        (
+            "complex_cte",
+            format!(
+                "WITH big AS (SELECT g, sum(v) s FROM read_parquet('{pq}') GROUP BY g HAVING sum(v) > 1000) SELECT count(*) FROM big JOIN read_parquet('{d}') d ON big.g = d.g;"
+            ),
+        ),
+        (
+            "complex_window",
+            format!(
+                "SELECT g, v, row_number() OVER (PARTITION BY g ORDER BY v DESC) rn FROM read_parquet('{pq}') WHERE g < 50 LIMIT 200;"
+            ),
+        ),
+        (
+            "complex_three_way",
+            format!(
+                "SELECT d2.cat, count(*) c FROM read_parquet('{pq}') t JOIN read_parquet('{d}') d ON t.g = d.g JOIN read_parquet('{d2}') d2 ON d.cat = d2.cat GROUP BY d2.cat;"
+            ),
+        ),
+    ];
+    let mut out = String::from(
+        "-- DuckDB 对照：读同一份源文件，逐 CASE 块计时 + 采峰值 RSS（runner.py）
+-- 口径：DuckDB 每次现读 parquet；本仓侧是管理表 + 段缓存（对 DuckDB 不利）
+",
+    );
+    for (name, sql) in cases {
+        out.push_str(&format!(
+            "
+-- CASE {name} rounds=3
+{sql}
+"
+        ));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
