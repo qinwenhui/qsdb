@@ -124,7 +124,7 @@ fn compact_partition_inner(
     }
 
     // 分区锁（写路径同一把锁，天然互斥）
-    let _guard = PartitionLock::acquire(&pdir.join(".lock"))?;
+    let _guard = PartitionLock::acquire_local(&pdir.join(".lock"))?;
     // 锁内重读（等待期间可能已被其他提交者变更）
     manifest = PartitionManifest::read(store, pdir)?.unwrap_or(manifest);
     if manifest.segments.len() < 2 {

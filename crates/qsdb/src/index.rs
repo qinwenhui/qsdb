@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{QsdbError, Result};
-use crate::fsutil::PartitionLock;
 use crate::manifest::PartitionManifest;
 use crate::scan::list_partitions;
 use crate::store::Store;
@@ -71,47 +70,59 @@ impl PartitionsIndex {
         rel_dir: &str,
         manifest: &PartitionManifest,
     ) -> Result<()> {
-        let _guard = PartitionLock::acquire(&table_dir.join(INDEX_LOCK))?;
-        let mut idx = Self::read(store, table_dir).unwrap_or_else(|| Self {
-            version: 1,
-            entries: Vec::new(),
-        });
-        match idx
-            .entries
-            .binary_search_by(|(d, _)| d.as_str().cmp(rel_dir))
-        {
-            Ok(pos) => idx.entries[pos].1 = manifest.clone(),
-            Err(pos) => idx
+        // **经 with_dir_lock 分派**（F23 第 2 条）：内核写路径只在 `is_local()`
+        // 分支调它，但函数本身对远端不设防——外部调用方（如 qsdb-sync replica、
+        // 未来的远端 idx 维护）一调就炸。分派收在锁入口，调用方不必各自判断。
+        crate::fsutil::with_dir_lock(store, &table_dir.join(INDEX_LOCK), || {
+            let mut idx = Self::read(store, table_dir).unwrap_or_else(|| Self {
+                version: 1,
+                entries: Vec::new(),
+            });
+            match idx
                 .entries
-                .insert(pos, (rel_dir.to_string(), manifest.clone())),
-        }
-        let bytes = postcard::to_allocvec(&idx)
-            .map_err(|e| QsdbError::meta(format!("serialize index failed: {e}")))?;
-        store.write_atomic(&table_dir.join(INDEX_FILE), &bytes)
+                .binary_search_by(|(d, _)| d.as_str().cmp(rel_dir))
+            {
+                Ok(pos) => idx.entries[pos].1 = manifest.clone(),
+                Err(pos) => idx
+                    .entries
+                    .insert(pos, (rel_dir.to_string(), manifest.clone())),
+            }
+            let bytes = postcard::to_allocvec(&idx)
+                .map_err(|e| QsdbError::meta(format!("serialize index failed: {e}")))?;
+            store.write_atomic(&table_dir.join(INDEX_FILE), &bytes)
+        })
     }
 
     /// 全量重建（锁内）：readdir + 逐分区读 manifest。
     pub fn rebuild(store: &Store, table_dir: &Path, partition_depth: usize) -> Result<Self> {
-        let _guard = PartitionLock::acquire(&table_dir.join(INDEX_LOCK))?;
-        let mut entries: Vec<(String, PartitionManifest)> = Vec::new();
-        for (pdir, _) in list_partitions(store, table_dir, partition_depth) {
-            if let Some(m) = PartitionManifest::read(store, &pdir)? {
-                let rel = pdir
-                    .strip_prefix(table_dir)
-                    .unwrap_or(&pdir)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                entries.push((rel, m));
-            }
-        }
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        let idx = Self {
+        // 同 `upsert`：锁入口分派（远端禁不起本地 flock）
+        let mut idx = Self {
             version: 1,
-            entries,
+            entries: Vec::new(),
         };
-        let bytes = postcard::to_allocvec(&idx)
-            .map_err(|e| QsdbError::meta(format!("serialize index failed: {e}")))?;
-        store.write_atomic(&table_dir.join(INDEX_FILE), &bytes)?;
+        crate::fsutil::with_dir_lock(store, &table_dir.join(INDEX_LOCK), || {
+            let mut entries: Vec<(String, PartitionManifest)> = Vec::new();
+            for (pdir, _) in list_partitions(store, table_dir, partition_depth) {
+                if let Some(m) = PartitionManifest::read(store, &pdir)? {
+                    let rel = pdir
+                        .strip_prefix(table_dir)
+                        .unwrap_or(&pdir)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    entries.push((rel, m));
+                }
+            }
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let built = Self {
+                version: 1,
+                entries,
+            };
+            let bytes = postcard::to_allocvec(&built)
+                .map_err(|e| QsdbError::meta(format!("serialize index failed: {e}")))?;
+            store.write_atomic(&table_dir.join(INDEX_FILE), &bytes)?;
+            idx = built;
+            Ok(())
+        })?;
         Ok(idx)
     }
 

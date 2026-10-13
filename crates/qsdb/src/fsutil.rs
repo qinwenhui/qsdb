@@ -118,14 +118,19 @@ pub fn tmp_sibling(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// 分区互斥锁：阻塞获取独占锁，守卫释放文件句柄即解锁。
+/// **本地**分区互斥锁：阻塞获取独占锁，守卫释放文件句柄即解锁。
+///
+/// 名字里带 `local` 是刻意的：它只认**真实文件系统**。远端 Store（S3/HDFS）的
+/// root 是虚拟路径，`create_dir_all("s3://…")` 只会炸（F23 的原始事故）。
+/// 跨后端安全的入口是 [`with_dir_lock`]，新代码一律用它。
 pub struct PartitionLock {
     _file: File,
 }
 
 impl PartitionLock {
     /// `path` 为锁文件路径（通常 `{partition}/.lock`），不存在则创建。
-    pub fn acquire(path: &Path) -> Result<Self> {
+    /// **仅限 Local 后端**（见类型文档）。
+    pub fn acquire_local(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| QsdbError::meta(format!("mkdir {} failed: {e}", parent.display())))?;
@@ -140,6 +145,40 @@ impl PartitionLock {
         file.lock_exclusive()
             .map_err(|e| QsdbError::meta(format!("lock {} failed: {e}", path.display())))?;
         Ok(Self { _file: file })
+    }
+}
+
+/// **目录级互斥（按后端分派）**——跨后端安全的加锁入口，除纯本地内部路径外一律用它。
+///
+/// - `Local`：同目录 flock（[`PartitionLock::acquire_local`]）——跨进程/多实例互斥；
+/// - `Remote`：**进程内**同路径互斥（`remote::with_partition_mutex`）——远端没有
+///   "文件锁"这种原语，跨进程/多实例的收敛交给对象存储的条件写（OCC / CAS）。
+///
+/// 为什么是**闭包**而不是 RAII 守卫：Remote 臂要持 `Arc<Mutex<()>>` 的 guard，
+/// 而 `Arc` 存在全局表里——guard 会自引用，生命周期过不了 borrowck；闭包把临界区
+/// 圈起来，两臂形状一致，调用点也不会有"忘了 drop / 提前 drop"的余地。
+///
+/// F23（qsdb-sync）：远端库 `CREATE USER` / 远端 idx 维护此前走本地 flock 直接炸，
+/// 影响面不止单一调用方——所以把分派收在这一个入口，调用点不必各自 `is_local()`。
+pub fn with_dir_lock<T>(
+    store: &crate::store::Store,
+    path: &Path,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if store.is_local() {
+        let _guard = PartitionLock::acquire_local(path)?;
+        return f();
+    }
+    #[cfg(feature = "remote")]
+    {
+        crate::remote::with_partition_mutex(path, f)
+    }
+    #[cfg(not(feature = "remote"))]
+    {
+        let _ = (path, f);
+        Err(QsdbError::unsupported(
+            "remote store requires an s3/hdfs build",
+        ))
     }
 }
 
@@ -287,11 +326,11 @@ mod tests {
     fn lock_mutual_exclusion() {
         let dir = tmpdir("lock");
         let lock_path = dir.join(".lock");
-        let guard = PartitionLock::acquire(&lock_path).unwrap();
+        let guard = PartitionLock::acquire_local(&lock_path).unwrap();
         // 同进程同文件二次加锁：fs2 flock 语义下同进程会成功（句柄独立），
         // 跨进程/跨线程互斥由 OS 保证；这里只验证守卫可正常获取与释放
         drop(guard);
-        let g2 = PartitionLock::acquire(&lock_path).unwrap();
+        let g2 = PartitionLock::acquire_local(&lock_path).unwrap();
         drop(g2);
         fs::remove_dir_all(&dir).ok();
     }

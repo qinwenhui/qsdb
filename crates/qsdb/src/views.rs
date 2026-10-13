@@ -49,9 +49,12 @@ impl ViewStore {
         };
         let text = serde_json::to_string_pretty(&f)
             .map_err(|e| QsdbError::meta(format!("serialize views failed: {e}")))?;
-        let _guard =
-            crate::fsutil::PartitionLock::acquire(&store.root().join("_catalog").join(".lock"))?;
-        store.write_atomic(&Self::path(store), text.as_bytes())
+        // **经 with_dir_lock 分派**：与 `UserStore::write_all` 同形（F23 同族，
+        // 反馈只点了 users——`CREATE VIEW` 在远端库上同样走不通）。
+        let lock = store.root().join("_catalog").join(".lock");
+        crate::fsutil::with_dir_lock(store, &lock, || {
+            store.write_atomic(&Self::path(store), text.as_bytes())
+        })
     }
 
     /// 创建/替换视图（SQL 已过可解析校验）。

@@ -749,7 +749,7 @@ impl Qsdb {
                 "remote store requires an s3/hdfs build",
             ));
         }
-        let _guard = crate::fsutil::PartitionLock::acquire(&dir.join(".lock"))?;
+        let _guard = crate::fsutil::PartitionLock::acquire_local(&dir.join(".lock"))?;
         let Some(old) = crate::manifest::PartitionManifest::read(&self.store, &dir)? else {
             return Ok(0);
         };
@@ -819,7 +819,7 @@ impl Qsdb {
                 ));
             }
         }
-        let _guard = crate::fsutil::PartitionLock::acquire(&tdir.join(".lock"))?;
+        let _guard = crate::fsutil::PartitionLock::acquire_local(&tdir.join(".lock"))?;
         let mut rows = 0u64;
         for entry in self.store.read_dir(tdir).unwrap_or_default() {
             if !entry.name.ends_with(".parquet") {

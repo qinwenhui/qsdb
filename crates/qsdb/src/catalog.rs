@@ -230,7 +230,7 @@ pub fn create_table(store: &Store, db: &str, def: &TableDef) -> Result<()> {
         return Err(QsdbError::unsupported("remote store requires feature 's3'"));
     }
     let root = store.root();
-    let _guard = PartitionLock::acquire(&catalog_lock(root))?;
+    let _guard = PartitionLock::acquire_local(&catalog_lock(root))?;
     let mut names = read_table_names(store, db)?;
     if names.iter().any(|n| n == &def.name) {
         return Err(QsdbError::already_exists(format!(
@@ -262,7 +262,7 @@ pub fn drop_table(store: &Store, db: &str, table: &str) -> Result<()> {
         return Err(QsdbError::unsupported("remote store requires feature 's3'"));
     }
     let root = store.root();
-    let _guard = PartitionLock::acquire(&catalog_lock(root))?;
+    let _guard = PartitionLock::acquire_local(&catalog_lock(root))?;
     let names = read_table_names(store, db)?;
     if !names.iter().any(|n| n == table) {
         return Err(QsdbError::table_not_found(format!("table {db}.{table}")));
@@ -284,7 +284,7 @@ pub fn alter_add_column(store: &Store, db: &str, table: &str, column: ColumnDef)
         return Err(QsdbError::unsupported("remote store requires feature 's3'"));
     }
     let root = store.root();
-    let _guard = PartitionLock::acquire(&catalog_lock(root))?;
+    let _guard = PartitionLock::acquire_local(&catalog_lock(root))?;
     let names = read_table_names(store, db)?;
     if !names.iter().any(|n| n == table) {
         return Err(QsdbError::table_not_found(format!("table {db}.{table}")));

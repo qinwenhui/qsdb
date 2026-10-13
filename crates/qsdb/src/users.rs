@@ -171,9 +171,13 @@ impl UserStore {
         };
         let text = serde_json::to_string_pretty(&f)
             .map_err(|e| QsdbError::meta(format!("serialize users failed: {e}")))?;
-        let _guard =
-            crate::fsutil::PartitionLock::acquire(&store.root().join("_catalog").join(".lock"))?;
-        store.write_atomic(&Self::path(store), text.as_bytes())
+        // **经 with_dir_lock 分派**（F23）：此前无条件走本地 flock，远端库
+        // （`--storage-type s3/hdfs`）的 `CREATE USER` 会去 `create_dir_all("s3://…")`
+        // 而整体不可用。远端臂 = 进程内互斥 + 对象存储条件写。
+        let lock = store.root().join("_catalog").join(".lock");
+        crate::fsutil::with_dir_lock(store, &lock, || {
+            store.write_atomic(&Self::path(store), text.as_bytes())
+        })
     }
 
     /// 校验用户名密码 → 角色（不匹配/不存在 → None）。

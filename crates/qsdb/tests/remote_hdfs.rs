@@ -42,8 +42,10 @@ fn db_at(prefix: &str, local_root: &std::path::Path) -> Qsdb {
     Qsdb::open_with_store(local_root, QsdbOptions::default(), store).unwrap()
 }
 
-fn drop_prefix(prefix: &str, db: &Qsdb) {
-    // 前缀整体删除（对象层；drop_table 只清单表）
+fn drop_prefix(db: &Qsdb) {
+    // 前缀整体删除（对象层；drop_table 只清单表）。
+    // 不需要 prefix 参数：store 的虚拟根**已经是**该前缀，list("/") 就只列到本用例的
+    // 对象（此前这个参数一直没被用，`-D warnings` 下会红——check.sh 首次真跑时抓到）。
     for obj in db.store().list_all(std::path::Path::new("/")).unwrap() {
         let _ = db.store().delete_object(&db.store().root().join(obj.key));
     }
@@ -116,7 +118,7 @@ fn hdfs_cas_primitives() {
     // 锁对象已清理
     let lock = store.root().join("cas-test.bin.__cas_lock");
     assert!(store.read(&lock).unwrap().is_none(), "CAS 锁应已释放");
-    drop_prefix(&prefix, &db);
+    drop_prefix(&db);
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -167,7 +169,7 @@ fn hdfs_managed_lifecycle() {
     // drop 清空
     db.drop_table("t").unwrap();
     assert!(db.tables().unwrap().is_empty());
-    drop_prefix(&prefix, &db);
+    drop_prefix(&db);
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -198,6 +200,6 @@ fn hdfs_staging_write() {
     let (uploaded, rows) = db.flush_staged().unwrap();
     assert_eq!((uploaded, rows), (2, 3));
     assert_eq!(count(&db, "SELECT count(*) FROM t"), 3);
-    drop_prefix(&prefix, &db);
+    drop_prefix(&db);
     std::fs::remove_dir_all(&root).ok();
 }

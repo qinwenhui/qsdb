@@ -444,7 +444,7 @@ pub(crate) fn append_partition(
             return Err(QsdbError::unsupported("remote store requires feature 's3'"));
         }
     }
-    let _guard = PartitionLock::acquire(&lock_path(&dir))?;
+    let _guard = PartitionLock::acquire_local(&lock_path(&dir))?;
 
     let entry = write_segment(
         store,
@@ -535,7 +535,7 @@ pub(crate) fn overwrite_partition(
             return Err(QsdbError::unsupported("remote store requires feature 's3'"));
         }
     }
-    let _guard = PartitionLock::acquire(&lock_path(&dir))?;
+    let _guard = PartitionLock::acquire_local(&lock_path(&dir))?;
 
     // 旧 manifest（不存在 = 新分区）
     let old = PartitionManifest::read(store, &dir)?;
