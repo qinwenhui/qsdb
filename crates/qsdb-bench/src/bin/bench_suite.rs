@@ -864,6 +864,24 @@ fn main() {
         generate(&dir, rows, per);
         return;
     }
+    // 诊断用：跑一条 SQL 并报「耗时 + 扫描行数」（各路径分段计时靠它）
+    if let Some(sql) = arg("--sql") {
+        let db = open(&dir);
+        let t0 = Instant::now();
+        match db.sql_collect(&sql) {
+            Ok(bs) => {
+                let n: usize = bs.iter().map(|b| b.num_rows()).sum();
+                println!(
+                    "SQL ok: {:.3}s rows={} rss_mb={:.1}",
+                    t0.elapsed().as_secs_f64(),
+                    n,
+                    peak_rss_kb() as f64 / 1024.0
+                );
+            }
+            Err(e) => println!("SQL ERR: {e}"),
+        }
+        return;
+    }
     if let Some(case) = arg("--case") {
         let mut times = Vec::new();
         let mut produced = 0u64;
