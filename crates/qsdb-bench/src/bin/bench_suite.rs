@@ -303,8 +303,25 @@ fn peak_rss_kb() -> u64 {
 // 造数 / 落盘
 // ---------------------------------------------------------------------------
 
+/// 打开库。`--budget-mb` / `--cache-mb` 可给内存预算与扫描缓存（默认：无预算 + 缓存 0）。
+///
+/// 为什么分开两个旋钮：**本文具默认无内存预算**（`memory_budget_bytes` 不设 = 池不限），
+/// 所以"给更多内存"对*单条*查询没有影响——真正影响重复查询/多查询的是**扫描缓存**
+/// （解码后的批，第二次同名扫描直接命中）。要比"给到 2G 能不能追平 DuckDB"，
+/// 得同时给上这两个。
 fn open(dir: &Path) -> Qsdb {
-    Qsdb::open(dir, QsdbOptions::default()).expect("open db")
+    let budget = arg("--budget-mb").and_then(|v| v.parse::<u64>().ok());
+    let cache = arg("--cache-mb")
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|mb| mb * 1024 * 1024);
+    let mut opts = QsdbOptions::default();
+    if let Some(mb) = budget {
+        opts.memory_budget_bytes = Some(mb * 1024 * 1024);
+    }
+    if let Some(c) = cache {
+        opts.scan_cache_bytes = c;
+    }
+    Qsdb::open(dir, opts).expect("open db")
 }
 
 /// 源文件写出（CSV + Parquet）：DuckDB 与本仓读**同一份**。
