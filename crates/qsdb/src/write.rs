@@ -444,8 +444,12 @@ pub(crate) fn append_partition(
             return Err(QsdbError::unsupported("remote store requires feature 's3'"));
         }
     }
+    let t = std::time::Instant::now();
     let _guard = PartitionLock::acquire_local(&lock_path(&dir))?;
+    P_LOCK_NS.fetch_add(t.elapsed().as_nanos() as u64, AtomicOrd::Relaxed);
+    P_CALLS.fetch_add(1, AtomicOrd::Relaxed);
 
+    let t = std::time::Instant::now();
     let entry = write_segment(
         store,
         &dir,
@@ -458,7 +462,9 @@ pub(crate) fn append_partition(
             .map(|f| f.name().clone())
             .collect::<Vec<_>>(),
     )?;
+    P_SEG_NS.fetch_add(t.elapsed().as_nanos() as u64, AtomicOrd::Relaxed);
 
+    let t = std::time::Instant::now();
     let mut manifest = PartitionManifest::read(store, &dir)?.unwrap_or_else(|| {
         PartitionManifest::new(named_values(def, values), def.schema_fingerprint())
     });
@@ -475,9 +481,14 @@ pub(crate) fn append_partition(
         manifest.schema_fingerprint = def.schema_fingerprint();
     }
     manifest.segments.push(entry.clone());
+    P_MAN_READ_NS.fetch_add(t.elapsed().as_nanos() as u64, AtomicOrd::Relaxed);
+    let t = std::time::Instant::now();
     manifest.commit(store, &dir)?;
+    P_MAN_COMMIT_NS.fetch_add(t.elapsed().as_nanos() as u64, AtomicOrd::Relaxed);
     if store.is_local() {
+        let t = std::time::Instant::now();
         sync_index(store, table_dir, &dir, &manifest);
+        P_IDX_NS.fetch_add(t.elapsed().as_nanos() as u64, AtomicOrd::Relaxed);
     }
     drop(_guard);
 
@@ -497,6 +508,39 @@ fn sync_index(store: &Store, table_dir: &Path, partition_dir: &Path, manifest: &
         .to_string_lossy()
         .replace('\\', "/");
     let _ = crate::index::PartitionsIndex::upsert(store, table_dir, &rel, manifest);
+}
+
+// ---------------------------------------------------------------------------
+// 写路径分段计时（`QSDB_WRITE_PROF=1`）
+//
+// 动机：`INSERT … SELECT` 比 `db.append` 慢 6 倍，而两者都只是"扫 + 写"；批大小
+// 一变，1M 行的落盘从 2.8s 变 15.4s（5.5x）——说明**每次 append 调用有可观固定开销**。
+// 要修就得知道这开销是锁、段写、manifest 提交还是索引维护，不能猜。
+// 静态累加，进程结束前由调用方（bench 的 `--sql`）打印一次。
+// ---------------------------------------------------------------------------
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrd};
+static P_LOCK_NS: AtomicU64 = AtomicU64::new(0);
+static P_SEG_NS: AtomicU64 = AtomicU64::new(0);
+static P_MAN_READ_NS: AtomicU64 = AtomicU64::new(0);
+static P_MAN_COMMIT_NS: AtomicU64 = AtomicU64::new(0);
+static P_IDX_NS: AtomicU64 = AtomicU64::new(0);
+static P_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// 打印写路径分段累计（`QSDB_WRITE_PROF=1` 时由调用方调用；否则返回 None）。
+pub fn write_prof_dump() -> Option<String> {
+    if std::env::var("QSDB_WRITE_PROF").is_err() {
+        return None;
+    }
+    let ms = |a: &AtomicU64| a.load(AtomicOrd::Relaxed) as f64 / 1e6;
+    Some(format!(
+        "calls={} lock={:.1}ms seg={:.1}ms man_read={:.1}ms commit={:.1}ms idx={:.1}ms",
+        P_CALLS.load(AtomicOrd::Relaxed),
+        ms(&P_LOCK_NS),
+        ms(&P_SEG_NS),
+        ms(&P_MAN_READ_NS),
+        ms(&P_MAN_COMMIT_NS),
+        ms(&P_IDX_NS),
+    ))
 }
 
 /// overwrite（单分区原子替换；空输入 = 清空分区）。

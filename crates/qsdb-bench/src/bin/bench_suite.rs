@@ -889,6 +889,9 @@ fn main() {
             ),
             Err(e) => println!("SQL ERR: {e}"),
         }
+        if let Some(d) = qsdb::write::write_prof_dump() {
+            println!("[write-prof] {d}");
+        }
         return;
     }
     if let Some(case) = arg("--case") {
