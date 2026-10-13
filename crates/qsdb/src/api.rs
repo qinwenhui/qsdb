@@ -382,10 +382,15 @@ impl Qsdb {
         ));
         let read_only = opts.read_only;
         // 溢出目录：只读句柄不写库根（回落系统 temp），并清理崩溃残留
-        let spill_dir = if read_only { None } else { opts.spill_dir.clone() };
+        let spill_dir = if read_only {
+            None
+        } else {
+            opts.spill_dir.clone()
+        };
         if let Some(dir) = &spill_dir {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| QsdbError::meta(format!("init spill dir {} failed: {e}", dir.display())))?;
+            std::fs::create_dir_all(dir).map_err(|e| {
+                QsdbError::meta(format!("init spill dir {} failed: {e}", dir.display()))
+            })?;
             purge_stale_spills(dir, opts.trash_grace_ms);
         }
         // staging（M6-4）：仅远端后端 + feature s3
@@ -916,7 +921,16 @@ impl Qsdb {
 
     /// 便捷：SELECT 物化执行（错误路径直接返回）。
     pub fn sql_collect(&self, sql: &str) -> Result<Vec<RecordBatch>> {
-        match crate::sql::execute_sql(self, sql)? {
+        // **走句柄配置的查询上下文**（内存池 + 运行期超时/单查询配额），
+        // 而不是 `QueryContext::benign()`——后者无池无配额**静默绕过**了
+        // `memory_budget_bytes` / `query_memory_limit_bytes`：手工设了全局预算的
+        // 嵌入方会以为"内存受控"，实际便捷 API 这条路完全没有约束
+        // （2026-10-13 由并行工作流插桩发现：`sql_collect` 跑的"全局预算"用例
+        // 全程走内存路径、预算根本没生效）。
+        // 默认 options（不限预算/配额/超时）下行为与从前**完全一致**，
+        // 只有显式设过限额的嵌入方才会看到差异——而那正是他要的。
+        let ctx = self.new_query_context(None);
+        match self.sql_with_context(sql, &ctx)? {
             crate::sql::SqlResult::Query { batches, .. } => Ok(batches),
             crate::sql::SqlResult::Ok { message } => {
                 Err(QsdbError::invalid(format!("not a query: {message}")))

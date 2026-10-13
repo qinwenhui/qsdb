@@ -41,7 +41,9 @@ impl SpillDir {
     pub fn new_in(base: Option<&std::path::Path>) -> Self {
         let path = match base {
             Some(b) => b.join(format!("qsdb_spill_{}", uuid::Uuid::now_v7().simple())),
-            None => std::env::temp_dir().join(format!("qsdb_spill_{}", uuid::Uuid::now_v7().simple())),
+            None => {
+                std::env::temp_dir().join(format!("qsdb_spill_{}", uuid::Uuid::now_v7().simple()))
+            }
         };
         let _ = std::fs::create_dir_all(&path);
         Self { path, counter: 0 }

@@ -380,7 +380,15 @@ impl HashJoinExec {
             batches.push(x);
         }
         let total = res.bytes();
-        res.grow(total)?; // concat 期间瞬时双份
+        // concat 期间瞬时双份（峰值真实存在，就该记账）；但**要不到这份峰值额度
+        // 不是终止理由**：本算子有溢出能力（P2 分区块 hash join），整批交溢出即可。
+        // 回归（本行原为 `res.grow(total)?`）：build 侧 ≤ 配额、只是 2x 峰值越过配额
+        // 时被直接上抛 QueryMemoryLimit——外面实测
+        // 「query ab at 64MB would exceed its 64MB limit」（build 侧 ~32MB 时翻倍命中）。
+        if res.grow(total).is_err() {
+            self.enter_spill(batches)?; // 全部批都在（含最后一批，见上）；res 随返回归还
+            return Ok(());
+        }
         let table = concat_batches(&batches, &self.build.schema())?;
         res.shrink(total); // 源批已随 Vec 释放
 

@@ -147,12 +147,6 @@ impl QueryContext {
         if let Some(limit) = self.memory_limit {
             let used = self.memory_used.load(Ordering::Relaxed);
             if used.saturating_add(bytes) > limit {
-                if std::env::var("QSDB_TRACE_QUOTA").is_ok() {
-                    eprintln!(
-                        "QUOTA FAIL used={used} bytes={bytes} limit={limit}\n{}",
-                        std::backtrace::Backtrace::force_capture()
-                    );
-                }
                 return Err(QsdbError::QueryMemoryLimit(format!(
                     "query {} at {}MB would exceed its {}MB limit",
                     self.query_id,

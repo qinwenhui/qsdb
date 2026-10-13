@@ -669,9 +669,21 @@ impl SortExec {
 
         if run_paths.is_empty() {
             // 纯内存路径（原逻辑）。concat + take 期间瞬时约 2x——峰值真实存在，
-            // 就该记账（要不到额度就失败，而不是靠超额分配侥幸跑过）
-            res.grow(res.bytes())?;
-            return sort_in_memory(chunk, &self.schema());
+            // 就该记账；但**要不到这份峰值额度不是终止理由**：本算子有溢出能力
+            // （P1 承诺「额度不够就落盘完成，而不是把查询打死」），尾块落盘后
+            // 内存即时归还、改走下面的归并即可。
+            //
+            // 回归（本行原为 `res.grow(res.bytes())?`）：`res` 此刻已覆盖驻留的
+            // chunk（= 全量输入），再 grow 同样的字节是**在已有预留之上**要第二份，
+            // 于是「输入 ≤ 配额」的查询只要输入 > 配额/2（2x 峰值越过配额）就被
+            // 直接上抛 QueryMemoryLimit——小配额下（如 64MB 配额排 39MB 数据）
+            // 明明装得下、且溢出路径可用，却报「at 78MB would exceed its 64MB limit」。
+            if res.grow(res.bytes()).is_ok() {
+                return sort_in_memory(chunk, &self.schema());
+            }
+            let back = chunk_bytes;
+            flush_chunk(&mut chunk, &mut chunk_bytes, &mut spill_dir, &mut run_paths)?;
+            res.shrink(back); // 尾块已写盘并从内存释放
         }
         // 有 run：尾块排序成内存 run，k 路归并（一次性产出合并批；
         // 流式化留待后续——排序输出本来就要被 limit/take 整体消费）

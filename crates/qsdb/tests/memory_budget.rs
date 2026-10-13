@@ -355,3 +355,116 @@ fn write_path_and_streaming_queries_are_unaffected() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+// ---------------------------------------------------------------------------
+// 回归：排序收尾的「峰值反冲记账」不得把**装得下配额**的查询打成配额错
+// ---------------------------------------------------------------------------
+
+/// 单列 v BIGINT 的表 + `batches × rows_per_batch` 行（批 = 段，扫描逐段出批）。
+fn sort_table(tag: &str, batches: usize, rows_per_batch: usize) -> (Arc<Qsdb>, std::path::PathBuf) {
+    let root = tmp_root(tag);
+    let db = Arc::new(Qsdb::open(&root, QsdbOptions::default()).unwrap());
+    db.sql("CREATE TABLE t (v BIGINT)").unwrap();
+    for b in 0..batches {
+        db.append(
+            "t",
+            &[batch_from(rows_per_batch, (b * rows_per_batch) as i64)],
+        )
+        .unwrap();
+    }
+    (db, root)
+}
+
+fn batch_from(n: usize, base: i64) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+    let vals: Vec<i64> = (0..n as i64).map(|i| base + i).collect();
+    RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vals))]).unwrap()
+}
+
+/// 读出 `SELECT v FROM t ORDER BY v` 的全部值（单列）。
+fn sorted_vals(db: &Qsdb, ctx: &Arc<QueryContext>) -> Vec<i64> {
+    let out = db
+        .sql_with_context("SELECT v FROM t ORDER BY v", ctx)
+        .expect("排序应完成");
+    let batches = match out {
+        qsdb::sql::SqlResult::Query { batches, .. } => batches,
+        qsdb::sql::SqlResult::Ok { .. } => panic!("expected query"),
+    };
+    batches
+        .iter()
+        .flat_map(|b| {
+            (0..b.num_rows())
+                .map(|i| {
+                    arrow::util::display::array_value_to_string(b.column(0).as_ref(), i)
+                        .unwrap()
+                        .parse::<i64>()
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// 输入 chunk 装得下配额、只是 `concat + take` 的瞬时 2x 峰值装不下时，
+/// **必须落盘完成**——而不是把查询打死。
+///
+/// 回归形态：`SortExec::collect_all` 收尾路径原为 `res.grow(res.bytes())?`。
+/// `res` 那一刻已覆盖驻留 chunk（= 全量输入），再 grow 同样的字节是**在已有预留
+/// 之上**要第二份 → 只要「输入 > 配额/2」，明明装得下（输入 ≤ 配额）也被上抛
+/// `QueryMemoryLimit`。外部实测（CentOS / 5M 行 ORDER BY v / 64MB 配额）报
+/// 「query ab at 78MB would exceed its 64MB limit」（39MB 输入 × 2 = 78MB）。
+///
+/// 守的语义：本算子有溢出能力（P1）→ 峰值记不上就落盘，且落盘/收尾后记账归零。
+#[test]
+fn sort_fitting_quota_but_not_its_concat_peak_spills_instead_of_failing() {
+    // 6 批 × 1000 行 ≈ 48KB 输入：≤ 64KB 配额，但 2x = 96KB > 配额 → 命中收尾路径
+    let (db, root) = sort_table("sort-peak", 6, 1000);
+    let ctx = QueryContext::new("peak-q", None, Some(64 * 1024));
+    let vals = sorted_vals(&db, &ctx);
+    let mut want: Vec<i64> = (0..6000).collect();
+    want.sort_unstable();
+    assert_eq!(vals, want, "落盘完成的结果必须与逐值有序");
+    assert_eq!(
+        ctx.memory_used(),
+        0,
+        "查询结束不得留下残余记账（峰值预留收缩/Drop 后必须归零）"
+    );
+    assert_eq!(db.memory_pool().exec_used(), 0);
+
+    // 不限配额的同查询照旧（没把功能改坏）
+    assert_eq!(
+        sorted_vals(&db, &QueryContext::new("peak-free", None, None)),
+        want
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 反复溢出（每轮多次「攒到配额附近 → 落盘 → 继续攒」）之后，**不得残留记账**：
+/// 残留会让下一轮提前失败（外部现象：同一查询第 3 轮才报配额错）。
+///
+/// 顺带钉住 C3：任意小配额下结果与不限内存**逐值相同**。
+#[test]
+fn repeated_spill_near_quota_leaves_no_residual_accounting() {
+    let (db, root) = sort_table("sort-residual", 6, 1000);
+    let mut want: Vec<i64> = (0..6000).collect();
+    want.sort_unstable();
+
+    for quota_kb in [4u64, 8, 16, 24, 48] {
+        for round in 0..3 {
+            // 每轮独立 ctx（与 ab_gate 一致）；同 ctx 复用也不得累积
+            let ctx = QueryContext::new("residual-q", None, Some(quota_kb * 1024));
+            let vals = sorted_vals(&db, &ctx);
+            assert_eq!(
+                vals, want,
+                "{quota_kb}KB 配额第 {round} 轮：溢出只改完成/拒绝的边界，不改结果"
+            );
+            assert_eq!(
+                ctx.memory_used(),
+                0,
+                "{quota_kb}KB 配额第 {round} 轮结束后残余记账必须为 0"
+            );
+            assert_eq!(db.memory_pool().exec_used(), 0);
+        }
+    }
+    std::fs::remove_dir_all(&root).ok();
+}

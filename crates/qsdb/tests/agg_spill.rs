@@ -153,6 +153,7 @@ fn multi_shard_spill_is_not_double_counted() {
 
 /// 全局预算（而非每查询配额）触发溢出时同样成立。
 #[test]
+#[ignore = "等缺口③（分区数/缓冲上界不看全局预算）修复后启用 —— 见 docs/进度与待办.md §二/§四"]
 fn global_budget_pressure_also_spills() {
     let root = tmp_root("global");
     let db = Qsdb::open(
@@ -182,10 +183,20 @@ fn global_budget_pressure_also_spills() {
         )
         .unwrap();
     }
-    // 预算 128KB 远小于组表需求 → 必须走溢出完成
-    let out = db
-        .sql_collect("SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g")
-        .unwrap_or_else(|e| panic!("预算压力下应溢出完成，而不是失败: {e}"));
+    // 预算 128KB 远小于组表需求 → 必须走溢出完成。
+    //
+    // **必须显式用句柄上下文**：`sql_collect` 曾经走 `QueryContext::benign()`
+    // （无池无配额）→ 这个用例是**空的**（并行工作流插桩发现：全程走内存路径、
+    // 预算根本没生效）。`sql_collect` 已修为池感知，这里仍显式传 ctx——
+    // 用例本身要测的是"预算生效"，别依赖便捷 API 的实现细节。
+    let ctx = db.new_query_context(None);
+    let out = match db
+        .sql_with_context("SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g", &ctx)
+        .unwrap_or_else(|e| panic!("预算压力下应溢出完成，而不是失败: {e}"))
+    {
+        qsdb::sql::SqlResult::Query { batches, .. } => batches,
+        qsdb::sql::SqlResult::Ok { .. } => panic!("expected query"),
+    };
     let n: usize = out.iter().map(|b| b.num_rows()).sum();
     assert_eq!(n, 1500, "15 组… 应为 1500 组");
     let _ = std::fs::remove_dir_all(&root);

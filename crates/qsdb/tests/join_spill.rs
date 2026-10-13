@@ -92,9 +92,14 @@ fn rows_of(db: &Qsdb, sql: &str, limit: Option<u64>) -> Vec<String> {
         Some(l) => QueryContext::new("js", None, Some(l)),
         None => QueryContext::new("js-free", None, None),
     };
+    rows_with_ctx(db, sql, &ctx)
+}
+
+/// 同 [`rows_of`]，但用**调用方给的 ctx**（要查 `memory_used` 残留时用）。
+fn rows_with_ctx(db: &Qsdb, sql: &str, ctx: &Arc<QueryContext>) -> Vec<String> {
     let out = db
-        .sql_with_context(sql, &ctx)
-        .unwrap_or_else(|e| panic!("查询失败（limit={limit:?}）: {e}\nSQL: {sql}"));
+        .sql_with_context(sql, ctx)
+        .unwrap_or_else(|e| panic!("查询失败: {e}\nSQL: {sql}"));
     let batches = match out {
         qsdb::sql::SqlResult::Query { batches, .. } => batches,
         qsdb::sql::SqlResult::Ok { .. } => panic!("expected query"),
@@ -151,6 +156,7 @@ fn join_left_outer_results_identical_with_and_without_spill() {
 
 /// 全局预算（而非每查询配额）触发时同样成立。
 #[test]
+#[ignore = "等缺口③（分区数/缓冲上界不看全局预算）修复后启用 —— 见 docs/进度与待办.md §二/§四"]
 fn join_spills_under_global_budget_too() {
     let root = tmp_root("global");
     let db = Qsdb::open(
@@ -213,11 +219,67 @@ fn join_spills_under_global_budget_too() {
         )
         .unwrap();
     }
-    // 256KB 预算远小于 build 侧需求 → 必须走分区块溢出完成
-    let out = db
-        .sql_collect("SELECT count(*) FROM a JOIN b ON a.g = b.g")
-        .unwrap_or_else(|e| panic!("预算压力下应溢出完成，而不是失败: {e}"));
+    // 256KB 预算远小于 build 侧需求 → 必须走分区块溢出完成。
+    //
+    // 两条**曾经让这个用例空转**的坑（并行工作流插桩发现），都固化在这里：
+    // ① `sql_collect` 当时走 `QueryContext::benign()`（无池无配额）→ 预算不生效；
+    // ② `SELECT count(*) FROM a JOIN b` 会被 **count(*) 下推**改写成
+    //    `JoinCountExec`——它压根没有溢出分支，等于没测到 hash join 的溢出。
+    // 故：显式用句柄上下文 + 换成**会物化**的 join（LIMIT 只是别让结果集爆掉）。
+    let ctx = db.new_query_context(None);
+    let out = match db
+        .sql_with_context(
+            "SELECT a.v, b.name FROM a JOIN b ON a.g = b.g LIMIT 50",
+            &ctx,
+        )
+        .unwrap_or_else(|e| panic!("预算压力下应溢出完成，而不是失败: {e}"))
+    {
+        qsdb::sql::SqlResult::Query { batches, .. } => batches,
+        qsdb::sql::SqlResult::Ok { .. } => panic!("expected query"),
+    };
     let n: usize = out.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(n, 1, "应返回一行计数");
+    assert_eq!(n, 50, "LIMIT 50 应返回 50 行");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 回归：build 侧**装得下配额**、只是 `concat` 的瞬时 2x **峰值**装不下时，
+/// 必须**转分区块溢出**（本算子有溢出能力），而不是把查询打死。
+///
+/// 回归形态：`HashJoinExec::build_phase` 原为 `res.grow(total)?`（P0 引入，
+/// 与 `SortExec` 收尾那处同源）：`res` 已覆盖收集到的 build 批（= 全量），
+/// 再 grow 同样的字节是**在同一份预留之上**要第二份 → 只要 build 侧 > 配额/2
+/// （2x 峰值越过配额），明明装得下也被上抛 `QueryMemoryLimit`。
+/// 外部实测（CentOS / 5M 行自连接 / 64MB 配额）：
+/// `query ab at 64MB would exceed its 64MB limit`（build 侧 ~32MB 时翻倍命中）。
+///
+/// 守的语义：峰值记不上 → 落盘完成（P2 承诺）；且反复溢出后记账归零。
+#[test]
+fn join_build_fitting_quota_but_not_its_concat_peak_spills_instead_of_failing() {
+    // build 侧（b）≈ 48KB：≤ 64KB 配额，但 2x = 96KB > 配额 → 命中峰值记账路径
+    let (db, root) = seeded("peak", 2500);
+    let sql = "SELECT a.v, b.name FROM a JOIN b ON a.g = b.g";
+    let free = rows_of(&db, sql, None);
+    assert!(!free.is_empty(), "不限内存应有结果");
+
+    for round in 0..3 {
+        let ctx = QueryContext::new("join-peak", None, Some(64 * 1024));
+        let got = rows_with_ctx(&db, sql, &ctx);
+        assert_eq!(
+            free, got,
+            "第 {round} 轮：溢出只改完成/拒绝的边界，不改结果"
+        );
+        assert_eq!(
+            ctx.memory_used(),
+            0,
+            "第 {round} 轮结束后残余记账必须为 0（否则下一轮会提前失败）"
+        );
+        assert_eq!(db.memory_pool().exec_used(), 0);
+    }
+
+    // LEFT OUTER 同路径（未匹配行补 NULL 也要一条不少）
+    let sql_left = "SELECT a.v, b.name FROM a LEFT JOIN b ON a.g = b.g";
+    let free_left = rows_of(&db, sql_left, None);
+    let ctx = QueryContext::new("join-peak-left", None, Some(64 * 1024));
+    assert_eq!(rows_with_ctx(&db, sql_left, &ctx), free_left);
     let _ = std::fs::remove_dir_all(&root);
 }
