@@ -868,9 +868,12 @@ fn main() {
     if let Some(sql) = arg("--sql") {
         let db = open(&dir);
         let t0 = Instant::now();
-        match db.sql_collect(&sql) {
-            Ok(bs) => {
-                let n: usize = bs.iter().map(|b| b.num_rows()).sum();
+        // DDL/DML 也要能跑（分段计时靠它）——`sql_collect` 只收查询，故这里用
+        // `sql_with_context` 走完整结果面：查询报行数、DML 报回执文案。
+        let ctx = db.new_query_context(None);
+        match db.sql_with_context(&sql, &ctx) {
+            Ok(qsdb::sql::SqlResult::Query { batches, .. }) => {
+                let n: usize = batches.iter().map(|b| b.num_rows()).sum();
                 println!(
                     "SQL ok: {:.3}s rows={} rss_mb={:.1}",
                     t0.elapsed().as_secs_f64(),
@@ -878,6 +881,12 @@ fn main() {
                     peak_rss_kb() as f64 / 1024.0
                 );
             }
+            Ok(qsdb::sql::SqlResult::Ok { message }) => println!(
+                "SQL ok: {:.3}s [{}] rss_mb={:.1}",
+                t0.elapsed().as_secs_f64(),
+                message,
+                peak_rss_kb() as f64 / 1024.0
+            ),
             Err(e) => println!("SQL ERR: {e}"),
         }
         return;
