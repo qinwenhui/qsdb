@@ -496,6 +496,7 @@ pub(crate) fn append_partition(
     def: &TableDef,
     values: &[crate::types::Literal],
     batches: &[RecordBatch],
+    epoch: u64,
 ) -> Result<WriteResult> {
     let schema = data_schema(def);
     let batches = pad_loose_batches(def, batches, &schema)?;
@@ -519,6 +520,7 @@ pub(crate) fn append_partition(
             batches,
             &schema,
             &file_schema,
+            epoch,
         );
         #[cfg(not(feature = "remote"))]
         {
@@ -550,6 +552,8 @@ pub(crate) fn append_partition(
     let mut manifest = PartitionManifest::read(store, &dir)?.unwrap_or_else(|| {
         PartitionManifest::new(named_values(def, values), def.schema_fingerprint())
     });
+    // F25：先把"我是不是过期写者"判掉，再干活（否则白写段文件）
+    manifest.check_writer_epoch(epoch)?;
     // 指纹一致 或 旧 schema 为当前前缀（ALTER ADD COLUMN）→ 允许追加并升格分区指纹
     if manifest.schema_fingerprint != def.schema_fingerprint() {
         if !def
@@ -568,7 +572,7 @@ pub(crate) fn append_partition(
     manifest.segments.extend(entries.iter().cloned());
     P_MAN_READ_NS.fetch_add(t.elapsed().as_nanos() as u64, AtomicOrd::Relaxed);
     let t = std::time::Instant::now();
-    manifest.commit(store, &dir)?;
+    manifest.commit(store, &dir, epoch)?;
     P_MAN_COMMIT_NS.fetch_add(t.elapsed().as_nanos() as u64, AtomicOrd::Relaxed);
     if store.is_local() {
         let t = std::time::Instant::now();
@@ -646,6 +650,7 @@ pub(crate) fn overwrite_partition(
     values: &[crate::types::Literal],
     batches: &[RecordBatch],
     expected: Option<u64>,
+    epoch: u64,
 ) -> Result<WriteResult> {
     let schema = data_schema(def);
     let batches = pad_loose_batches(def, batches, &schema)?;
@@ -680,6 +685,10 @@ pub(crate) fn overwrite_partition(
     // 旧 manifest（不存在 = 新分区）
     let old = PartitionManifest::read(store, &dir)?;
 
+    // F25：写者身份先判（与 CAS 同位置——锁内、写段之前，免得白写段留孤儿）
+    if let Some(m) = old.as_ref() {
+        m.check_writer_epoch(epoch)?;
+    }
     // ★ CAS 检查：**锁内、写段之前**——写段之后再拒会把新段留成孤儿
     if let Some(exp) = expected {
         check_expected_generation(&dir, old.as_ref(), exp)?;
@@ -724,7 +733,7 @@ pub(crate) fn overwrite_partition(
     };
     manifest.segments = new_segments;
     let old_files: Vec<PathBuf> = old.map(|m| m.segment_paths(&dir)).unwrap_or_default();
-    manifest.commit(store, &dir)?;
+    manifest.commit(store, &dir, epoch)?;
     if store.is_local() {
         sync_index(store, table_dir, &dir, &manifest);
     }
@@ -749,13 +758,18 @@ pub(crate) fn occ_append_entry(
     def: &TableDef,
     values: &[crate::types::Literal],
     entry: &SegmentEntry,
+    epoch: u64,
 ) -> Result<()> {
     let mpath = PartitionManifest::manifest_path(dir);
     crate::remote::with_partition_mutex(dir, || {
         crate::remote::occ_commit(store, &mpath, |cur| {
+            if let Some(c) = cur.as_ref() {
+                c.check_writer_epoch(epoch)?;
+            }
             let mut m = cur.unwrap_or_else(|| {
                 PartitionManifest::new(named_values(def, values), def.schema_fingerprint())
             });
+            m.epoch = epoch;
             // 指纹一致 或 旧 schema 为当前前缀（ALTER ADD COLUMN）→ 升格
             if m.schema_fingerprint != def.schema_fingerprint() {
                 if !def.prefix_fingerprints().contains(&m.schema_fingerprint) {
@@ -791,6 +805,7 @@ fn append_partition_remote(
     batches: &[RecordBatch],
     schema: &SchemaRef,
     file_schema: &SchemaRef,
+    epoch: u64,
 ) -> Result<WriteResult> {
     let col_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
     let entry = match staging {
@@ -818,7 +833,7 @@ fn append_partition_remote(
         )?,
     };
     if staging.is_none() {
-        occ_append_entry(store, dir, def, values, &entry)?;
+        occ_append_entry(store, dir, def, values, &entry, epoch)?;
     }
     Ok(WriteResult {
         rows: entry.row_count,
@@ -1073,6 +1088,7 @@ mod tests {
             &d,
             &vals,
             &[data_batch(vec![Some(10)])],
+            0,
         )
         .unwrap();
         assert_eq!(r.rows, 1);
@@ -1098,6 +1114,7 @@ mod tests {
             &d,
             &vals,
             &[data_batch(vec![Some(10)])],
+            0,
         )
         .unwrap();
         append_partition(
@@ -1107,6 +1124,7 @@ mod tests {
             &d,
             &vals,
             &[data_batch(vec![Some(20)])],
+            0,
         )
         .unwrap();
         let pdir = tdir.join("dt=1970-01-02");
@@ -1127,6 +1145,7 @@ mod tests {
             &vals,
             &[data_batch(vec![Some(7), Some(8)])],
             None,
+            0,
         )
         .unwrap();
         let m = PartitionManifest::read(&store, &pdir).unwrap().unwrap();
@@ -1136,7 +1155,7 @@ mod tests {
         // 延迟回收语义：旧文件留原地（不被 manifest 引用 = 孤儿），
         // GC 安全期后清理——不再立即进 trash（保护在途扫描）
         // 空 overwrite = 清空分区
-        overwrite_partition(&store, None, &tdir, &d, &vals, &[], None).unwrap();
+        overwrite_partition(&store, None, &tdir, &d, &vals, &[], None, 0).unwrap();
         let m = PartitionManifest::read(&store, &pdir).unwrap().unwrap();
         assert_eq!(m.total_rows(), 0);
         assert!(m.segments.is_empty());
@@ -1149,7 +1168,16 @@ mod tests {
         let d = def();
         let tdir = root.join("t");
         let vals = [Literal::Date(1)];
-        append_partition(&store, None, &tdir, &d, &vals, &[data_batch(vec![Some(1)])]).unwrap();
+        append_partition(
+            &store,
+            None,
+            &tdir,
+            &d,
+            &vals,
+            &[data_batch(vec![Some(1)])],
+            0,
+        )
+        .unwrap();
         // 错列名
         let schema = Arc::new(Schema::new(vec![Field::new(
             "wrong",
@@ -1161,12 +1189,12 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1]))],
         )
         .unwrap();
-        assert!(append_partition(&store, None, &tdir, &d, &vals, &[b]).is_err());
+        assert!(append_partition(&store, None, &tdir, &d, &vals, &[b], 0).is_err());
         // 错类型
         let schema2 = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, true)]));
         let b2 =
             RecordBatch::try_new(schema2, vec![Arc::new(StringArray::from(vec!["x"]))]).unwrap();
-        assert!(append_partition(&store, None, &tdir, &d, &vals, &[b2]).is_err());
+        assert!(append_partition(&store, None, &tdir, &d, &vals, &[b2], 0).is_err());
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1182,6 +1210,7 @@ mod tests {
             &d,
             &[Literal::Date(1)],
             &[data_batch(vec![Some(5), None])],
+            0,
         )
         .unwrap();
         let pdir = tdir.join("dt=1970-01-02");

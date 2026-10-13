@@ -1117,7 +1117,7 @@ fn error_catalog_endpoint_and_no_off_catalog_codes() {
     assert_eq!(r.status, 200, "目录端点应免鉴权可读");
     let codes = r.json()["codes"].as_array().cloned().unwrap_or_default();
     // 条数与代码侧枚举一致（docs/error-codes.md ↔ enum 的逐字对账在单测里）
-    assert_eq!(codes.len(), 22, "目录应列出全部 22 个码");
+    assert_eq!(codes.len(), 23, "目录应列出全部 23 个码");
     for c in &codes {
         for k in ["code", "http", "retry", "category", "sqlState"] {
             assert!(c.get(k).is_some(), "目录条目缺字段 {k}: {c}");

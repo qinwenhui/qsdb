@@ -34,6 +34,7 @@ pub enum ErrorCode {
     // ---- resource ----
     AlreadyExists,
     WriteConflict,
+    StaleWriter,
     NotFound,
     // ---- request ----
     InvalidArgument,
@@ -54,7 +55,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// 全量清单（目录端点与漂移测试的唯一来源）。
-    pub const ALL: [ErrorCode; 22] = [
+    pub const ALL: [ErrorCode; 23] = [
         Self::QueryTimeout,
         Self::QueryCancelled,
         Self::QueryMemoryLimit,
@@ -66,6 +67,7 @@ impl ErrorCode {
         Self::Unsupported,
         Self::AlreadyExists,
         Self::WriteConflict,
+        Self::StaleWriter,
         Self::InvalidArgument,
         Self::InvalidIpc,
         Self::NotFound,
@@ -93,6 +95,7 @@ impl ErrorCode {
             Self::Unsupported => "UNSUPPORTED",
             Self::AlreadyExists => "ALREADY_EXISTS",
             Self::WriteConflict => "WRITE_CONFLICT",
+            Self::StaleWriter => "STALE_WRITER",
             Self::InvalidArgument => "INVALID_ARGUMENT",
             Self::InvalidIpc => "INVALID_IPC",
             Self::NotFound => "NOT_FOUND",
@@ -123,7 +126,7 @@ impl ErrorCode {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
             Self::Unsupported => StatusCode::NOT_IMPLEMENTED,
-            Self::AlreadyExists | Self::WriteConflict => StatusCode::CONFLICT,
+            Self::AlreadyExists | Self::WriteConflict | Self::StaleWriter => StatusCode::CONFLICT,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
@@ -156,7 +159,9 @@ impl ErrorCode {
             | Self::ParseError
             | Self::TypeError
             | Self::Unsupported => "query",
-            Self::AlreadyExists | Self::WriteConflict | Self::NotFound => "resource",
+            Self::AlreadyExists | Self::WriteConflict | Self::StaleWriter | Self::NotFound => {
+                "resource"
+            }
             Self::InvalidArgument | Self::InvalidIpc => "request",
             Self::Unauthorized | Self::Forbidden => "auth",
             Self::TooManyQueries | Self::MemoryPressure | Self::ReadOnly => "capacity",
@@ -184,6 +189,7 @@ impl ErrorCode {
             // 40001 = serialization_failure：并发更新冲突的**标准码**（客户端据此
             // "重读再决定"，不是"改名"）
             Self::WriteConflict => "40001",
+            Self::StaleWriter => "40001",
             Self::InvalidArgument => "42000",
             Self::InvalidIpc => "08P01",
             Self::NotFound => "42704",
@@ -215,6 +221,7 @@ impl ErrorCode {
             QsdbError::InvalidArgument(_) => Self::InvalidArgument,
             QsdbError::AlreadyExists(_) => Self::AlreadyExists,
             QsdbError::WriteConflict { .. } => Self::WriteConflict,
+            QsdbError::StaleWriter(_) => Self::StaleWriter,
             QsdbError::Unsupported(_) => Self::Unsupported,
             QsdbError::Meta(_) => Self::MetadataError,
             // 只读库拒绝变更：对客户端是"这台不行"，不是"请求写错了"
@@ -276,7 +283,9 @@ impl ErrorCode {
             Self::AlreadyExists => Code::AlreadyExists,
             // gRPC 无专用并发冲突码；ABORTED 是标准类（"请重读再试"），
             // 不用 AlreadyExists（那是"改名"语义，会误导调用方）
-            Self::WriteConflict => Code::Aborted,
+            // 与 WRITE_CONFLICT 同族（"分区已前进，你的写被拒"），gRPC 侧一并用
+            // ABORTED（标准类 = 读最新状态后重新决定；盲目重试无用）
+            Self::WriteConflict | Self::StaleWriter => Code::Aborted,
             Self::IoError => Code::Unavailable,
             Self::QueryMemoryLimit
             | Self::QueryPanic

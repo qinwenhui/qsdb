@@ -145,6 +145,19 @@ pub struct QsdbOptions {
     /// refresh-index；server /write 返回 503）。standby/只读副本用——
     /// 与「多写者协议」正交：只读句柄永不做写者，杜绝误连双主。
     pub read_only: bool,
+    /// **写者身份代**（qsdb-sync F25；默认 0 = 不启用）。
+    ///
+    /// 每次分区提交原样盖进 manifest（`PartitionManifest::epoch`）。
+    /// 它是**持久身份**、不是进程标识、也**不由进程自增**：
+    /// - 正常单写者：一直 0，行为与旧版完全一致；
+    /// - 主备/failover：接管方配一个**比原主库大**的值（`--writer-epoch N`），
+    ///   从此这块数据"归属于第 N 代写者"；
+    /// - 生态侧（qsdb-sync replica）用 `(epoch, generation)` 复合序判增量，
+    ///   于是"两边独立追平到同一个 generation"这种撞值**不再可能静默分歧**。
+    ///
+    /// 内核自己也会拦：盘上 `epoch` 比本配置大 → 拒绝写入（`STALE_WRITER`）——
+    /// 防止接管后老进程（配着小 epoch）继续写回。
+    pub writer_epoch: u64,
 }
 
 impl Default for QsdbOptions {
@@ -161,6 +174,7 @@ impl Default for QsdbOptions {
             staging_dir: None,
             durability: Durability::ProcessCrash,
             read_only: false,
+            writer_epoch: 0,
         }
     }
 }
@@ -458,6 +472,12 @@ impl Qsdb {
         self.read_only
     }
 
+    /// **写者身份代**（F25；见 [`QsdbOptions::writer_epoch`]）。写路径把它盖进
+    /// manifest，并据此拒绝"过期写者"。
+    pub fn writer_epoch(&self) -> u64 {
+        self.opts.writer_epoch
+    }
+
     /// 写路径统一闸门：只读句柄拒绝一切变更。
     fn ensure_writable(&self) -> Result<()> {
         if self.read_only {
@@ -575,6 +595,7 @@ impl Qsdb {
                         &def,
                         &values,
                         &[merged],
+                        self.writer_epoch(),
                     )?,
                 );
                 cur.clear();
@@ -683,6 +704,7 @@ impl Qsdb {
             &ordered,
             &data_batches,
             expected_generation,
+            self.writer_epoch(),
         )
     }
 
@@ -852,7 +874,7 @@ impl Qsdb {
             .zip(ordered.iter().cloned())
             .collect();
         empty.segments = Vec::new();
-        empty.commit(&self.store, &dir)?;
+        empty.commit(&self.store, &dir, self.writer_epoch())?;
         let rel = dir
             .strip_prefix(tdir)
             .unwrap_or(&dir)
@@ -1245,7 +1267,10 @@ impl Qsdb {
             Some(&self.file_cache),
             &tdir,
             &def,
-            &crate::compact::CompactOptions::default(),
+            &crate::compact::CompactOptions {
+                writer_epoch: self.writer_epoch(),
+                ..Default::default()
+            },
         )
     }
 
@@ -1258,6 +1283,10 @@ impl Qsdb {
         self.ensure_writable()?;
         let def = self.def(None, table)?;
         let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
+        let opts = crate::compact::CompactOptions {
+            writer_epoch: self.writer_epoch(),
+            ..opts
+        };
         crate::compact::compact_table(&self.store, Some(&self.file_cache), &tdir, &def, &opts)
     }
 
@@ -1409,6 +1438,7 @@ impl Qsdb {
                         &def,
                         &rec.partition_values,
                         &rec.entry,
+                        self.writer_epoch(),
                     )?;
                 }
                 st.remove_pair(&rec, &parquet);

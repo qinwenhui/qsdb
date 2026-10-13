@@ -135,11 +135,12 @@ impl WriteBuffer {
         let tdir = table_dir(self.db.root(), crate::catalog::DEFAULT_DB, table);
         let store = Arc::clone(self.db.store());
         let staging = self.db.staging(); // Option<&Staging>：Copy，直接进闭包
+        let epoch = self.db.writer_epoch(); // 写者身份代（F25），闭包内按值捕获
         use rayon::prelude::*;
         let results: Vec<Result<WriteResult>> = merged
             .into_par_iter()
             .map(|(_key, (vals, list))| {
-                write::append_partition(&store, staging, &tdir, &def, &vals, &list)
+                write::append_partition(&store, staging, &tdir, &def, &vals, &list, epoch)
             })
             .collect();
         let mut total = WriteResult::default();

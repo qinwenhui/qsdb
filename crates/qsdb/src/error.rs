@@ -79,6 +79,13 @@ pub enum QsdbError {
         actual: u64,
     },
 
+    /// **过期写者**（qsdb-sync F25）：分区的 `epoch` 比本进程配置的大。
+    ///
+    /// 与 [`Self::WriteConflict`] 同族但**动作不同**：冲突是"重读再决定"，
+    /// 过期写者是"**停止写**"——本进程要么配错了库，要么接管身份没抬 epoch。
+    #[error("stale writer: {0}")]
+    StaleWriter(String),
+
     /// 查询被取消（kill / 客户端断连）
     #[error("query cancelled: {0}")]
     QueryCancelled(String),
@@ -183,6 +190,10 @@ impl QsdbError {
 
     pub fn already_exists(msg: impl Into<String>) -> Self {
         Self::AlreadyExists(msg.into())
+    }
+
+    pub fn stale_writer(msg: impl Into<String>) -> Self {
+        Self::StaleWriter(msg.into())
     }
 
     pub fn read_only(msg: impl Into<String>) -> Self {

@@ -44,8 +44,28 @@ pub struct PartitionManifest {
     pub schema_fingerprint: u64,
     /// 远端多写者诊断（存储设计 §7.2）：写者进程标识，仅用于 GC/诊断，
     /// 不参与正确性。本地提交恒 0（旧 manifest 兼容：字段缺省即 0）。
+    ///
+    /// **别与下面的 `epoch` 混用**：这个是"哪个进程写的"（每次启动随机），
+    /// `epoch` 是"哪一代写者"（持久、单调、参与正确性）。
     #[serde(default)]
     pub writer_epoch: u64,
+    /// **写者身份代**（qsdb-sync F25）。由部署显式配置
+    /// （`QsdbOptions::writer_epoch`，默认 0），每次提交原样落盘。
+    ///
+    /// 与 `generation` 的分工：
+    /// - `generation` 是**分区提交计数器**（本地每次 +1），回答"这个分区被改过几次"；
+    /// - `epoch` 是**写者身份**，回答"这块数据属于哪一代写者"，**接管（failover）时
+    ///   由运维显式抬高**，进程自己永不自增。
+    ///
+    /// 为什么要它：`generation` 是计数器不是内容指纹，防脑裂只是**单向**保证
+    /// （`dst > src` 拒绝），`dst == src` 并不蕴含内容一致 —— 脑裂后两边各自演进
+    /// 到同一个 generation 就会**静默分歧**。生态侧（qsdb-sync replica）改用
+    /// `(epoch, generation)` 复合序即可根除撞值：epoch 不同即拒绝协商，
+    /// 不依赖任何内容比对。
+    ///
+    /// 缺省 0 = 未启用身份代（旧 manifest 兼容：字段缺省即 0）。
+    #[serde(default)]
+    pub epoch: u64,
 }
 
 impl PartitionManifest {
@@ -57,7 +77,24 @@ impl PartitionManifest {
             segments: Vec::new(),
             schema_fingerprint,
             writer_epoch: 0,
+            epoch: 0,
         }
+    }
+
+    /// **写者身份校验**：盘上的 epoch 比本进程配置的大 ⇒ 本进程是**过期写者**，
+    /// 拒绝写入（qsdb-sync F25 的第二半——光记录 epoch 只是让生态能判，
+    /// 这条让内核自己也不许"退回去写"）。
+    ///
+    /// 默认全 0 时**恒通过**（未启用身份代 = 旧行为不变）；只有运维显式抬高过
+    /// epoch 之后，忘配/配小的进程才会被拦下——这正是我们要的"显式拒绝"。
+    pub fn check_writer_epoch(&self, configured: u64) -> Result<()> {
+        if self.epoch > configured {
+            return Err(QsdbError::stale_writer(format!(
+                "partition (values {:?}) was last written by writer epoch {} but this process                  is epoch {} — refusing to write as a stale writer. If this process really                  should take over, start it with --writer-epoch {} (or larger); otherwise                  it is pointed at the wrong database.",
+                self.partition_values, self.epoch, configured, self.epoch
+            )));
+        }
+        Ok(())
     }
 
     pub fn manifest_path(partition_dir: &Path) -> PathBuf {
@@ -85,9 +122,13 @@ impl PartitionManifest {
         }
     }
 
-    /// 原子提交（在分区锁内调用）：generation+1 后替换磁盘文件。
-    pub fn commit(&mut self, store: &Store, partition_dir: &Path) -> Result<()> {
+    /// 原子提交（在分区锁内调用）：generation+1、**写者身份代盖章**后替换磁盘文件。
+    ///
+    /// `epoch` 来自部署配置（[`crate::QsdbOptions::writer_epoch`]）——提交时无条件
+    /// 盖章，所以"谁最后写的"在盘上永远可查。
+    pub fn commit(&mut self, store: &Store, partition_dir: &Path, epoch: u64) -> Result<()> {
         self.generation += 1;
+        self.epoch = epoch;
         let bytes = postcard::to_allocvec(self)
             .map_err(|e| QsdbError::meta(format!("serialize manifest failed: {e}")))?;
         store.write_atomic(&Self::manifest_path(partition_dir), &bytes)
@@ -160,7 +201,7 @@ mod tests {
     fn commit_roundtrip_and_generation() {
         let (store, dir) = tmpdir("rt");
         let mut m = sample(vec![("dt".into(), Literal::Date(1))]);
-        m.commit(&store, &dir).unwrap();
+        m.commit(&store, &dir, 0).unwrap();
         assert_eq!(m.generation, 1);
         let back = PartitionManifest::read(&store, &dir).unwrap().unwrap();
         assert_eq!(back, m);
@@ -174,7 +215,7 @@ mod tests {
             created_at: 2,
             column_stats: vec![],
         });
-        m2.commit(&store, &dir).unwrap();
+        m2.commit(&store, &dir, 0).unwrap();
         let back2 = PartitionManifest::read(&store, &dir).unwrap().unwrap();
         assert_eq!(back2.generation, 2);
         assert_eq!(back2.total_rows(), 15);

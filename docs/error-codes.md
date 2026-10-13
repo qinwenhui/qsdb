@@ -63,6 +63,7 @@ retry, category, sqlState}` 全表——驱动冷启动即可自配置映射，�
 | `UNSUPPORTED` | 501 | no | query | 当前版本未开放的能力（如 `CROSS JOIN`） | 改写法；确需则提需求 | `0A000` |
 | `ALREADY_EXISTS` | 409 | no | resource | DDL 对象已存在 | 加 `IF NOT EXISTS` 或改名 | `42P07` |
 | `WRITE_CONFLICT` | 409 | no | resource | **分区乐观并发冲突**：`overwrite_partition` 传了 `expected_generation`，而分区当前 `generation` 不符（已被他人改写） | **重读该分区最新 `generation` 再决定**（重试/换分区/人工介入）——盲目重试无用 | `40001` |
+| `STALE_WRITER` | 409 | no | resource | **过期写者**：分区的 `epoch`（写者身份代，见 `QsdbOptions::writer_epoch`）比本进程配置的大——本进程要么连错了库，要么接管身份没抬 epoch | **别重试**：确需接管就抬高 `--writer-epoch`（≥ 盘上值）后重启；否则检查连的哪个库 | `40001` |
 | `INVALID_ARGUMENT` | 400 | no | request | 参数非法：请求体形状错、值不在白名单、抽取失败 | 修请求（**拼错会显式报错，不静默兜底**） | `42000` |
 | `INVALID_IPC` | 400 | no | request | `/write` 的 Arrow IPC 流非法（缺 schema / 截断 / 列不匹配） | 修客户端编码 | `08P01` |
 | `NOT_FOUND` | 404 | no | resource | **资源端点**（`/files`、`/tables/{t}/schema` 等）的对象不存在 | 资源名写错？ | `42704` |

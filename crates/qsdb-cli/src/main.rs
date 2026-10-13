@@ -36,11 +36,18 @@ enum Cmd {
         /// 数据库根目录
         #[arg(long)]
         path: PathBuf,
+        /// 写者身份代（F25；默认 0）。接管后要经 CLI 写入时必须显式抬高，
+        /// 否则会被 `STALE_WRITER` 拦下（见 `docs/configuration.md`）。
+        #[arg(long, default_value_t = 0)]
+        writer_epoch: u64,
     },
     /// 执行单条 SQL（DDL/DML/SELECT）
     Query {
         #[arg(long)]
         path: PathBuf,
+        /// 写者身份代（F25；默认 0）。接管后要经 CLI 写入时必须显式抬高。
+        #[arg(long, default_value_t = 0)]
+        writer_epoch: u64,
         sql: String,
     },
     /// 运维：表/分区/索引/垃圾清理
@@ -62,6 +69,14 @@ enum Cmd {
         /// 自动 compaction 周期（秒）
         #[arg(long)]
         auto_compact_secs: Option<u64>,
+        /// **写者身份代**（qsdb-sync F25；默认 0 = 不启用）。
+        ///
+        /// 主备/failover 时由接管方**显式抬高**（比原主库大）。之后：
+        /// ① 每次提交把它盖进 manifest，生态（qsdb-sync replica）据此用
+        /// `(epoch, generation)` 复合序判增量——撞值不再可能；
+        /// ② 配着小 epoch 的旧进程再连回来会被拒（`STALE_WRITER`）。
+        #[arg(long, default_value_t = 0)]
+        writer_epoch: u64,
         /// 热数据缓存预算（MB；0 = 关闭，默认 256）。
         /// 保守默认守低占用定位；宽投影要快请显式调大（代价见
         /// `QsdbOptions::scan_cache_bytes` 文档的内存-性能权衡）。
@@ -187,9 +202,13 @@ enum AdminCmd {
 fn main() {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Shell { path } => shell(path),
-        Cmd::Query { path, sql } => {
-            let db = open(&path);
+        Cmd::Shell { path, writer_epoch } => shell(path, writer_epoch),
+        Cmd::Query {
+            path,
+            writer_epoch,
+            sql,
+        } => {
+            let db = open_with_epoch(&path, writer_epoch);
             let t = std::time::Instant::now();
             match db.sql(&sql) {
                 Ok(r) => print_result(&r, t.elapsed()),
@@ -368,6 +387,7 @@ fn main() {
             addr,
             token,
             auto_compact_secs,
+            writer_epoch,
             cache_mb,
             max_concurrent_queries,
             spill_dir,
@@ -456,6 +476,7 @@ fn main() {
                 storage,
                 durability: dur,
                 read_only,
+                writer_epoch,
                 // MB → 字节；0 = 不限（嵌入方/部署方自控）
                 memory_budget_bytes: (memory_budget_mb > 0)
                     .then(|| memory_budget_mb.saturating_mul(1024 * 1024)),
@@ -506,7 +527,16 @@ fn main() {
 }
 
 fn open(path: &std::path::Path) -> Qsdb {
-    match Qsdb::open(path, QsdbOptions::default()) {
+    open_with_epoch(path, 0)
+}
+
+/// 带写者身份代打开（F25）。
+fn open_with_epoch(path: &std::path::Path, writer_epoch: u64) -> Qsdb {
+    let opts = QsdbOptions {
+        writer_epoch,
+        ..Default::default()
+    };
+    match Qsdb::open(path, opts) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("open {} failed: {e}", path.display());
@@ -515,8 +545,8 @@ fn open(path: &std::path::Path) -> Qsdb {
     }
 }
 
-fn shell(path: PathBuf) {
-    let db = open(&path);
+fn shell(path: PathBuf, writer_epoch: u64) {
+    let db = open_with_epoch(&path, writer_epoch);
     println!("QSDB shell — path: {}", path.display());
     println!("commands end with ';'. dot-commands: .tables  .schema <t>  .exit");
     let mut rl = rustyline::DefaultEditor::new().expect("init readline");

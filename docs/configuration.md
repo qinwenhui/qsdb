@@ -184,3 +184,38 @@ CLI 等价：`qsdb admin tables|partitions|compact|refresh-index|gc`。
 1. 新配置项必须先归入上表某一层级并在本文登记，才能进代码。
 2. 「运行期热更」是能力承诺：热更项不允许在 open 后被缓存进长生命周期结构。
 3. 改默认值需同步更新本文、`QsdbOptions::default()`、CI 中相关断言。
+
+## `--writer-epoch`：写者身份代（qsdb-sync F25）
+
+主备 / failover 场景下的**持久写者身份**，默认 `0`（不启用）。它与
+`generation` 不是一回事：
+
+| | `generation` | `writer_epoch` |
+|---|---|---|
+| 是什么 | **分区提交计数器** | **写者身份代** |
+| 谁改 | 每次提交由内核 +1 | **只有运维动作**（接管时显式抬高） |
+| 回答 | "这个分区被改过几次" | "这块数据属于哪一代写者" |
+| 用途 | CAS（`expected_generation`）、同步增量 | `(epoch, generation)` 复合判据、防静默分歧 |
+
+**为什么需要它**：`generation` 是计数器不是内容指纹，防脑裂只是**单向**保证
+（`dst > src` 拒绝），而 `dst == src` 并不蕴含内容一致。脑裂后两边各自演进恰好
+追平到同一个 generation 时，以 generation 为判据的同步会误判"已同步"而**静默分歧**。
+
+**怎么用**：
+
+```bash
+# 主库：不配（默认 0）
+qsdb server --path /data/db --addr 0.0.0.0:9430
+
+# 备库接管（failover）：显式抬到比原主库大
+qsdb server --path /data/db --addr 0.0.0.0:9430 --writer-epoch 1
+```
+
+两条保证：
+1. **每次提交把 epoch 盖进 manifest**（`PartitionManifest::epoch`）——生态侧
+   （qsdb-sync replica）据此用 `(epoch, generation)` 复合序判增量，撞值不再可能；
+2. **内核自己也不许回退写**：盘上 `epoch` 比本进程配置大 → 写被拒，
+   返回 `STALE_WRITER`（409，`retry=no`）——防止"接管后老进程又连回来"。
+
+默认全 0 时两项都是 no-op（与旧版行为完全一致）；只有运维显式抬高过 epoch 之后，
+忘配 / 配小的进程才会被拦下。

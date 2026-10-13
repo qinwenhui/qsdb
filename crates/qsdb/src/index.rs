@@ -160,6 +160,7 @@ mod tests {
             }],
             schema_fingerprint: 7,
             writer_epoch: 0,
+            epoch: 0,
         }
     }
 

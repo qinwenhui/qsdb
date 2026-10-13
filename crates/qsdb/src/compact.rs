@@ -38,6 +38,9 @@ pub struct CompactOptions {
     pub min_segments: usize,
     /// 平均 segment 大于该值（字节）则跳过（已足够大）
     pub max_avg_segment_bytes: u64,
+    /// **写者身份代**（F25）：compaction 也是写者，提交时一并盖章。
+    /// 从 `QsdbOptions::writer_epoch` 透传（见 `Qsdb::compact_table_with`）。
+    pub writer_epoch: u64,
 }
 
 impl Default for CompactOptions {
@@ -45,6 +48,7 @@ impl Default for CompactOptions {
         Self {
             min_segments: 4,
             max_avg_segment_bytes: 64 * 1024 * 1024,
+            writer_epoch: 0,
         }
     }
 }
@@ -183,7 +187,7 @@ fn compact_partition_inner(
 
     // 原子提交：单 segment manifest
     manifest.segments = vec![entry.clone()];
-    manifest.commit(store, pdir)?;
+    manifest.commit(store, pdir, opts.writer_epoch)?;
     let rel = pdir
         .strip_prefix(table_dir)
         .unwrap_or(pdir)
@@ -377,10 +381,14 @@ fn compact_partition_remote(
         let mpath = PartitionManifest::manifest_path(pdir);
         let new_entry = entry.clone();
         crate::remote::occ_commit(store, &mpath, |cur| {
+            if let Some(c) = cur.as_ref() {
+                c.check_writer_epoch(opts.writer_epoch)?; // F25：过期写者不许 compact
+            }
             let mut m = cur.unwrap_or_else(|| {
                 PartitionManifest::new(manifest.partition_values.clone(), def.schema_fingerprint())
             });
             m.generation += 1;
+            m.epoch = opts.writer_epoch;
             m.segments = vec![new_entry.clone()];
             Ok(m)
         })?;
