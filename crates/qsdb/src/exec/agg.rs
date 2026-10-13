@@ -389,6 +389,57 @@ impl GroupTable {
     ///
     /// 用它的地方：`HashAggExec` 按本值增量预留（见 `exec/mod.rs`），
     /// 从而把「每分片各建一份完整组表」的**分片放大**如实记进全局预算。
+    /// **组件级占用剖析**（`QSDB_AGG_PROF=1` 时由执行器打印）。
+    ///
+    /// 为什么要有它：`estimated_bytes` 只给一个总数，而"组表胖"有好几种完全不同的
+    /// 成因（键 arena 涨 / 每组的 `Vec` 头 / 每组一个 `Literal` 堆对象 /
+    /// 哈希桶失衡），总数看不出是哪一种，改起来就只能猜。
+    /// 实测（2026-10-14）`SELECT DISTINCT gs` 250 万字符串组占 4.4GB，
+    /// 而 500 万 int64 组只占 569MB —— 差的就是这张表要指出的东西。
+    pub fn profile_bytes(&self) -> Vec<(&'static str, u64)> {
+        let vec_hdr = std::mem::size_of::<Vec<u32>>() as u64;
+        vec![
+            ("key_arena", self.key_arena.len() as u64),
+            ("key_arena_cap", self.key_arena.capacity() as u64),
+            ("key_off", self.key_off.len() as u64 * 4),
+            ("key_off_cap", self.key_off.capacity() as u64 * 4),
+            ("by_hash_buckets", self.by_hash.capacity() as u64 * 33),
+            ("by_hash_len", self.by_hash.len() as u64),
+            (
+                "by_hash_payload",
+                self.by_hash
+                    .values()
+                    .map(|v| v.capacity() as u64 * 4 + vec_hdr)
+                    .sum(),
+            ),
+            ("fast_slots_cap", self.fast_slots.capacity() as u64 * 16),
+            (
+                "fast_slots_inline_cap",
+                self.fast_slots_inline.capacity() as u64 * 16,
+            ),
+            (
+                "group_lits_cap",
+                self.group_lits
+                    .iter()
+                    .map(|v| v.capacity() as u64 * std::mem::size_of::<Literal>() as u64)
+                    .sum(),
+            ),
+            // **堆内字符串**（`Literal::Utf8` 的 String 体）——`estimated_bytes`
+            // **没有**把这块算进去（它只数容器容量）。这一行就是为了让那笔账可见。
+            (
+                "group_lits_heap_str",
+                self.group_lits
+                    .iter()
+                    .flat_map(|v| v.iter())
+                    .map(|l| match l {
+                        Literal::Utf8(s) => s.capacity() as u64 + 32,
+                        _ => 0,
+                    })
+                    .sum(),
+            ),
+        ]
+    }
+
     pub fn estimated_bytes(&self) -> u64 {
         let mut b: u64 = 0;
         b += self.key_arena.capacity() as u64;
@@ -1266,17 +1317,10 @@ impl GroupTable {
         self.pending_arity.unwrap_or(0)
     }
 
-    /// 输出用组键（[gid][分组列]）。
-    pub fn group_keys(&self) -> Vec<Vec<Literal>> {
-        let n = self.len();
-        let mut by_row = vec![Vec::with_capacity(self.group_lits.len()); n];
-        for gid in 0..n {
-            for col in &self.group_lits {
-                by_row[gid].push(col[gid].clone());
-            }
-        }
-        by_row
-    }
+    // `group_keys()` **已删**（2026-10-14）：它把列式的 `group_lits` 转置成
+    // `Vec<Vec<Literal>>`（每组一个 Vec 堆对象 + 一次 Literal 克隆），调用方再转回
+    // 列式——一进一出纯白扔。唯一调用方 `DistinctExec` 改走列式的
+    // [`build_output_batch_cols`]。留着它就是留着一个"顺手拿行式键"的陷阱。
 
     fn update_aggs(
         &mut self,
@@ -1717,7 +1761,132 @@ fn finalize_col(table: &GroupTable, ai: usize, agg: &AggExpr, n: usize) -> Resul
 }
 
 /// Literal 列表 → arrow 数组。
+///
+/// **快路径 = 一次遍历的 typed builder**（常见类型）；不认识的类型退回
+/// [`literals_to_array_slow`]。
+///
+/// 为什么要有快路径（2026-10-14 实测）：慢路径是"**每行建一个单元素 Arrow 数组
+/// 再 `interleave` 拼起来**"——n 行 = **n 个数组**，每个自带 `ArrayData` +
+/// buffers + `Arc` 链。`SELECT DISTINCT gs`（250 万字符串组）因此吃满 **4.4GB / 9s**
+/// （组表本身账上只有 449MB），对照 `count(DISTINCT gs)` 的 DuckDB 0.20s/400MB
+/// 差 87×。builder 是 O(n) 一趟、增量扩容，没有逐行的数组对象。
+///
+/// 快路径**只在字面量变体与目标 arrow 类型精确对应时**生效；需要隐式转换
+/// （如 `Int32` → `Int64`、带时区的 timestamp、decimal 精度调整）的一律退回慢路径——
+/// 那里有无条件 cast，语义完全一致。**宁可慢，不许悄悄换语义。**
 pub fn literals_to_array(lits: &[&Literal], ty: &LogicalType) -> Result<ArrayRef> {
+    use arrow::array::{BooleanBuilder, StringBuilder};
+    use arrow::datatypes::{DataType, Int8Type, Int16Type, Int32Type, Int64Type, TimeUnit};
+
+    if lits.is_empty() {
+        return Ok(arrow::array::new_empty_array(&ty.arrow_type()));
+    }
+    let dt = ty.arrow_type();
+
+    /// 数值/时间类共用的 builder 循环：`f` 做不到就是"类型不精确对应" → 退慢路径。
+    fn prim<T, F>(lits: &[&Literal], f: F) -> Option<ArrayRef>
+    where
+        T: arrow::datatypes::ArrowPrimitiveType,
+        F: Fn(&Literal) -> Option<T::Native>,
+    {
+        use arrow::array::PrimitiveBuilder;
+        let mut b = PrimitiveBuilder::<T>::with_capacity(lits.len());
+        for l in lits {
+            match l {
+                Literal::Null => b.append_null(),
+                other => b.append_value(f(other)?),
+            }
+        }
+        Some(std::sync::Arc::new(b.finish()) as ArrayRef)
+    }
+
+    let fast: Option<ArrayRef> = match &dt {
+        DataType::Int64 => prim::<Int64Type, _>(lits, |l| match l {
+            Literal::Int64(v) => Some(*v),
+            _ => None,
+        }),
+        DataType::Int32 => prim::<Int32Type, _>(lits, |l| match l {
+            Literal::Int32(v) => Some(*v),
+            _ => None,
+        }),
+        DataType::Int16 => prim::<Int16Type, _>(lits, |l| match l {
+            Literal::Int16(v) => Some(*v),
+            _ => None,
+        }),
+        DataType::Int8 => prim::<Int8Type, _>(lits, |l| match l {
+            Literal::Int8(v) => Some(*v),
+            _ => None,
+        }),
+        DataType::Float64 => prim::<arrow::datatypes::Float64Type, _>(lits, |l| match l {
+            Literal::Float64(v) => Some(*v),
+            _ => None,
+        }),
+        DataType::Float32 => prim::<arrow::datatypes::Float32Type, _>(lits, |l| match l {
+            Literal::Float32(v) => Some(*v),
+            _ => None,
+        }),
+        DataType::Date32 => prim::<arrow::datatypes::Date32Type, _>(lits, |l| match l {
+            Literal::Date(v) => Some(*v),
+            _ => None,
+        }),
+        // 只在**无时区**时走快路径：带 tz 的目标类型要 cast，交给慢路径。
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => {
+            prim::<arrow::datatypes::TimestampNanosecondType, _>(lits, |l| match l {
+                Literal::Timestamp(v) => Some(*v),
+                _ => None,
+            })
+        }
+        DataType::Boolean => {
+            let mut b = BooleanBuilder::with_capacity(lits.len());
+            let mut ok = true;
+            for l in lits {
+                match l {
+                    Literal::Null => b.append_null(),
+                    Literal::Boolean(v) => b.append_value(*v),
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            ok.then(|| std::sync::Arc::new(b.finish()) as ArrayRef)
+        }
+        DataType::Utf8 => {
+            let bytes: usize = lits
+                .iter()
+                .map(|l| match l {
+                    Literal::Utf8(s) => s.len(),
+                    _ => 0,
+                })
+                .sum();
+            let mut b = StringBuilder::with_capacity(lits.len(), bytes);
+            let mut ok = true;
+            for l in lits {
+                match l {
+                    Literal::Null => b.append_null(),
+                    Literal::Utf8(s) => b.append_value(s),
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            ok.then(|| std::sync::Arc::new(b.finish()) as ArrayRef)
+        }
+        _ => None,
+    };
+    if let Some(a) = fast {
+        return Ok(a);
+    }
+    literals_to_array_slow(lits, ty)
+}
+
+/// 慢路径：每行一个单元素数组 + `interleave`。
+///
+/// **只用于快路径覆盖不到的类型**（decimal / Binary / Interval / Time /
+/// LargeUtf8 / 带时区 ts / 需要隐式 cast 的混合字面量）。它正确但沉重——
+/// 别把它当默认路径用，见 [`literals_to_array`] 的实测数字。
+fn literals_to_array_slow(lits: &[&Literal], ty: &LogicalType) -> Result<ArrayRef> {
     let dt = ty.arrow_type();
     let mut one_by_one: Vec<ArrayRef> = Vec::with_capacity(lits.len());
     for l in lits {
@@ -1749,22 +1918,39 @@ pub fn literals_to_array(lits: &[&Literal], ty: &LogicalType) -> Result<ArrayRef
         .map_err(|e| QsdbError::invalid(format!("interleave literals: {e}")))
 }
 
-/// Distinct 输出（group keys → 全列批）。
-pub fn build_output_batch(
-    keys: &[Vec<Literal>],
+/// Distinct 输出（**列式**：直接从组表的 SoA 取键，不做行式转置）。
+///
+/// 早先 `DistinctExec` 走的是 `group_keys()`——把列式的 `group_lits` 转置成
+/// `Vec<Vec<Literal>>`（**每组一个 Vec 堆对象**：250 万组 = 250 万次分配），
+/// 交给 `build_output_batch` 再转回列式。**这一进一出纯属白扔**：
+/// `group_lits` 本来就是列式的（`finalize_table` 里的循环是同款）。
+pub fn build_output_batch_cols(
+    table: &GroupTable,
     schema: &arrow::datatypes::SchemaRef,
 ) -> Result<RecordBatch> {
-    let n = schema.fields().len();
-    let mut cols = Vec::with_capacity(n);
-    for c in 0..n {
-        let lits: Vec<&Literal> = keys.iter().map(|k| &k[c]).collect();
-        let ty =
-            LogicalType::try_from_arrow(schema.field(c).data_type()).unwrap_or(LogicalType::Int64);
+    let n = table.len();
+    let ncol = schema.fields().len();
+    // 组键列数必须与 schema 对齐：错位会静默把 A 列的值写进 B 列
+    if ncol != table.group_lits.len() {
+        return Err(QsdbError::invalid(format!(
+            "distinct 输出：schema {} 列 vs 组键 {} 列",
+            ncol,
+            table.group_lits.len()
+        )));
+    }
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(ncol);
+    for (gi, f) in schema.fields().iter().enumerate() {
+        let lits: Vec<&Literal> = (0..n).map(|gid| &table.group_lits[gi][gid]).collect();
+        let ty = LogicalType::try_from_arrow(f.data_type()).unwrap_or(LogicalType::Int64);
         cols.push(literals_to_array(&lits, &ty)?);
     }
     RecordBatch::try_new(Arc::clone(schema), cols)
-        .map_err(|e| QsdbError::invalid(format!("distinct output: {e}")))
+        .map_err(|e| QsdbError::invalid(format!("distinct out: {e}")))
 }
+
+// `build_output_batch(keys: &[Vec<Literal>], …)` **已删**（2026-10-14）：行式键的唯一
+// 来源是上面删掉的 `group_keys()`，两个一起走。列式入口见
+// [`build_output_batch_cols`]（`GROUP BY` 侧一直用的是同款列式循环 `finalize_table`）。
 
 #[cfg(test)]
 mod tests {

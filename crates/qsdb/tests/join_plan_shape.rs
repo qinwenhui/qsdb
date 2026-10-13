@@ -68,30 +68,27 @@ fn nodes(p: &LogicalPlan) -> (usize, usize) {
 }
 
 fn seeded(tag: &str) -> (qsdb::Qsdb, std::path::PathBuf) {
-    let root = std::env::temp_dir()
-        .join("qsdb_join_shape")
-        .join(format!(
-            "{tag}_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    let root = std::env::temp_dir().join("qsdb_join_shape").join(format!(
+        "{tag}_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
     let db = qsdb::Qsdb::open(&root, qsdb::QsdbOptions::default()).unwrap();
     db.sql("CREATE TABLE t (g BIGINT, v BIGINT)").unwrap();
     db.sql("CREATE TABLE d (g BIGINT, cat STRING)").unwrap();
-    db.sql("CREATE TABLE d2 (cat STRING, alias STRING)").unwrap();
-    // d3 的 join 键是**第二列**：`l_full`（左输入宽度）算错时会静默连错列
-    db.sql("CREATE TABLE d3 (note STRING, alias STRING)").unwrap();
-    db.sql("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+    db.sql("CREATE TABLE d2 (cat STRING, alias STRING)")
         .unwrap();
+    // d3 的 join 键是**第二列**：`l_full`（左输入宽度）算错时会静默连错列
+    db.sql("CREATE TABLE d3 (note STRING, alias STRING)")
+        .unwrap();
+    db.sql("INSERT INTO t VALUES (1,10),(2,20),(3,30)").unwrap();
     db.sql("INSERT INTO d VALUES (1,'a'),(2,'b'),(3,'a')")
         .unwrap();
-    db.sql("INSERT INTO d2 VALUES ('a','A'),('b','B')")
-        .unwrap();
-    db.sql("INSERT INTO d3 VALUES ('x','A'),('y','B')")
-        .unwrap();
+    db.sql("INSERT INTO d2 VALUES ('a','A'),('b','B')").unwrap();
+    db.sql("INSERT INTO d3 VALUES ('x','A'),('y','B')").unwrap();
     (db, root)
 }
 
@@ -109,7 +106,10 @@ fn three_table_equi_join_is_not_a_cross_product() {
     );
     let (j, c) = nodes(&p);
     assert_eq!(j, 2, "三表等值 join 应有 2 个 Join 节点：{p:?}");
-    assert_eq!(c, 0, "等值 join **不许**退化成叉积（结果会同、代价是乘积）：{p:?}");
+    assert_eq!(
+        c, 0,
+        "等值 join **不许**退化成叉积（结果会同、代价是乘积）：{p:?}"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 

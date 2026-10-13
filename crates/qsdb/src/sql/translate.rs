@@ -1328,7 +1328,8 @@ pub fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<(String, LogicalTyp
         // 要的都是"列"，限定名由 join 层的 ctx 另行提供。
         // 此前这里直接报错，于是**左侧是 join 的 join**（三表以上）只能走叉积分支——
         // 那正是 `complex_three_way` 113× 的另一半原因，两个 bug 恰好互相掩护。
-        LogicalPlan::Join { left, right, .. } | LogicalPlan::CrossJoinFilter { left, right, .. } => {
+        LogicalPlan::Join { left, right, .. }
+        | LogicalPlan::CrossJoinFilter { left, right, .. } => {
             let mut cols = plan_output_columns(left)?;
             cols.extend(plan_output_columns(right)?);
             cols

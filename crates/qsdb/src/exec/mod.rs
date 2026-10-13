@@ -940,11 +940,8 @@ impl ExecNode for DistinctExec {
             if t.is_empty() {
                 return self.next(); // 空分区：继续下一个
             }
-            let keys = t.group_keys();
-            return Some(
-                agg::build_output_batch(&keys, &self.schema())
-                    .map_err(|e| QsdbError::invalid(format!("distinct out: {e}"))),
-            );
+            // **列式**输出：组表本来就是 SoA，别再转置成行式（见 `build_output_batch_cols`）
+            return Some(agg::build_output_batch_cols(&t, &self.schema()));
         }
         while let Some(b) = self.input.next() {
             if let Err(e) = self.ctx.check() {
@@ -988,15 +985,28 @@ impl ExecNode for DistinctExec {
             return self.next();
         }
         self.emitted = true;
+        if std::env::var("QSDB_AGG_PROF").is_ok() {
+            let mut parts = self.state.profile_bytes();
+            parts.push(("estimated_bytes", self.state.estimated_bytes()));
+            parts.push(("groups", self.state.len() as u64));
+            eprintln!(
+                "[agg-prof] distinct rows={} {}",
+                self.accounted,
+                parts
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
         if self.state.is_empty() {
             return None;
         }
-        let keys = self.state.group_keys();
-        let out = match agg::build_output_batch(&keys, &self.schema()) {
-            Ok(o) => o,
-            Err(e) => return Some(Err(e)),
-        };
-        Some(Ok(out))
+        // **列式**输出：组表本来就是 SoA，别再转置成行式（见 `build_output_batch_cols`）
+        match agg::build_output_batch_cols(&self.state, &self.schema()) {
+            Ok(o) => Some(Ok(o)),
+            Err(e) => Some(Err(e)),
+        }
     }
 }
 

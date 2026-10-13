@@ -191,7 +191,7 @@ impl PartitionManifest {
                             "manifest {} 是格式 v{v}，本内核读 v{MANIFEST_VERSION}\
                              （v1 = 无 writer-identity 字段）",
                             path.display()
-                        )))
+                        )));
                     }
                 }?;
                 if m.version != 1 && m.version != MANIFEST_VERSION {
@@ -366,9 +366,7 @@ mod tests {
         let bytes = std::fs::read(&p).unwrap();
         assert_eq!(leading_version(&bytes), Some(MANIFEST_VERSION));
         // 砍掉尾部 3 字节（epoch 之外还有别的字段）→ 版本仍是 2，必须报损坏
-        store
-            .write_atomic(&p, &bytes[..bytes.len() - 3])
-            .unwrap();
+        store.write_atomic(&p, &bytes[..bytes.len() - 3]).unwrap();
         let e = format!("{}", PartitionManifest::read(&store, &dir).unwrap_err());
         assert!(e.contains("corrupt"), "截断应报损坏：{e}");
         std::fs::remove_dir_all(&dir).ok();
@@ -382,7 +380,10 @@ mod tests {
         m.version = 1;
         let bytes = postcard::to_allocvec(&m).unwrap();
         store
-            .write_atomic(&PartitionManifest::manifest_path(&dir), &bytes[..bytes.len() - 1])
+            .write_atomic(
+                &PartitionManifest::manifest_path(&dir),
+                &bytes[..bytes.len() - 1],
+            )
             .unwrap();
         let mut back = PartitionManifest::read(&store, &dir).unwrap().unwrap();
         assert_eq!(back.version, 1);
