@@ -156,7 +156,6 @@ fn join_left_outer_results_identical_with_and_without_spill() {
 
 /// 全局预算（而非每查询配额）触发时同样成立。
 #[test]
-#[ignore = "等缺口③（分区数/缓冲上界不看全局预算）修复后启用 —— 见 docs/进度与待办.md §二/§四"]
 fn join_spills_under_global_budget_too() {
     let root = tmp_root("global");
     let db = Qsdb::open(

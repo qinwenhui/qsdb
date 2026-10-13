@@ -1284,11 +1284,10 @@ fn spill_aware_merge(
         }
         // ② 本分区落盘的原始行（继续聚合进同一张表）
         for sp in spills.iter_mut().flatten() {
-            // AggSpill 自持预留（走 reserve_spill：只受全局预算约束）
-            let rows = sp.take_partition(pi)?;
-            for b in &rows {
-                merged.ingest(group, aggs, b)?;
-            }
+            // AggSpill 自持预留（走 reserve_spill：只受全局预算约束）。
+            // **流式**逐 run 吃（峰值 = 一个 run）——整个分区的行一起物化要求
+            // "单分区放得下"，小预算下做不到（聚合逐批可吃，没必要）。
+            sp.for_each_partition(pi, |b| merged.ingest(group, aggs, b))?;
         }
         if merged.is_empty() {
             out.push(None);

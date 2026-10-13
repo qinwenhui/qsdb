@@ -191,9 +191,8 @@ impl WindowExec {
     fn enter_spill(&mut self, collected: Vec<RecordBatch>) -> Result<()> {
         let schema = self.input.schema();
         let ctx = Arc::clone(&self.ctx);
-        let nparts = crate::exec::agg_spill::default_nparts();
-        let cap = crate::exec::agg_spill::PartSpill::part_cap_for(&ctx, nparts);
-        let mut sp = crate::exec::agg_spill::PartSpill::new(schema, &ctx, cap)?;
+        let (nparts, cap) = crate::exec::agg_spill::PartSpill::plan(&ctx);
+        let mut sp = crate::exec::agg_spill::PartSpill::new(schema, &ctx, nparts, cap)?;
         let n = sp.nparts();
         // ① 已物化的批：**含触发失败的那一批**（坑见 `execute_all`）
         for b in collected {
@@ -477,13 +476,21 @@ fn compute_window_fn(
             Ok(Arc::new(Int64Array::from(rn)))
         }
         WindowFn::Rank => {
+            // 名次的分母是**分区内位置**，不是全局行号：`rank()` 定义 = 分区内
+            // 严格排在其前面的行数 + 1，并列者同名次且跳号。故必须自己数
+            // 分区内位置 `pos`——早先用全局 `i + 1` 会让**第二个分区起跳号**
+            // （6 行两分区 → `1,2,3,1,5,6`）。
             let mut rk = vec![0i64; n];
             let mut cur_rank = 0i64;
+            let mut pos = 0i64;
             for i in 0..n {
                 if partition_start[i] {
-                    cur_rank = 1;
-                } else if order_changed(i) {
-                    cur_rank = i as i64 + 1;
+                    pos = 0;
+                }
+                pos += 1;
+                if pos == 1 || order_changed(i) {
+                    // 分区首行 / 新并列组首行 → 名次 = 该行在分区内的位置
+                    cur_rank = pos;
                 }
                 rk[i] = cur_rank;
             }

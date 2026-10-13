@@ -21,6 +21,9 @@
 //!
 //! 内存口径：在途 = 各分区缓冲合计（**计入全局预算**：push 时预留、落盘时归还）
 //! + 收尾时**单个分区**的行。峰值与分区数、单分区上界成正比，**与输入规模无关**。
+//! 额度不够时缓冲自动降级（提前落盘 / 一批一个 run），**push 不会因为要不到额度
+//! 而失败**——见 [`PartSpill::push_routed`]；取回侧同理，聚合类消费者走
+//! [`PartSpill::for_each_partition`] 逐 run 流式吃（峰值 = 一个 run）。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,9 +44,10 @@ use super::spill::{self, SpillDir};
 const PART_CAP_MAX: u64 = 4 * 1024 * 1024;
 const PART_CAP_MIN: u64 = 64 * 1024;
 
-/// 分区数：与常见并行度同量级即可——分区越多单分区越小，但文件数与收尾开销随之涨。
-/// （自适应分区留到 P3；先固定值把正确性与内存上界立住。）
-pub fn default_nparts() -> usize {
+/// 分区数（恒取此值）：与常见并行度同量级即可——分区越多单分区越小（物化消费者
+/// 的单分区足迹随之变小），但文件数与收尾开销随之涨。**不随额度收窄**，理由见
+/// [`PartSpill::plan`]。
+pub fn max_nparts() -> usize {
     rayon::current_num_threads().clamp(2, 16)
 }
 
@@ -87,20 +91,45 @@ pub struct PartSpill {
 }
 
 impl PartSpill {
-    /// 单分区缓冲上界的自适应（见 `AggSpill::part_cap_for` 的注释）。
-    pub fn part_cap_for(ctx: &crate::query::QueryContext, nparts: usize) -> u64 {
-        match ctx.memory_limit {
-            Some(l) => (l / (4 * nparts.max(1) as u64)).clamp(PART_CAP_MIN, PART_CAP_MAX),
-            None => PART_CAP_MAX,
-        }
+    /// **分区数与单分区缓冲上界的统一口径**（一次算定；调用方拿 `nparts` 算路由，
+    /// 再原样传给 [`Self::new`]——两处各算一次必然漂）。
+    ///
+    /// **分区数恒取上限**，只有单分区缓冲上界随有效额度 `eff` 缩放
+    /// （`eff = min(每查询配额, 全局预算)`；只看配额会在小全局预算下把逃生通道
+    /// 自己掐死，只看预算则每查询配额语义失效）。
+    ///
+    /// 为什么分区数**不**跟着小额度往下缩（早先缩到 2，是错的）：
+    /// - 分区数决定的是**物化消费者**的单分区足迹（join 建索引、窗口排序要整个
+    ///   分区在内存里）——那才是真正的大头内存，也正是"分区块"要解决的问题；
+    ///   分区少了，小额度下 join 反而**必然**失败（实测 256KB 预算 + 2 万行 build
+    ///   侧：`nparts = 2` → 单分区 330KB 装不下；`nparts = 16` → 40KB 轻松装下）。
+    /// - 而**被动缓冲**（分区数 × 单分区上界）有优雅降级：要不到额度就把该分区
+    ///   已缓冲的行提前落盘、甚至一批一个 run（见 [`Self::push_routed`]）——
+    ///   它不该反过来约束分区数。
+    ///
+    /// 单分区缓冲上界：`eff/4/nparts`（沿用旧比例），夹在 `[PART_CAP_MIN, PART_CAP_MAX]`；
+    /// 额度大时（常见生产配置）与旧口径**逐字节相同**，只有额度小到夹不住时才
+    /// 靠降级路径兜（此时总缓冲的真实硬上界是全局预算本身）。
+    pub fn plan(ctx: &crate::query::QueryContext) -> (usize, u64) {
+        let nparts = max_nparts();
+        let eff = match (ctx.memory_limit, ctx.global_budget()) {
+            (None, None) => return (nparts, PART_CAP_MAX),
+            (Some(l), None) => l,
+            (None, Some(g)) => g,
+            (Some(l), Some(g)) => l.min(g),
+        };
+        let cap = (eff / 4 / nparts as u64).clamp(PART_CAP_MIN, PART_CAP_MAX);
+        (nparts, cap)
     }
 
+    /// `nparts` 与 `part_cap` 由调用方经 [`Self::plan`] 算出后**原样传入**
+    /// （路由已按同一 `nparts` 算好，此处不得另行推导）。
     pub fn new(
         schema: SchemaRef,
         ctx: &std::sync::Arc<crate::query::QueryContext>,
+        nparts: usize,
         part_cap: u64,
     ) -> Result<Self> {
-        let nparts = default_nparts();
         let res = ctx.reserve_spill(0)?;
         Ok(Self {
             dir: SpillDir::new_in(ctx.spill_base()),
@@ -144,7 +173,32 @@ impl PartSpill {
             let sub = RecordBatch::try_new(Arc::clone(&self.schema), cols)
                 .map_err(|e| QsdbError::invalid(format!("part spill batch: {e}")))?;
             let bytes = sub.get_array_memory_size() as u64;
-            self.res.grow(bytes)?;
+            if self.res.grow(bytes).is_err() {
+                // **额度不够也不能失败**：`part_cap` 只是"想攒多大再落盘"的期望
+                // 上界，不是硬要求。先把这个分区已缓冲的行落盘腾地方，再试一次；
+                // 仍要不到（连一批都装不下，如预算已被常驻组表吃满）就**把这批
+                // 单独落成一个 run**——缓冲因此恒为空，每批必有进展。
+                //
+                // 早先这里是 `?`：小预算下逃生通道第一批就被自己掐死（实测
+                // 128KB 预算 + 124KB 组表 → 要 4KB 要不到 → 查询失败）。
+                if !self.bufs[p].is_empty() {
+                    let freed = self.buf_bytes[p];
+                    let path = spill::write_run(&mut self.dir, &self.bufs[p], &self.schema)?;
+                    self.runs[p].push(path);
+                    self.bufs[p].clear();
+                    self.buf_bytes[p] = 0;
+                    self.res.shrink(freed);
+                }
+                if self.res.grow(bytes).is_err() {
+                    // 记账拿不到就**不记账**：这批马上要落盘（下面 write_run 后即
+                    // 释放），驻留窗口是一个批，不会随输入规模增长——为它拒绝一个
+                    // 本可完成的查询不划算（同 `for_each_partition` 的口径）。
+                    let path =
+                        spill::write_run(&mut self.dir, std::slice::from_ref(&sub), &self.schema)?;
+                    self.runs[p].push(path);
+                    continue;
+                }
+            }
             self.buf_bytes[p] += bytes;
             self.bufs[p].push(sub);
             if self.buf_bytes[p] >= self.part_cap {
@@ -179,6 +233,43 @@ impl PartSpill {
 
     pub fn spilled_runs(&self) -> usize {
         self.runs.iter().map(|v| v.len()).sum()
+    }
+
+    /// **逐 run 流式取回**一个分区（峰值 = 一个 run，不是整个分区的行）。
+    ///
+    /// 与 [`Self::take_partition`] 的分工：**能逐批吃**的消费者（`GroupTable::ingest`）
+    /// 用本方法——把整个分区的行一起物化等于要求"单分区放得下"，小预算下做不到
+    /// 也没必要；**要整分区随机访问**的消费者（join 建索引、窗口排序）只能用
+    /// `take_partition`（那是算子固有需求，放不下就该如实报错）。
+    ///
+    /// 记账**尽力而为**：批已经由 `read_run` 分配出来了，此刻拒绝只会让一个本可
+    /// 完成的查询失败（数据已在盘上，没有别的出路）。峰值由 run 大小兜底
+    /// （≤ `part_cap` + 一批；退化路径下 = 一批），不构成 OOM 风险。
+    pub fn for_each_partition<F>(&mut self, p: usize, mut f: F) -> Result<()>
+    where
+        F: FnMut(&RecordBatch) -> Result<()>,
+    {
+        self.res.shrink(self.live);
+        self.live = 0;
+        for path in std::mem::take(&mut self.runs[p]) {
+            for b in spill::read_run(&path)? {
+                let bytes = b.get_array_memory_size() as u64;
+                let accounted = self.res.grow(bytes).is_ok();
+                f(&b)?;
+                if accounted {
+                    self.res.shrink(bytes);
+                }
+            }
+        }
+        // 内存里还没落盘的尾批（一个分区也可能攒着未达 cap 的尾巴）
+        let tail = std::mem::take(&mut self.bufs[p]);
+        let tail_bytes = std::mem::take(&mut self.buf_bytes[p]);
+        for b in &tail {
+            f(b)?;
+        }
+        drop(tail);
+        self.res.shrink(tail_bytes);
+        Ok(())
     }
 }
 
@@ -239,19 +330,18 @@ pub struct AggSpill {
 }
 
 impl AggSpill {
-    /// 单分区缓冲上界（转发 [`PartSpill::part_cap_for`]）。
-    pub fn part_cap_for(ctx: &crate::query::QueryContext, nparts: usize) -> u64 {
-        PartSpill::part_cap_for(ctx, nparts)
+    /// 分区数 / 单分区缓冲上界（转发 [`PartSpill::plan`]）。
+    pub fn plan(ctx: &crate::query::QueryContext) -> (usize, u64) {
+        PartSpill::plan(ctx)
     }
 
     pub fn new(
         schema: SchemaRef,
         ctx: &std::sync::Arc<crate::query::QueryContext>,
     ) -> Result<Self> {
-        let nparts = default_nparts();
-        let part_cap = PartSpill::part_cap_for(ctx, nparts);
+        let (nparts, part_cap) = PartSpill::plan(ctx);
         Ok(Self {
-            core: PartSpill::new(schema, ctx, part_cap)?,
+            core: PartSpill::new(schema, ctx, nparts, part_cap)?,
         })
     }
 
@@ -268,6 +358,14 @@ impl AggSpill {
 
     pub fn take_partition(&mut self, p: usize) -> Result<Vec<RecordBatch>> {
         self.core.take_partition(p)
+    }
+
+    /// 逐 run 流式取回（转发 [`PartSpill::for_each_partition`]，聚合类消费者用）。
+    pub fn for_each_partition<F>(&mut self, p: usize, f: F) -> Result<()>
+    where
+        F: FnMut(&RecordBatch) -> Result<()>,
+    {
+        self.core.for_each_partition(p, f)
     }
 
     pub fn spilled_runs(&self) -> usize {
@@ -326,6 +424,56 @@ mod tests {
             }
         }
         assert_eq!(total, 8, "行数守恒");
+    }
+
+    /// **额度掐死时的降级契约**（缺口③ 的另一半）：缓冲要不到额度 → 提前落盘 /
+    /// 一批一个 run，**push 永不失败**；随后 `for_each_partition` 仍能一行不少地
+    /// 取回。用可观察量（run 数）证明降级路径真的被走到——不是"恰好够用"。
+    #[test]
+    fn push_degrades_instead_of_failing_when_budget_is_exhausted() {
+        use crate::memory::MemoryPool;
+        // 预算 = 一批的大小（不是 0：池要真实存在才会拒绝）；组表不存在于此用例，
+        // 故这批的额度先被下面这次"占位预留"吃满 → 后续 push 必走降级。
+        let batch_bytes = batch(&[0; 64], &[0; 64]).get_array_memory_size() as u64;
+        let pool = Arc::new(MemoryPool::new(batch_bytes));
+        let ctx = crate::query::QueryContext::new_with_pool("t", None, None, Some(pool));
+        let hog = ctx.reserve_spill(batch_bytes).unwrap(); // 占满预算（模拟常驻组表）
+
+        let group = vec![PhysExpr::Column {
+            idx: 0,
+            name: "g".into(),
+            ty: crate::types::LogicalType::Int64,
+        }];
+        let mut sp = AggSpill::new(schema(), &ctx).unwrap();
+        let pushes = 10usize;
+        for k in 0..pushes {
+            let g: Vec<i64> = (0..64).map(|i| ((k * 64 + i) % 7) as i64).collect();
+            let v: Vec<i64> = (0..64).map(|i| (k * 64 + i) as i64).collect();
+            sp.push(&batch(&g, &v), &group)
+                .expect("额度不足时 push 必须降级而不是报错");
+        }
+        let runs = sp.spilled_runs();
+        assert!(
+            runs >= pushes - 1,
+            "预算被占满时应逐批落盘（应 ≥ {pushes} 个 run，实得 {runs}）——\
+             若为 0~1 说明降级路径没被走到，用例是空的"
+        );
+
+        // 取回：行数守恒（降级后 run 变多变小，但一行都不能丢）
+        let mut total = 0usize;
+        let mut per_part = Vec::new();
+        for p in 0..sp.nparts() {
+            let before = total;
+            sp.for_each_partition(p, |b| {
+                total += b.num_rows();
+                Ok(())
+            })
+            .unwrap();
+            per_part.push(total - before);
+        }
+        assert_eq!(total, pushes * 64, "降级路径丢行了");
+        assert_eq!(per_part.iter().sum::<usize>(), pushes * 64);
+        drop(hog);
     }
 
     /// 规范形态对 `Literal` 的等价性（组表侧与行侧同源）。

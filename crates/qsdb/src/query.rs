@@ -119,8 +119,8 @@ impl QueryContext {
     /// 为什么单开一条：配额管的是「这个查询的物化规模」（用户承诺的上限），
     /// 而溢出是配额不够时的**逃生通道**——若逃生通道自己也吃配额，小配额下
     /// 溢出永远启动不了（实测：64KB 配额的 GROUP BY 直接失败而不是落盘完成，
-    /// 那 P1 就等于没做）。上界由调用方按配额缩放单分区缓冲来兜
-    /// （`AggSpill::part_cap_for`），真正的硬上界是全局预算。
+    /// 那 P1 就等于没做）。上界由调用方按**有效额度**（配额与全局预算取小）缩放
+    /// 分区数与单分区缓冲来兜（`PartSpill::plan`），真正的硬上界是全局预算。
     pub fn reserve_spill(self: &Arc<Self>, bytes: u64) -> Result<Reservation> {
         let n = self.reserve_global(bytes)?;
         Ok(Reservation::from_parts_global(Arc::clone(self), n))
@@ -181,6 +181,16 @@ impl QueryContext {
     /// 溢出目录根（`None` = 系统临时目录）。
     pub fn spill_base(&self) -> Option<&std::path::Path> {
         self.spill_base.as_deref()
+    }
+
+    /// 全局预算（`None` = 无池 / 池本身不限）。
+    ///
+    /// 溢出缓冲的**自适应口径**必须看它：只看每查询配额（`memory_limit`）时，
+    /// 分区数 × 单分区上界算出的缓冲需求会撞上小全局预算——**逃生通道自己先被
+    /// 预算掐死**（报 `MEMORY_PRESSURE` 而不是落盘完成）。见
+    /// [`crate::exec::agg_spill::PartSpill::plan`]。
+    pub fn global_budget(&self) -> Option<u64> {
+        self.pool.as_ref().map(|p| p.budget()).filter(|b| *b > 0)
     }
 
     pub fn memory_used(&self) -> u64 {

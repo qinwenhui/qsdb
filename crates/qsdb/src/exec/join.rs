@@ -415,7 +415,15 @@ impl HashJoinExec {
         };
         // 键索引（键值 + 行号列表）同样常驻，一并记账：粗估每行 16B
         // （键拷贝 + 行号），量级正确即可——目的是让预算覆盖它，不追求逐字节。
-        res.grow(table.num_rows() as u64 * 16)?;
+        //
+        // **要不到这份额度不是终止理由**（同上面的 concat 峰值）：索引是 build 侧
+        // 常驻的第二块，装不下说明"单分区 build 侧太大"，正解是分得更细——交
+        // `enter_spill` 让每个分区各自物化（分区小了，行与索引一起变小）。
+        // 回归：本行原为 `res.grow(...)?`，小全局预算下 join 被直接打死。
+        if res.grow(table.num_rows() as u64 * 16).is_err() {
+            self.enter_spill(vec![table])?; // `res` 是局部量，随本次返回归还
+            return Ok(());
+        }
         self.build_res = Some(res);
         self.build_state = Some(BuildState { table, index });
         self.probe.prefetch(); // 见 CrossJoinExec：build 侧已退出，预取 probe
@@ -652,10 +660,9 @@ impl HashJoinExec {
         let build_schema = self.build.schema();
         let probe_schema = self.probe.schema();
         let ctx = Arc::clone(&self.ctx);
-        let nparts = crate::exec::agg_spill::default_nparts();
-        let cap = crate::exec::agg_spill::PartSpill::part_cap_for(&ctx, nparts);
-        let mut bs = crate::exec::agg_spill::PartSpill::new(build_schema, &ctx, cap)?;
-        let mut ps = crate::exec::agg_spill::PartSpill::new(probe_schema, &ctx, cap)?;
+        let (nparts, cap) = crate::exec::agg_spill::PartSpill::plan(&ctx);
+        let mut bs = crate::exec::agg_spill::PartSpill::new(build_schema, &ctx, nparts, cap)?;
+        let mut ps = crate::exec::agg_spill::PartSpill::new(probe_schema, &ctx, nparts, cap)?;
         let n = bs.nparts();
         // ① 已收集的 build 行 + 剩余 build 输入
         for b in collected {

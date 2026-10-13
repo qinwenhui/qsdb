@@ -117,12 +117,25 @@ impl MemoryPool {
         if self.try_add(bytes) {
             return Ok(());
         }
+        // 用 KB 而不是 MB：小预算（+小请求）下 MB 会把三个数全抹成 0，
+        // 排障时看不出"到底要了多少、还占着多少"（踩过一次）。
         Err(QsdbError::MemoryPressure(format!(
-            "memory budget {}MB exhausted: {}MB in use, {}MB requested (retry later)",
-            self.budget / 1_048_576,
-            self.exec.load(Ordering::Relaxed) / 1_048_576,
-            bytes / 1_048_576
+            "memory budget {}KB exhausted: {}KB in use ({}KB cache, {}KB evictable), {}KB requested (retry later)",
+            self.budget / 1024,
+            self.exec.load(Ordering::Relaxed) / 1024,
+            self.cache.load(Ordering::Relaxed) / 1024,
+            self.yieldable_bytes() / 1024,
+            bytes / 1024
         )))
+    }
+
+    /// 可挤兑者当前占用（**只读观测**：走 `used_bytes` 而不是 `yield_bytes`——
+    /// 后者会真去挤兑，拼错误信息的路上顺手清空缓存是荒谬的副作用）。
+    fn yieldable_bytes(&self) -> u64 {
+        let Ok(v) = self.yielders.lock() else {
+            return 0;
+        };
+        v.iter().map(|y| y.used_bytes()).sum()
     }
 
     /// 无条件尝试入账（CAS 循环，防并发超额）。

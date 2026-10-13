@@ -834,17 +834,14 @@ impl ExecNode for DistinctExec {
             })
             .collect();
         // 已在溢出态：逐分区产出
-        if let Some(sp) = self.spill.as_mut() {
+        if let Some(sp) = self.spill.take() {
             if self.spill_part >= sp.nparts() {
                 self.emitted = true;
+                self.spill = Some(sp);
                 return None;
             }
             let pi = self.spill_part;
             self.spill_part += 1;
-            let rows = match sp.take_partition(pi) {
-                Ok(r) => r,
-                Err(e) => return Some(Err(e)),
-            };
             let mut t = agg::GroupTable::new();
             let ogs: Vec<usize> = {
                 let lits = self.state.group_lits();
@@ -860,10 +857,14 @@ impl ExecNode for DistinctExec {
             if !ogs.is_empty() {
                 t.merge_subset(&self.state, ogs, 0);
             }
-            for b in &rows {
-                if let Err(e) = t.ingest(&group_exprs, &[], b) {
-                    return Some(Err(e));
-                }
+            // **流式**吃该分区（峰值 = 一个 run）：整个分区的行一起物化等于要求
+            // "单分区放得下"，小预算下做不到也没必要（聚合是逐批可吃的）。
+            // `take` 出 `sp` 是为了让闭包能借 `self` 的其它字段（借用冲突）。
+            let mut sp = sp;
+            let r = sp.for_each_partition(pi, |b| t.ingest(&group_exprs, &[], b));
+            self.spill = Some(sp);
+            if let Err(e) = r {
+                return Some(Err(e));
             }
             if t.is_empty() {
                 return self.next(); // 空分区：继续下一个
@@ -1029,17 +1030,14 @@ impl HashAggExec {
 
     /// 单分区产出：保留表里属于该分区的组 + 该分区落盘的行 → 一次聚合。
     fn spill_next(&mut self) -> Option<Result<RecordBatch>> {
-        let sp = self.spill.as_mut()?;
+        let mut sp = self.spill.take()?;
         if self.spill_part >= sp.nparts() {
             self.emitted = true;
+            self.spill = Some(sp);
             return None;
         }
         let pi = self.spill_part;
         self.spill_part += 1;
-        let rows = match sp.take_partition(pi) {
-            Ok(r) => r,
-            Err(e) => return Some(Err(e)),
-        };
         let mut t = agg::GroupTable::new();
         let ogs: Vec<usize> = {
             let lits = self.state.group_lits();
@@ -1054,10 +1052,13 @@ impl HashAggExec {
         if !ogs.is_empty() {
             t.merge_subset(&self.state, ogs, self.aggs.len());
         }
-        for b in &rows {
-            if let Err(e) = t.ingest(&self.group, &self.aggs, b) {
-                return Some(Err(e));
-            }
+        // 流式吃该分区（同 `DistinctExec`：峰值 = 一个 run）
+        let agg_list = self.aggs.clone();
+        let group = self.group.clone();
+        let r = sp.for_each_partition(pi, |b| t.ingest(&group, &agg_list, b));
+        self.spill = Some(sp);
+        if let Err(e) = r {
+            return Some(Err(e));
         }
         Some(agg::finalize_table(
             &t,

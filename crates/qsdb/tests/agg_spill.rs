@@ -153,7 +153,6 @@ fn multi_shard_spill_is_not_double_counted() {
 
 /// 全局预算（而非每查询配额）触发溢出时同样成立。
 #[test]
-#[ignore = "等缺口③（分区数/缓冲上界不看全局预算）修复后启用 —— 见 docs/进度与待办.md §二/§四"]
 fn global_budget_pressure_also_spills() {
     let root = tmp_root("global");
     let db = Qsdb::open(
