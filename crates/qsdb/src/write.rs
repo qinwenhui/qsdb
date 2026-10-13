@@ -642,6 +642,9 @@ pub fn write_prof_dump() -> Option<String> {
 /// 消失。Delta/Iceberg 对同分区并发 overwrite 都是**冲突报错让调用方裁决**。
 /// 机制现成：`generation` 是分区提交计数器（`PartitionManifest::commit` 每次 +1），
 /// 比对放在**锁内**（读到旧 manifest 之后、写新段之前）才是真 CAS。
+// 参数确实多（store/staging/table_dir/def/values/batches/expected/epoch），但每一个
+// 都是独立的写路径输入；与 `append_partition_remote` 同处理。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn overwrite_partition(
     store: &Store,
     staging: Option<&crate::staging::Staging>,
