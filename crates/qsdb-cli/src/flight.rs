@@ -146,11 +146,15 @@ impl FlightService for QsdbFlightService {
             .map_err(|_| Status::invalid_argument("descriptor cmd must be UTF-8 SQL"))?;
         let (_, res) = self.run_registered(&meta, &sql).await?;
         let (schema, rows) = match res {
-            qsdb::sql::SqlResult::Query { schema, batches } => {
-                (schema, batches.iter().map(|b| b.num_rows()).sum::<usize>())
-            }
-            qsdb::sql::SqlResult::Ok { message, .. } => {
-                return Err(Status::invalid_argument(format!("not a query: {message}")));
+            qsdb::sql::SqlResult::Query {
+                schema, batches, ..
+            } => (schema, batches.iter().map(|b| b.num_rows()).sum::<usize>()),
+            // `SqlResult` 是 `#[non_exhaustive]`（F27）：外部匹配必须留通配臂
+            // ——内核将来加的结果变体不该打断这里的编译。
+            _ => {
+                return Err(Status::invalid_argument(
+                    "not a query (unexpected result variant)",
+                ));
             }
         };
         let endpoint = FlightEndpoint {
@@ -187,8 +191,12 @@ impl FlightService for QsdbFlightService {
         let (_, res) = self.run_registered(&meta, &sql).await?;
         let schema = match res {
             qsdb::sql::SqlResult::Query { schema, .. } => schema,
-            qsdb::sql::SqlResult::Ok { message, .. } => {
-                return Err(Status::invalid_argument(format!("not a query: {message}")));
+            // `SqlResult` 是 `#[non_exhaustive]`（F27）：外部匹配必须留通配臂
+            // ——内核将来加的结果变体不该打断这里的编译。
+            _ => {
+                return Err(Status::invalid_argument(
+                    "not a query (unexpected result variant)",
+                ));
             }
         };
         let opts = arrow::ipc::writer::IpcWriteOptions::default();
@@ -216,8 +224,12 @@ impl FlightService for QsdbFlightService {
         let (query_id, res) = self.run_registered(&meta, &sql).await?;
         let batches = match res {
             qsdb::sql::SqlResult::Query { batches, .. } => batches,
-            qsdb::sql::SqlResult::Ok { message, .. } => {
-                return Err(Status::invalid_argument(format!("not a query: {message}")));
+            // `SqlResult` 是 `#[non_exhaustive]`（F27）：外部匹配必须留通配臂
+            // ——内核将来加的结果变体不该打断这里的编译。
+            _ => {
+                return Err(Status::invalid_argument(
+                    "not a query (unexpected result variant)",
+                ));
             }
         };
         if batches.is_empty() {

@@ -248,6 +248,7 @@ pub async fn serve(
         .route("/api/v1/auth/login", post(auth_login))
         .route("/api/v1/error-codes", get(error_codes))
         .route("/api/v1/files", get(download_file))
+        .route("/api/v1/users/export", get(export_users))
         .route("/api/v1/query", post(query))
         .route("/api/v1/write", post(write))
         .route("/api/v1/tables", get(tables))
@@ -581,6 +582,37 @@ async fn download_file(
         h.insert(axum::http::header::CONTENT_LENGTH, v);
     }
     resp
+}
+
+/// GET /api/v1/users/export —— **用户面导出**（qsdb-sync 用户面同步的 HTTP 源）。
+///
+/// 起因（qsdb-sync）：物理复制早就能走 HTTP 了（F11），但**用户表导不出来**——
+/// `--users × HTTP src` 只能显式报错。本端点补上那一半。
+///
+/// 契约要点：
+/// - 体与 `qsdb admin user-export` **同源**（同一个 `UserStore::export_json`），
+///   因此可直接喂给 `UserStore::import_json`（replica 的 `--users` 就是
+///   「export src → import dst overwrite」）——**export↔import 往返由回归钉住**。
+/// - **含口令哈希、不含明文密码**（与 CLI 一致）。
+/// - **admin 专属**：体里有哈希，拖走等于拖走全部凭证。
+async fn export_users(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let Some(role) = auth_role(&s, &headers) else {
+        return ErrorCode::Unauthorized.response("unauthorized");
+    };
+    if !role.is_admin() {
+        return ErrorCode::Forbidden.response("user export requires admin");
+    }
+    match qsdb::users::UserStore::export_json(s.db.store()) {
+        Ok(json) => {
+            let mut resp = json.into_response();
+            resp.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
+            resp
+        }
+        Err(e) => ErrorCode::Internal.response(e.to_string()),
+    }
 }
 
 /// 把内存池的实时占用刷进指标原子（渲染前调一次；池本身在 `Qsdb` 上）。

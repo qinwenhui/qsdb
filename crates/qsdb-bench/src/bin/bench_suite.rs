@@ -46,10 +46,17 @@ const FACT_COLS: &str = "id BIGINT, g BIGINT, gs STRING, v BIGINT, x DOUBLE, s S
 ///
 /// 列域刻意覆盖常见分析形态：
 /// - `g` ∈ [0, 100k)：**中基数**分组键（join 键，与 d.g 对应）
-/// - `gs`：**高基数**字符串（`k-{i}`，distinct 的主战场）
+/// - `gs`：**高基数 + 半数重复**字符串（`k-{i % (rows/2)}`，distinct 的主战场）。
+///   **为什么不全局唯一**（2026-10-13 改）：原先 `k-{i}` 全局唯一 ⇒
+///   `count(gs)` 与 `count(DISTINCT gs)` **数值相同**，用例区分不出"去重做了没有"
+///   ——`DISTINCT` 被静默丢弃（回错数字）在这份数据上躺了很久正是这个原因。
+///   现在一半重复：`count(gs)` = rows、`count(DISTINCT gs)` = rows/2，**两者可分**，
+///   值断言才真正有意义。⚠️ 基数变了 ⇒ **旧的 `simple_distinct` 数字不可比**，
+///   需在同一份数据上重测（见 `docs/真机基准对账.md`）。
 /// - `s`：字符串谓词（`region-{0..49}` 前缀 + 填充，LIKE 用）
 /// - `x`：双精度（avg/sum）
 /// - `dt`：日期（时间维）
+///
 /// 逐批生成事实表数据（**流式**）。
 ///
 /// **为什么必须流式**：导入用例测的是"导入算子的内存"，若先把 5M 行全建在内存里
@@ -62,9 +69,13 @@ fn for_each_batch(rows: i64, per: i64, mut f: impl FnMut(RecordBatch)) {
         let b = (0..n).map(|i| done + i).collect::<Vec<i64>>();
         let id = Int64Array::from(b.clone());
         let g = Int64Array::from(b.iter().map(|i| i % 100_000).collect::<Vec<i64>>());
+        // `gs`：半数重复（`i % (rows/2)`）——**让 distinct 用例真的测去重**，
+        // 见 `for_each_batch` 上方注释（全局唯一时两者数值相同 = 等于没测）。
+        // 每批各自取模（批次边界无关：i 是全局行号，`rows/2` 是全局量）。
+        let half = (rows / 2).max(1);
         let gs = StringArray::from(
             b.iter()
-                .map(|i| format!("k-{:012}", i))
+                .map(|i| format!("k-{:012}", i % half))
                 .collect::<Vec<String>>(),
         );
         let v = Int64Array::from(
@@ -787,16 +798,15 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
             let t0 = Instant::now();
             // 等价改写（原生 `count(DISTINCT gs)` 在绑定层显式拒绝，见 case 列表注释）
             let n = rows_of(&db, "SELECT count(*) FROM (SELECT DISTINCT gs FROM t)");
-            // `gs` 全局唯一 ⇒ 去重结果 = 总行数。**注意这条断言区分不出
-            // `count(gs)` 与 `count(DISTINCT gs)`**——造数里 gs 无重复，两者
-            // 数值相同（这也是那个 bug 在数据上隐形的原因）；真正拦住它的是
-            // 绑定层的显式拒绝。要让本用例变成**真正的去重压测**，需给 gs 造重复
-            // （那会改变基数、使既有数字不可比，故单独一轮做，见待办）。
-            assert_eq!(
-                scalar_i64(&db, "SELECT count(*) FROM (SELECT DISTINCT gs FROM t)"),
-                rows,
-                "去重结果必须等于总行数（gs 全局唯一）"
-            );
+            // `gs = k-{i % (rows/2)}` ⇒ 恰好半数重复。**两条断言一起才有效**：
+            // 去重后 = rows/2、不去重 = rows——`count(gs)` 与 `count(DISTINCT gs)`
+            // **必须能分开**（这正是 2026-10-13 改数据的原因：原先 gs 全局唯一，
+            // 两者恒等，用例对"去重做没做"完全瞎）。
+            let distinct = scalar_i64(&db, "SELECT count(*) FROM (SELECT DISTINCT gs FROM t)");
+            let plain = scalar_i64(&db, "SELECT count(gs) FROM t");
+            assert_eq!(distinct, rows / 2, "去重结果 = 基数（半数为重复）");
+            assert_eq!(plain, rows, "不去重 = 总行数");
+            assert_ne!(distinct, plain, "本用例的数据必须能区分去重与否");
             (n, t0.elapsed().as_millis() as u64)
         }
         // ---- 复杂分析 ----
@@ -884,8 +894,8 @@ fn scan_to_parquet(
         predicate: None,
         limit: None,
     };
-    let mut it = db.scan(req).expect("scan");
-    while let Some(b) = it.next() {
+    let it = db.scan(req).expect("scan");
+    for b in it {
         let b = b.expect("scan batch");
         n += b.num_rows() as u64;
         bytes += crate::nb(&b);
@@ -919,8 +929,8 @@ fn scan_to_csv(db: &Qsdb, out: &Path, _sql: &str) -> u64 {
         predicate: None,
         limit: None,
     };
-    let mut it = db.scan(req).expect("scan");
-    while let Some(b) = it.next() {
+    let it = db.scan(req).expect("scan");
+    for b in it {
         let b = b.expect("scan batch");
         n += b.num_rows() as u64;
         w.write(&b).expect("csv write");

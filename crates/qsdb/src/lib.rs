@@ -49,9 +49,21 @@ pub use expr::udaf;
 pub use expr::udf;
 pub use manifest::{ColumnStats, PartitionManifest, SegmentEntry};
 pub use memory::{MemoryPool, Reservation};
-// format-spec 原语（F13：生态工具实现合规布局的契约级稳定面）
+// ---- format-spec 原语门面（F13）：生态工具实现**合规布局**的契约级稳定面 ----
+//
+// **为什么单独成组、且要在根上一处拿全**：生态工具（qsdb-sync 的 sink / replica、
+// 未来的湖导出）需要**独立实现**符合 format-spec 的读写，而它们**不该去 fork 一份
+// 内核实现**——qsdb-sync 的 sink-parquet 初版就复刻过一份 `encode_partition_value`，
+// 那种复刻一旦与内核漂移，产出的是"看着对、读不回"的数据。
+//
+// 本组列出的是**格式契约的一部分**：与 `docs/format-spec.md` 同源冻结，变更走
+// format-spec 的流程（追加式 / 版本号），**不是普通 pub 项的"可能随版本变化"**。
+// 未列出的 pub 项仍按 `docs/对接契约.md` 开头的原则——内部实现，不通知不迁移。
+pub use index::{INDEX_FILE, INDEX_LOCK, PartitionsIndex};
+pub use manifest::MANIFEST_FILE;
 pub use partition::{
-    encode_partition_value, parse_partition_dir, parse_partition_value, partition_dir,
+    decode_partition_value, encode_partition_value, is_partition_dir_name, parse_partition_dir,
+    parse_partition_value, partition_dir, partition_value_string,
 };
 pub use scan::{Predicate, Scan};
 pub use store::Store;

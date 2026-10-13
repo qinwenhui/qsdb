@@ -1274,3 +1274,98 @@ fn concurrency_gate_has_dedicated_code() {
     let r = query(p, "SELECT 1", None);
     assert_eq!(r.status, 200, "闸门释放后应立刻可查");
 }
+
+// ---------------------------------------------------------------------------
+// 用户面导出端点（qsdb-sync：`--users × HTTP src` 的那一半）
+// ---------------------------------------------------------------------------
+
+/// `GET /api/v1/users/export`：admin 专属 + 与 `import_json` 往返可用。
+///
+/// 这条端点补的是"物理复制能走 HTTP 了，但**用户表导不出来**"（qsdb-sync
+/// `--users × HTTP src` 只能显式报错）。契约的核心不是"能返回 JSON"，而是
+/// **返回的东西能直接喂给 `UserStore::import_json`**——所以这里真跑一次往返。
+#[test]
+fn users_export_over_http_roundtrips_into_import() {
+    let s = Server::start(&["--token", "s3cret"]);
+    let p = s.port;
+    let admin = [("Authorization", "Bearer s3cret")];
+
+    // 先建两个用户（无 token 配置时开放；这里必须带 admin）
+    for sql in [
+        "CREATE USER alice WITH PASSWORD 'pass123' ROLE admin",
+        "CREATE USER bob WITH PASSWORD 'pass456' ROLE reader",
+    ] {
+        let body = serde_json::json!({ "sql": sql }).to_string();
+        let r = http(
+            p,
+            "POST",
+            "/api/v1/query",
+            &[("Content-Type", "application/json"), admin[0]],
+            body.as_bytes(),
+        );
+        assert_eq!(r.status, 200, "{sql}: {}", String::from_utf8_lossy(&r.body));
+    }
+
+    // ① admin 导出成功，形状是 {"users":[{name,role,salt,hash}]}
+    let r = http(p, "GET", "/api/v1/users/export", &admin, b"");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.header("content-type").unwrap_or(""),
+        "application/json",
+        "内容类型要明确（消费方据此选解析器）"
+    );
+    let v = r.json();
+    let users = v["users"].as_array().expect("users 数组");
+    assert_eq!(users.len(), 2, "两个用户都要在");
+    let names: Vec<&str> = users.iter().filter_map(|u| u["name"].as_str()).collect();
+    assert!(
+        names.contains(&"alice") && names.contains(&"bob"),
+        "{names:?}"
+    );
+    for u in users {
+        for k in ["name", "role", "salt", "hash"] {
+            assert!(u.get(k).is_some(), "缺字段 {k}: {u}");
+        }
+    }
+
+    // ② **不许有明文口令**（拖走哈希可以，明文不行）
+    let text = String::from_utf8_lossy(&r.body);
+    assert!(
+        !text.contains("pass123") && !text.contains("pass456"),
+        "导出体里出现了明文口令"
+    );
+
+    // ③ **往返**：导出体直接喂 import_json（replica `--users` 就是这么干的）
+    let scratch = std::env::temp_dir().join(format!("qsdb_users_import_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).unwrap();
+    let store = qsdb::store::Store::local(&scratch);
+    let n = qsdb::users::UserStore::import_json(&store, &text, true)
+        .unwrap_or_else(|e| panic!("导出体必须能被 import_json 吃下: {e}"));
+    assert_eq!(n, 2, "两个用户都该导入");
+    // 导入后能用原密码验过（凭证无缝迁移是 F15 的承诺）
+    assert!(
+        qsdb::users::UserStore::verify(&store, "bob", "pass456").is_some(),
+        "导入后原密码必须仍可登录"
+    );
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    // ④ 非 admin（reader 用 Basic）→ 403：体里有全部哈希
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode("bob:pass456");
+    let basic = format!("Basic {b64}");
+    let r = http(
+        p,
+        "GET",
+        "/api/v1/users/export",
+        &[("Authorization", basic.as_str())],
+        b"",
+    );
+    assert_eq!(r.status, 403, "reader 不许导出用户面");
+    assert_eq!(r.code(), "FORBIDDEN");
+
+    // ⑤ 无凭证 → 401
+    let r = http(p, "GET", "/api/v1/users/export", &[], b"");
+    assert_eq!(r.status, 401);
+    assert_eq!(r.code(), "UNAUTHORIZED");
+}
