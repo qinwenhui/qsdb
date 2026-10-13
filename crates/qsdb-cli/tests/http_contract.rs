@@ -19,7 +19,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Date32Array, Int64Array};
+use arrow::array::{Date32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -222,6 +222,107 @@ fn ipc_two_int_cols(n: usize) -> Vec<u8> {
         w.finish().expect("finish ipc");
     }
     buf
+}
+
+/// **无依赖批量通道**（`format=bulk` / `format=csv`，读**与**写两个方向）。
+///
+/// 动机：生态工具（尤其 Java）不想引 arrow-java（JDK 11+ + FlatBuffers/Jackson），
+/// 于是拿不到 IPC 快通道、只能逐条发 SQL（实测 5M 行 81s vs 二进制 2.18s）。
+/// 见 `docs/bulk-format.md`。
+#[test]
+fn bulk_and_csv_channels_both_directions() {
+    let srv = Server::start(&[]);
+    let p = srv.port;
+    assert_eq!(
+        query(p, "CREATE TABLE t (a BIGINT, s STRING)", None).status,
+        200
+    );
+
+    // ① 写：bulk（列式二进制）
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int64, true),
+        Field::new("s", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])),
+            Arc::new(StringArray::from(vec![Some("x"), Some("y"), None])),
+        ],
+    )
+    .unwrap();
+    let bulk = qsdb::bulk::encode(&[batch]).unwrap();
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/write?table=t&mode=append&format=bulk",
+        &[("Content-Type", "application/vnd.qsdb.bulk")],
+        &bulk,
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+
+    // ② 读：bulk 往返（含 NULL 保真）
+    let q = |sql: &str, fmt: &str| {
+        let body = serde_json::json!({"sql": sql, "format": fmt}).to_string();
+        http(
+            p,
+            "POST",
+            "/api/v1/query",
+            &[("Content-Type", "application/json")],
+            body.as_bytes(),
+        )
+    };
+    let r = q("SELECT a, s FROM t ORDER BY a NULLS LAST", "bulk");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.header("content-type"), Some("application/vnd.qsdb.bulk"));
+    let back = qsdb::bulk::decode(&r.body).unwrap();
+    assert_eq!(back.num_rows(), 3);
+    let disp = |b: &RecordBatch, c: usize| -> Vec<String> {
+        (0..b.num_rows())
+            .map(|i| {
+                if b.column(c).is_null(i) {
+                    "NULL".into()
+                } else {
+                    arrow::util::display::array_value_to_string(b.column(c), i).unwrap()
+                }
+            })
+            .collect()
+    };
+    assert_eq!(disp(&back, 0), vec!["1", "3", "NULL"]);
+    assert_eq!(disp(&back, 1), vec!["x", "NULL", "y"]);
+
+    // ③ 读：csv（文本，零依赖）
+    let r = q("SELECT a, s FROM t ORDER BY a NULLS LAST", "csv");
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("content-type"), Some("text/csv"));
+    let text = String::from_utf8_lossy(&r.body).to_string();
+    assert!(text.starts_with("a,s"), "首行应为表头，实得 {text:?}");
+
+    // ④ 写：csv（列序 = 表列序；空字段 = NULL；不做类型推断）
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/write?table=t&mode=append&format=csv",
+        &[("Content-Type", "text/csv")],
+        b"a,s
+7,seven
+8,
+",
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let r = query(p, "SELECT count(*) FROM t", None);
+    assert_eq!(r.json()["rows"][0][0], 5, "应共 5 行（3 + 2）");
+
+    // ⑤ 未知 format → 400（显式拒绝，不静默兜底）
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/write?table=t&mode=append&format=arrow",
+        &[],
+        b"",
+    );
+    assert_eq!(r.status, 400);
+    assert_eq!(r.code(), "INVALID_ARGUMENT");
 }
 
 /// **J12**：DML 回执要有**结构化字段**（`command` + `rowsAffected`），

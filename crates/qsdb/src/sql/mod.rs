@@ -647,6 +647,15 @@ fn reorder_rows(
         .collect()
 }
 
+/// **`Literal` 行 → 表列序 RecordBatch**（公开：服务端的 CSV/bulk 写入路径也要它）。
+/// 与 `INSERT … VALUES` 走的是同一份构造逻辑，故列序/类型/空值语义天然一致。
+pub fn rows_to_batch(
+    def: &crate::catalog::TableDef,
+    rows: &[Vec<crate::types::Literal>],
+) -> Result<RecordBatch> {
+    build_insert_batch(def, rows)
+}
+
 /// VALUES 行 → RecordBatch（按表列序 cast）。行宽已由调用方按列清单校验，
 /// 这里再判一次是廉价防线（宽度不符时下面的列取用会错位）。
 fn build_insert_batch(

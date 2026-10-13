@@ -659,10 +659,15 @@ async fn query(
         None => "json".to_string(),
         Some(f) if f.eq_ignore_ascii_case("json") => "json".to_string(),
         Some(f) if f.eq_ignore_ascii_case("ipc") => "ipc".to_string(),
+        // **无依赖二进制**（生态工具：Java 侧不想引 arrow-java）——见 docs/bulk-format.md
+        Some(f) if f.eq_ignore_ascii_case("bulk") => "bulk".to_string(),
+        // 文本（任何语言零依赖）：列序 = 结果 schema，首行表头
+        Some(f) if f.eq_ignore_ascii_case("csv") => "csv".to_string(),
         Some(f) => {
             s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-            return ErrorCode::InvalidArgument
-                .response(format!("invalid format: expect json|ipc (got {f:?})"));
+            return ErrorCode::InvalidArgument.response(format!(
+                "invalid format: expect json|ipc|bulk|csv (got {f:?})"
+            ));
         }
     };
     // 会话：每请求一个 QueryContext（超时可经 X-QSDB-Timeout 头覆盖）
@@ -721,6 +726,38 @@ async fn query(
                                 axum::http::HeaderValue::from_static(
                                     "application/vnd.apache.arrow.stream",
                                 ),
+                            )],
+                            bytes,
+                        )
+                            .into_response(),
+                        Err(e) => {
+                            s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                            ErrorCode::Internal.response(e.to_string())
+                        }
+                    }
+                } else if fmt.eq_ignore_ascii_case("bulk") {
+                    // **无依赖二进制**（读侧；与写侧同一格式）
+                    match qsdb::bulk::encode(&batches) {
+                        Ok(bytes) => (
+                            [(
+                                axum::http::header::CONTENT_TYPE,
+                                axum::http::HeaderValue::from_static("application/vnd.qsdb.bulk"),
+                            )],
+                            bytes,
+                        )
+                            .into_response(),
+                        Err(e) => {
+                            s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                            ErrorCode::Unsupported.response(e.to_string())
+                        }
+                    }
+                } else if fmt.eq_ignore_ascii_case("csv") {
+                    // 文本 CSV（读侧；列序 = schema，首行表头）
+                    match batches_to_csv(&schema, &batches) {
+                        Ok(bytes) => (
+                            [(
+                                axum::http::header::CONTENT_TYPE,
+                                axum::http::HeaderValue::from_static("text/csv"),
                             )],
                             bytes,
                         )
@@ -798,6 +835,11 @@ struct WriteParams {
     /// 同时接受 `expectedGeneration`（camelCase 别名，兼容生态客户端习惯）。
     #[serde(default, alias = "expectedGeneration")]
     expected_generation: Option<u64>,
+    /// body 编码：`ipc`（默认，Arrow IPC 流）/ `bulk`（无依赖列式，见
+    /// `docs/bulk-format.md`）/ `csv`（文本，首行表头可选，列序 = **表列序**）。
+    /// 生态工具（Java 等不想引 arrow 库）用后两者。
+    #[serde(default)]
+    format: Option<String>,
 }
 
 async fn write(
@@ -832,12 +874,46 @@ async fn write(
             "expected_generation only applies to mode=overwrite (append merges under the lock)",
         );
     }
-    // IPC 解码（同步 CPU 工作，直接做）
-    let batches = match ipc_to_batches(&body) {
-        Ok(b) => b,
-        Err(e) => {
+    // body 解码（同步 CPU 工作，直接做）：ipc（默认）/ bulk / csv
+    let fmt = p.format.as_deref().unwrap_or("ipc").to_ascii_lowercase();
+    let batches = match fmt.as_str() {
+        "ipc" => match ipc_to_batches(&body) {
+            Ok(b) => b,
+            Err(e) => {
+                s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                return ErrorCode::InvalidIpc.response(e.to_string());
+            }
+        },
+        "bulk" => match qsdb::bulk::decode(&body) {
+            Ok(b) => vec![b],
+            Err(e) => {
+                s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                return ErrorCode::InvalidArgument.response(e.to_string());
+            }
+        },
+        "csv" => {
+            // CSV body：列序 = **表列序**（与 `/write` 的既有约定一致：全列批）。
+            // 首行若是表头（与表列名一致）则跳过。
+            let def = match s.db.table_def(&p.table) {
+                Ok(d) => d,
+                Err(e) => {
+                    s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    return ErrorCode::from_qsdb(&e, true).response(e.to_string());
+                }
+            };
+            match csv_body_to_batches(&body, &def) {
+                Ok(b) => b,
+                Err(e) => {
+                    s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    return ErrorCode::InvalidArgument.response(e.to_string());
+                }
+            }
+        }
+        other => {
             s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-            return ErrorCode::InvalidIpc.response(e.to_string());
+            return ErrorCode::InvalidArgument.response(format!(
+                "invalid format: expect ipc|bulk|csv (got {other:?})"
+            ));
         }
     };
     let mode_out = mode.clone();
@@ -1229,6 +1305,84 @@ fn batches_to_ipc(
     Ok(buf)
 }
 
+/// CSV body → 全列批（`/write?format=csv`）。
+///
+/// 列序 = **表列序**（与 `/write` 的既有全列批约定一致）；首行若与表列名逐字相同则
+/// 视为表头跳过。类型按表列类型解析（**不做类型推断**——推断会把 `001` 变成 `1`，
+/// 这类静默改变在写入面不可接受）。
+fn csv_body_to_batches(
+    bytes: &[u8],
+    def: &qsdb::catalog::TableDef,
+) -> Result<Vec<RecordBatch>, QsdbError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|e| QsdbError::invalid(format!("csv body is not UTF-8: {e}")))?;
+    let mut lines = text.lines().peekable();
+    // 表头（可选）
+    if let Some(first) = lines.peek() {
+        let cells: Vec<&str> = first.split(',').map(|s| s.trim()).collect();
+        let is_header = cells.len() == def.columns.len()
+            && cells.iter().zip(&def.columns).all(|(c, col)| {
+                c.eq_ignore_ascii_case(&col.name) || c == &format!("\"{}\"", col.name)
+            });
+        if is_header {
+            lines.next();
+        }
+    }
+    let rows: Vec<Vec<qsdb::Literal>> = lines
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let cells = split_csv_line(l);
+            if cells.len() != def.columns.len() {
+                return Err(QsdbError::invalid(format!(
+                    "csv row has {} fields, table {} has {} columns",
+                    cells.len(),
+                    def.name,
+                    def.columns.len()
+                )));
+            }
+            cells
+                .iter()
+                .zip(&def.columns)
+                .map(|(c, col)| parse_csv_cell(c, &col.logical_type))
+                .collect::<std::result::Result<Vec<_>, QsdbError>>()
+        })
+        .collect::<std::result::Result<Vec<_>, QsdbError>>()?;
+    Ok(vec![qsdb::sql::rows_to_batch(def, &rows)?])
+}
+
+/// CSV 行切分（引号内的逗号不算分隔；`""` = 字面引号）。
+fn split_csv_line(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_q = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if in_q => {
+                if chars.peek() == Some(&'"') {
+                    cur.push('"');
+                    chars.next();
+                } else {
+                    in_q = false;
+                }
+            }
+            '"' if !in_q => in_q = true,
+            ',' if !in_q => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
+}
+
+/// 单个 CSV 字段 → 该列类型的 `Literal`（空串 = NULL——写入面唯一的空值表示）。
+fn parse_csv_cell(s: &str, ty: &qsdb::LogicalType) -> Result<qsdb::Literal, QsdbError> {
+    if s.is_empty() {
+        return Ok(qsdb::Literal::Null);
+    }
+    qsdb::partition::parse_partition_value(s, ty)
+}
+
 fn ipc_to_batches(bytes: &[u8]) -> Result<Vec<RecordBatch>, QsdbError> {
     let mut reader = StreamReader::try_new(std::io::Cursor::new(bytes.to_vec()), None)
         .map_err(|e| QsdbError::invalid(format!("ipc reader: {e}")))?;
@@ -1266,6 +1420,27 @@ fn concat_batches(batches: &[RecordBatch]) -> Result<RecordBatch, QsdbError> {
         &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(n)),
     )
     .map_err(|e| QsdbError::invalid(format!("concat batch: {e}")))
+}
+
+/// 结果批 → CSV 文本（读侧 `format=csv`）：列序 = schema，首行表头。
+///
+/// 给"零依赖客户端"用（Java 拼 CSV 谁都会）。批量场景仍建议 `bulk`/`ipc`。
+fn batches_to_csv(
+    schema: &arrow::datatypes::SchemaRef,
+    batches: &[RecordBatch],
+) -> Result<Vec<u8>, QsdbError> {
+    let mut out = Vec::with_capacity(1024);
+    {
+        let mut w = arrow::csv::WriterBuilder::new()
+            .with_header(true)
+            .build(&mut out);
+        for b in batches {
+            w.write(b)
+                .map_err(|e| QsdbError::invalid(format!("csv write: {e}")))?;
+        }
+    }
+    let _ = schema;
+    Ok(out)
 }
 
 fn schema_fields(schema: &arrow::datatypes::SchemaRef) -> Vec<serde_json::Value> {
