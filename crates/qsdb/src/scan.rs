@@ -1575,6 +1575,11 @@ pub struct Scan {
     store: Arc<Store>,
     /// 远端段文件磁盘缓存（外表专用；管理表本地不启用）
     file_cache: Option<Arc<crate::filecache::FileCache>>,
+    /// 本对象**是某个分片**（`shard()` 产出）→ 不再自我并行（避免嵌套）。
+    is_shard: bool,
+    /// 并行读状态（**首次 `next()` 懒启动**；`None` = 串行或尚未判定）。
+    par: Option<crate::exec::par_scan::ParReader>,
+    par_tried: bool,
 }
 
 /// 批来源：parquet 流式 reader 或缓存命中批列表。
@@ -1620,6 +1625,9 @@ impl Scan {
             ctx,
             store: Arc::clone(store),
             file_cache: None,
+            is_shard: false,
+            par: None,
+            par_tried: false,
         })
     }
 
@@ -1696,6 +1704,9 @@ impl Scan {
             ctx,
             store: Arc::clone(store),
             file_cache,
+            is_shard: false,
+            par: None,
+            par_tried: false,
         })
     }
 
@@ -1777,6 +1788,9 @@ impl Scan {
                 ctx: Arc::clone(&self.ctx),
                 store: Arc::clone(&self.store),
                 file_cache: self.file_cache.clone(),
+                is_shard: true, // 分片自身不再并行（避免嵌套并行）
+                par: None,
+                par_tried: true,
             })
             .collect();
         for (s, b) in shards.iter_mut().zip(buckets) {
@@ -1932,6 +1946,32 @@ impl Iterator for Scan {
     type Item = Result<RecordBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // **并行读（懒启动）**：首次抽取时若可分片（文件/row-group ≥ 2 且无 LIMIT），
+        // 就把分片交给专用池并行读、有界 channel 回传。
+        //
+        // 为什么放在**公开 scan API** 这一层：导出工具、嵌入方走的都是 `db.scan()`，
+        // 而并行此前只在 SQL 路径（`make_scan`）生效——于是"导出永远单线程"。
+        // 调用方**不需要知道**这件事，也不该需要（批大小/并行度是引擎的自选动作）。
+        //
+        // 语义变化：**无 ORDER BY 的行序不再保证**（SQL 本就不保证；PG/DuckDB 同理）。
+        // 需要顺序请用 ORDER BY。诊断/对照可用 `QSDB_SCAN_SERIAL=1` 关掉并行。
+        if !self.is_shard && !self.par_tried && !self.files.is_empty() {
+            self.par_tried = true;
+            if !crate::exec::par_scan::scan_parallel_disabled() {
+                let threads = rayon::current_num_threads().clamp(2, 16);
+                if let Some(shards) = self.shard(threads, true) {
+                    // 分片会把 files 挪走 → 本对象的串行状态作废（走 channel）
+                    self.files.clear();
+                    self.par = Some(crate::exec::par_scan::spawn_reader(
+                        shards,
+                        Arc::clone(&self.ctx),
+                    ));
+                }
+            }
+        }
+        if let Some(p) = self.par.as_mut() {
+            return p.recv(); // None = 生产端结束
+        }
         loop {
             if let Err(e) = self.ctx.check() {
                 return Some(Err(e));

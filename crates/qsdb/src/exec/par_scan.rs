@@ -58,6 +58,7 @@ fn scan_pool() -> &'static rayon::ThreadPool {
 struct Pending {
     shards: Vec<Scan>,
     tx: std::sync::mpsc::SyncSender<Result<RecordBatch>>,
+    done: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// 并行扫描节点。
@@ -84,11 +85,16 @@ impl ParScanExec {
         let shards = scan.shard(threads, true)?;
         // 有界 channel = 背压，也是**内存上界**（在途批 ≤ 容量 × 批大小）
         let (tx, rx) = sync_channel::<Result<RecordBatch>>(threads.clamp(2, 16) * 2);
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         Some(Self {
             rx,
             schema,
-            pending: Some(Pending { shards, tx }),
-            done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pending: Some(Pending {
+                shards,
+                tx,
+                done: Arc::clone(&done),
+            }),
+            done,
             started: false,
             ctx,
         })
@@ -102,35 +108,11 @@ impl ParScanExec {
 
     /// 首次取数才提交分片任务。
     fn start(&mut self) {
-        let Some(Pending { shards, tx }) = self.pending.take() else {
+        let Some(Pending { shards, tx, done }) = self.pending.take() else {
             return;
         };
         self.started = true;
-        let done = Arc::clone(&self.done);
-        let worker_ctx = Arc::clone(&self.ctx);
-        std::thread::spawn(move || {
-            use rayon::prelude::*;
-            let items: Vec<_> = shards.into_iter().map(|s| (s, tx.clone())).collect();
-            // **专用池**（不占全局 rayon 池，避免与查询自身的并行互锁）
-            scan_pool().install(|| {
-                items.into_par_iter().for_each(|(mut shard, tx)| {
-                    for item in shard.by_ref() {
-                        if worker_ctx.check().is_err() {
-                            // 取消/超时：把错误发给消费端并停止本分片
-                            let _ = tx.send(Err(crate::error::QsdbError::QueryCancelled(
-                                worker_ctx.query_id.clone(),
-                            )));
-                            break;
-                        }
-                        if tx.send(item).is_err() {
-                            break; // 消费端提前退出（如 LIMIT 截断）
-                        }
-                    }
-                });
-            });
-            drop(tx); // 关闭 channel：消费端 recv → None
-            done.store(true, std::sync::atomic::Ordering::Release);
-        });
+        spawn_producer(shards, tx, done, Arc::clone(&self.ctx));
     }
 }
 
@@ -171,6 +153,67 @@ impl Drop for ParScanExec {
             }
         }
     }
+}
+
+/// 并行读的接收端（`Scan::next` 用它，见 [`spawn_reader`]）。
+pub struct ParReader {
+    rx: std::sync::mpsc::Receiver<Result<RecordBatch>>,
+    /// 生产端全部结束（仅为诊断/观测，不强等）
+    pub done: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ParReader {
+    /// 取下一批（`None` = 生产端结束）。
+    pub fn recv(&mut self) -> Option<Result<RecordBatch>> {
+        self.rx.recv().ok()
+    }
+}
+
+/// 起并行生产端：分片 → 专用池 → 有界 channel（背压即内存上界）。
+///
+/// 与 [`ParScanExec`] 同一套机制，抽出来给**公开 scan API** 用——那才是导出工具、
+/// 嵌入方走的路；此前只有 SQL 路径（`make_scan`）享受并行，`db.scan()` 是串行的。
+pub fn spawn_reader(shards: Vec<Scan>, ctx: Arc<crate::query::QueryContext>) -> ParReader {
+    let (tx, rx) = sync_channel::<Result<RecordBatch>>(shards.len().clamp(2, 16) * 2);
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    spawn_producer(shards, tx, Arc::clone(&done), ctx);
+    ParReader { rx, done }
+}
+
+/// 是否禁用扫描并行（`QSDB_SCAN_SERIAL=1`）——**诊断/对照开关**，
+/// 也用于"并行会不会改变行为"的 A/B。
+pub fn scan_parallel_disabled() -> bool {
+    std::env::var("QSDB_SCAN_SERIAL").is_ok()
+}
+
+/// 把分片喂进 channel（专用池，不占全局 rayon 池——避免与查询自身并行互锁）。
+fn spawn_producer(
+    shards: Vec<Scan>,
+    tx: std::sync::mpsc::SyncSender<Result<RecordBatch>>,
+    done: Arc<std::sync::atomic::AtomicBool>,
+    ctx: Arc<crate::query::QueryContext>,
+) {
+    std::thread::spawn(move || {
+        use rayon::prelude::*;
+        let items: Vec<_> = shards.into_iter().map(|s| (s, tx.clone())).collect();
+        scan_pool().install(|| {
+            items.into_par_iter().for_each(|(mut shard, tx)| {
+                for item in shard.by_ref() {
+                    if ctx.check().is_err() {
+                        let _ = tx.send(Err(crate::error::QsdbError::QueryCancelled(
+                            ctx.query_id.clone(),
+                        )));
+                        break;
+                    }
+                    if tx.send(item).is_err() {
+                        break; // 消费端退出（LIMIT 截断 / 提前 drop）
+                    }
+                }
+            });
+        });
+        drop(tx);
+        done.store(true, std::sync::atomic::Ordering::Release);
+    });
 }
 
 /// 构造扫描节点：可分片走并行，否则串行。

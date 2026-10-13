@@ -1621,7 +1621,12 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect();
-        assert_eq!(got, vec!["b".to_string(), "a".to_string()]);
+        // **行序不承诺**：扫描现在可能并行（文件级分片 → 专用池），无 ORDER BY 时
+        // 行的先后由完成顺序决定（SQL 语义本就不承诺；PG/DuckDB 同理）。
+        // 这里断言**集合**而不是顺序。
+        let mut sorted = got.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["a".to_string(), "b".to_string()]);
 
         // limit
         let batches = db
