@@ -50,9 +50,12 @@ const FACT_COLS: &str = "id BIGINT, g BIGINT, gs STRING, v BIGINT, x DOUBLE, s S
 /// - `s`：字符串谓词（`region-{0..49}` 前缀 + 填充，LIKE 用）
 /// - `x`：双精度（avg/sum）
 /// - `dt`：日期（时间维）
-fn make_batches(rows: i64, per: i64) -> Vec<RecordBatch> {
+/// 逐批生成事实表数据（**流式**）。
+///
+/// **为什么必须流式**：导入用例测的是"导入算子的内存"，若先把 5M 行全建在内存里
+/// 再喂，峰值 RSS 记的是**造数器**的占用（实测把 append 的峰值抬到 583MB，真值被淹没）。
+fn for_each_batch(rows: i64, per: i64, mut f: impl FnMut(RecordBatch)) {
     let schema = fact_schema();
-    let mut out = Vec::new();
     let mut done = 0i64;
     while done < rows {
         let n = per.min(rows - done);
@@ -80,23 +83,27 @@ fn make_batches(rows: i64, per: i64) -> Vec<RecordBatch> {
                 .map(|i| 19_000 + (i % 365) as i32)
                 .collect::<Vec<i32>>(),
         );
-        out.push(
-            RecordBatch::try_new(
-                std::sync::Arc::clone(&schema),
-                vec![
-                    std::sync::Arc::new(id),
-                    std::sync::Arc::new(g),
-                    std::sync::Arc::new(gs),
-                    std::sync::Arc::new(v),
-                    std::sync::Arc::new(x),
-                    std::sync::Arc::new(s),
-                    std::sync::Arc::new(dt),
-                ],
-            )
-            .expect("build batch"),
-        );
+        f(RecordBatch::try_new(
+            std::sync::Arc::clone(&schema),
+            vec![
+                std::sync::Arc::new(id),
+                std::sync::Arc::new(g),
+                std::sync::Arc::new(gs),
+                std::sync::Arc::new(v),
+                std::sync::Arc::new(x),
+                std::sync::Arc::new(s),
+                std::sync::Arc::new(dt),
+            ],
+        )
+        .expect("build batch"));
         done += n;
     }
+}
+
+/// 全部批（仅造数/写源文件用；导入用例走 [`for_each_batch`] 流式）。
+fn make_batches(rows: i64, per: i64) -> Vec<RecordBatch> {
+    let mut out = Vec::new();
+    for_each_batch(rows, per, |b| out.push(b));
     out
 }
 
@@ -610,43 +617,48 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
             db.sql("DROP TABLE IF EXISTS t_ins").ok();
             db.sql(&format!("CREATE TABLE t_ins ({FACT_COLS})"))
                 .unwrap();
-            let batches = make_batches(rows, per);
             let t0 = Instant::now();
             // 1000 行/语句（贴近"客户端批量 INSERT"的真实形态：解析 + 绑定 + 执行都算）
-            for b in &batches {
-                let batch = b.slice(0, b.num_rows().min(1000));
-                let mut sql = String::from("INSERT INTO t_ins VALUES ");
-                for i in 0..batch.num_rows() {
-                    if i > 0 {
-                        sql.push(',');
+            for_each_batch(rows, per, |b| {
+                for off in (0..b.num_rows()).step_by(1000) {
+                    let batch = b.slice(off, 1000.min(b.num_rows() - off));
+                    let mut sql = String::from("INSERT INTO t_ins VALUES ");
+                    for i in 0..batch.num_rows() {
+                        if i > 0 {
+                            sql.push(',');
+                        }
+                        sql.push_str(&format!(
+                            "({},{},'{}',{},{},'{}',DATE '2022-01-01')",
+                            int_at(&batch, 0, i),
+                            int_at(&batch, 1, i),
+                            str_at(&batch, 2, i),
+                            int_at(&batch, 3, i),
+                            float_at(&batch, 4, i),
+                            str_at(&batch, 5, i),
+                        ));
                     }
-                    sql.push_str(&format!(
-                        "({},{},'{}',{},{},'{}',DATE '2022-01-01')",
-                        int_at(&batch, 0, i),
-                        int_at(&batch, 1, i),
-                        str_at(&batch, 2, i),
-                        int_at(&batch, 3, i),
-                        float_at(&batch, 4, i),
-                        str_at(&batch, 5, i),
-                    ));
+                    db.sql(&sql).expect("insert");
                 }
-                db.sql(&sql).expect("insert");
-            }
+            });
             let dt = t0.elapsed();
             let n = scalar_i64(&db, "SELECT count(*) FROM t_ins") as u64;
+            assert_eq!(
+                n, rows as u64,
+                "import_insert 必须真的插满（别只插每批的头一段）"
+            );
             (n, dt.as_millis() as u64)
         }
         "import_append" => {
             db.sql("DROP TABLE IF EXISTS t_app").ok();
             db.sql(&format!("CREATE TABLE t_app ({FACT_COLS})"))
                 .unwrap();
-            let batches = make_batches(rows, per);
             let t0 = Instant::now();
-            for b in &batches {
-                db.append("t_app", std::slice::from_ref(b)).unwrap();
-            }
+            for_each_batch(rows, per, |b| {
+                db.append("t_app", std::slice::from_ref(&b)).unwrap();
+            });
             let dt = t0.elapsed();
             let n = scalar_i64(&db, "SELECT count(*) FROM t_app") as u64;
+            assert_eq!(n, rows as u64, "import_append 必须真的灌满");
             (n, dt.as_millis() as u64)
         }
         // ---- 导出 ----
