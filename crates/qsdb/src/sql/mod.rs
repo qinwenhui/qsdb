@@ -321,8 +321,13 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
             let def = db.table_def(&table)?;
             match source {
                 translate::InsertSource::Values(rows) => {
-                    // VALUES 源：列清单必须覆盖全部表列（既有契约）
-                    let perm = insert_column_perm(&def, column_order.as_deref(), true)?;
+                    // VALUES 源：列清单可只给部分列，未列出的列补 NULL
+                    // （2026-10-13 放宽：此前要求"必须覆盖全部表列"，理由是"宁可报错
+                    //  也不要补 NULL 写进半行"——但 INSERT … SELECT 一直允许部分列，
+                    //  同一条理由并不成立；而且写端本就有 NOT NULL/CHECK 兜底
+                    //  （`write::check_constraints`），缺列补 NULL 后照样会被拦下来。
+                    //  放宽后与标准 SQL（MySQL/PG 都允许省略列）及本仓 SELECT 源一致。）
+                    let perm = insert_column_perm(&def, column_order.as_deref(), false)?;
                     insert_values(db, &table, &def, &perm, rows, overwrite, ctx)
                 }
                 translate::InsertSource::Select(q) => {
@@ -528,11 +533,12 @@ fn metadata_shortcut_count(
 /// `column_order` 是**位置语义**（标准 SQL：INSERT…VALUES 与 INSERT…SELECT 都按
 /// 位置对齐列清单，不按名匹配），所以这里只把列名翻译成表列下标。
 ///
-/// `require_full`：列清单是否必须覆盖全部表列——
-/// - VALUES 源传 `true`：SQL-0 起的既有契约（`INSERT INTO events (dt, tenant)
-///   VALUES …` 必须报错，而不是补 NULL 写进半行），已被 e2e 测试锁定；
-/// - SELECT 源传 `false`：导入场景常只给部分列（缺的列补 NULL，真正的
-///   NOT NULL/CHECK 判定是写入端的事，见 `write::check_constraints`）。
+/// `require_full`：列清单是否必须覆盖全部表列。**两个源现在都传 `false`**
+/// （未列出的列补 NULL，NOT NULL/CHECK 由写入端兜底，见 `write::check_constraints`），
+/// 保留参数是为了让"要不要收紧"这件事在调用点可见。
+///
+/// 历史上 VALUES 源传 `true`（"宁可报错也不要补 NULL 写进半行"）——与 SELECT 源
+/// 口径不一致，2026-10-13 统一放宽。
 fn insert_column_perm(
     def: &crate::catalog::TableDef,
     column_order: Option<&[String]>,
