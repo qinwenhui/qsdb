@@ -71,13 +71,61 @@ fn main() {
         batches.len()
     );
 
-    let t0 = Instant::now();
-    let (st, resp) = post(&addr, "/api/v1/write?table=t_http&mode=append", &whole);
-    println!(
-        "HTTP 一次整批: {:.3}s status={st} {}",
-        t0.elapsed().as_secs_f64(),
-        resp.lines().last().unwrap_or("")
-    );
+    // 目标表（三种格式各一个）
+    for fmt in ["ipc", "bulk", "csv"] {
+        let body = format!(
+            "{{\"sql\":\"CREATE TABLE t_{fmt} (id BIGINT, g BIGINT, gs STRING, v BIGINT, x DOUBLE, s STRING, dt DATE)\"}}"
+        );
+        let mut s = TcpStream::connect(&addr).expect("connect");
+        let req = format!(
+            "POST /api/v1/query HTTP/1.1
+Host: {addr}
+Connection: close
+             Content-Type: application/json
+Content-Length: {}
+
+",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).unwrap();
+        s.write_all(body.as_bytes()).unwrap();
+        let mut raw = Vec::new();
+        s.read_to_end(&mut raw).unwrap();
+        let text = String::from_utf8_lossy(&raw);
+        println!("建表 t_{fmt}: {}", text.lines().last().unwrap_or(""));
+    }
+    for fmt in ["ipc", "bulk", "csv"] {
+        let body: Vec<u8> = match fmt {
+            "ipc" => whole.clone(),
+            "bulk" => qsdb::bulk::encode(&batches).expect("bulk encode"),
+            _ => {
+                // CSV：列序 = 表列序（与 /write 约定一致）；这里手写表头 + 逐行
+                let schema = batches[0].schema();
+                let mut buf: Vec<u8> = Vec::with_capacity(600 << 20);
+                let mut w = arrow::csv::WriterBuilder::new()
+                    .with_header(true)
+                    .build(&mut buf);
+                for b in &batches {
+                    w.write(b).unwrap();
+                }
+                drop(w);
+                let _ = schema;
+                buf
+            }
+        };
+        let t0 = Instant::now();
+        let (st, resp) = post(
+            &addr,
+            &format!("/api/v1/write?table=t_{fmt}&mode=append&format={fmt}"),
+            &body,
+        );
+        println!(
+            "HTTP 整批 format={fmt:<5} body={:>7.1}MB: {:.3}s status={st} {}",
+            body.len() as f64 / 1e6,
+            t0.elapsed().as_secs_f64(),
+            resp.lines().last().unwrap_or("")
+        );
+    }
 
     // ② 分批（每请求 1 批）——"工具按自己的节奏流式推"的形态
     let t0 = Instant::now();
