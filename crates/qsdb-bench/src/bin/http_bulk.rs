@@ -219,7 +219,7 @@ fn main() {
     }
 
     // ③ 读侧（`/query` 的 format）——驱动取结果集走的就是这条
-    println!("\n③ 读（SELECT * FROM t_rows，1M 行 / 7 列）");
+    println!("\n③ 读（SELECT * FROM t_rows，{rows} 行）");
     for fmt in fmts {
         let body = serde_json::json!({ "sql": "SELECT * FROM t_rows", "format": fmt }).to_string();
         let t0 = Instant::now();
