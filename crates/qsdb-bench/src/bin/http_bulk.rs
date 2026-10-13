@@ -45,7 +45,7 @@ fn main() {
 
     let batches: Vec<RecordBatch> = {
         let f = std::fs::File::open(&pq).expect("open parquet");
-        let r = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
+        let mut r = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
             .expect("parquet builder")
             .with_batch_size(65536)
             .build()
