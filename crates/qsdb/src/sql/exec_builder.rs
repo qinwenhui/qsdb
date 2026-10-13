@@ -1067,44 +1067,62 @@ fn build_aggregate(
     }
 
     use rayon::prelude::*;
-    let partials: Vec<(GroupTable, crate::memory::Reservation)> = shards
+    type Partial = (
+        GroupTable,
+        crate::memory::Reservation,
+        Option<crate::exec::agg_spill::AggSpill>,
+    );
+    let partials: Vec<Partial> = shards
         .into_par_iter()
         .map(|s| run_partial(db, s, &semis, &filters, &group, &aggs, ctx))
         .collect::<Result<Vec<_>>>()?;
     // 分片表的内存预留活到 merge 结束（峰值 = N 张分片表 + 合并中的分区）
-    let (tables, _hold): (Vec<_>, Vec<_>) = partials.into_iter().unzip();
+    let mut tables = Vec::with_capacity(partials.len());
+    let mut _hold = Vec::with_capacity(partials.len());
+    let mut spills = Vec::with_capacity(partials.len());
+    for (t, r, sp) in partials {
+        tables.push(t);
+        _hold.push(r);
+        spills.push(sp);
+    }
 
     // merge：按组 key hash 分区并行（每分区独立合并全部 shard 的对应组——
     // 分区表小缓存友好；原本单线程串行 merge 是高组数下的瓶颈），
     // 各分区各自 finalize 后按列 concat。
     let p = rayon::current_num_threads().clamp(1, 32);
     // 分区主序桶：parts[pi][ti] = 第 ti 张表中 hash 落 pi 分区的组下标
-    let mut parts: Vec<Vec<Vec<usize>>> = vec![vec![Vec::new(); tables.len()]; p];
-    for (ti, t) in tables.iter().enumerate() {
-        for g in 0..t.len() {
-            parts[(t.group_hash(g) as usize) % p][ti].push(g);
+    // **有溢出** → 逐分区（顺序）：分区按 `partition_of_lits` 划，与溢出路由一致，
+    // 于是每个分区把"各分片表里属于它的组"与"它落盘的行"合到一起算完。
+    // 顺序执行（不并行）是刻意的：溢出路径本就 I/O 受限，简单 > 快。
+    let batches: Vec<Option<RecordBatch>> = if spills.iter().any(|s| s.is_some()) {
+        spill_aware_merge(tables, spills, &group, &aggs, &schema, &mut _hold)?
+    } else {
+        let mut parts: Vec<Vec<Vec<usize>>> = vec![vec![Vec::new(); tables.len()]; p];
+        for (ti, t) in tables.iter().enumerate() {
+            for g in 0..t.len() {
+                parts[(t.group_hash(g) as usize) % p][ti].push(g);
+            }
         }
-    }
-    let group_ref = &group;
-    let aggs_ref = &aggs;
-    let schema_ref = &schema;
-    let batches: Vec<Option<RecordBatch>> = parts
-        .into_par_iter()
-        .map(|mut table_buckets| {
-            let mut merged = GroupTable::new();
-            for (ti, t) in tables.iter().enumerate() {
-                let ogs = std::mem::take(&mut table_buckets[ti]);
-                if !ogs.is_empty() {
-                    merged.merge_subset(t, ogs, aggs_ref.len());
+        let group_ref = &group;
+        let aggs_ref = &aggs;
+        let schema_ref = &schema;
+        parts
+            .into_par_iter()
+            .map(|mut table_buckets| {
+                let mut merged = GroupTable::new();
+                for (ti, t) in tables.iter().enumerate() {
+                    let ogs = std::mem::take(&mut table_buckets[ti]);
+                    if !ogs.is_empty() {
+                        merged.merge_subset(t, ogs, aggs_ref.len());
+                    }
                 }
-            }
-            if merged.is_empty() {
-                return Ok(None);
-            }
-            crate::exec::agg::finalize_table(&merged, aggs_ref, group_ref, schema_ref).map(Some)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let _ = &tables;
+                if merged.is_empty() {
+                    return Ok(None);
+                }
+                crate::exec::agg::finalize_table(&merged, aggs_ref, group_ref, schema_ref).map(Some)
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
     let some_batches: Vec<RecordBatch> = batches.into_iter().flatten().collect();
     if some_batches.is_empty() {
         return Ok(Box::new(OneShotExec {
@@ -1213,6 +1231,62 @@ fn run_partial_fused(
     Ok((table, res))
 }
 
+/// **溢出感知的合并**：逐分区把「各分片表里属于该分区的组」与「该分区落盘的
+/// 原始行」合到一起，再聚合/去重。
+///
+/// 为什么分区口径必须与溢出路由一致：落盘的行是按 `partition_of_lits` 分的，
+/// 分片表里的组也必须按**同一个**函数归位——否则同一个组的"内存部分"与
+/// "落盘部分"会被分到不同分区，各自聚合出半个结果而**静默算错**。
+/// （这也是不能用 `group_hash`（表内部 arena 编码）来划分的原因。）
+fn spill_aware_merge(
+    tables: Vec<GroupTable>,
+    mut spills: Vec<Option<crate::exec::agg_spill::AggSpill>>,
+    group: &[PhysExpr],
+    aggs: &[AggExpr],
+    schema: &Arc<arrow::datatypes::Schema>,
+    _hold: &mut [crate::memory::Reservation],
+) -> Result<Vec<Option<RecordBatch>>> {
+    let nparts = spills
+        .iter()
+        .flatten()
+        .map(|s| s.nparts())
+        .next()
+        .unwrap_or(1);
+    let mut out = Vec::with_capacity(nparts);
+    for pi in 0..nparts {
+        let mut merged = GroupTable::new();
+        // ① 各分片表里属于本分区的组
+        for t in tables.iter() {
+            let lits = t.group_lits();
+            let ogs: Vec<usize> = (0..t.len())
+                .filter(|&g| {
+                    let l: Vec<crate::types::Literal> = lits.iter().map(|c| c[g].clone()).collect();
+                    crate::exec::agg_spill::partition_of_lits(&l, nparts) == pi
+                })
+                .collect();
+            if !ogs.is_empty() {
+                merged.merge_subset(t, ogs, aggs.len());
+            }
+        }
+        // ② 本分区落盘的原始行（继续聚合进同一张表）
+        for sp in spills.iter_mut().flatten() {
+            // AggSpill 自持预留（走 reserve_spill：只受全局预算约束）
+            let rows = sp.take_partition(pi)?;
+            for b in &rows {
+                merged.ingest(group, aggs, b)?;
+            }
+        }
+        if merged.is_empty() {
+            out.push(None);
+            continue;
+        }
+        out.push(Some(crate::exec::agg::finalize_table(
+            &merged, aggs, group, schema,
+        )?));
+    }
+    Ok(out)
+}
+
 /// 分片合并 + 分区并行 finalize（融合路径）：与主路径 merge 块同款。
 fn finish_partitioned_merge(
     tables: Vec<GroupTable>,
@@ -1284,7 +1358,11 @@ fn run_partial(
     group: &[PhysExpr],
     aggs: &[AggExpr],
     ctx: &Arc<crate::query::QueryContext>,
-) -> Result<(GroupTable, crate::memory::Reservation)> {
+) -> Result<(
+    GroupTable,
+    crate::memory::Reservation,
+    Option<crate::exec::agg_spill::AggSpill>,
+)> {
     let mut node: Box<dyn ExecNode> = Box::new(ScanExec::new(scan));
     // semi 阶段按「自底向上」应用（try_shard_source 剥离序为自顶向下）
     for st in semis.iter().rev() {
@@ -1315,12 +1393,15 @@ fn run_partial(
         node = Box::new(FilterExec::new(node, f.clone(), Arc::clone(ctx)));
     }
     let mut exec = HashAggExec::new(node, group.to_vec(), aggs.to_vec(), Arc::clone(ctx))?;
+    // 分片路径：溢出由调用方接管（分区结果要走 merge，不能在此当作最终行 emit）
+    exec.set_defer_spill(true);
     while let Some(b) = exec.next() {
         b?; // 取消/超时/内存超限在此冒泡
     }
     // 预留随组表一起交回：分片表在 merge 期间仍然活着（N 张表同时在内存
     // 正是峰值），账不能在这里提前放掉
-    Ok(exec.into_state())
+    let (table, res, spill) = exec.into_parts();
+    Ok((table, res, spill))
 }
 
 /// 源分片：`(Scan | Filter)+` 链且 scan 可切多片 → Some((分片, 逆序 filters))。

@@ -89,6 +89,35 @@ pub fn write_sorted_run(
     Ok(path)
 }
 
+/// 无序 run：批合并后**直接落盘**（不排序）。
+///
+/// 用于**聚合/去重的分区溢出**：先把输入行按 group key 的 hash 分到 P 个分区
+/// 各自落盘，收尾时逐分区读回、分区内聚合——同一组的行必然落在同一分区，
+/// 故每分区可独立聚合出正确结果（见 `exec/agg_spill.rs`）。
+pub fn write_run(
+    dir: &mut SpillDir,
+    batches: &[RecordBatch],
+    schema: &Arc<arrow::datatypes::Schema>,
+) -> Result<PathBuf> {
+    let batch = concat_batches(batches, schema)?;
+    let path = dir.next_run();
+    let props = parquet::file::properties::WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::ZSTD(
+            parquet::basic::ZstdLevel::try_new(1)
+                .map_err(|e| QsdbError::invalid(format!("zstd: {e}")))?,
+        ))
+        .build();
+    let file = File::create(&path)
+        .map_err(|e| QsdbError::meta(format!("spill create {}: {e}", path.display())))?;
+    let mut w = ArrowWriter::try_new(file, Arc::clone(schema), Some(props))
+        .map_err(|e| QsdbError::meta(format!("spill writer: {e}")))?;
+    w.write(&batch)
+        .map_err(|e| QsdbError::meta(format!("spill write: {e}")))?;
+    w.close()
+        .map_err(|e| QsdbError::meta(format!("spill close: {e}")))?;
+    Ok(path)
+}
+
 /// 读取一个 run 为批列表（run 已排序）。
 pub fn read_run(path: &std::path::Path) -> Result<Vec<RecordBatch>> {
     let file = File::open(path)

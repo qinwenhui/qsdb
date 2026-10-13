@@ -1162,8 +1162,13 @@ impl GroupTable {
             }) {
                 Some(g) => g,
                 None => {
-                    // 列状态种类未初始化（空表首组）：从 other 继承结构
-                    if self.kinds.is_empty() {
+                    // 列状态种类未初始化（**还没有任何组**）：从 other 继承结构。
+                    //
+                    // 判据是"还没有组"而不是 `kinds.is_empty()`：DISTINCT/无聚合列
+                    // 的表 `kinds` **恒为空**，用它当代理会导致每新增一组就重置一次
+                    // `group_lits` → 组键列表与 `key_off` 长度错位 → 输出时越界
+                    // （实测：DISTINCT 溢出路径 panic "len is 126 but index is 126"）。
+                    if self.key_off.is_empty() {
                         self.kinds = other.kinds.clone();
                         self.group_lits = other
                             .group_lits
@@ -1221,6 +1226,11 @@ impl GroupTable {
     /// 组 key 的 hash（分区 merge 分桶用）。
     pub fn group_hash(&self, g: usize) -> u64 {
         fxhash_bytes(self.key_of(g))
+    }
+
+    /// 各组的分组键 Literal（`[列][组]`）。溢出路由要用它算出"这一组属于哪个分区"。
+    pub fn group_lits(&self) -> &[Vec<Literal>] {
+        &self.group_lits
     }
 
     /// partial 分片执行辅助：聚合列数注册（首批前调用；列状态首批 ingest 落地）。

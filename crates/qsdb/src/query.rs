@@ -100,6 +100,30 @@ impl QueryContext {
         Ok(Reservation::from_parts(Arc::clone(self), n))
     }
 
+    /// **溢出缓冲专用准入**：只受全局预算约束、**不受每查询配额约束**。
+    ///
+    /// 为什么单开一条：配额管的是「这个查询的物化规模」（用户承诺的上限），
+    /// 而溢出是配额不够时的**逃生通道**——若逃生通道自己也吃配额，小配额下
+    /// 溢出永远启动不了（实测：64KB 配额的 GROUP BY 直接失败而不是落盘完成，
+    /// 那 P1 就等于没做）。上界由调用方按配额缩放单分区缓冲来兜
+    /// （`AggSpill::part_cap_for`），真正的硬上界是全局预算。
+    pub fn reserve_spill(self: &Arc<Self>, bytes: u64) -> Result<Reservation> {
+        let n = self.reserve_global(bytes)?;
+        Ok(Reservation::from_parts_global(Arc::clone(self), n))
+    }
+
+    /// 只受全局预算约束的准入（溢出缓冲 / 其增长用）。
+    pub(crate) fn reserve_global(&self, bytes: u64) -> Result<u64> {
+        if bytes == 0 {
+            return Ok(0);
+        }
+        if let Some(pool) = &self.pool {
+            pool.acquire(bytes)?;
+        }
+        self.memory_used.fetch_add(bytes, Ordering::Relaxed);
+        Ok(bytes)
+    }
+
     /// 准入但不构造预留（[`Reservation::grow`] 用）：返回实际保留字节。
     pub(crate) fn reserve_plain(&self, bytes: u64) -> Result<u64> {
         if bytes == 0 {

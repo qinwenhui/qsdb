@@ -203,27 +203,45 @@ fn cache_is_evicted_under_execution_pressure() {
 #[test]
 fn previously_unaccounted_operators_now_respect_limit() {
     let (db, root) = seeded_db("holes", 256);
-    // 极小配额：这些算子过去连 ctx 都没有（Distinct）或以 benign 跑（CTE），
-    // 表现为"无界增长不报错"；现在必须**报错**而不是悄悄吃满内存。
     let tiny = || QueryContext::new("holes-q", None, Some(1024));
 
+    // ① **有溢出能力**的（P1 起）：额度不够就落盘完成——而不是报错，
+    //    更不是从前那样无界增长。
+    //    （UNION 的去重走 DistinctExec，故它也进了这一组。）
     for sql in [
-        "SELECT DISTINCT v FROM t",                           // DistinctExec
-        "WITH c AS (SELECT v FROM t) SELECT count(*) FROM c", // CTE 物化
-        "SELECT v FROM t UNION SELECT v FROM t",              // SetOp + Distinct
+        "SELECT DISTINCT v FROM t",              // DistinctExec（P1 分区溢出）
+        "SELECT v, count(*) FROM t GROUP BY v",  // HashAgg（P1 分区溢出）
+        "SELECT v FROM t UNION SELECT v FROM t", // SetOp(Union) + DistinctExec 溢出
     ] {
         let ctx = tiny();
-        let r = db.sql_with_context(sql, &ctx);
         assert!(
-            r.is_err(),
-            "极小配额下应报错（此前无记账 = 无界增长）: {sql}"
+            db.sql_with_context(sql, &ctx).is_ok(),
+            "有溢出能力的算子在极小配额下应落盘完成: {sql}"
         );
     }
-    // 不限配额时照常成功（保证没把功能改坏）
+
+    // ② **还没有溢出能力**的：必须**报错**——此前的病灶是"无记账 = 无界增长"，
+    //    现在至少要有账并且能拒绝（它们的溢出留待 P1.5/P2）。
+    for sql in [
+        "WITH c AS (SELECT v FROM t) SELECT count(*) FROM c", // CTE 物化（P1.5）
+        "SELECT v FROM t INTERSECT SELECT v FROM t",          // SetOp 右表集合（P1.5）
+        "SELECT v, row_number() OVER (ORDER BY v) AS rn FROM t", // Window（P3）
+    ] {
+        let ctx = tiny();
+        let err = err_of(db.sql_with_context(sql, &ctx));
+        assert!(
+            matches!(err, QsdbError::QueryMemoryLimit(_)),
+            "无溢出能力的算子应给出配额错（而不是无界增长）: {sql} → {err}"
+        );
+    }
+
+    // 不限配额时全部照常成功（保证没把功能改坏）
     for sql in [
         "SELECT DISTINCT v FROM t",
+        "SELECT v, count(*) FROM t GROUP BY v",
         "WITH c AS (SELECT v FROM t) SELECT count(*) FROM c",
         "SELECT v FROM t UNION SELECT v FROM t",
+        "SELECT v, row_number() OVER (ORDER BY v) AS rn FROM t",
     ] {
         assert!(db.sql_collect(sql).is_ok(), "不限内存时应成功: {sql}");
     }

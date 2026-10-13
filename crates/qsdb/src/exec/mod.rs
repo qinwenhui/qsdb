@@ -4,6 +4,7 @@
 //! Scan 由 `crate::scan::Scan` 包装。并行聚合见 `agg`（文件级 rayon 展开）。
 
 pub mod agg;
+pub mod agg_spill;
 pub mod join;
 pub mod par_scan;
 pub mod spill;
@@ -749,6 +750,9 @@ pub struct DistinctExec {
     /// 不吃超时——隔离承诺在这里是空的）。RAII，节点销毁即归还。
     res: crate::memory::Reservation,
     accounted: u64,
+    /// 溢出态（与 HashAggExec 同机制：分区落盘 → 逐分区聚合）
+    spill: Option<crate::exec::agg_spill::AggSpill>,
+    spill_part: usize,
 }
 
 impl DistinctExec {
@@ -763,6 +767,8 @@ impl DistinctExec {
             ctx,
             res,
             accounted: 0,
+            spill: None,
+            spill_part: 0,
         })
     }
 }
@@ -785,6 +791,47 @@ impl ExecNode for DistinctExec {
                     .unwrap_or(crate::types::LogicalType::Int64),
             })
             .collect();
+        // 已在溢出态：逐分区产出
+        if let Some(sp) = self.spill.as_mut() {
+            if self.spill_part >= sp.nparts() {
+                self.emitted = true;
+                return None;
+            }
+            let pi = self.spill_part;
+            self.spill_part += 1;
+            let rows = match sp.take_partition(pi) {
+                Ok(r) => r,
+                Err(e) => return Some(Err(e)),
+            };
+            let mut t = agg::GroupTable::new();
+            let ogs: Vec<usize> = {
+                let lits = self.state.group_lits();
+                let n = self.state.len();
+                (0..n)
+                    .filter(|&g| {
+                        let l: Vec<crate::types::Literal> =
+                            lits.iter().map(|c| c[g].clone()).collect();
+                        crate::exec::agg_spill::partition_of_lits(&l, sp.nparts()) == pi
+                    })
+                    .collect()
+            };
+            if !ogs.is_empty() {
+                t.merge_subset(&self.state, ogs, 0);
+            }
+            for b in &rows {
+                if let Err(e) = t.ingest(&group_exprs, &[], b) {
+                    return Some(Err(e));
+                }
+            }
+            if t.is_empty() {
+                return self.next(); // 空分区：继续下一个
+            }
+            let keys = t.group_keys();
+            return Some(
+                agg::build_output_batch(&keys, &self.schema())
+                    .map_err(|e| QsdbError::invalid(format!("distinct out: {e}"))),
+            );
+        }
         while let Some(b) = self.input.next() {
             if let Err(e) = self.ctx.check() {
                 return Some(Err(e));
@@ -798,11 +845,33 @@ impl ExecNode for DistinctExec {
             }
             let est = self.state.estimated_bytes();
             if est > self.accounted {
-                if let Err(e) = self.res.grow(est - self.accounted) {
-                    return Some(Err(e));
+                if self.res.grow(est - self.accounted).is_err() {
+                    // 要不到额度 → 转分区溢出（去重与聚合同机制：组 = 全部列）
+                    let schema = self.input.schema();
+                    match crate::exec::agg_spill::AggSpill::new(schema, &self.ctx) {
+                        Ok(sp) => self.spill = Some(sp),
+                        Err(e) => return Some(Err(e)),
+                    }
+                    break;
                 }
                 self.accounted = est;
             }
+        }
+        if let Some(sp) = self.spill.as_mut() {
+            while let Some(b) = self.input.next() {
+                if let Err(e) = self.ctx.check() {
+                    return Some(Err(e));
+                }
+                let batch = match b {
+                    Ok(x) => x,
+                    Err(e) => return Some(Err(e)),
+                };
+                if let Err(e) = sp.push(&batch, &group_exprs) {
+                    return Some(Err(e));
+                }
+            }
+            self.spill_part = 0;
+            return self.next();
         }
         self.emitted = true;
         if self.state.is_empty() {
@@ -848,6 +917,12 @@ pub struct HashAggExec {
     schema: SchemaRef,
     emitted: bool,
     ctx: Arc<crate::query::QueryContext>,
+    /// 溢出态（内存要不到额度时启用；见 `exec/agg_spill.rs`）
+    spill: Option<crate::exec::agg_spill::AggSpill>,
+    /// 溢出模式下正在产出的分区游标
+    spill_part: usize,
+    /// 由**调用方**接管溢出（分片并行路径：结果要走 merge，不能在这里 emit）
+    defer_spill: bool,
     /// 组表内存预留（随组表增长；节点销毁即归还）。
     ///
     /// 旧实现按「输入批 / 2」记一次且**永不 release**——既没算分片放大
@@ -890,16 +965,82 @@ impl HashAggExec {
             schema: Arc::new(arrow::datatypes::Schema::new(fields)),
             emitted: false,
             ctx,
+            spill: None,
+            spill_part: 0,
+            defer_spill: false,
             res,
             accounted: 0,
         })
     }
 
+    /// 分片并行路径：溢出由调用方接管（它要把各分片的结果 merge 起来，
+    /// 不能在这里把分区结果当最终行 emit 掉——那样 merge 只会拿到保留表，
+    /// **结果静默丢一半**）。
+    pub fn set_defer_spill(&mut self, v: bool) {
+        self.defer_spill = v;
+    }
+
+    /// 取走溢出器（defer 模式下调用方 merge 时用；`None` = 本分片没溢出）。
+    pub fn take_spill(&mut self) -> Option<crate::exec::agg_spill::AggSpill> {
+        self.spill.take()
+    }
+
+    /// 单分区产出：保留表里属于该分区的组 + 该分区落盘的行 → 一次聚合。
+    fn spill_next(&mut self) -> Option<Result<RecordBatch>> {
+        let sp = self.spill.as_mut()?;
+        if self.spill_part >= sp.nparts() {
+            self.emitted = true;
+            return None;
+        }
+        let pi = self.spill_part;
+        self.spill_part += 1;
+        let rows = match sp.take_partition(pi) {
+            Ok(r) => r,
+            Err(e) => return Some(Err(e)),
+        };
+        let mut t = agg::GroupTable::new();
+        let ogs: Vec<usize> = {
+            let lits = self.state.group_lits();
+            let n = self.state.len();
+            (0..n)
+                .filter(|&g| {
+                    let l: Vec<crate::types::Literal> = lits.iter().map(|c| c[g].clone()).collect();
+                    crate::exec::agg_spill::partition_of_lits(&l, sp.nparts()) == pi
+                })
+                .collect()
+        };
+        if !ogs.is_empty() {
+            t.merge_subset(&self.state, ogs, self.aggs.len());
+        }
+        for b in &rows {
+            if let Err(e) = t.ingest(&self.group, &self.aggs, b) {
+                return Some(Err(e));
+            }
+        }
+        Some(agg::finalize_table(
+            &t,
+            &self.aggs,
+            &self.group,
+            &self.schema,
+        ))
+    }
+
     /// 取走组表 + 它的内存预留（分片路径用：表要交给 merge，预留也得跟着走，
     /// 否则 merge 期间「N 张分片表同时在内存」这个峰值就不在账上）。
-    pub fn into_state(self) -> (agg::GroupTable, crate::memory::Reservation) {
-        let Self { mut state, res, .. } = self;
-        (std::mem::take(&mut state), res)
+    pub fn into_parts(
+        self,
+    ) -> (
+        agg::GroupTable,
+        crate::memory::Reservation,
+        Option<crate::exec::agg_spill::AggSpill>,
+    ) {
+        let Self {
+            mut state,
+            res,
+            spill,
+            ..
+        } = self;
+        (std::mem::take(&mut state), res, spill)
     }
 }
 
@@ -917,6 +1058,13 @@ impl ExecNode for HashAggExec {
         if self.emitted {
             return None;
         }
+        // 已在溢出态：逐分区产出（defer 模式下由调用方取走，不在此 emit）
+        if self.spill.is_some() {
+            if self.defer_spill {
+                return None; // 调用方：表 + spill 都归它，走 merge
+            }
+            return self.spill_next();
+        }
         while let Some(b) = self.input.next() {
             if let Err(e) = self.ctx.check() {
                 return Some(Err(e));
@@ -932,11 +1080,41 @@ impl ExecNode for HashAggExec {
             // 一批的滞后可接受：增长上界就是刚摄入这批的规模。
             let est = self.state.estimated_bytes();
             if est > self.accounted {
-                if let Err(e) = self.res.grow(est - self.accounted) {
-                    return Some(Err(e));
+                if self.res.grow(est - self.accounted).is_err() {
+                    // **要不到额度 → 转分区溢出**（而不是把查询打死）。
+                    // 已聚合的组保留在 `self.state`（它就是"分区 0 的部分结果"），
+                    // 本批也已摄入，故**不重复路由本批**；后续行全部落盘。
+                    let schema = self.input.schema();
+                    match crate::exec::agg_spill::AggSpill::new(schema, &self.ctx) {
+                        Ok(sp) => self.spill = Some(sp),
+                        Err(e) => return Some(Err(e)),
+                    }
+                    break;
                 }
                 self.accounted = est;
             }
+        }
+        if let Some(sp) = self.spill.as_mut() {
+            // 剩余输入 → 按分组键路由到各分区（超界落盘）
+            let group = self.group.clone();
+            while let Some(b) = self.input.next() {
+                if let Err(e) = self.ctx.check() {
+                    return Some(Err(e));
+                }
+                let batch = match b {
+                    Ok(x) => x,
+                    Err(e) => return Some(Err(e)),
+                };
+                if let Err(e) = sp.push(&batch, &group) {
+                    return Some(Err(e));
+                }
+            }
+            if self.defer_spill {
+                self.emitted = true;
+                return None;
+            }
+            self.spill_part = 0;
+            return self.spill_next();
         }
         self.emitted = true;
         if self.state.is_empty() {

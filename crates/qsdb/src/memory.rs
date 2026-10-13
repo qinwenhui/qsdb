@@ -178,6 +178,10 @@ impl MemoryPool {
 pub struct Reservation {
     ctx: Arc<QueryContext>,
     bytes: u64,
+    /// 是否受**每查询配额**约束。溢出缓冲走 `false`——见
+    /// [`QueryContext::reserve_spill`]：逃生通道不能自己也吃配额，否则
+    /// 小配额下溢出永远启动不了（`grow` 会再撞配额，实测踩过）。
+    quota: bool,
 }
 
 impl std::fmt::Debug for Reservation {
@@ -193,7 +197,20 @@ impl std::fmt::Debug for Reservation {
 impl Reservation {
     /// 由 [`QueryContext::try_reserve`] 构造（账已入，此处只移交所有权）。
     pub(crate) fn from_parts(ctx: Arc<QueryContext>, bytes: u64) -> Self {
-        Self { ctx, bytes }
+        Self {
+            ctx,
+            bytes,
+            quota: true,
+        }
+    }
+
+    /// 溢出缓冲用：只受全局预算约束（不受每查询配额）。
+    pub(crate) fn from_parts_global(ctx: Arc<QueryContext>, bytes: u64) -> Self {
+        Self {
+            ctx,
+            bytes,
+            quota: false,
+        }
     }
 
     /// 已预留字节。
@@ -208,7 +225,12 @@ impl Reservation {
         if more == 0 {
             return Ok(());
         }
-        self.bytes += self.ctx.reserve_plain(more)?;
+        let n = if self.quota {
+            self.ctx.reserve_plain(more)?
+        } else {
+            self.ctx.reserve_global(more)?
+        };
+        self.bytes += n;
         Ok(())
     }
 

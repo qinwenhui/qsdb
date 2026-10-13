@@ -120,7 +120,7 @@ drift 时显式报错转人工 ALTER（最小权限原则）。此矩阵不改�
 
 | 租户 | 谁 | 记账 | 压力下的行为 |
 |---|---|---|---|
-| **执行内存** | 显式物化算子：HashJoin build / CrossJoin / Sort / Window / HashAgg / Distinct / SetOp / JoinCount / semi-anti 存在集 / CTE 物化 | 按**分配点的实际保留量**增量预留（聚合按组表**每分片**实记——分片放大是真占用） | 有溢出能力（Sort）→ 落盘完成；否则 → `MEMORY_PRESSURE`（503 **可退避重试**） |
+| **执行内存** | 显式物化算子：HashJoin build / CrossJoin / Sort / Window / HashAgg / Distinct / SetOp / JoinCount / semi-anti 存在集 / CTE 物化。**其中 Sort / HashAgg / Distinct 已能落盘**（内存要不到额度就溢出完成，见 [`内存预算与溢出设计.md`](内存预算与溢出设计.md) §四） | 按**分配点的实际保留量**增量预留（聚合按组表**每分片**实记——分片放大是真占用） | 有溢出能力（Sort）→ 落盘完成；否则 → `MEMORY_PRESSURE`（503 **可退避重试**） |
 | **解码缓存** | `SegmentCache`（实例级共享 LRU） | 由缓存自己同步 `used` | **先被挤兑**（纯缓存，丢了大不了重算；只挤到够用，不一挤到底） |
 | **写缓冲** | `WriteBuffer` | **不纳入预算**（自带上界 64 批 / 128MB） | 攒批阈值触发 flush |
 
