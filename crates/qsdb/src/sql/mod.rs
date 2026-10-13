@@ -379,13 +379,10 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
             materialize_ctes(db, &cte_defs, ctx)?;
             ctx.check()?;
             // M4-4 元数据短路：count(*) + 纯分区列谓词 → manifest O(1) 应答
-            if let Some(n) = metadata_shortcut_count(db, &plan)? {
+            // （输出列名随客户端别名走——J13）
+            if let Some((n, out_name)) = metadata_shortcut_count(db, &plan)? {
                 let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-                    arrow::datatypes::Field::new(
-                        "count(*)",
-                        arrow::datatypes::DataType::Int64,
-                        true,
-                    ),
+                    arrow::datatypes::Field::new(out_name, arrow::datatypes::DataType::Int64, true),
                 ]));
                 let batch = RecordBatch::try_new(
                     Arc::clone(&schema),
@@ -447,14 +444,36 @@ fn materialize_ctes(
 
 /// 检测可元数据应答的形态：Project? → Aggregate(count(*), 无 group) → Scan(predicate 仅分区列)。
 /// 返回 Some(count) 表示短路命中（None 走正常执行）。
+/// `count(*)` 的 **O(1) 元数据短路**：返回 `(行数, 输出列名)`。
+///
+/// 返回列名是必须的：调用方要拿它建结果 schema（J13——此前硬编码 `"count(*)")`，
+/// 把 `SELECT COUNT(*) AS n` 的别名吞了）。
 fn metadata_shortcut_count(
     db: &Qsdb,
     plan: &crate::sql::translate::LogicalPlan,
-) -> Result<Option<u64>> {
+) -> Result<Option<(u64, String)>> {
     use crate::sql::translate::LogicalPlan;
-    // 剥 Project
+    // 剥 Project —— 但只认「**恰好一个裸列引用**」的投影：
+    //   · 多个输出列（`SELECT COUNT(*), 1 AS k FROM t`）→ 短路只回一列，**静默吞列**
+    //   · 表达式投影（`SELECT COUNT(*) + 1 AS n FROM t`）→ 短路拿原始 count 顶上，
+    //     **值直接算错**（实测 SQL 里的 `+1` 被无声忽略）
+    // 两条都是"用户拿到错东西还不报错"，必须让开走常规路径（慢一点但正确）。
+    let mut out_name = "count(*)".to_string();
     let mut cur = plan;
-    if let LogicalPlan::Project { input, .. } = cur {
+    if let LogicalPlan::Project {
+        input,
+        exprs,
+        names,
+    } = cur
+    {
+        let plain_single_col =
+            exprs.len() == 1 && matches!(exprs[0], crate::expr::PhysExpr::Column { .. });
+        if !plain_single_col {
+            return Ok(None);
+        }
+        if let Some(n) = names.first() {
+            out_name = n.clone(); // 别名透出（J13）
+        }
         cur = input;
     }
     // Aggregate：无 group、唯一聚合 count(*)
@@ -479,7 +498,9 @@ fn metadata_shortcut_count(
         if predicate.is_some() {
             return Ok(None);
         }
-        return db.scan_metadata_count(&def.name, None);
+        return Ok(db
+            .scan_metadata_count(&def.name, None)?
+            .map(|n| (n, out_name)));
     }
     if let Some(pred) = predicate {
         let mut cols = std::collections::HashSet::new();
@@ -493,7 +514,9 @@ fn metadata_shortcut_count(
             return Ok(None);
         }
     }
-    db.scan_metadata_count(&def.name, predicate.as_ref())
+    Ok(db
+        .scan_metadata_count(&def.name, predicate.as_ref())?
+        .map(|n| (n, out_name)))
 }
 
 // ---------------------------------------------------------------------------
