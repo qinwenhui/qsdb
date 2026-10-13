@@ -43,7 +43,7 @@ const PART_CAP_MIN: u64 = 64 * 1024;
 
 /// 分区数：与常见并行度同量级即可——分区越多单分区越小，但文件数与收尾开销随之涨。
 /// （自适应分区留到 P3；先固定值把正确性与内存上界立住。）
-fn default_nparts() -> usize {
+pub fn default_nparts() -> usize {
     rayon::current_num_threads().clamp(2, 16)
 }
 
@@ -63,29 +63,31 @@ pub fn partition_of_lits(lits: &[Literal], nparts: usize) -> usize {
     (h % nparts as u64) as usize
 }
 
-/// 分区溢出器：按行路由 → 有界缓冲 → 落盘 → 逐分区取回。
-pub struct AggSpill {
+// ---------------------------------------------------------------------------
+// 通用分区溢出内核：**路由由调用方算**（`part_of_row`），本结构只管
+// 有界缓冲 → 落盘 → 逐分区取回 → 内存记账。
+//
+// 两个使用者、两套路由口径（都必须与各自**内存路径**的口径一致，否则同一逻辑键
+// 会被拆到不同分区、两边各算出半个结果）：
+// - 聚合/去重：`route_by_lits`（Literal 规范形态——组表里只有 Literal）
+// - hash join：`route_by_join_key`（`encode_join_key`——join 索引用的就是它）
+// ---------------------------------------------------------------------------
+
+/// 分区溢出内核。
+pub struct PartSpill {
     dir: SpillDir,
     nparts: usize,
-    /// 各分区的内存尾批（未落盘部分）
     bufs: Vec<Vec<RecordBatch>>,
     buf_bytes: Vec<u64>,
-    /// 各分区已落盘的 run 路径（按写入顺序）
     runs: Vec<Vec<PathBuf>>,
-    /// 落盘/读回共用的输入 schema
     schema: SchemaRef,
-    /// 单分区缓冲上界（按查询配额自适应，见 [`Self::part_cap_for`]）
     part_cap: u64,
-    /// 溢出缓冲的内存预留：**走 `reserve_spill`（只受全局预算约束）**
     res: Reservation,
-    /// 已交给调用方、尚未释放的行字节
     live: u64,
 }
 
-impl AggSpill {
-    /// 单分区缓冲上界：**按查询配额缩放**——极小配额（如 64KB）下若还用 4MB
-    /// 缓冲，光缓冲就远超用户给这个查询的额度；反之配额充裕时缓冲太小会让
-    /// 落盘次数暴增。取 `配额 / (4×分区数)`，夹在 [64KB, 4MB]。
+impl PartSpill {
+    /// 单分区缓冲上界的自适应（见 `AggSpill::part_cap_for` 的注释）。
     pub fn part_cap_for(ctx: &crate::query::QueryContext, nparts: usize) -> u64 {
         match ctx.memory_limit {
             Some(l) => (l / (4 * nparts.max(1) as u64)).clamp(PART_CAP_MIN, PART_CAP_MAX),
@@ -96,9 +98,9 @@ impl AggSpill {
     pub fn new(
         schema: SchemaRef,
         ctx: &std::sync::Arc<crate::query::QueryContext>,
+        part_cap: u64,
     ) -> Result<Self> {
         let nparts = default_nparts();
-        let part_cap = Self::part_cap_for(ctx, nparts);
         let res = ctx.reserve_spill(0)?;
         Ok(Self {
             dir: SpillDir::new(),
@@ -117,32 +119,16 @@ impl AggSpill {
         self.nparts
     }
 
-    /// 路由一批（**原始输入批，不改形状**）：按行算分区 → 分组 take → 追加到该分区
-    /// 缓冲 → 超界落盘。
-    ///
-    /// 缓冲内存由本结构自持的预留记账（`reserve_spill`：**只受全局预算约束**），
-    /// 缓冲增长 `grow`、落盘 `shrink`——否则"落盘省内存"就是把账做假。
-    pub fn push(&mut self, batch: &RecordBatch, group: &[PhysExpr]) -> Result<()> {
+    /// 按**调用方算好的分区号**分发一批（分组 take → 追加缓冲 → 超界落盘）。
+    pub fn push_routed(&mut self, batch: &RecordBatch, part_of_row: &[u32]) -> Result<()> {
         let n = batch.num_rows();
         if n == 0 {
             return Ok(());
         }
-        // 分组键 → 行分区（求值一次，各行复用）
-        let group_arrays: Vec<arrow::array::ArrayRef> = group
-            .iter()
-            .map(|g| crate::expr::eval::eval(g, batch))
-            .collect::<Result<_>>()?;
+        debug_assert_eq!(n, part_of_row.len());
         let mut idx_by_part: Vec<Vec<u32>> = vec![Vec::new(); self.nparts];
-        let mut lits: Vec<Literal> = Vec::with_capacity(group_arrays.len());
-        for row in 0..n {
-            lits.clear();
-            lits.extend(
-                group_arrays
-                    .iter()
-                    .map(|a| array_value_to_literal(a.as_ref(), row)),
-            );
-            let p = partition_of_lits(&lits, self.nparts);
-            idx_by_part[p].push(row as u32);
+        for (row, &p) in part_of_row.iter().enumerate() {
+            idx_by_part[p as usize].push(row as u32);
         }
         for (p, idx) in idx_by_part.into_iter().enumerate() {
             if idx.is_empty() {
@@ -152,11 +138,11 @@ impl AggSpill {
             let cols: Vec<arrow::array::ArrayRef> = (0..batch.num_columns())
                 .map(|c| {
                     arrow::compute::take(batch.column(c), &take_idx, None)
-                        .map_err(|e| QsdbError::invalid(format!("agg spill take: {e}")))
+                        .map_err(|e| QsdbError::invalid(format!("part spill take: {e}")))
                 })
                 .collect::<Result<_>>()?;
             let sub = RecordBatch::try_new(Arc::clone(&self.schema), cols)
-                .map_err(|e| QsdbError::invalid(format!("agg spill batch: {e}")))?;
+                .map_err(|e| QsdbError::invalid(format!("part spill batch: {e}")))?;
             let bytes = sub.get_array_memory_size() as u64;
             self.res.grow(bytes)?;
             self.buf_bytes[p] += bytes;
@@ -167,18 +153,15 @@ impl AggSpill {
                 self.runs[p].push(path);
                 self.bufs[p].clear();
                 self.buf_bytes[p] = 0;
-                self.res.shrink(freed); // 已落盘 → 内存还给预算
+                self.res.shrink(freed);
             }
         }
         Ok(())
     }
 
-    /// 取出一个分区**全部行**（落盘 run + 内存尾批）。
-    ///
-    /// 逐分区消费：调用方处理完一个再取下一个，峰值只多"一个分区的行"——
-    /// 故本函数顺带释放**上一个**已交给调用方的分区的记账（调用方用完即弃）。
+    /// 取出一个分区**全部行**（落盘 run + 内存尾批）；顺带释放上一分区的记账。
     pub fn take_partition(&mut self, p: usize) -> Result<Vec<RecordBatch>> {
-        self.res.shrink(self.live); // 上一分区已被调用方消费
+        self.res.shrink(self.live);
         self.live = 0;
         let mut out: Vec<RecordBatch> = Vec::new();
         for path in self.runs[p].drain(..) {
@@ -194,9 +177,101 @@ impl AggSpill {
         Ok(out)
     }
 
-    /// 是否已有落盘内容（诊断/测试用）。
     pub fn spilled_runs(&self) -> usize {
         self.runs.iter().map(|v| v.len()).sum()
+    }
+}
+
+/// 路由口径①：聚合/去重——分组键的 `Literal` 规范形态（**与组表的键同源**：
+/// 组表的键就是 `array_value_to_literal` 造出来的）。
+pub fn route_by_lits(batch: &RecordBatch, group: &[PhysExpr], nparts: usize) -> Result<Vec<u32>> {
+    let group_arrays: Vec<arrow::array::ArrayRef> = group
+        .iter()
+        .map(|g| crate::expr::eval::eval(g, batch))
+        .collect::<Result<_>>()?;
+    let mut out = Vec::with_capacity(batch.num_rows());
+    let mut lits: Vec<Literal> = Vec::with_capacity(group_arrays.len());
+    for row in 0..batch.num_rows() {
+        lits.clear();
+        lits.extend(
+            group_arrays
+                .iter()
+                .map(|a| array_value_to_literal(a.as_ref(), row)),
+        );
+        out.push(partition_of_lits(&lits, nparts) as u32);
+    }
+    Ok(out)
+}
+
+/// 路由口径②：hash join——`encode_join_key` 的字节（**与 join 索引同源**：
+/// 索引也是拿它建键的；NULL 键带 0 前缀，两侧一致即可）。
+pub fn route_by_join_key(
+    batch: &RecordBatch,
+    keys: &[PhysExpr],
+    nparts: usize,
+) -> Result<Vec<u32>> {
+    let key_cols: Vec<arrow::array::ArrayRef> = keys
+        .iter()
+        .map(|k| crate::expr::eval::eval(k, batch))
+        .collect::<Result<_>>()?;
+    let mut out = Vec::with_capacity(batch.num_rows());
+    let mut buf: Vec<u8> = Vec::with_capacity(64);
+    for row in 0..batch.num_rows() {
+        crate::exec::join::encode_join_key(&key_cols, row, &mut buf);
+        out.push((fxhash_bytes(&buf) % nparts as u64) as u32);
+    }
+    Ok(out)
+}
+
+fn fxhash_bytes(bytes: &[u8]) -> u64 {
+    const K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+    let mut h: u64 = 0;
+    for &b in bytes {
+        h = (h.rotate_left(5) ^ u64::from(b)).wrapping_mul(K);
+    }
+    h
+}
+
+/// 聚合/去重的分区溢出器：路由口径 = 分组键的 `Literal` 规范形态
+/// （内核见 [`PartSpill`]，`push` 即"算路由 + 交给内核"）。
+pub struct AggSpill {
+    core: PartSpill,
+}
+
+impl AggSpill {
+    /// 单分区缓冲上界（转发 [`PartSpill::part_cap_for`]）。
+    pub fn part_cap_for(ctx: &crate::query::QueryContext, nparts: usize) -> u64 {
+        PartSpill::part_cap_for(ctx, nparts)
+    }
+
+    pub fn new(
+        schema: SchemaRef,
+        ctx: &std::sync::Arc<crate::query::QueryContext>,
+    ) -> Result<Self> {
+        let nparts = default_nparts();
+        let part_cap = PartSpill::part_cap_for(ctx, nparts);
+        Ok(Self {
+            core: PartSpill::new(schema, ctx, part_cap)?,
+        })
+    }
+
+    pub fn nparts(&self) -> usize {
+        self.core.nparts()
+    }
+
+    /// 路由一批（口径见 [`route_by_lits`]）→ 内核。
+    pub fn push(&mut self, batch: &RecordBatch, group: &[PhysExpr]) -> Result<()> {
+        let nparts = self.core.nparts();
+        let parts = route_by_lits(batch, group, nparts)?;
+        self.core.push_routed(batch, &parts)
+    }
+
+    pub fn take_partition(&mut self, p: usize) -> Result<Vec<RecordBatch>> {
+        self.core.take_partition(p)
+    }
+
+    pub fn spilled_runs(&self) -> usize {
+        self.core.spilled_runs()
     }
 }
 

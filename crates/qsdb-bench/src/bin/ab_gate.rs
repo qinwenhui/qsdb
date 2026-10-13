@@ -38,7 +38,11 @@ fn cases() -> Vec<(&'static str, String, bool)> {
             "SELECT count(*), sum(v), min(v), max(v) FROM t".into(),
             false,
         ),
-        ("filter_num", "SELECT count(*) FROM t WHERE v < 100".into(), false),
+        (
+            "filter_num",
+            "SELECT count(*) FROM t WHERE v < 100".into(),
+            false,
+        ),
         (
             "filter_str",
             "SELECT count(*) FROM t WHERE s LIKE 's-1%'".into(),
@@ -78,11 +82,7 @@ fn cases() -> Vec<(&'static str, String, bool)> {
             "SELECT g, count(*) AS c, sum(v) AS s FROM t GROUP BY g".into(),
             true,
         ),
-        (
-            "spill_order_by",
-            "SELECT v FROM t ORDER BY v".into(),
-            true,
-        ),
+        ("spill_order_by", "SELECT v FROM t ORDER BY v".into(), true),
     ]
 }
 
@@ -102,7 +102,9 @@ fn peak_rss_kb() -> u64 {
 
 fn arg(name: &str) -> Option<String> {
     let a: Vec<String> = std::env::args().collect();
-    a.iter().position(|x| x == name).and_then(|i| a.get(i + 1).cloned())
+    a.iter()
+        .position(|x| x == name)
+        .and_then(|i| a.get(i + 1).cloned())
 }
 
 fn has(flag: &str) -> bool {
@@ -128,16 +130,14 @@ fn open(data: &str) -> Qsdb {
 /// 建数据：`t`（分区表，多列多段） + `dim`。幂等：已存在则跳过。
 fn prepare(data: &str, rows: i64) {
     let db = open(data);
-    if db
-        .sql("SELECT count(*) FROM t")
-        .ok()
-        .is_some()
-    {
+    if db.sql("SELECT count(*) FROM t").ok().is_some() {
         println!("数据已存在，跳过准备: {data}");
         return;
     }
-    db.sql("CREATE TABLE t (dp BIGINT, g BIGINT, v BIGINT, x DOUBLE, s STRING) PARTITIONED BY (dp)")
-        .expect("create t");
+    db.sql(
+        "CREATE TABLE t (dp BIGINT, g BIGINT, v BIGINT, x DOUBLE, s STRING) PARTITIONED BY (dp)",
+    )
+    .expect("create t");
     db.sql("CREATE TABLE dim (g BIGINT, name STRING)")
         .expect("create dim");
 
@@ -245,7 +245,9 @@ fn run_case(idx: usize, data: &str, rounds: usize, limit_mb: u64) {
 fn main() {
     let data = arg("--data").unwrap_or_else(|| "/root/bench/ab-data".to_string());
     if has("--prepare") {
-        let rows: i64 = arg("--rows").and_then(|v| v.parse().ok()).unwrap_or(5_000_000);
+        let rows: i64 = arg("--rows")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5_000_000);
         // 给足准备阶段的内存（这是建数据，不是被测对象）
         prepare(&data, rows);
         return;
@@ -258,7 +260,14 @@ fn main() {
             let cs = cases();
             println!("用例清单（用 --case N 逐个跑，独立子进程隔离）:");
             for (i, (n, _, c)) in cs.iter().enumerate() {
-                println!("  {i:>2} {n}{}", if *c { "  [极小配额：验证溢出]" } else { "" });
+                println!(
+                    "  {i:>2} {n}{}",
+                    if *c {
+                        "  [极小配额：验证溢出]"
+                    } else {
+                        ""
+                    }
+                );
             }
         }
     }

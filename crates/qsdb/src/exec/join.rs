@@ -198,6 +198,17 @@ pub struct HashJoinExec {
     /// semi/anti 族 build 产物（与 build_state 互斥，按 join_type 选）
     exists_state: Option<ExistsState>,
     probe_done: bool,
+    // ── 溢出态（build 侧要不到额度时启用）：**分区块 hash join** ──
+    /// build 侧按 join key 分区落盘
+    spill_build: Option<crate::exec::agg_spill::PartSpill>,
+    /// probe 侧按 join key 分区落盘（同一键必然同分区 → 分区内连接即完整）
+    spill_probe: Option<crate::exec::agg_spill::PartSpill>,
+    /// 当前正在处理的分区号
+    spill_part: usize,
+    /// 当前分区的 build 索引（每分区重建一次）
+    cur_build: Option<BuildState>,
+    /// 当前分区待探测的行（从磁盘读回，逐批流式）
+    cur_probe: Option<std::vec::IntoIter<RecordBatch>>,
 }
 
 struct BuildState {
@@ -337,6 +348,11 @@ impl HashJoinExec {
             build_res: None,
             exists_state: None,
             probe_done: false,
+            spill_build: None,
+            spill_probe: None,
+            spill_part: 0,
+            cur_build: None,
+            cur_probe: None,
         }
     }
 
@@ -353,7 +369,14 @@ impl HashJoinExec {
         while let Some(b) = self.build.next() {
             self.ctx.check()?;
             let x = b?;
-            res.grow(x.get_array_memory_size() as u64)?;
+            if res.grow(x.get_array_memory_size() as u64).is_err() {
+                // **要不到额度 → 转分区块 hash join**（而不是把查询打死）。
+                // 注意：**本批也要进分区**——它就是压垮内存的那一批，
+                // 只交已收集的 `batches` 会静默少一个批的行（实测丢 2000 行）。
+                batches.push(x);
+                self.enter_spill(batches)?;
+                return Ok(());
+            }
             batches.push(x);
         }
         let total = res.bytes();
@@ -606,6 +629,147 @@ pub fn semi_mask(
     Ok(BooleanArray::from(mask))
 }
 
+impl HashJoinExec {
+    /// 转入**分区块 hash join**：两侧都按 join key 分区落盘，再逐分区连接。
+    ///
+    /// 为什么两侧都要分区：同一键必须落同一分区（`route_by_join_key` 与 join
+    /// 索引同用 `encode_join_key`），故分区内连接即完整——但这也意味着探测侧要
+    /// 能**按分区重放**，而它是流式的、只能落盘一次（每行写一次读一次）。
+    ///
+    /// 覆盖范围：**INNER / LEFT OUTER**（build 侧要物化整行的大头就在这两类）。
+    /// 不覆盖：semi/anti 族（build 侧只存**键集**、体量小一个量级，另走
+    /// `build_phase_exists`，要不到额度仍报 `MEMORY_PRESSURE`）；非等值 join
+    /// （`CrossJoinExec` 无键可分区）。
+    fn enter_spill(&mut self, collected: Vec<RecordBatch>) -> Result<()> {
+        let build_schema = self.build.schema();
+        let probe_schema = self.probe.schema();
+        let ctx = Arc::clone(&self.ctx);
+        let nparts = crate::exec::agg_spill::default_nparts();
+        let cap = crate::exec::agg_spill::PartSpill::part_cap_for(&ctx, nparts);
+        let mut bs = crate::exec::agg_spill::PartSpill::new(build_schema, &ctx, cap)?;
+        let mut ps = crate::exec::agg_spill::PartSpill::new(probe_schema, &ctx, cap)?;
+        let n = bs.nparts();
+        // ① 已收集的 build 行 + 剩余 build 输入
+        for b in collected {
+            let parts = crate::exec::agg_spill::route_by_join_key(&b, &self.build_keys, n)?;
+            bs.push_routed(&b, &parts)?;
+        }
+        while let Some(b) = self.build.next() {
+            self.ctx.check()?;
+            let b = b?;
+            let parts = crate::exec::agg_spill::route_by_join_key(&b, &self.build_keys, n)?;
+            bs.push_routed(&b, &parts)?;
+        }
+        // ② probe 侧全量（它原本是流式的，现在必须先落盘才能按分区重放）
+        while let Some(b) = self.probe.next() {
+            self.ctx.check()?;
+            let b = b?;
+            let parts = crate::exec::agg_spill::route_by_join_key(&b, &self.probe_keys, n)?;
+            ps.push_routed(&b, &parts)?;
+        }
+        self.spill_build = Some(bs);
+        self.spill_probe = Some(ps);
+        self.spill_part = 0;
+        Ok(())
+    }
+
+    /// 逐分区产出：读该分区的 build 行 → 建索引 → 流式探测该分区的 probe 行。
+    fn spill_next(&mut self) -> Option<Result<RecordBatch>> {
+        loop {
+            // 进入下一分区：建索引 + 取回该分区的 probe 行
+            if self.cur_build.is_none() {
+                let nparts = self.spill_build.as_ref()?.nparts();
+                if self.spill_part >= nparts {
+                    self.probe_done = true;
+                    return None;
+                }
+                let pi = self.spill_part;
+                self.spill_part += 1;
+                let bs = self.spill_build.as_mut()?;
+                let rows = match bs.take_partition(pi) {
+                    Ok(r) => r,
+                    Err(e) => return Some(Err(e)),
+                };
+                if rows.is_empty() {
+                    continue; // 该分区 build 侧为空 → 无匹配（LEFT 也无需发射）
+                }
+                let table = match concat_batches(&rows, &self.build.schema()) {
+                    Ok(t) => t,
+                    Err(e) => return Some(Err(e)),
+                };
+                // 分区表也记账：正常情况 ≈ build 总量 / P，但**键倾斜**时可能
+                // 仍很大——那时要不到额度就如实报错（不再往下切分），
+                // 而不是让它无界涨上去。
+                //
+                // 走 `reserve_spill`（**只受全局预算约束**）：溢出路径的记账不
+                // 吃每查询配额——否则小配额下"逃生通道"自己先被配额掐死
+                // （P1 同样的坑，实测复现）。真正的硬上界是全局预算。
+                let mut r = match self.ctx.reserve_spill(0) {
+                    Ok(r) => r,
+                    Err(e) => return Some(Err(e)),
+                };
+                let est = table.get_array_memory_size() as u64 + table.num_rows() as u64 * 16;
+                if let Err(e) = r.grow(est) {
+                    return Some(Err(e));
+                }
+                let key_cols: Vec<ArrayRef> = match self
+                    .build_keys
+                    .iter()
+                    .map(|k| eval::eval(k, &table))
+                    .collect::<Result<_>>()
+                {
+                    Ok(c) => c,
+                    Err(e) => return Some(Err(e)),
+                };
+                let index: HashIndex = if HashIndex::int_ok(&self.build_keys) {
+                    let mut m: I64Map<Vec<u32>> = I64Map::default();
+                    if let Some(vals) = int_key_column(&key_cols[0]) {
+                        for row in 0..table.num_rows() {
+                            if let Some(v) = vals(row) {
+                                m.entry(v).or_default().push(row as u32);
+                            }
+                        }
+                        HashIndex::I64(m)
+                    } else {
+                        HashIndex::Bytes(build_bytes_index(&key_cols, table.num_rows()))
+                    }
+                } else {
+                    HashIndex::Bytes(build_bytes_index(&key_cols, table.num_rows()))
+                };
+                self.build_res = Some(r);
+                self.cur_build = Some(BuildState { table, index });
+                let ps = self.spill_probe.as_mut()?;
+                let rows = match ps.take_partition(pi) {
+                    Ok(r) => r,
+                    Err(e) => return Some(Err(e)),
+                };
+                self.cur_probe = Some(rows.into_iter());
+            }
+            // 当前分区还有探测行 → 连接
+            let batch = match self.cur_probe.as_mut().and_then(|it| it.next()) {
+                Some(b) => b,
+                None => {
+                    self.cur_build = None;
+                    self.cur_probe = None;
+                    continue; // 下一分区（build 索引与预留随之释放）
+                }
+            };
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let out_schema = Arc::clone(&self.schema);
+            let probe_keys = self.probe_keys.clone();
+            let join_type = self.join_type;
+            let build = self.cur_build.as_ref()?;
+            match join_batch(&batch, build, &probe_keys, &out_schema, join_type) {
+                Ok(Some(b)) => return Some(Ok(b)),
+                Ok(None) => continue,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+}
+
 impl ExecNode for HashJoinExec {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
@@ -615,8 +779,16 @@ impl ExecNode for HashJoinExec {
         if self.probe_done {
             return None;
         }
+        // 溢出态：逐分区"建索引 → 探测"，两侧的行都已落盘
+        if self.spill_build.is_some() {
+            return self.spill_next();
+        }
         if let Err(e) = self.build_phase() {
             return Some(Err(e));
+        }
+        // build_phase 可能刚转入溢出态（本次 build 要不到额度）
+        if self.spill_build.is_some() {
+            return self.spill_next();
         }
         let join_type = self.join_type;
         let out_schema = Arc::clone(&self.schema);
