@@ -19,6 +19,10 @@ fn arg(name: &str) -> Option<String> {
 }
 
 fn post(addr: &str, path: &str, body: &[u8]) -> (u16, String) {
+    post_ct(addr, path, "application/octet-stream", body)
+}
+
+fn post_ct(addr: &str, path: &str, ct: &str, body: &[u8]) -> (u16, String) {
     let mut s = TcpStream::connect(addr).expect("connect");
     let req = format!(
         "POST {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
@@ -72,6 +76,14 @@ fn main() {
     );
 
     // 目标表（三种格式各一个）
+    for fmt in ["ipc", "bulk", "csv"] {
+        let sql = format!(
+            "CREATE TABLE t_{fmt} (id BIGINT, g BIGINT, gs STRING, v BIGINT, x DOUBLE, s STRING, dt DATE)"
+        );
+        let body = serde_json::json!({"sql": sql}).to_string();
+        let (st, resp) = post_ct(&addr, "/api/v1/query", "application/json", body.as_bytes());
+        println!("建表 t_{fmt}: status={st} {}", resp.lines().last().unwrap_or(""));
+    }
     for fmt in ["ipc", "bulk", "csv"] {
         let body = format!(
             "{{\"sql\":\"CREATE TABLE t_{fmt} (id BIGINT, g BIGINT, gs STRING, v BIGINT, x DOUBLE, s STRING, dt DATE)\"}}"
