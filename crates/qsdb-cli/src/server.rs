@@ -529,6 +529,11 @@ async fn auth_login(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Respo
 /// GET /api/v1/files?path=<相对 db root 的路径>——物理复制源（qsdb-sync F11）。
 /// 路径白名单：禁止 `_trash`/`_filecache`/`..`；其余（manifest/segment/table.json/
 /// partitions.idx）均可下载。配合 read_only 模式即成为标准复制源。
+///
+/// **流式返回**（qsdb-sync 回灌：此前是 `fs::read` 整文件进内存再返回，段多大就吃
+/// 多少——复制大段会把源端打爆）。现在按 8KB 块边读边发，源端内存与段大小无关。
+/// `Content-Length` 照给（从 `metadata()` 拿），所以客户端仍能校验完整性；
+/// 中途读失败就断开连接、**响应体短于 Content-Length**，客户端据此可判为失败重试。
 #[derive(serde::Deserialize)]
 struct FileParams {
     path: String,
@@ -554,23 +559,28 @@ async fn download_file(
         return ErrorCode::Forbidden.response("internal paths not downloadable");
     }
     let full = s.db.root().join(&rel);
-    let result = tokio::task::spawn_blocking(move || std::fs::read(&full)).await;
-    match result {
-        Ok(Ok(bytes)) => {
-            let len = bytes.len().to_string();
-            (
-                StatusCode::OK,
-                [
-                    ("content-type", "application/octet-stream"),
-                    ("content-length", len.as_str()),
-                ],
-                bytes,
-            )
-                .into_response()
-        }
-        Ok(Err(e)) => ErrorCode::NotFound.response(format!("file not found: {e}")),
-        Err(e) => ErrorCode::Internal.response(format!("io task: {e}")),
+    // 目录要先挡掉：`File::open` 在 Linux 上能打开目录，读起来报 EISDIR，
+    // 那时响应头已经发出去了 —— 只能变成"截断的 200"，很难排查。
+    let md = match tokio::fs::metadata(&full).await {
+        Ok(m) if m.is_file() => m,
+        Ok(_) => return ErrorCode::NotFound.response(format!("not a file: {rel}")),
+        Err(e) => return ErrorCode::NotFound.response(format!("file not found: {e}")),
+    };
+    let f = match tokio::fs::File::open(&full).await {
+        Ok(f) => f,
+        Err(e) => return ErrorCode::NotFound.response(format!("file not found: {e}")),
+    };
+    let mut resp =
+        axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(f)).into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/octet-stream"),
+    );
+    if let Ok(v) = axum::http::HeaderValue::from_str(&md.len().to_string()) {
+        h.insert(axum::http::header::CONTENT_LENGTH, v);
     }
+    resp
 }
 
 /// 把内存池的实时占用刷进指标原子（渲染前调一次；池本身在 `Qsdb` 上）。

@@ -19,6 +19,7 @@ rustyline = { workspace = true }
 arrow = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 arrow-flight = { version = "60", optional = true }

@@ -33,7 +33,11 @@ sqlparser = "0.63"
 clap = { version = "4", features = ["derive"] }
 rustyline = "18"
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "fs"] }
+## 只为 `tokio_util::io::ReaderStream`（`GET /api/v1/files` 流式下载，qsdb-sync F11）。
+## 注意：**它本来就在依赖树里**（axum → h2/tower → tokio-util），这里只是打开 `io`
+## feature 并声明成直接依赖 —— 不新增任何 crate，二进制增量 ≈ 0。
+tokio-util = { version = "0.7", features = ["io"] }
 
 # 内部 crate
 qsdb = { path = "crates/qsdb" }

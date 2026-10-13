@@ -452,6 +452,64 @@ fn rows_body_without_schema() -> Vec<u8> {
     b
 }
 
+/// **F11：物理复制的段下载端点**（`GET /api/v1/files`）。
+///
+/// 这条端点此前**一个测试都没有**——正是"契约文档写可用、却没有东西钉着"的形态
+/// （同一个坑刚在 HTTP overwrite 上踩过）。这里补上：字节级往返（含跨多个读块的
+/// 大文件）、路径白名单、目录与缺失的 404。
+///
+/// 流式（qsdb-sync 回灌项）不在此处断言内存——**用"大文件能逐字节拿全"间接证明
+/// 分块读没把内容搞坏**；内存本身由实现决定（`ReaderStream` 按块读，不再整文件载入）。
+#[test]
+fn file_download_roundtrip_and_whitelist() {
+    let srv = Server::start(&[]);
+    let p = srv.port;
+    assert_eq!(
+        query(p, "CREATE TABLE t (a BIGINT, s STRING)", None).status,
+        200
+    );
+    assert_eq!(
+        query(p, "INSERT INTO t VALUES (1, 'x'), (2, 'y')", None).status,
+        200
+    );
+
+    let get = |path: &str| http(p, "GET", &format!("/api/v1/files?path={path}"), &[], b"");
+
+    // ① 真段文件/manifest：与磁盘逐字节一致
+    let manifest = srv.root.join("default").join("t").join("manifest.postcard");
+    assert!(manifest.exists(), "段/manifest 应已落盘: {manifest:?}");
+    let on_disk = std::fs::read(&manifest).unwrap();
+    let r = get("default/t/manifest.postcard");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.header("content-type"), Some("application/octet-stream"));
+    assert_eq!(r.body, on_disk, "下载内容必须与磁盘逐字节一致");
+
+    // ② 跨多个读块的大文件（8KB 一块 → 5MB 要读 600+ 次）
+    let mut big = vec![0u8; 5 * 1024 * 1024];
+    for (i, b) in big.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    std::fs::write(srv.root.join("big.bin"), &big).unwrap();
+    let r = get("big.bin");
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body.len(), big.len(), "长度必须完整");
+    assert!(
+        r.body == big,
+        "大文件内容必须逐字节一致（分块读不能错位/截断）"
+    );
+
+    // ③ 路径白名单（显式拒绝，不静默兜底）
+    assert_eq!(get("..%2FCargo.toml").status, 400, "上跳必须 400");
+    assert_eq!(get("/etc/passwd").status, 400, "绝对路径必须 400");
+    assert_eq!(get("_trash/x").status, 403, "内部目录必须 403");
+    assert_eq!(get("_spill/seg").status, 403, "内部目录必须 403");
+
+    // ④ 目录 → 404（**不能**变成"截断的 200"：Linux 上 File::open 能打开目录）
+    assert_eq!(get("default").status, 404);
+    // ⑤ 不存在的文件 → 404
+    assert_eq!(get("default/t/nope.parquet").status, 404);
+}
+
 /// **J15：零行结果在每种 format 下都要读得回来**（`WHERE false` / `LIMIT 0`）。
 ///
 /// 这是 BI 工具探测元数据的标准姿势（DBeaver 之类先 `LIMIT 0` 拿列名/类型）。
