@@ -115,9 +115,12 @@ impl LockingStore {
                 }
                 Err(e) => return Err(e),
             }
-            if round % 8 == 7 {
-                tracing::debug!(target: "qsdb::occ", key = %location, round,
-                    "CAS lock contention, backing off");
+            // 诊断走**环境变量门控的 eprintln**（仓内既有惯例：`QSDB_JOIN_PROF` /
+            // `QSDB_AGG_TIMING`），不引 `tracing`——内核刻意无日志设施（日志在
+            // CLI 层），而 `feature hdfs` 也未声明 `dep:tracing`（此前这条
+            // `tracing::debug!` 让 hdfs feature 直接 E0433 编不过）。
+            if round % 8 == 7 && std::env::var("QSDB_OCC_PROF").is_ok() {
+                eprintln!("[occ] CAS lock contention key={location} round={round}, backing off");
             }
             if round % 4 == 3 {
                 tokio::time::sleep(std::time::Duration::from_millis(LOCK_RETRY_MS)).await;
