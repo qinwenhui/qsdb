@@ -1323,10 +1323,15 @@ pub fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<(String, LogicalTyp
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Distinct { input } => plan_output_columns(input)?,
-        LogicalPlan::Join { .. } | LogicalPlan::CrossJoinFilter { .. } => {
-            return Err(QsdbError::unsupported(
-                "CTE output from JOIN not inferable in binder",
-            ));
+        // join 输出 = 左段 ++ 右段（与 `translate_select_inner` 里 ctx 的注册顺序同构）。
+        // 这里给的是**非限定**列名：本函数的读者（CTE/派生表/`UNION` 两侧/`l_full` 宽度）
+        // 要的都是"列"，限定名由 join 层的 ctx 另行提供。
+        // 此前这里直接报错，于是**左侧是 join 的 join**（三表以上）只能走叉积分支——
+        // 那正是 `complex_three_way` 113× 的另一半原因，两个 bug 恰好互相掩护。
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::CrossJoinFilter { left, right, .. } => {
+            let mut cols = plan_output_columns(left)?;
+            cols.extend(plan_output_columns(right)?);
+            cols
         }
         LogicalPlan::Window {
             input, window_fns, ..
@@ -2535,11 +2540,17 @@ fn translate_select_inner(
         };
         // ctx 扩展：右表列仅以限定名注册（table.col），顺序 = join 输出右段。
         // 非限定右列引用不支持（SQL-2 约束，歧义保护）。
-        let n_left_plain = ctx.cols.iter().filter(|(n, _)| !n.contains('.')).count();
+        //
+        // **左侧宽度 = `ctx.cols` 现有长度**，不是"非限定列数"。第二次 join 起，
+        // 左侧已经含上一次带进来的**限定**列（`… JOIN d ON … JOIN d2 ON d.c = d2.c` 里的
+        // `d.c`），按"非限定"计数会把它算进右侧 ⇒ 两个操作数同侧 ⇒ `split_equi_condition`
+        // 报错 ⇒ 落到叉积分支（**静默退化**：结果对，代价 5M×|右表|）。
+        // 第一次 join 时左侧恰好全是非限定列，两者相等——所以这个错只从第二张表起暴露。
+        let n_left = ctx.cols.len();
         for (cn, ct) in &right_cols {
             ctx.cols.push((format!("{right_name}.{cn}"), ct.clone()));
         }
-        match split_equi_condition(on_expr, n_left_plain, &ctx) {
+        match split_equi_condition(on_expr, n_left, &ctx) {
             Ok((lkey, rkey)) => {
                 plan = LogicalPlan::Join {
                     left: Box::new(plan),
@@ -2987,6 +2998,11 @@ fn replace_top_project(plan: LogicalPlan, exprs: Vec<PhysExpr>, names: Vec<Strin
 }
 
 /// ON expr：等值条件 a.k = b.k 拆为（左键, 右键）。idx < n_left 属左表。
+/// 把 `ON <等值>` 拆成 (左键, 右键)。
+///
+/// `n_left` = **左侧输入的输出宽度**（列序号 < n_left 即属左侧）。调用方必须传
+/// `ctx.cols` 在**追加右表列之前**的长度——见 `translate_select_inner` 里 JOIN 循环处
+/// 的注释（那里曾误用"非限定列数"，导致第二次 join 静默退化成叉积）。
 fn split_equi_condition(
     e: &sqlparser::ast::Expr,
     n_left: usize,
