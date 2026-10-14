@@ -182,13 +182,14 @@ fn cases() -> Vec<(&'static str, &'static str, &'static str)> {
         (
             "simple_distinct",
             "简单",
-            // ⚠️ 2026-10-13：本仓的**聚合参数 DISTINCT 未实现**（此前被静默当成
-            // `count(gs)` 执行——错值，现已在绑定层显式拒绝）。故本仓侧跑的是
-            // **语义等价的改写**（`SELECT DISTINCT` + `count(*)`，去重是对的），
-            // DuckDB 侧仍是原生 `count(DISTINCT gs)`。**这是能力对照，不是同
-            // 实现对照**；且旧数据里"4× 领先"是拿我们的 `count(gs)` 比对方的
-            // `count(DISTINCT gs)` 得来的，**那个数字无效，已撤回**。
-            "COUNT(DISTINCT gs) 等价改写：SELECT DISTINCT 子查询 + count(*)（原生聚合 DISTINCT 未实现）",
+            // ✅ 2026-10-14：**两边都是原生 `count(DISTINCT gs)` 了**（本仓补上了
+            // 聚合参数 DISTINCT：绑定层等价改写 + `DistinctCountExec` 融合计数）。
+            // 这条从"能力对照"升格成**同实现对照**。
+            // 历史提醒：旧数据里那个"4× 领先"是拿我们的 `count(gs)` 比对方的
+            // `count(DISTINCT gs)` 得来的，**早就撤回**；10-13~10-14 期间本仓侧
+            // 跑的是等价改写（`SELECT DISTINCT` 子查询 + `count(*)`），那期间的
+            // 数字也不能与本轮直接比（换过尺子）。
+            "COUNT(DISTINCT gs)（原生）",
         ),
         (
             "complex_join_group",
@@ -272,8 +273,7 @@ CREATE TABLE t_pq AS SELECT * FROM read_parquet('{pq}');"
         ),
         (
             "simple_distinct",
-            // DuckDB 侧保持**原生**写法：本仓侧跑的是等价改写（见 case 列表注释），
-            // 故这一格是**能力对照**——同一条等价查询，谁快谁慢。
+            // 两侧同实现（都是原生 `count(DISTINCT gs)`）——见 qsdb 侧 case 列表注释。
             format!("SELECT count(DISTINCT gs) FROM read_parquet('{pq}');"),
         ),
         (
@@ -817,8 +817,9 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
         }
         "simple_distinct" => {
             let t0 = Instant::now();
-            // 等价改写（原生 `count(DISTINCT gs)` 在绑定层显式拒绝，见 case 列表注释）
-            let n = rows_of(&db, "SELECT count(*) FROM (SELECT DISTINCT gs FROM t)");
+            // 原生形态（2026-10-14 起）：绑定层改写成 `Distinct` + `count(*)`，
+            // 执行层再由 `DistinctCountExec` 融成单遍计数。
+            let n = rows_of(&db, "SELECT count(DISTINCT gs) FROM t");
             let ms = t0.elapsed().as_millis() as u64; // ← 计时到此为止（下面全是校验）
             // ⚠️ `rows_of` 对聚合**恒回 1**（结果只有一行），所以"去重结果对不对"
             // 必须另查一条标量——**而这条查询自己就是一次完整的 `SELECT DISTINCT`**，
@@ -828,7 +829,14 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
             // 去重后 = rows/2、不去重 = rows——`count(gs)` 与 `count(DISTINCT gs)`
             // **必须能分开**（这正是 2026-10-13 改数据的原因：原先 gs 全局唯一，
             // 两者恒等，用例对"去重做没做"完全瞎）。
+            // 校验用**等价改写**（另一条独立路径：物化去重结果再数）交叉对照，
+            // 免得"原生实现错了"和"断言写错了"互相掩护。
             let distinct = scalar_i64(&db, "SELECT count(*) FROM (SELECT DISTINCT gs FROM t)");
+            assert_eq!(
+                scalar_i64(&db, "SELECT count(DISTINCT gs) FROM t"),
+                distinct,
+                "原生 count(DISTINCT) 与等价改写必须同值"
+            );
             let plain = scalar_i64(&db, "SELECT count(gs) FROM t");
             assert_eq!(distinct, rows / 2, "去重结果 = 基数（半数为重复）");
             assert_eq!(plain, rows, "不去重 = 总行数");
