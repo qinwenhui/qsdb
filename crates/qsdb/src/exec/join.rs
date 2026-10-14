@@ -363,6 +363,9 @@ impl HashJoinExec {
         if self.build_state.is_some() {
             return Ok(());
         }
+        // 诊断：**建侧到底值多少**（分片路径里它每片各来一次）。
+        // 值是"分片优化该不该做"的唯一依据——没有它就只能猜（猜错过一次）。
+        let __t0 = std::time::Instant::now();
         // 物化右表：预留随表存活（RAII），节点销毁即归还
         let mut res = self.ctx.try_reserve(0)?;
         let mut batches = Vec::new();
@@ -423,6 +426,14 @@ impl HashJoinExec {
         if res.grow(table.num_rows() as u64 * 16).is_err() {
             self.enter_spill(vec![table])?; // `res` 是局部量，随本次返回归还
             return Ok(());
+        }
+        if std::env::var("QSDB_JOIN_PROF").is_ok() {
+            eprintln!(
+                "[join-build] {} 行 / {} 列，耗时 {:.1}ms",
+                table.num_rows(),
+                table.num_columns(),
+                __t0.elapsed().as_secs_f64() * 1000.0
+            );
         }
         self.build_res = Some(res);
         self.build_state = Some(BuildState { table, index });
