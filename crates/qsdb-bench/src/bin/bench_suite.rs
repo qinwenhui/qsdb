@@ -166,6 +166,15 @@ fn cases() -> Vec<(&'static str, &'static str, &'static str)> {
         ),
         ("import_append", "导入", "嵌入 append（内存批直写）"),
         (
+            "import_append_once",
+            "导入",
+            // **诊断用**：纯"写段"的尺子 —— 造数在计时**之外**，且**一次调用
+            // = 一次提交**（`import_append` 是每批一次提交，5M 行 = 77 次，
+            // 量的是提交次数不是写段）。
+            // ⚠️ RSS 含造数器（5M 行全在内存里），别拿它的内存列说事。
+            "一次 append 写 5M 行（纯写段，造数在计时外）",
+        ),
+        (
             "import_csv_parse_only",
             "导入",
             // **诊断用，不是对比格**：把 import_csv 拆成"解析"与"写段"两半。
@@ -711,9 +720,16 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
         }
         "import_csv_parse_only" => {
             let t0 = Instant::now();
+            // ⚠️ **必须碰全部 7 列**。早先这里只写 `sum(v)` —— 聚合只引用一列
+            // ⇒ 列裁剪生效、**其余 6 列根本不解析** ⇒ 这把尺子**低估解析成本**
+            // （实测把 0.95s 当"解析"，而 import_csv 减掉写段后还剩 ~1.8s）。
+            // 也不用 `count(*)`：它可能被元数据短路，那测的是"短路有多快"。
             let sum = scalar_i64(
                 &db,
-                &format!("SELECT sum(v) FROM read_csv('{src}/src/t.csv')"),
+                &format!(
+                    "SELECT sum(id) + sum(g) + sum(v) + count(gs) + count(s) + count(dt) \
+                     FROM read_csv('{src}/src/t.csv')"
+                ),
             );
             let ms = t0.elapsed().as_millis() as u64;
             assert!(sum > 0, "解析出 0 行");
@@ -778,6 +794,20 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
             let dt = t0.elapsed();
             let n = scalar_i64(&db, "SELECT count(*) FROM t_app") as u64;
             assert_eq!(n, rows as u64, "import_append 必须真的灌满");
+            (n, dt.as_millis() as u64)
+        }
+        "import_append_once" => {
+            // 造数**在计时之外**（否则量的是造数器）
+            let batches = make_batches(rows, 65_536);
+            db.sql("DROP TABLE IF EXISTS t_app1").ok();
+            db.sql(&format!("CREATE TABLE t_app1 ({FACT_COLS})"))
+                .unwrap();
+            let t0 = Instant::now();
+            db.append("t_app1", &batches).expect("append once");
+            let dt = t0.elapsed();
+            let n = scalar_i64(&db, "SELECT count(*) FROM t_app1") as u64;
+            assert_eq!(n, rows as u64, "import_append_once 必须真的灌满");
+            std::mem::drop(batches);
             (n, dt.as_millis() as u64)
         }
         // ---- 导出 ----
