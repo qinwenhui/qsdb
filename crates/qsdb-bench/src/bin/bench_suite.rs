@@ -192,6 +192,19 @@ fn cases() -> Vec<(&'static str, &'static str, &'static str)> {
             "COUNT(DISTINCT gs)（原生）",
         ),
         (
+            "simple_distinct_int",
+            "简单",
+            // **为什么必须单独立一格**（2026-10-14）：`simple_distinct` 用的是
+            // **字符串**列，而字符串走不了 Int64 内联槽表 ⇒ 那条用例**看不出**
+            // 整型去重的实现差异。实测代价：整型那格曾经因为 count-only 关掉
+            // 内联快路径，从 0.168s 退到 0.913s（100 万组）——**5.4× 的回归，
+            // bench 一条都没红**。字典型列上的 `count(DISTINCT …)`（用户 ID、
+            // 商品 ID）恰恰是 BI 里最常见的形态，所以这格必须常在。
+            // 数据：`v = (i*2654435761) % 1_000_000`，K 与 1e6 互素 ⇒ 周期 1e6
+            // ⇒ 不同值**恰好 1,000,000**（值断言见 runner）。
+            "COUNT(DISTINCT v)（原生，整型高基数）",
+        ),
+        (
             "complex_join_group",
             "复杂",
             "事实 × 维表 join + GROUP BY cat + ORDER BY",
@@ -275,6 +288,12 @@ CREATE TABLE t_pq AS SELECT * FROM read_parquet('{pq}');"
             "simple_distinct",
             // 两侧同实现（都是原生 `count(DISTINCT gs)`）——见 qsdb 侧 case 列表注释。
             format!("SELECT count(DISTINCT gs) FROM read_parquet('{pq}');"),
+        ),
+        (
+            "simple_distinct_int",
+            // 同上：两侧原生。**不能省**——字符串那格看不出整型去重的实现差异，
+            // 而那正是用户 ID / 商品 ID 这类字典列的形态。
+            format!("SELECT count(DISTINCT v) FROM read_parquet('{pq}');"),
         ),
         (
             "complex_join_group",
@@ -841,6 +860,21 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
             assert_eq!(distinct, rows / 2, "去重结果 = 基数（半数为重复）");
             assert_eq!(plain, rows, "不去重 = 总行数");
             assert_ne!(distinct, plain, "本用例的数据必须能区分去重与否");
+            (n, ms)
+        }
+        "simple_distinct_int" => {
+            let t0 = Instant::now();
+            let n = rows_of(&db, "SELECT count(DISTINCT v) FROM t");
+            let ms = t0.elapsed().as_millis() as u64; // ← 计时到此为止
+            // 值断言（造数与 `for_each_batch` 一致：K 与 1e6 互素 ⇒ 周期 1e6）
+            let distinct = scalar_i64(&db, "SELECT count(DISTINCT v) FROM t");
+            assert_eq!(distinct, 1_000_000, "整型基数是 1e6（K 与 1e6 互素）");
+            // 交叉对照：**不融合**的那条等价写法必须同值（走 DistinctExec 老路径）
+            assert_eq!(
+                scalar_i64(&db, "SELECT count(v) FROM (SELECT DISTINCT v FROM t)"),
+                distinct,
+                "原生与等价改写必须同值"
+            );
             (n, ms)
         }
         // ---- 复杂分析 ----
