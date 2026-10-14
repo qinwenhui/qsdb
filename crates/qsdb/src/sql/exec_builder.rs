@@ -147,21 +147,7 @@ pub fn build(
 ) -> Result<Box<dyn ExecNode>> {
     // M4-3 列裁剪下推：收集全计划引用列，Scan 只读所需列（含谓词列）。
     // Window 计划的窗口列 idx 假设全列序——下推重排会破坏索引映射，跳过。
-    if has_window_node(plan) {
-        return build_inner(db, plan, None, ctx);
-    }
-    let mut used: Vec<String> = Vec::new();
-    collect_plan_columns(plan, &mut used);
-    if let Some(def) = plan_scan_def(plan) {
-        let all: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
-        let mut proj: Vec<String> = all
-            .iter()
-            .filter(|n| used.iter().any(|u| u.eq_ignore_ascii_case(n.as_str())))
-            .cloned()
-            .collect();
-        if proj.is_empty() {
-            proj = all.first().cloned().into_iter().collect();
-        }
+    if let Some((all, proj)) = prune_decision(plan) {
         if proj.len() < all.len() {
             let mapping = build_mapping(&all, &proj);
             let rewritten = rewrite_plan(plan, &mapping, &all);
@@ -169,6 +155,31 @@ pub fn build(
         }
     }
     build_inner(db, plan, None, ctx)
+}
+
+/// 列裁剪的**决策**：`(表全列, 实际要读的列)`；`None` = 这条计划不走裁剪。
+///
+/// 单独拎出来是为了让它**可断言**——这个优化已经三次因为「表达式活在哪个
+/// 索引空间」静默出错（见 `exprs_are_in_table_space`、`Sort` 臂的注释），
+/// 而"结果对不对"根本看不出它有没有白跑（少裁一列只是变慢，不是变错）。
+/// 回归：`tests/projection_space.rs`。
+pub fn prune_decision(plan: &LogicalPlan) -> Option<(Vec<String>, Vec<String>)> {
+    if has_window_node(plan) {
+        return None;
+    }
+    let mut used: Vec<String> = Vec::new();
+    collect_plan_columns(plan, &mut used);
+    let def = plan_scan_def(plan)?;
+    let all: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
+    let mut proj: Vec<String> = all
+        .iter()
+        .filter(|n| used.iter().any(|u| u.eq_ignore_ascii_case(n.as_str())))
+        .cloned()
+        .collect();
+    if proj.is_empty() {
+        proj = all.first().cloned().into_iter().collect();
+    }
+    Some((all, proj))
 }
 
 /// 全计划引用列名（Column 节点）。
@@ -324,9 +335,80 @@ fn build_mapping(all: &[String], proj: &[String]) -> Vec<Option<usize>> {
         .collect()
 }
 
+/// 计划的**输出 schema 是不是就是被裁剪那张表的原始 schema**。
+///
+/// 只有 `Scan` 自己，以及它上面一串**恒等 schema** 的节点（Filter/Sort/Limit/
+/// Distinct —— 它们只改行、不改列）才是；`Project`/`Aggregate`/`Window` 会
+/// 重定义列空间，从那里往下就不再是表空间。
+fn out_schema_is_table(p: &LogicalPlan) -> bool {
+    match p {
+        // **三个扫描叶都在此列**——`plan_scan_def` 认它们、裁剪也会落在它们身上，
+        // 漏掉一个就等于把它上面的表达式**全部跳过重映射**（这次差点漏掉外表两兄弟，
+        // `tests/external_parquet.rs` 立刻炸了）。加新的扫描叶时**必须同步加到这里**。
+        LogicalPlan::Scan { .. }
+        | LogicalPlan::ExternalScan { .. }
+        | LogicalPlan::CsvScan { .. } => true,
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Distinct { input } => out_schema_is_table(input),
+        // **semi/anti 族的输出就是左输入的 schema**（右表只出掩码，不出列）
+        // ⇒ 也是恒等。漏了这条，`SELECT v FROM t WHERE g IN (…)` 的投影就不重映射，
+        // 而扫描已被裁到 2 列 ⇒ `index out of bounds: len 2 index 2`。
+        LogicalPlan::Join {
+            left, join_type, ..
+        } if join_type.is_semi_family() => out_schema_is_table(left),
+        _ => false,
+    }
+}
+
+/// 该节点**自身的表达式**（谓词 / 投影式 / 分组键 / 聚合参数）是否按**表列序**编号。
+///
+/// 表达式永远是对**自己输入的输出**求值 ⇒ 当且仅当那个输出就是表空间。
+///
+/// 这个判定替代了原先"**按列名猜**"的做法（`all.contains(name)`），后者在
+/// 「上下两层列名相同、但列空间不同」的形状上会**拿外层的位置去查表空间映射**，
+/// 静默取到隔壁那一列。实测（2026-10-14，先于本次改动就存在）：
+///
+/// ```sql
+/// SELECT g, x FROM (SELECT DISTINCT g, x FROM t)   -- t(id,g,x)
+/// -- 实际回 (1,1),(1,1),(2,2),(3,3),(3,3)：x 列变成了 g 列（mapping[1] = g 的投影位）
+/// SELECT g, count(x) FROM (SELECT DISTINCT g, x FROM t) GROUP BY g
+/// -- 实际回 2|1、3|2（正确是 2|0、3|1）——NULL 组被算进了 count
+/// ```
+///
+/// 同类前科：`Sort` 的键也踩过（见 `rewrite_plan` 的 `Sort` 臂注释，
+/// 回归 `tests/order_by_prune.rs`）。回归：`tests/projection_space.rs`。
+fn exprs_are_in_table_space(plan: &LogicalPlan) -> bool {
+    match plan {
+        // 扫描谓词是对**自己**的列求值（而且按列名寻址，见 `scan::Predicate`）
+        LogicalPlan::Scan { .. }
+        | LogicalPlan::ExternalScan { .. }
+        | LogicalPlan::CsvScan { .. } => true,
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Distinct { input } => out_schema_is_table(input),
+        _ => false,
+    }
+}
+
 /// 重写计划中所有 Column.idx（全表列序 → 投影序）。
 /// `all`：表全列名——非表列（聚合输出列如 sum(x)）保持原 idx。
 fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -> LogicalPlan {
+    // `mapping` 只在「表达式按表列序编号」时才有意义——见 `exprs_are_in_table_space`。
+    // 用**位置**说不清的节点（外层 Project/Filter/Aggregate 坐在别的 Project 之上）
+    // 一律**原样保留**：宁可少裁一列，也不能把表达式指到隔壁列上去。
+    let tbl = exprs_are_in_table_space(plan);
+    let re = |e: &PhysExpr| -> PhysExpr {
+        if tbl {
+            rewrite_expr(e, mapping, all)
+        } else {
+            e.clone()
+        }
+    };
     match plan {
         LogicalPlan::Scan {
             def,
@@ -348,6 +430,9 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
             left: Box::new(rewrite_plan(left, mapping, all)),
             // 右键为右子计划局部 idx（绑定期约定），裁剪不触碰
             right: Box::new((**right).clone()),
+            // ⚠️ 左键**无条件**按表列序重写（不要按 `out_schema_is_table(left)` 加闸门：
+            // 实测 4 条 subquery 用例立刻 `index out of bounds` / 回空 —— semi 的左键
+            // 在 plan_scan_def 认的那些形状下就是表列序，加了闸门反而漏重映射）。
             left_keys: left_keys
                 .iter()
                 .map(|k| rewrite_expr(k, mapping, all))
@@ -373,7 +458,7 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
         },
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(rewrite_plan(input, mapping, all)),
-            predicate: rewrite_expr(predicate, mapping, all),
+            predicate: re(predicate),
         },
         LogicalPlan::Project {
             input,
@@ -381,26 +466,21 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
             names,
         } => LogicalPlan::Project {
             input: Box::new(rewrite_plan(input, mapping, all)),
-            exprs: exprs
-                .iter()
-                .map(|e| rewrite_expr(e, mapping, all))
-                .collect(),
+            exprs: exprs.iter().map(&re).collect(),
             names: names.clone(),
         },
         LogicalPlan::Aggregate { input, group, aggs } => LogicalPlan::Aggregate {
             input: Box::new(rewrite_plan(input, mapping, all)),
-            group: group
-                .iter()
-                .map(|g| rewrite_expr(g, mapping, all))
-                .collect(),
+            group: group.iter().map(&re).collect(),
             aggs: aggs
                 .iter()
                 .map(|a| crate::expr::AggExpr {
                     func: a.func,
-                    arg: a.arg.as_ref().map(|e| rewrite_expr(e, mapping, all)),
+                    arg: a.arg.as_ref().map(&re),
                     out_name: a.out_name.clone(),
                     out_ty: a.out_ty.clone(),
                     udaf: a.udaf.clone(),
+                    distinct: a.distinct,
                 })
                 .collect(),
         },
@@ -1229,6 +1309,16 @@ fn build_aggregate(
     scan_proj: &Option<Vec<String>>,
     ctx: &Arc<crate::query::QueryContext>,
 ) -> Result<Box<dyn ExecNode>> {
+    // 聚合参数上的 `DISTINCT` 必须已在**绑定期**被 `rewrite_distinct_aggs` 消费掉。
+    // 执行层不认识这个语义：放过去 = 把 `count(DISTINCT x)` 当成 `count(x)` 跑出
+    // 一个**静默的错误数字**（2026-10-13 之前的真实老行为）。宁可炸。
+    if let Some(a) = aggs.iter().find(|a| a.distinct) {
+        return Err(crate::error::QsdbError::unsupported(format!(
+            "aggregate `{}` still carries DISTINCT at execution time — the binder rewrite \
+             (rewrite_distinct_aggs) did not run",
+            a.out_name
+        )));
+    }
     // ── count(*) over INNER 等值 JOIN：计数下推（T3 优化）──
     // 低基数键下 JOIN 输出行数 = Σ左键匹配数，物化代价 n²/keys。
     // 恒等变换为「右键计数 + 左键累加」→ O(n)、build 侧只物化键列。

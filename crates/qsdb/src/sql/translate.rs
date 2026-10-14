@@ -2796,10 +2796,14 @@ fn translate_select_inner(
             agg_ctx_cols.push((a.out_name.clone(), a.out_ty.clone()));
         }
         let agg_ctx = SchemaCtx { cols: agg_ctx_cols };
+        // 聚合参数上的 `DISTINCT`：等价改写（去重 + 原聚合）。见 `rewrite_distinct_aggs`。
+        // ⚠️ 只改**喂给计划节点**的 group/aggs；上面的 `agg_ctx` 与下游重绑一律
+        // 仍用原始表达式（列名不变 ⇒ 下游一个字都不用动）。
+        let (agg_input, plan_group, plan_aggs) = rewrite_distinct_aggs(plan, &group_exprs, &aggs)?;
         plan = LogicalPlan::Aggregate {
-            input: Box::new(plan),
-            group: group_exprs.clone(),
-            aggs: aggs.clone(),
+            input: Box::new(agg_input),
+            group: plan_group,
+            aggs: plan_aggs,
         };
         if let Some(hp) = having_pred {
             plan = LogicalPlan::Filter {
@@ -4522,6 +4526,13 @@ fn try_bind_agg(f: &sqlparser::ast::Function, ctx: &SchemaCtx) -> Result<Option<
     if !is_agg_name(&name) {
         // UDAF 注册表（窗口形态的 UDAF 后置）
         if f.over.is_none() {
+            // UDAF 不走等价改写（改写要重绑参数表达式，UDAF 输出类型由 `ret_ty` 定），
+            // 仍然显式拒绝——**绝不静默丢弃**。
+            if has_duplicate_treatment(f) && crate::expr::udaf::lookup(&name).is_some() {
+                return Err(QsdbError::unsupported(format!(
+                    "{name}(DISTINCT …) is not supported for user-defined aggregates"
+                )));
+            }
             if let Some(def) = crate::expr::udaf::lookup(&name) {
                 return try_bind_udaf(f, &name, def, ctx).map(Some);
             }
@@ -4531,25 +4542,15 @@ fn try_bind_agg(f: &sqlparser::ast::Function, ctx: &SchemaCtx) -> Result<Option<
     if f.over.is_some() {
         return Ok(None); // 窗口函数不作为聚合处理（由 collect_window_calls / 投影置换接管）
     }
-    // **聚合参数上的 `DISTINCT`：显式拒绝，绝不静默丢弃**。
+    // **聚合参数上的 `DISTINCT`**：这里只打标记，真正的等价改写落在计划构造处
+    // （`rewrite_distinct_aggs`：去重 + 普通聚合）。
     //
-    // 此前这里从不读 `duplicate_treatment`，于是 `count(DISTINCT a)` 被当成
-    // `count(a)` 执行——回的是**错的数字**（`{1,1,2}` 上回 3 而非 2），
-    // 而且是"完全合法的 SQL、悄悄给错值"这一类。宁可报错。
+    // 历史：2026-10-13 之前这里压根不读 `duplicate_treatment`，于是
+    // `count(DISTINCT a)` 被当成 `count(a)` 执行——回的是**错的数字**
+    // （`{1,1,2}` 上回 3 而非 2），"完全合法的 SQL、悄悄给错值"这一类。
+    // 当时改成显式拒绝；2026-10-14 补上原生语义，拒绝撤掉。
     //
-    // 等价写法（**今天就能用**，`SELECT DISTINCT` 的去重是对的）：
-    //   `SELECT count(DISTINCT a) FROM t`
-    // → `SELECT count(*) FROM (SELECT DISTINCT a FROM t)`
-    // 带分组：`SELECT g, count(DISTINCT a) FROM t GROUP BY g`
-    // → `SELECT g, count(*) FROM (SELECT DISTINCT g, a FROM t) GROUP BY g`
-    // 原生实现（真值去重、可与其它聚合混用、走溢出）在路线图上另立。
-    if has_duplicate_treatment(f) {
-        return Err(QsdbError::unsupported(format!(
-            "{name}(DISTINCT …) is not implemented yet — it used to be silently executed as \
-             {name}(…), returning a WRONG number, so it is now rejected outright. \
-             Equivalent query: `SELECT count(*) FROM (SELECT DISTINCT … FROM …)`"
-        )));
-    }
+    let distinct = has_duplicate_treatment(f);
     let func = match name.as_str() {
         "count" => AggFunc::Count,
         "sum" => AggFunc::Sum,
@@ -4581,14 +4582,134 @@ fn try_bind_agg(f: &sqlparser::ast::Function, ctx: &SchemaCtx) -> Result<Option<
     if arg.is_none() && func != AggFunc::Count {
         return Err(QsdbError::invalid(format!("{name}(*) is not valid")));
     }
+    if distinct && arg.is_none() {
+        return Err(QsdbError::invalid(format!(
+            "{name}(DISTINCT *) is not valid"
+        )));
+    }
+    // `count(DISTINCT x)` 的**显示名**必须与 `count(x)` 不同：`collect_aggs` 按
+    // `out_name` 去重，同名会把语义不同的两个聚合合并成一个（少算一列）。
+    // PG/DuckDB 对这类列名同样回 `count(DISTINCT x)`。
     let out_name = format!(
-        "{}({})",
+        "{}({}{})",
         name,
+        if distinct { "DISTINCT " } else { "" },
         arg.as_ref()
             .map(|a| a.display())
             .unwrap_or_else(|| "*".into())
     );
-    Ok(Some(AggExpr::new(func, arg, out_name)?))
+    let mut agg = AggExpr::new(func, arg, out_name)?;
+    agg.distinct = distinct;
+    Ok(Some(agg))
+}
+
+/// 聚合参数上的 `DISTINCT` → 等价改写：**先去重，再跑原聚合**。
+///
+/// ```text
+/// count(DISTINCT x)              → aggregate{ aggs: [count(*)],  input: Distinct{[x]} }
+/// count(DISTINCT x) GROUP BY g   → aggregate{ group:[g], aggs:[count(x)],
+///                                             input: Distinct{[g, x]} }
+/// ```
+///
+/// ⚠️ **NULL 语义——这里是最容易写错的地方**，两处必须分开处理：
+///
+/// * **无分组**：`count(DISTINCT x)` 跳过 NULL，`count(*)` 不跳，两者差一个
+///   "NULL 组"。所以在去重**之前**先滤掉 `x IS NULL`，此时 `count(*)` = 不同非空
+///   x 的个数 ✓（顺带把 `count(x)` 收紧成 `count(*)`，让执行层的融合计数节点
+///   能认出来）。`sum/avg/min/max` 同样忽略 NULL，滤掉不影响 ✓。
+/// * **有分组**：**绝不能过滤** —— 某个组可能只有 NULL 的 x，滤掉会让**整组消失**
+///   （正确结果是该组回 0，而不是没有这一行；实测 `GROUP BY` 全空组会漏行）。
+///   这里保留 `count(x)`：Distinct 把 NULL 当独立值，所以每组的 NULL 自成一行，
+///   `count(x)` 数不到它 —— 逐值等价 ✓。
+///
+/// 只支持「**全部**聚合都带 DISTINCT 且参数表达式相同」：混用时一次去重会同时
+/// 改掉那些**不带** DISTINCT 的聚合的输入（`sum(y)` 会少算行），所以显式拒绝而不是硬猜。
+fn rewrite_distinct_aggs(
+    input: LogicalPlan,
+    group: &[PhysExpr],
+    aggs: &[AggExpr],
+) -> Result<(LogicalPlan, Vec<PhysExpr>, Vec<AggExpr>)> {
+    if !aggs.iter().any(|a| a.distinct) {
+        return Ok((input, group.to_vec(), aggs.to_vec()));
+    }
+    // ① 组合校验（宁可报错，也不猜语义）。
+    if let Some(bad) = aggs.iter().find(|a| !a.distinct) {
+        return Err(QsdbError::unsupported(format!(
+            "mixing DISTINCT and non-DISTINCT aggregates is not supported yet: a single \
+             de-duplication would also change the input of `{}`",
+            bad.out_name
+        )));
+    }
+    let key = aggs[0]
+        .arg
+        .as_ref()
+        .ok_or_else(|| QsdbError::invalid("DISTINCT aggregate requires an argument"))?;
+    if let Some(other) = aggs.iter().find(|a| {
+        !a.arg
+            .as_ref()
+            .is_some_and(|e| e.display() == key.display() && e.data_type() == key.data_type())
+    }) {
+        return Err(QsdbError::unsupported(format!(
+            "DISTINCT aggregates over different arguments are not supported yet \
+             (`{}` vs `{}`)",
+            aggs[0].out_name, other.out_name
+        )));
+    }
+    // ② 去重输入 = [分组键…, 去重参数]（列序即位置，上层按位置引用）。
+    let n_g = group.len();
+    let mut src = input;
+    if n_g == 0 {
+        // 见上面 NULL 语义：无分组才允许过滤
+        src = LogicalPlan::Filter {
+            input: Box::new(src),
+            predicate: PhysExpr::IsNull(Box::new(key.clone()), true),
+        };
+    }
+    let mut exprs: Vec<PhysExpr> = group.to_vec();
+    let mut names: Vec<String> = group.iter().map(|g| g.display()).collect();
+    exprs.push(key.clone());
+    names.push(key.display());
+    let src = LogicalPlan::Distinct {
+        input: Box::new(LogicalPlan::Project {
+            input: Box::new(src),
+            exprs,
+            names,
+        }),
+    };
+    // ③ 聚合改写成对「去重输出列」的位置引用。列名沿用原 `display()` ——
+    // 聚合输出 schema 与下游重绑（`rebind_over_agg`）全都按**名字**对齐，
+    // 名字一改，下游的 HAVING/投影就找不到列了。
+    let plan_group: Vec<PhysExpr> = group
+        .iter()
+        .enumerate()
+        .map(|(i, g)| PhysExpr::Column {
+            idx: i,
+            name: g.display(),
+            ty: g.data_type(),
+        })
+        .collect();
+    let plan_aggs: Vec<AggExpr> = aggs
+        .iter()
+        .map(|a| AggExpr {
+            // 无分组时去重前已滤掉 NULL ⇒ `count(x)` 与 `count(*)` 等价，
+            // 收成 `count(*)` 让执行层的融合计数节点认得出来（见 `DistinctCountExec`）。
+            func: a.func,
+            arg: if n_g == 0 && a.func == AggFunc::Count {
+                None
+            } else {
+                Some(PhysExpr::Column {
+                    idx: n_g,
+                    name: key.display(),
+                    ty: key.data_type(),
+                })
+            },
+            out_name: a.out_name.clone(),
+            out_ty: a.out_ty.clone(),
+            udaf: a.udaf.clone(),
+            distinct: false,
+        })
+        .collect();
+    Ok((src, plan_group, plan_aggs))
 }
 
 /// 收集 SELECT item 里的全部聚合调用（按发现顺序去重）。

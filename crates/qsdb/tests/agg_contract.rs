@@ -1,4 +1,4 @@
-//! 聚合的**两条 SQL 契约** + 聚合 `DISTINCT` 的显式拒绝（2026-10-13 自查）。
+//! 聚合的**两条 SQL 契约** + 聚合 `DISTINCT` 的原生语义（2026-10-13 自查）。
 //!
 //! 三条都是"合法 SQL、悄悄给错结果"这一类，且都因为 `count(*)` 走元数据短路
 //! 而长期隐形（那条路径恰好是对的）：
@@ -10,9 +10,10 @@
 //! ② **零行结果仍带一个空批 + 完整 schema**（`对接契约.md` §二 的 schema
 //!    协商承诺，`LIMIT 0` 是标准姿势）。此前是零个批，schema 只在
 //!    `SqlResult::Query.schema` 里，逐批消费的调用方拿不到列名。
-//! ③ **聚合参数上的 `DISTINCT` 此前被静默丢弃**：`count(DISTINCT a)` 当成
-//!    `count(a)` 执行，回**错的数字**（`{1,1,2}` 上回 3 而非 2）。现在绑定层
-//!    显式拒绝，并给出等价改写。
+//! ③ **聚合参数上的 `DISTINCT` 曾被静默丢弃**：`count(DISTINCT a)` 当成
+//!    `count(a)` 执行，回**错的数字**（`{1,1,2}` 上回 3 而非 2）。2026-10-13
+//!    先改成**显式拒绝**并给出等价改写；2026-10-14 补上原生实现（绑定层等价
+//!    改写：`Distinct` 去重 + 原聚合），契约随之翻转成"必须正确"。
 
 use qsdb::{Qsdb, QsdbOptions};
 
@@ -50,13 +51,6 @@ fn rows(db: &Qsdb, sql: &str) -> usize {
         .iter()
         .map(|b| b.num_rows())
         .sum()
-}
-
-fn sql_err(db: &Qsdb, sql: &str) -> String {
-    match db.sql(sql) {
-        Ok(_) => panic!("本应被拒却成功了: {sql}"),
-        Err(e) => format!("{e}"),
-    }
 }
 
 /// **① 空输入的无 `GROUP BY` 聚合：恰好一行，值正确**（count→0，其余→NULL）。
@@ -131,9 +125,15 @@ fn zero_row_result_carries_one_empty_batch_with_schema() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// **③ 聚合 `DISTINCT`：显式拒绝（绝不静默给错值）+ 等价改写正确**。
+/// **③ 聚合 `DISTINCT`：原生语义，必须与等价改写逐值一致**。
+///
+/// 历史：2026-10-13 之前 `DISTINCT` 被**静默丢弃**（`count(DISTINCT a)` 当
+/// `count(a)` 跑，回错数字）；那天的处置是**显式拒绝**，本测试当时断言"必须报错"。
+/// 2026-10-14 补上原生实现（绑定层等价改写，见 `translate::rewrite_distinct_aggs`），
+/// 于是契约翻转成"**必须正确且不许回退成静默错值**"。
+/// 语义细节（NULL、分组空组）另见 `tests/agg_distinct.rs`。
 #[test]
-fn aggregate_distinct_is_rejected_not_silently_ignored() {
+fn aggregate_distinct_is_native_and_matches_the_equivalent_rewrite() {
     let root = tmp("distinct");
     let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
     db.sql("CREATE TABLE d (a BIGINT, g BIGINT)").unwrap();
@@ -141,22 +141,22 @@ fn aggregate_distinct_is_rejected_not_silently_ignored() {
     db.sql("INSERT INTO d VALUES (1,1),(1,1),(2,1),(3,2),(3,2),(3,2)")
         .unwrap();
 
-    for sql in [
-        "SELECT count(DISTINCT a) FROM d",
-        "SELECT sum(DISTINCT a) FROM d",
-        "SELECT avg(DISTINCT a) FROM d",
-        "SELECT min(DISTINCT a) FROM d",
-        "SELECT max(DISTINCT a) FROM d",
-        "SELECT count(DISTINCT a) FROM d WHERE a > 1",
-    ] {
-        let e = sql_err(&db, sql);
-        assert!(
-            e.contains("DISTINCT") && e.contains("not implemented"),
-            "{sql}: 要说清是 DISTINCT 未实现（实得 {e}）"
-        );
-    }
+    // 原生形态：逐个函数都要回**对的值**（只数行数的话，回错值也全绿）
+    assert_eq!(scalar(&db, "SELECT count(DISTINCT a) FROM d"), "3");
+    assert_eq!(scalar(&db, "SELECT sum(DISTINCT a) FROM d"), "6");
+    assert_eq!(scalar(&db, "SELECT avg(DISTINCT a) FROM d"), "2.0");
+    assert_eq!(scalar(&db, "SELECT min(DISTINCT a) FROM d"), "1");
+    assert_eq!(scalar(&db, "SELECT max(DISTINCT a) FROM d"), "3");
+    assert_eq!(
+        scalar(&db, "SELECT count(DISTINCT a) FROM d WHERE a > 1"),
+        "2"
+    );
+    // 别把普通聚合一起改了
+    assert_eq!(scalar(&db, "SELECT count(a) FROM d"), "6");
+    assert_eq!(scalar(&db, "SELECT sum(a) FROM d"), "13");
 
-    // 等价改写（报错信息里给的那条）必须是对的
+    // **交叉对照**：原生形态 vs 文档里那条等价改写，必须逐值一致。
+    // （改写是"先去重再数"的另一条路径，两边都错成同一个数的概率极低。）
     assert_eq!(
         scalar(&db, "SELECT count(*) FROM (SELECT DISTINCT a FROM d)"),
         "3"
@@ -172,17 +172,25 @@ fn aggregate_distinct_is_rejected_not_silently_ignored() {
         ),
         "2"
     );
-    // 带分组的改写
+    // 带分组：数行数会漏掉"值算错"（本仓因此栽过），所以逐组比**值**
     assert_eq!(
-        rows(
+        scalar(
             &db,
-            "SELECT g, count(*) FROM (SELECT DISTINCT g, a FROM d) GROUP BY g"
+            "SELECT count(DISTINCT a) FROM d GROUP BY g HAVING g = 1"
         ),
+        "2"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT count(DISTINCT a) FROM d GROUP BY g HAVING g = 2"
+        ),
+        "1"
+    );
+    assert_eq!(
+        rows(&db, "SELECT g, count(DISTINCT a) FROM d GROUP BY g"),
         2
     );
-    // 对照：不带 DISTINCT 的原样查询值不变（别把普通聚合一起拒了）
-    assert_eq!(scalar(&db, "SELECT count(a) FROM d"), "6");
-    assert_eq!(scalar(&db, "SELECT sum(a) FROM d"), "13");
 
     std::fs::remove_dir_all(&root).ok();
 }

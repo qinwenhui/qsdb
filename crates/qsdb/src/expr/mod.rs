@@ -463,6 +463,14 @@ pub struct AggExpr {
     pub out_ty: LogicalType,
     /// UDAF 定义（func == Udaf 时必有；其余 None）
     pub udaf: Option<std::sync::Arc<udaf::UdafDef>>,
+    /// 参数上写了 `DISTINCT`（`count(DISTINCT x)`）。
+    ///
+    /// **绑定层必须把它消费掉**：等价改写（`Distinct` 去重 + 普通聚合）在
+    /// `translate` 里完成，落到计划节点上的 `AggExpr` 一律是 `false`。
+    /// 执行层不认识这个语义，所以 `build_aggregate` 见到 `true` 会**显式报错**
+    /// ——宁可炸，也不能把 `count(DISTINCT x)` 当成 `count(x)` 跑出个错数字
+    /// （这正是 2026-10-13 之前的老行为）。
+    pub distinct: bool,
 }
 
 impl AggExpr {
@@ -482,6 +490,7 @@ impl AggExpr {
             out_name: out_name.into(),
             out_ty,
             udaf: None,
+            distinct: false,
         })
     }
 
@@ -498,6 +507,7 @@ impl AggExpr {
             out_name: out_name.into(),
             out_ty,
             udaf: Some(def),
+            distinct: false,
         })
     }
 
