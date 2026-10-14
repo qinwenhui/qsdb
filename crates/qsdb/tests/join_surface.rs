@@ -105,7 +105,7 @@ fn count1(db: &Qsdb, sql: &str) -> i64 {
 /// 也能让用例绿（本文件第一版就栽在这——行元组那条报的其实是"列不存在"，
 /// 是造数写错，探针却照收）。所以这里要求文案里出现 `unsupported`
 /// （引擎对"语法认识、但没实现"的固定说法）。
-fn rejected(db: &Qsdb, sql: &str) {
+fn rejected(db: &Qsdb, sql: &str) -> String {
     match db.sql(sql) {
         Ok(_) => panic!("`{sql}` 被接受了 —— 要么实现它，要么显式拒（不许静默）"),
         Err(e) => {
@@ -116,6 +116,16 @@ fn rejected(db: &Qsdb, sql: &str) {
                 "`{sql}` 报的不是「未实现」而是别的错：{m}\n\
                  （无关错误混进来 = 这条探针没测到它想测的东西）"
             );
+            // **文案里不许 dump 语法树**：`{expr:?}` 会把 `Ident { value: "a",
+            // span: Span(Location(1,40)..Location(1,41)) }` 这种整棵打出来，
+            // 一条几百字符，人和驱动都读不出重点。这是驱动面事故（J 系列同源：
+            // 消费方按文案猜）。
+            assert!(
+                !m.contains("Ident {") && !m.contains("Span("),
+                "拒绝文案里 dump 了 sqlparser 语法树：{m}"
+            );
+            assert!(m.len() < 300, "拒绝文案过长（{} 字符）：{m}", m.len());
+            m
         }
     }
 }
@@ -278,9 +288,23 @@ fn right_join_与_full_join_根本没有实现() {
     let (db, root) = seeded("rightfull");
     // 注意：`JoinType` 枚举里**没有** RightOuter/FullOuter 变体 ——
     // 这不是"没接上"，是结构性缺失（要做就得连执行层一起加）。
-    rejected(&db, "SELECT count(*) FROM a RIGHT JOIN b ON a.k = b.k");
-    rejected(&db, "SELECT count(*) FROM a FULL JOIN b ON a.k = b.k");
-    rejected(&db, "SELECT count(*) FROM a FULL OUTER JOIN b ON a.k = b.k");
+    //
+    // 文案要说**用户写的那种写法**（"RIGHT JOIN"），不是 sqlparser 的变体名、
+    // 更不是语法树 dump。修复前这里打的是：
+    // `JOIN type Right(On(BinaryOp { left: CompoundIdentifier([Ident { value: "a", …`
+    // （`m` 带 `unsupported: ` 类别前缀，判"第一句说的是不是这种写法"要先剥掉它）
+    let m = rejected(&db, "SELECT count(*) FROM a RIGHT JOIN b ON a.k = b.k");
+    let body = m.strip_prefix("unsupported: ").unwrap_or(&m);
+    assert!(
+        body.starts_with("RIGHT JOIN"),
+        "文案该直接说 RIGHT JOIN：{m}"
+    );
+    let m = rejected(&db, "SELECT count(*) FROM a FULL JOIN b ON a.k = b.k");
+    let body = m.strip_prefix("unsupported: ").unwrap_or(&m);
+    assert!(body.starts_with("FULL"), "{m}");
+    let m = rejected(&db, "SELECT count(*) FROM a FULL OUTER JOIN b ON a.k = b.k");
+    let body = m.strip_prefix("unsupported: ").unwrap_or(&m);
+    assert!(body.starts_with("FULL"), "{m}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -358,27 +382,28 @@ fn full_outer_join_的等价拼法() {
 #[test]
 fn 行元组_in_与_any() {
     let (db, root) = seeded("tuple");
-    // ⚠️ 这两条**是明确拒绝，但归类不同**（2026-10-15 实测）：
-    //   - `= ANY(...)` → `unsupported`（对）
-    //   - 行元组 `(a,b) IN (...)` → **`invalid argument: IN subquery must select
-    //     exactly one column (got 2)`** —— 归类在**"你的 SQL 写错了"**那一档，
-    //     可它是**合法 SQL、我们没实现**（标准 SQL 的行值比较）⇒ 按码表该是
-    //     `UNSUPPORTED`（501/`0A000`，"改写法"而不是"修正参数"）。
-    //     已记 `docs/进度与待办.md`（驱动按码决定动作，归类错了动作就错）。
+    // 两条都该归 `UNSUPPORTED`（"改写法"档），**不是** `INVALID_ARGUMENT`
+    // （"修正参数"档）——驱动按码决定动作。
+    //
+    // 行元组这条曾经报 `invalid argument: IN subquery must select exactly one
+    // column (got 2)`：把"我们没实现"说成了"你写错了"。2026-10-15 修
+    // （`translate.rs::is_row_value`）。
+    //
     // 注意两侧都用了**真实存在**的列：第一版这里写成 b 的 `x`，报的是
     // `column 'x' not found` —— 一个**无关错误**，而当时的断言只看"有没有报错"，
-    // 照收（探针自己歪了）。
-    rejected(
+    // 照收（探针自己歪了；现在 `rejected` 要求文案里出现 `unsupported`）。
+    let m = rejected(
         &db,
         "SELECT count(*) FROM a WHERE k = ANY (SELECT k FROM b)",
     );
-    match db.sql("SELECT count(*) FROM a WHERE (k, x) IN (SELECT k, y FROM b)") {
-        Ok(_) => panic!("行元组 IN 被接受了 —— 要么实现，要么显式拒"),
-        Err(e) => {
-            let m = format!("{e}");
-            eprintln!("[拒绝·归类待改] 行元组 IN → {m}");
-            assert!(m.contains("one column"), "文案变了，同步更新这条断言：{m}");
-        }
-    }
+    assert!(m.contains("ANY"), "文案该点出是哪种写法：{m}");
+    let m = rejected(
+        &db,
+        "SELECT count(*) FROM a WHERE (k, x) IN (SELECT k, y FROM b)",
+    );
+    assert!(
+        m.contains("row-value") || m.contains("row value"),
+        "文案该点出「行值比较」这个真实原因：{m}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

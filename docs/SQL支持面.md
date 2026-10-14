@@ -58,12 +58,13 @@
 |---|---|---|
 | 多表逗号连接（`FROM a, b`） | ✋ | `unsupported: multi-FROM (comma join) not supported` |
 | `INNER JOIN`（`JOIN` 同义）/ `LEFT [OUTER] JOIN` + `ON <等值>` | ✅ | 哈希 join；三表以上链式等值同样走它 |
-| `RIGHT JOIN` / `FULL [OUTER] JOIN` | ✋ | `JOIN type Right/FullOuter(…) not supported (INNER/LEFT only)`。**注意**：`JoinType` 枚举里没有这两个变体 ⇒ 是**结构性缺失**（要做得连执行层一起加），不是"没接上线" |
+| `RIGHT JOIN` / `FULL [OUTER] JOIN` | ✋ | `RIGHT JOIN not supported (only INNER JOIN / LEFT [OUTER] JOIN with an equi `ON`)`。**注意**：`JoinType` 枚举里没有这两个变体 ⇒ 是**结构性缺失**（要做得连执行层一起加），不是"没接上线" |
 | ↑ 这两种的**替代写法**（实测通过，见 `join_surface.rs`） | ✅ | `A RIGHT JOIN B` ≡ `B LEFT JOIN A`（列序自己重排）。`FULL OUTER` 拼出来是：<br>`SELECT a.k FROM a LEFT JOIN b ON a.k = b.k`<br>`UNION ALL`<br>`SELECT b.k FROM b WHERE NOT EXISTS (SELECT 1 FROM a WHERE a.k = b.k)`<br>（左全 + 右未匹配；**列数/类型要对齐**，右侧补的列写 `CAST(NULL AS <类型>)`） |
 | `JOIN … USING (…)` / `NATURAL JOIN` | ✋ | `JOIN ... ON <equi-cond> required`（静默当叉积会**炸行数**，故必须拒） |
 | 非等值 `ON` + `INNER` | ✅ | 走 `CrossJoinFilter`（叉积 + 过滤）。代价 = **左行数 × 右行数**，只适合小表 |
-| 非等值 `ON` + `LEFT` | ✋ | `non-equi LEFT JOIN lands later`（**绝不能按 INNER 跑**——那会静默丢掉未匹配行） |
-| `CROSS JOIN` | ✋ | `JOIN type CrossJoin(None) not supported (INNER/LEFT only)`。⚠️ **本表此前把它写成 ✅，是错的**（2026-10-15 实测纠正；`docs/error-codes.md` 的 `UNSUPPORTED` 条目一直拿它当例子——那边是对的）。要笛卡尔积请写 `JOIN b ON TRUE`（走非等值 INNER 那条路） |
+| 非等值 `ON` + `LEFT` | ✋ | `non-equi LEFT JOIN not supported (only non-equi INNER is)`（**绝不能按 INNER 跑**——那会静默丢掉未匹配行） |
+| `CROSS JOIN` | ✋ | `CROSS JOIN not supported (only INNER JOIN / LEFT [OUTER] JOIN with an equi `ON`)`。⚠️ **本表此前把它写成 ✅，是错的**（2026-10-15 实测纠正；`docs/error-codes.md` 的 `UNSUPPORTED` 条目一直拿它当例子——那边是对的）。要笛卡尔积请写 `JOIN b ON TRUE`（走非等值 INNER 那条路） |
+| 行值比较 `(a, b) IN (子查询)` / `= ANY/ALL (…)` | ✋ | 见 §三（表达式面）。⚠️ 行值那条**此前归类在 `INVALID_ARGUMENT`**（"你写错了"），2026-10-15 改成 `UNSUPPORTED`（"没实现，改写法"）——驱动按码决定动作 |
 | `IN (子查询)` / `EXISTS` / `NOT IN` / `NOT EXISTS` | ✅ | 走 semi/anti 族（存在集，非物化整行）。`NOT IN` 有专门的三值语义实现 |
 | 派生表列别名 `… AS d(a,b)` | ✋ | 此前**别名被丢掉**，之后报"列不存在"（误导） |
 | 表因子列别名 `FROM t AS x(a,b)` | ✋ | 同样被静默丢掉。⚠️ 真实踩坑：`SELECT * FROM t EXCLUDE (b)` 会被解析成「别名 `exclude` + 列清单」⇒ 拿到**全列**（Snowflake 用户会中招） |
@@ -85,7 +86,9 @@
 | 函数参数内的 `ORDER BY` / `LIMIT` / `SEPARATOR` | ✋ | |
 | `WITHIN GROUP (ORDER BY …)` | ✋ | |
 | `IGNORE/RESPECT NULLS` | ✋ | 静默忽略会改窗口函数结果 |
-| `INTERVAL` / `AT TIME ZONE` / `COLLATE` / `SIMILAR TO` / `= ANY(...)` / 行元组 `(a,b) IN (…)` | ✋ | |
+| `INTERVAL` / `AT TIME ZONE` / `COLLATE` / `SIMILAR TO` | ✋ | |
+| 行元组 `(a,b) IN (…)` | ✋ | `row-value comparison `(a, b) IN (subquery)` not supported — write it as EXISTS (SELECT 1 FROM … WHERE … AND …)`（**归类 `UNSUPPORTED`**，改写法即可） |
+| `= ANY(...)` / `= ALL(...)` | ✋ | `` `= ANY/ALL (subquery)` not supported — use IN / EXISTS, or an explicit OR/AND chain `` |
 | 位置参数 `?` | ✋ | 本仓走 HTTP/API 层参数化，不做服务端占位符 |
 | 标量函数集 | ✅ | `SELECT abs(1)` 之类报错会**列出支持清单**，以之为准 |
 | `GREATEST` / `LEAST` / `array_agg` 等 | ✋ | 未实现（报错列清单） |

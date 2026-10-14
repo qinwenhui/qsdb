@@ -1930,6 +1930,17 @@ fn build_in_semi_join(
     cte_defs.extend(extra);
     let sub_cols = plan_output_columns(&sub_plan)?;
     if sub_cols.len() != 1 {
+        // 行值比较 `(a, b) IN (子查询)` 是**标准 SQL、我们没实现**（2026-10-15 的
+        // join 支持面探针抓到这条归类错）：此前一律报 400 `INVALID_ARGUMENT`
+        // "IN subquery must select exactly one column" —— 那是把"没实现"说成
+        // "你写错了"。**驱动按码决定动作**（400 = 修正参数 / 501 = 改写法），
+        // 归类错了动作就错。
+        if is_row_value(lhs) {
+            return Err(QsdbError::unsupported(
+                "row-value comparison `(a, b) IN (subquery)` not supported — \
+                 write it as EXISTS (SELECT 1 FROM … WHERE … AND …)",
+            ));
+        }
         return Err(QsdbError::invalid(format!(
             "IN subquery must select exactly one column (got {})",
             sub_cols.len()
@@ -2467,6 +2478,11 @@ fn translate_select_inner(
     };
 
     // JOIN 链（SQL-2：等值 INNER/LEFT）
+    //
+    // ⚠️ 拒绝文案里**不许 `{op:?}`**：那是把 sqlparser 的语法树 Debug-print 给用户，
+    // 一条能到几百字符（`Join type Right(On(BinaryOp { left: CompoundIdentifier([Ident
+    // { value: "a", span: Span(Location(1,40)..Location(1,41)) }]), …`），人和驱动都
+    // 读不出重点——真正有用的信息只是"你不认识哪种写法"。见 `join_op_name`。
     let no_joins: Vec<sqlparser::ast::Join> = Vec::new();
     let joins = select
         .from
@@ -2483,7 +2499,8 @@ fn translate_select_inner(
             }
             other => {
                 return Err(QsdbError::unsupported(format!(
-                    "JOIN type {other:?} not supported (INNER/LEFT only)"
+                    "{} not supported (only INNER JOIN / LEFT [OUTER] JOIN with an equi `ON`)",
+                    join_op_name(other)
                 )));
             }
         };
@@ -2601,9 +2618,14 @@ fn translate_select_inner(
                 };
             }
             Err(e) => {
-                return Err(QsdbError::unsupported(format!(
-                    "non-equi LEFT JOIN lands later: {e}"
-                )));
+                // 非等值只实现了 INNER（走叉积+过滤）。**不能按 INNER 跑**——
+                // 那会静默丢掉左表未匹配的行。文案说清"改怎么写"，别留
+                // `lands later` 这种路线图口吻（对使用者毫无信息）。
+                let _ = e;
+                return Err(QsdbError::unsupported(
+                    "non-equi LEFT JOIN not supported (only non-equi INNER is) — \
+                     put the condition in WHERE for an INNER, or join on an equi key",
+                ));
             }
         }
     }
@@ -3035,6 +3057,62 @@ fn replace_top_project(plan: LogicalPlan, exprs: Vec<PhysExpr>, names: Vec<Strin
 /// `n_left` = **左侧输入的输出宽度**（列序号 < n_left 即属左侧）。调用方必须传
 /// `ctx.cols` 在**追加右表列之前**的长度——见 `translate_select_inner` 里 JOIN 循环处
 /// 的注释（那里曾误用"非限定列数"，导致第二次 join 静默退化成叉积）。
+/// `JoinOperator` → **用户写的那种写法**（用于拒绝文案）。
+///
+/// **别用 `{op:?}`**：`JoinOperator` 的 Debug 会把整条 `ON` 表达式连同 `Ident`/
+/// `Span` 一起打出来（实测一条几百字符），人和驱动都读不出重点；而这里要说的
+/// 只是"你不认识哪种写法"。
+///
+/// 穷尽匹配、**不留通配臂**：sqlparser 升级加了新算子时**编译期就会红**
+/// （那时才该决定新写法是支持还是拒），比默默报一个 `"this JOIN form"` 强。
+fn join_op_name(op: &sqlparser::ast::JoinOperator) -> &'static str {
+    use sqlparser::ast::JoinOperator as J;
+    match op {
+        J::Join(_) => "JOIN",
+        J::Inner(_) => "INNER JOIN",
+        J::Left(_) => "LEFT JOIN",
+        J::LeftOuter(_) => "LEFT OUTER JOIN",
+        J::Right(_) => "RIGHT JOIN",
+        J::RightOuter(_) => "RIGHT OUTER JOIN",
+        J::FullOuter(_) => "FULL [OUTER] JOIN",
+        J::CrossJoin(_) => "CROSS JOIN",
+        J::Semi(_) => "SEMI JOIN",
+        J::LeftSemi(_) => "LEFT SEMI JOIN",
+        J::RightSemi(_) => "RIGHT SEMI JOIN",
+        J::Anti(_) => "ANTI JOIN",
+        J::LeftAnti(_) => "LEFT ANTI JOIN",
+        J::RightAnti(_) => "RIGHT ANTI JOIN",
+        J::CrossApply => "CROSS APPLY",
+        J::OuterApply => "OUTER APPLY",
+        J::AsOf { .. } => "ASOF JOIN",
+        J::StraightJoin(_) => "STRAIGHT_JOIN",
+        J::ArrayJoin => "ARRAY JOIN",
+        J::LeftArrayJoin => "LEFT ARRAY JOIN",
+        J::InnerArrayJoin => "INNER ARRAY JOIN",
+    }
+}
+
+/// 左操作数是不是**行值构造** `(a, b)`（含括号包裹的形态）。
+///
+/// 用途见 `build_in_semi_join`：行值 `IN` 是合法 SQL 但没实现 ⇒ 该报 `UNSUPPORTED`
+/// 而不是"你的子查询列数不对"。
+fn is_row_value(e: &sqlparser::ast::Expr) -> bool {
+    match e {
+        sqlparser::ast::Expr::Tuple { .. } => true,
+        sqlparser::ast::Expr::Nested(inner) => is_row_value(inner),
+        _ => false,
+    }
+}
+
+/// 一段 AST 的 `Debug` 输出 → **只留变体名**（兜底用，见 `join_op_name` 的说明）。
+///
+/// 不可穷尽匹配的地方（如 `Expr` 有上百个变体）用这个：拿 `Debug` 串的**前缀**，
+/// 后面的字段全丢掉。至少是短的、能指认的。
+fn ast_head(debug: &str) -> &str {
+    let end = debug.find(['{', '(', ' ']).unwrap_or(debug.len());
+    debug[..end].trim()
+}
+
 fn split_equi_condition(
     e: &sqlparser::ast::Expr,
     n_left: usize,
@@ -3046,7 +3124,8 @@ fn split_equi_condition(
     };
     if !matches!(op, sqlparser::ast::BinaryOperator::Eq) {
         return Err(QsdbError::unsupported(
-            "JOIN ON supports only equality (non-equi lands in M5)",
+            "JOIN ON supports only equality for INNER/LEFT (non-equi INNER goes through a \
+             cross join + filter)",
         ));
     }
     let lb = bind_expr(left, ctx)?;
@@ -3926,9 +4005,21 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
             }
             bind_scalar_fn(f, ctx)
         }
-        other => Err(QsdbError::unsupported(format!(
-            "expression {other:?} not supported"
-        ))),
+        // 两条常见的"语法认识、但没实现"——单独给话，**别落到兜底去 Debug-print**
+        sqlparser::ast::Expr::AnyOp { .. } => Err(QsdbError::unsupported(
+            "`= ANY/ALL (subquery)` not supported — use IN / EXISTS, or an explicit OR/AND chain",
+        )),
+        sqlparser::ast::Expr::Tuple { .. } => Err(QsdbError::unsupported(
+            "row value `(a, b)` not supported here",
+        )),
+        // 兜底：**只报变体名**，不 dump 整棵语法树（`ast_head` 的说明）
+        other => {
+            let d = format!("{other:?}");
+            Err(QsdbError::unsupported(format!(
+                "expression `{}` not supported (list: docs/SQL支持面.md §三)",
+                ast_head(&d)
+            )))
+        }
     }
 }
 
