@@ -54,7 +54,40 @@ DuckDB 是 morsel 驱动的**全算子并行**流水线；我们除"并行聚合
 | ⑦ | window 流式帧 | 整分区物化 | 有序输入下可流式累积 |
 | ⑧ | **CSV 解析并行** | 单线程（5M 行 3.0s） | 按字节段切分 + 段内独立解析；**import_csv 的 1.75× 全在这** |
 | ⑨ | `VALUES` 快路径 | 每格一个 `Literal` 再翻成数组（12ms/1000 行） | 直接从 AST 值构造列式数组 |
-| ⑩ | **聚合参数 `DISTINCT`**（`count/sum/avg(DISTINCT x)`） | **未实现**（2026-10-13 前被静默当成不带 DISTINCT 执行 = 回错数字；现已绑定层显式拒绝）。**★ 2026-10-14 复测：这是当前最大的一格（30×）**——基准里我们跑的是**等价改写** `SELECT count(*) FROM (SELECT DISTINCT gs FROM t)`（全量物化 250 万行再数），DuckDB 跑的是原生单遍哈希计数，**结构性吃亏**。（`SELECT DISTINCT` 本身这一轮已修掉两处 O(n) 退化：4.4GB/9.0s → 588MB/6.2s，但"物化再数"终究打不过"边数边去重"，而且它的内存是 DuckDB 的 2×） | 高价值算子，**我们对外宣称过**。原生实现要真值去重 + 与其它聚合混用 + 走溢出；`count(DISTINCT x)` 是主战场 |
+| ⑩ | **聚合参数 `DISTINCT`**（`count/sum/avg(DISTINCT x)`） | **未实现**（2026-10-13 前被静默当成不带 DISTINCT 执行 = 回错数字；现已绑定层显式拒绝）。**★ 2026-10-14：当前最大的一格（14.3×）**——基准跑的是**等价改写** `SELECT count(*) FROM (SELECT DISTINCT gs FROM t)`（全量物化 250 万行再数），对手跑原生单遍哈希计数。`SELECT DISTINCT` 本身已修掉三处退化（4.4GB/9.0s → **767MB/2.9s**，含记账增量化），但"物化再数"终究打不过"边数边去重"。<br>**设计已定（见下）** | 高价值算子，**我们对外宣称过**。原生实现要真值去重 + 与其它聚合混用 + 走溢出；`count(DISTINCT x)` 是主战场 |
+
+#### P1⑩ 的落地方案（2026-10-14 设计定稿，尚未写码）
+
+**第一步：绑定层把拒绝改成等价改写**（关掉能力缺口——BI 工具天天用，拒着会痛）。
+
+    count(DISTINCT x)                   → aggregate{ aggs: [count(x)], input: Distinct{keys: [x]} }
+    count(DISTINCT x) … GROUP BY g      → aggregate{ group:[g], aggs:[count(x)],
+                                                    input: Distinct{keys: [g, …, x]} }
+
+⚠️ **语义坑（最容易写错的一处）**：改写后必须是 **`count(x)` 而不是 `count(*)`**。
+`count(DISTINCT x)` **跳过 NULL**，而 `count(*)` 会把 NULL 组也算一行 ✗。
+带上分组列 `g` 进 DISTINCT 键之后，`count(x)` 数到的正是"每组里非空 x 的不同值个数"
+—— 与 `count(DISTINCT x)` 逐值等价 ✓。
+
+`sum`/`avg(DISTINCT x)` 同一套（它们本来也跳过 NULL ✓）；`min`/`max(DISTINCT x)` 里
+DISTINCT 是恒等变换，直接去掉即可。
+
+**第二步（速度）：把 `Aggregate(Count) ← Distinct ← Scan` 融成一个单遍计数节点。**
+
+现成的先例是 `JoinCountExec`（`count(*) over INNER JOIN` 的计数下推）——同一套路子：
+识别形状 → 换成一个专用节点 → 不物化中间结果。这里同样：不输出 250 万行、
+不做第二遍聚合，只维护一个"已见值集合"的计数。
+
+⚠️ 集合必须**带真值**（不能只存 64 位哈希 —— 那是有碰撞概率的静默错值）。
+建议复用 `GroupTable` 的 key 编码 + `fxhash → 桶 → key_arena` 那套（已被
+`estimated_bytes` 的增量记账优化过），但**不要建 `group_lits`**：
+250 万字符串组里，`group_lits` 的 `Literal` 槽 + 每组的 `String` 克隆正是
+"组表仍胖"（767MB vs 对手 400MB）的大头，而编码后的 key **已经在 `key_arena` 里**。
+
+**第三步（可选）：与其它聚合混用 + 走溢出**。若与 `sum`/`avg` 等混用，就回到
+"GroupTable 新增一个聚合状态种类"的老路（`init_cols`/`update`/`finalize`/
+`merge_subset`/`spill` 五处都要覆盖——**那是 Bug C 的老巢**，务必带契约测试）。
+只在"纯 count(DISTINCT)"上做专用节点，可以完全避开这条风险路径。
 
 ### P2 把"少干活"的优势再扩大（我们已赢的领域）
 
