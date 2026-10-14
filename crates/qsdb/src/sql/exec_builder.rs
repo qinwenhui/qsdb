@@ -1300,6 +1300,18 @@ fn annotate_walk(plan: &LogicalPlan, needed: &[u32], allow_scan_read: bool) -> L
     }
 }
 
+/// `count(*) over DISTINCT` 是否走**融合计数**（[`crate::exec::DistinctCountExec`]）。
+///
+/// 单独成函数是为了让它**可断言**：融合**静默不触发**只会让性能数字变难看，
+/// 正确性测试一条都不会红 —— 优化白写了也没人知道。回归：`tests/distinct_count_fused.rs`。
+pub fn distinct_fuse_applies(group: &[PhysExpr], aggs: &[AggExpr], input: &LogicalPlan) -> bool {
+    group.is_empty()
+        && aggs.len() == 1
+        && matches!(aggs[0].func, crate::expr::AggFunc::Count)
+        && aggs[0].arg.is_none()
+        && matches!(input, LogicalPlan::Distinct { .. })
+}
+
 /// 聚合构建：含 UDAF → 串行物化路径；可分片源 → 并行 partial/merge；否则串行。
 fn build_aggregate(
     db: &Qsdb,
@@ -1319,6 +1331,37 @@ fn build_aggregate(
             a.out_name
         )));
     }
+    // ── count(*) over DISTINCT：**融合计数**（不物化去重结果）──
+    //
+    //   Aggregate{ group: [], aggs: [count(*)] } ← Distinct ← X
+    //
+    // ⇒ 语义就是"X 的不同行数"，一个节点里数完。基准那句
+    // `SELECT count(*) FROM (SELECT DISTINCT gs FROM t)` 与绑定层从
+    // `count(DISTINCT x)` 改写出来的计划都是这个形状。
+    //
+    // 必须**先**于下面的分片/join 融合判断：它们不认识 `Distinct`，会各自落空。
+    // 开关 `QSDB_NO_DISTINCT_FUSE=1`（A/B 对照；缺省开）。
+    if distinct_fuse_applies(group, aggs, input) && std::env::var("QSDB_NO_DISTINCT_FUSE").is_err()
+    {
+        if let LogicalPlan::Distinct { input } = input {
+            let mut fields: Vec<arrow::datatypes::Field> = Vec::with_capacity(aggs.len());
+            for a in aggs {
+                fields.push(arrow::datatypes::Field::new(
+                    &a.out_name,
+                    a.out_ty.arrow_type(),
+                    true,
+                ));
+            }
+            let out_schema = Arc::new(arrow::datatypes::Schema::new(fields));
+            let node = build_inner(db, input, scan_proj.clone(), ctx)?;
+            return Ok(Box::new(crate::exec::DistinctCountExec::new(
+                node,
+                out_schema,
+                Arc::clone(ctx),
+            )?));
+        }
+    }
+
     // ── count(*) over INNER 等值 JOIN：计数下推（T3 优化）──
     // 低基数键下 JOIN 输出行数 = Σ左键匹配数，物化代价 n²/keys。
     // 恒等变换为「右键计数 + 左键累加」→ O(n)、build 侧只物化键列。

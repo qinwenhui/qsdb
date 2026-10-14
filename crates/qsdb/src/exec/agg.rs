@@ -377,6 +377,19 @@ pub struct GroupTable {
     sums: Vec<SumCol>,
     /// Min/Max 值（仅 Min/Max 列分配）
     minmax: Vec<Vec<Option<Literal>>>,
+    /// **只要"组数"、不要组键正文**（`count(DISTINCT x)` 的融合计数节点）。
+    ///
+    /// 关掉两样东西：
+    /// 1. `group_lits`（不建）—— 250 万字符串组里，它的 `Literal` 槽 + 每组一次
+    ///    `String` 克隆正是"组表仍胖"的大头，而编码后的键**已经在 `key_arena` 里**；
+    /// 2. **Int64 内联快路径**——它把键存成裸 8 字节，通用路径是 tag+值。融合节点
+    ///    要按**键字节**做溢出分区，两套编码混用会让同一个键分到不同分区
+    ///    ⇒ **静默多数/少数**。统一走通用编码，换来两边口径一致。
+    ///
+    /// ⚠️ 也正因为第 2 条，`assign_groups_fast_inline` 里那段"无 literal 表从
+    /// `key_arena` 回填"的兜底永远不会被 count-only 表触发 —— 那条路径的真值
+    /// 全靠 literal，本来就只对**有 literal 的表**成立。
+    count_only: bool,
 }
 
 impl GroupTable {
@@ -510,7 +523,7 @@ impl GroupTable {
 
     /// 组 g 的 key 字节。
     #[inline]
-    fn key_of(&self, g: usize) -> &[u8] {
+    pub(crate) fn key_of(&self, g: usize) -> &[u8] {
         &self.key_arena[self.key_off[g] as usize..self.key_off[g + 1] as usize]
     }
 
@@ -573,7 +586,9 @@ impl GroupTable {
         if !self.kinds.is_empty() {
             return;
         }
-        if self.group_lits.is_empty() {
+        // count-only：**不建** group_lits（见该字段说明）。留空即可——
+        // `push_group` 的 zip 会自然跳过，`estimated_bytes` 也自然记 0。
+        if self.group_lits.is_empty() && !self.count_only {
             self.group_lits = vec![Vec::new(); group.len()];
         }
         self.kinds = aggs.iter().map(|a| a.func).collect();
@@ -1031,7 +1046,13 @@ impl GroupTable {
                 None => Ok(None),
             })
             .collect::<Result<_>>()?;
-        let fast_cols = int64_group_columns(&group_arrays);
+        // count-only 一律走通用编码（内联快路径的键是裸 8 字节，与溢出分区的
+        // tag+值口径不一致 ⇒ 会**静默分错区**。见 `count_only` 字段说明）。
+        let fast_cols = if self.count_only {
+            None
+        } else {
+            int64_group_columns(&group_arrays)
+        };
 
         self.init_cols(group, aggs, &agg_arrays);
 
@@ -1228,12 +1249,43 @@ impl GroupTable {
                 }
             }
         }
-        // 新组
-        let lits: Vec<Literal> = arrays
-            .iter()
-            .map(|a| array_value_to_literal(a, row))
-            .collect();
+        // 新组（count-only 不建 literal —— 这是该模式省下的主要内存与拷贝）
+        let lits: Vec<Literal> = if self.count_only {
+            Vec::new()
+        } else {
+            arrays
+                .iter()
+                .map(|a| array_value_to_literal(a, row))
+                .collect()
+        };
         let gid = self.push_group(key, &lits);
+        self.bucket_push(h, gid);
+        gid
+    }
+
+    /// 新建一张**只数组数**的表（[`GroupTable::count_only`]）。
+    pub fn new_count_only() -> Self {
+        Self {
+            count_only: true,
+            ..Self::default()
+        }
+    }
+
+    /// 只按**已经编码好的键字节**建组（不碰 literal、不进内联快路径）。
+    ///
+    /// 给融合计数节点的**溢出重分区**用：把内存里已建的组按同一个键字节口径
+    /// 重新灌进各分区的表。两边必须用同一种编码——所以 count-only 表禁用了
+    /// 内联快路径（见该字段说明）。
+    pub fn insert_raw_key(&mut self, key: &[u8]) -> u32 {
+        let h = fxhash_bytes(key);
+        if let Some(cands) = self.by_hash.get(&h) {
+            for &gid in cands {
+                if self.key_of(gid as usize) == key {
+                    return gid;
+                }
+            }
+        }
+        let gid = self.push_group(key, &[]);
         self.bucket_push(h, gid);
         gid
     }

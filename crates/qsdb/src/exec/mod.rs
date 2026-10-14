@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use arrow::array::Array;
 
+use arrow::array::ArrayRef;
 use arrow::compute::kernels::sort::{SortColumn, lexsort_to_indices};
 use arrow::compute::{concat, filter_record_batch, take};
 use arrow::datatypes::SchemaRef;
@@ -1005,6 +1006,178 @@ impl ExecNode for DistinctExec {
         // **列式**输出：组表本来就是 SoA，别再转置成行式（见 `build_output_batch_cols`）
         match agg::build_output_batch_cols(&self.state, &self.schema()) {
             Ok(o) => Some(Ok(o)),
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `count(*) over DISTINCT` 的**融合计数**：只数"不同的行"，不物化去重结果。
+//
+// 认出的形状（`build_aggregate`）：
+//     Aggregate{ group: [], aggs: [count(*)] } ← Distinct ← X
+// 语义 = X 的不同行数。基准那句 `SELECT count(*) FROM (SELECT DISTINCT gs FROM t)`
+// 与绑定层从 `count(DISTINCT x)` 改写出来的计划都长这样。
+//
+// 相比"先物化 250 万行、再数一遍"省掉三件事：
+// 1. 中间批（250 万次 `literals_to_array` 拼字符串数组）；
+// 2. 第二遍聚合（250 万行再入一次组表）；
+// 3. 组表里的 literal（每组一次 `String` 克隆 + `Literal` 槽）——
+//    见 `agg::GroupTable::count_only`。
+//
+// ⚠️ 集合**必须带真值**（`key_arena` 存完整键）：只存 64 位哈希是有碰撞概率的
+// **静默错值**，不能为了省内存那么干。
+// ---------------------------------------------------------------------------
+pub struct DistinctCountExec {
+    input: Box<dyn ExecNode>,
+    /// 去重键 = 输入的全部列（`LogicalPlan::Distinct` 语义就是"整行去重"）
+    keys: Vec<PhysExpr>,
+    state: agg::GroupTable,
+    ctx: Arc<crate::query::QueryContext>,
+    res: crate::memory::Reservation,
+    accounted: u64,
+    spill: Option<agg_spill::PartSpill>,
+    emitted: bool,
+    schema: SchemaRef,
+}
+
+/// 键字节 → 溢出分区号。**内存侧（`key_of`）与批侧（`encode_key_row`）必须走同一个**
+/// —— 两套口径会让同一逻辑键落到不同分区，两边各算一次 ⇒ **静默多数**。
+fn route_key_bytes(key: &[u8], nparts: usize) -> usize {
+    // FNV-1a（与 `agg::fxhash_bytes` 无关，只要求本文件内自洽）
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in key {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    (h % nparts as u64) as usize
+}
+
+impl DistinctCountExec {
+    /// `out_schema` 是**聚合节点的输出 schema**（`count(*)` 那一列），不是输入的
+    /// —— 本节点替代的是整个 `Aggregate ← Distinct` 两层，上层按聚合的 schema 认列。
+    pub fn new(
+        input: Box<dyn ExecNode>,
+        out_schema: SchemaRef,
+        ctx: Arc<crate::query::QueryContext>,
+    ) -> Result<Self> {
+        let in_schema = input.schema();
+        // 键 = 全部输入列（与 `DistinctExec` 同款：那里也是"整行做组键"）
+        let keys: Vec<PhysExpr> = in_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, f)| PhysExpr::Column {
+                idx: i,
+                name: f.name().clone(),
+                ty: crate::types::LogicalType::try_from_arrow(f.data_type())
+                    .unwrap_or(crate::types::LogicalType::Int64),
+            })
+            .collect();
+        let res = ctx.try_reserve(0)?;
+        Ok(Self {
+            input,
+            keys,
+            state: agg::GroupTable::new_count_only(),
+            ctx,
+            res,
+            accounted: 0,
+            spill: None,
+            emitted: false,
+            schema: out_schema,
+        })
+    }
+
+    /// 溢出：把**剩下的**输入批按键字节分区落盘。
+    fn spill_rest(&mut self) -> Result<()> {
+        if std::env::var("QSDB_DISTINCT_PROF").is_ok() {
+            eprintln!(
+                "[distinct-count] 转溢出重分区：内存中已建组 {}",
+                self.state.len()
+            );
+        }
+        let schema = self.input.schema();
+        let (nparts, cap) = agg_spill::PartSpill::plan(&self.ctx);
+        let mut sp = agg_spill::PartSpill::new(schema, &self.ctx, nparts, cap)?;
+        let mut buf: Vec<u8> = Vec::with_capacity(64);
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.keys.len());
+        while let Some(b) = self.input.next() {
+            self.ctx.check()?;
+            let batch = b?;
+            arrays.clear();
+            for k in &self.keys {
+                arrays.push(eval::eval(k, &batch)?);
+            }
+            let mut parts: Vec<u32> = Vec::with_capacity(batch.num_rows());
+            for row in 0..batch.num_rows() {
+                agg::encode_key_row(&arrays, row, &mut buf);
+                parts.push(route_key_bytes(&buf, sp.nparts()) as u32);
+            }
+            sp.push_routed(&batch, &parts)?;
+        }
+        self.spill = Some(sp);
+        Ok(())
+    }
+
+    /// 逐分区取回：每个分区一张新表，**先灌入内存里已归到本分区的组**（同一个键
+    /// 字节口径），再流式吃本分区的落盘行。各分区互不相交 ⇒ 组数直接相加。
+    fn drain_partitions(&mut self) -> Result<u64> {
+        let mut sp = self.spill.take().expect("溢出态");
+        let nparts = sp.nparts();
+        let mut by_part: Vec<Vec<u32>> = vec![Vec::new(); nparts];
+        for gid in 0..self.state.len() as u32 {
+            let p = route_key_bytes(self.state.key_of(gid as usize), nparts);
+            by_part[p].push(gid);
+        }
+        let keys = self.keys.clone();
+        let mut total: u64 = 0;
+        for (p, gids) in by_part.iter().enumerate() {
+            let mut t = agg::GroupTable::new_count_only();
+            for &gid in gids {
+                t.insert_raw_key(self.state.key_of(gid as usize));
+            }
+            sp.for_each_partition(p, |b| t.ingest(&keys, &[], b))?;
+            total += t.len() as u64;
+        }
+        Ok(total)
+    }
+
+    fn run(&mut self) -> Result<u64> {
+        while let Some(b) = self.input.next() {
+            self.ctx.check()?;
+            let batch = b?;
+            self.state.ingest(&self.keys, &[], &batch)?;
+            let est = self.state.estimated_bytes();
+            if est > self.accounted {
+                if self.res.grow(est - self.accounted).is_err() {
+                    // 额度不够 → 转溢出（与聚合/去重同机制）
+                    self.spill_rest()?;
+                    return self.drain_partitions();
+                }
+                self.accounted = est;
+            }
+        }
+        Ok(self.state.len() as u64)
+    }
+
+    fn one_row(&self, total: u64) -> Result<RecordBatch> {
+        let arr = arrow::array::Int64Array::from(vec![total as i64]);
+        RecordBatch::try_new(Arc::clone(&self.schema), vec![Arc::new(arr)])
+            .map_err(|e| QsdbError::unsupported(format!("count() 输出构造失败: {e}")))
+    }
+}
+
+impl ExecNode for DistinctCountExec {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+    fn next(&mut self) -> Option<Result<RecordBatch>> {
+        if self.emitted {
+            return None;
+        }
+        self.emitted = true;
+        match self.run() {
+            Ok(total) => Some(self.one_row(total)),
             Err(e) => Some(Err(e)),
         }
     }
