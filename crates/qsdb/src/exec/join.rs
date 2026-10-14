@@ -46,6 +46,34 @@ impl JoinType {
 }
 
 /// 笛卡尔积（非等值 INNER JOIN 的底座）：右表首拉时物化，左批逐批 × 右表展开。
+/// 一次 `next()` 最多吐多少行。
+///
+/// ⚠️ **这个常量同时管两件事，别改小聪明**：
+/// ① **取消/超时的生效延迟**：展开了却不发出去的行，中间没有任何 `ctx.check()`
+///    机会（2026-10-15 实测：`n_left × n_right` 一次性展开时，7000×7000 的
+///    取消要 1.9s 才生效、基线 5.8s —— 取消形同摆设）；
+/// ② **峰值内存**：25M 行 × 列宽，一次 `take` 出来就是几百 MB 的瞬时物化。
+/// 64K 行 ≈ 一次 `take` 的量级（同 `batch_size` 一个数量级），两头都够用。
+const CROSS_CHUNK_ROWS: usize = 64 * 1024;
+
+/// 块内**再**查一次取消的间隔（块本身也不许长到"点不动"）。
+///
+/// 只靠"每块一次"在极窄的列上有风险（64K 行的 `take` 是 µs 级，但若将来有人
+/// 把块调大、或 `build` 侧宽到每行几百字节，块内就可能几十毫秒起步）。
+const CROSS_CHECK_EVERY: usize = 16 * 1024;
+
+/// 当前 probe 批的展开进度（跨 `next()` 调用保持）。
+struct CrossCursor {
+    /// 左（probe）批。
+    batch: RecordBatch,
+    /// 右表行数（展开前定下，免得每块重算）。
+    n_right: usize,
+    /// 已发射的 pair 数。
+    cursor: usize,
+    /// 本批总 pair 数 = `batch.num_rows() × n_right`。
+    total: usize,
+}
+
 pub struct CrossJoinExec {
     probe: Box<dyn ExecNode>,
     build: Option<Box<dyn ExecNode>>,
@@ -54,6 +82,8 @@ pub struct CrossJoinExec {
     build_res: Option<crate::memory::Reservation>,
     schema: SchemaRef,
     ctx: Arc<QueryContext>,
+    /// 在飞的 probe 批（`None` = 该去取下一批）。见 [`CROSS_CHUNK_ROWS`]。
+    cur: Option<CrossCursor>,
 }
 
 impl CrossJoinExec {
@@ -73,6 +103,7 @@ impl CrossJoinExec {
             build_res: None,
             schema,
             ctx,
+            cur: None,
         }
     }
 
@@ -125,59 +156,103 @@ impl ExecNode for CrossJoinExec {
         if let Err(e) = self.materialize_build() {
             return Some(Err(e));
         }
-        let batch = self.probe.next()?;
-        let batch = match batch {
-            Ok(b) => b,
-            Err(e) => return Some(Err(e)),
-        };
-        if batch.num_rows() == 0 {
-            return self.next();
-        }
-        // 展开：左批每行 × 右表每行
-        let n_left = batch.num_rows();
-        let n_right = self.build_state.as_ref().map(|b| b.num_rows()).unwrap_or(0);
-        let total = n_left * n_right;
-        let mut left_indices: Vec<u32> = Vec::with_capacity(total);
-        let mut right_indices: Vec<u32> = Vec::with_capacity(total);
-        for l in 0..n_left {
-            for r in 0..n_right {
-                left_indices.push(l as u32);
-                right_indices.push(r as u32);
+        loop {
+            // 上一批还有没发完的 → 接着发（**不重算索引**，只推游标）
+            if let Some(c) = &self.cur {
+                if c.cursor < c.total {
+                    return Some(self.emit_chunk());
+                }
+                self.cur = None;
             }
-        }
-        let li = UInt32Array::from(left_indices);
-        let ri = UInt32Array::from(right_indices);
-        let mut cols: Vec<ArrayRef> = Vec::with_capacity(self.schema.fields().len());
-        for c in 0..batch.num_columns() {
-            let taken = take(batch.column(c), &li, None)
-                .map_err(|e| QsdbError::invalid(format!("cross take: {e}")));
-            match taken {
-                Ok(a) => cols.push(a),
+            let batch = match self.probe.next()? {
+                Ok(b) => b,
                 Err(e) => return Some(Err(e)),
+            };
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let n_right = self.build_state.as_ref().map(|b| b.num_rows()).unwrap_or(0);
+            self.cur = Some(CrossCursor {
+                total: batch.num_rows() * n_right,
+                batch,
+                n_right,
+                cursor: 0,
+            });
+            // 右表为空 ⇒ `total = 0` ⇒ 下一轮直接丢掉游标、取下一批 probe
+            // （cross join 与空集连接恒为空，与原实现同义）
+        }
+    }
+}
+
+impl CrossJoinExec {
+    /// 展开**一块**（最多 [`CROSS_CHUNK_ROWS`] 行）并射出。
+    ///
+    /// 索引按 `(l, r) = (k / n_right, k % n_right)` 递增推进，不预先物化整批的
+    /// 索引向量（那本身就是 `2 × 4 字节 × 总对数` 的瞬时内存）。
+    fn emit_chunk(&mut self) -> Result<RecordBatch> {
+        let Self {
+            cur,
+            build_state,
+            schema,
+            ctx,
+            ..
+        } = self;
+        let c = cur.as_mut().expect("emit_chunk 只在有待发批时调用");
+        let n_right = c.n_right;
+        debug_assert!(n_right > 0, "空右表不该走到展开（total = 0）");
+        let start = c.cursor;
+        let end = (start + CROSS_CHUNK_ROWS).min(c.total);
+        let n = end - start;
+        let mut li: Vec<u32> = Vec::with_capacity(n);
+        let mut ri: Vec<u32> = Vec::with_capacity(n);
+        let mut l = start / n_right;
+        let mut r = start % n_right;
+        for k in 0..n {
+            if k % CROSS_CHECK_EVERY == 0 {
+                // 块内也不许长到"点不动"：见 `CROSS_CHECK_EVERY`
+                ctx.check()?;
+            }
+            li.push(l as u32);
+            ri.push(r as u32);
+            r += 1;
+            if r == n_right {
+                r = 0;
+                l += 1;
             }
         }
-        if let Some(build) = &self.build_state {
-            for c in 0..build.num_columns() {
-                let taken = take(build.column(c), &ri, None)
-                    .map_err(|e| QsdbError::invalid(format!("cross take: {e}")));
-                match taken {
-                    Ok(a) => cols.push(a),
-                    Err(e) => return Some(Err(e)),
+        c.cursor = end;
+        let li = UInt32Array::from(li);
+        let ri = UInt32Array::from(ri);
+        let mut cols: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+        for i in 0..c.batch.num_columns() {
+            cols.push(
+                take(c.batch.column(i), &li, None)
+                    .map_err(|e| QsdbError::invalid(format!("cross take: {e}")))?,
+            );
+        }
+        match build_state {
+            Some(build) => {
+                for i in 0..build.num_columns() {
+                    cols.push(
+                        take(build.column(i), &ri, None)
+                            .map_err(|e| QsdbError::invalid(format!("cross take: {e}")))?,
+                    );
                 }
             }
-        } else {
-            // 右表为空批：补全空列
-            for f in self.schema.fields().iter().skip(batch.num_columns()) {
-                cols.push(arrow::array::new_null_array(f.data_type(), total));
+            // 右表为空批：补全空列（本分支实际到不了，`total = 0`；留着是给
+            // "schema 有右列但 build 为空"的形状一个不 panic 的兜底）
+            None => {
+                for f in schema.fields().iter().skip(c.batch.num_columns()) {
+                    cols.push(arrow::array::new_null_array(f.data_type(), n));
+                }
             }
         }
-        let out = RecordBatch::try_new_with_options(
-            Arc::clone(&self.schema),
+        RecordBatch::try_new_with_options(
+            Arc::clone(schema),
             cols,
-            &RecordBatchOptions::new().with_row_count(Some(total)),
+            &RecordBatchOptions::new().with_row_count(Some(n)),
         )
-        .map_err(|e| QsdbError::invalid(format!("cross output: {e}")));
-        Some(out)
+        .map_err(|e| QsdbError::invalid(format!("cross output: {e}")))
     }
 }
 

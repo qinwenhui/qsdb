@@ -524,11 +524,18 @@ fn 取消运行中的查询() {
     // 这条 eprintln 是**测量**，不是装饰：取消的"生效延迟"取决于执行器在哪一层
     // 轮询取消标志。把它与基线放一起才有意义（见 `docs/真机基准对账.md` 的对应条目）
     eprintln!("[cancel] 从发出取消到查询线程收到响应：{stopped:?}（基线 {full_secs:?}）");
-    assert!(
-        stopped < Duration::from_secs(60),
-        "取消后 60s 还没回来，形同挂死：{stopped:?}（基线 {full_secs:?}）"
-    );
-    let _ = full_secs;
+    // 判据是**比值**：取消必须比跑完快一个数量级。绝对秒数写死会变成 flaky 的尺子，
+    // 而"取消只用了几百毫秒"这种绝对数在慢机器上本来也可能成立却毫无意义。
+    // （修复前实测 19.74s：请求被受理、也回了 QUERY_CANCELLED，但执行器要跑到
+    //  该形状收尾才轮询到标志 —— 见 `crates/qsdb/tests/cancel_latency.rs`。）
+    if full_secs > Duration::from_secs(2) {
+        assert!(
+            stopped * 10 < full_secs,
+            "取消生效太慢：{stopped:?} vs 基线 {full_secs:?}（应快一个数量级）"
+        );
+    } else {
+        eprintln!("跳过比值断言：基线只有 {full_secs:?}（< 2s），比不出快慢");
+    }
     match r {
         Err(e) => {
             let code = e.code().unwrap_or("");
