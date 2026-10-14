@@ -5,7 +5,6 @@
 //! - build 侧全量物化（ctx 内存记账）；probe 侧流式
 //! - 输出列序：左表列 ++ 右表列
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -224,7 +223,7 @@ struct BuildState {
 /// 键 → build 行号列表。单整数键（Int/Date/Boolean/Timestamp）用 i64 直查。
 enum HashIndex {
     I64(I64Map<Vec<u32>>),
-    Bytes(HashMap<Vec<u8>, Vec<u32>>),
+    Bytes(BytesMap<Vec<u32>>),
 }
 
 impl HashIndex {
@@ -257,7 +256,7 @@ pub struct ExistsState {
 
 enum ExistsKeys {
     /// 通用：多键/字符串/浮点 → 键字节编码存在集
-    Bytes(std::collections::HashSet<Vec<u8>>),
+    Bytes(BytesSet),
     /// 单整数键（Int8..64/Date32/Boolean）→ 免编码 i64 存在集（快哈希）
     I64(std::collections::HashSet<i64, BuildI64Hasher>),
     /// 单整数键且域稠密（max−min ≤ 16M 位 = 2MB）→ 位图探测：
@@ -504,7 +503,7 @@ pub fn prepare_exists_state(
     } else {
         None
     };
-    let mut bytes: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::default();
+    let mut bytes: BytesSet = BytesSet::default();
     let mut buf: Vec<u8> = Vec::new();
     while let Some(b) = build.next() {
         ctx.check()?;
@@ -890,8 +889,8 @@ impl ExecNode for HashJoinExec {
 }
 
 /// 字节键索引构建（多键/字符串/浮点路径）。
-fn build_bytes_index(key_cols: &[ArrayRef], nrows: usize) -> HashMap<Vec<u8>, Vec<u32>> {
-    let mut index: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
+fn build_bytes_index(key_cols: &[ArrayRef], nrows: usize) -> BytesMap<Vec<u32>> {
+    let mut index: BytesMap<Vec<u32>> = BytesMap::default();
     let mut buf: Vec<u8> = Vec::new();
     for row in 0..nrows {
         encode_join_key(key_cols, row, &mut buf);
@@ -1274,6 +1273,56 @@ impl std::hash::BuildHasher for BuildI64Hasher {
 /// i64 键 map（快哈希）。
 pub type I64Map<V> = std::collections::HashMap<i64, V, BuildI64Hasher>;
 
+/// `Vec<u8>` 键的 **8 字节块** FxHash。
+///
+/// 为什么要它：`HashMap<Vec<u8>, _>` 默认用 `RandomState` = **SipHash**。
+/// `perf` 实测（2026-10-14，`complex_three_way` 0.363s / 2586 采样）：
+/// `Sip13Round` **4.64%** + `RandomState` **4.13%** = **8.77%**，且旁边就是
+/// `encode_join_key`（3.77%）—— 全在 join 建侧索引与去重集合上。
+///
+/// ⚠️ 不复用 `I64Hasher`：它的 `write` 是**逐字节** rotate-mix，
+/// 对字节序列等于每字节一次运算；这里按 8 字节一块走（与 `agg::fxhash_bytes` 同构）。
+pub struct ByteHasher(u64);
+
+impl std::hash::Hasher for ByteHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+        let mut h = if self.0 == 0 { SEED } else { self.0 };
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            let v = u64::from_le_bytes(c.try_into().unwrap());
+            h = (h.rotate_left(5) ^ v).wrapping_mul(SEED);
+        }
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..rem.len()].copy_from_slice(rem);
+            h = (h.rotate_left(5) ^ u64::from_le_bytes(buf)).wrapping_mul(SEED);
+        }
+        self.0 = h;
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct BuildByteHasher;
+
+impl std::hash::BuildHasher for BuildByteHasher {
+    type Hasher = ByteHasher;
+    #[inline]
+    fn build_hasher(&self) -> ByteHasher {
+        ByteHasher(0)
+    }
+}
+
+/// `Vec<u8>` 键的 map / set（快哈希）。
+pub type BytesMap<V> = std::collections::HashMap<Vec<u8>, V, BuildByteHasher>;
+pub type BytesSet = std::collections::HashSet<Vec<u8>, BuildByteHasher>;
+
 // ---------------------------------------------------------------------------
 // count(*) 下推（T3 优化）：JOIN 输出的行数 = Σ(左键匹配的右键行数)，
 // 恒等变换为「右键计数 + 左键累加」——不物化 JOIN 输出。
@@ -1305,7 +1354,7 @@ enum CountMap {
         miss: u64,
     },
     I64(I64Map<u64>),
-    Bytes(std::collections::HashMap<Vec<u8>, u64>),
+    Bytes(BytesMap<u64>),
 }
 
 impl JoinCountExec {
@@ -1352,8 +1401,7 @@ impl JoinCountExec {
         let t0 = std::time::Instant::now();
         let use_i64 = Self::int_key_ok(&self.build_keys);
         let mut i64_map: I64Map<u64> = I64Map::default();
-        let mut bytes_map: std::collections::HashMap<Vec<u8>, u64> =
-            std::collections::HashMap::new();
+        let mut bytes_map: BytesMap<u64> = BytesMap::default();
         // 稠密直索引候选：单整数键时先收集键值（build 侧通常远小于 probe）
         let mut dense_keys: Vec<i64> = Vec::new();
         let mut buf: Vec<u8> = Vec::new();
