@@ -166,6 +166,14 @@ fn cases() -> Vec<(&'static str, &'static str, &'static str)> {
         ),
         ("import_append", "导入", "嵌入 append（内存批直写）"),
         (
+            "import_csv_parse_only",
+            "导入",
+            // **诊断用，不是对比格**：把 import_csv 拆成"解析"与"写段"两半。
+            // 用 `sum(v)` 而不是 `count(*)`——后者可能被元数据短路掉，
+            // 那就测的是"短路有多快"而不是"解析有多慢"（同族：选错口径）。
+            "只解析 CSV 不建表（import_csv 耗时的下界）",
+        ),
+        (
             "export_parquet",
             "导出",
             "全表扫描 → Parquet 文件（内核暂无导出原语，见 docs §F9）",
@@ -700,6 +708,13 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
             let n = scalar_i64(&db, "SELECT count(*) FROM t_csv") as u64;
             assert!(n > 0, "import_csv 灌了 0 行");
             (n, dt.as_millis() as u64)
+        }
+        "import_csv_parse_only" => {
+            let t0 = Instant::now();
+            let sum = scalar_i64(&db, &format!("SELECT sum(v) FROM read_csv('{src}/src/t.csv')"));
+            let ms = t0.elapsed().as_millis() as u64;
+            assert!(sum > 0, "解析出 0 行");
+            (1u64, ms)
         }
         "import_parquet" => {
             db.sql("DROP TABLE IF EXISTS t_pq").ok();
