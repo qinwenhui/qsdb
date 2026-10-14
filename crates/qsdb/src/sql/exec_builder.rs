@@ -1271,7 +1271,7 @@ fn annotate_walk(plan: &LogicalPlan, needed: &[u32], allow_scan_read: bool) -> L
                 let mut rc = Vec::new();
                 r.collect_columns(&mut rc);
                 for c in rc {
-                    if (c as usize) < lw {
+                    if c < lw {
                         if !ln.contains(&(c as u32)) {
                             ln.push(c as u32);
                         }
