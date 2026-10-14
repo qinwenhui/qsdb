@@ -338,6 +338,7 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
             left_keys,
             right_keys,
             join_type,
+            needed,
         } if join_type.is_semi_family() => LogicalPlan::Join {
             left: Box::new(rewrite_plan(left, mapping, all)),
             // 右键为右子计划局部 idx（绑定期约定），裁剪不触碰
@@ -348,6 +349,7 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
                 .collect(),
             right_keys: right_keys.clone(),
             join_type: *join_type,
+            needed: needed.clone(),
         },
         LogicalPlan::ExternalScan {
             def,
@@ -604,6 +606,7 @@ fn build_inner(
                 left_keys,
                 right_keys,
                 join_type,
+                ..
             } = input.as_ref()
             {
                 if let Some(node) = try_project_join(
@@ -619,7 +622,11 @@ fn build_inner(
             )))
         }
         LogicalPlan::Aggregate { input, group, aggs } => {
-            build_aggregate(db, input, group, aggs, &scan_proj, ctx)
+            // ★ join 输出投影下推（P1⑥）：**聚合是 join 输出唯一的读者**，
+            // 且它的表达式可枚举 ⇒ "哪几列没人读"是**可证的**（不是猜的）。
+            // 标注结果只影响"join 少物化那几列"（填 NULL），schema 与索引**一概不动**。
+            let narrowed = annotate_join_needs(input, group, aggs);
+            build_aggregate(db, &narrowed, group, aggs, &scan_proj, ctx)
         }
         LogicalPlan::Sort { input, keys } => Ok(Box::new(SortExec::new(
             build_inner(db, input, scan_proj.clone(), ctx)?,
@@ -761,6 +768,7 @@ fn build_inner(
             left_keys,
             right_keys,
             join_type,
+            needed,
         } => {
             // semi 族：左子继承裁剪投影（build() 对 semi 计划做了列裁剪——
             // 传 None 会读全列使左键 idx 错位；INNER/LEFT 无上游裁剪，None 等价）
@@ -793,14 +801,25 @@ fn build_inner(
                     })
                     .collect()
             };
-            Ok(Box::new(crate::exec::join::HashJoinExec::new(
-                probe,
-                build,
-                left_keys.clone(),
-                local_keys,
-                *join_type,
-                Arc::clone(ctx),
-            )))
+            if needed.is_some() && std::env::var("QSDB_JOIN_PROF").is_ok() {
+                eprintln!(
+                    "[join-proj] 输出列 {} → 只物化 {}（其余填 NULL）",
+                    probe.schema().fields().len() + build.schema().fields().len(),
+                    needed.as_ref().map_or(0, |n| n.len())
+                );
+            }
+            Ok(Box::new(
+                crate::exec::join::HashJoinExec::new(
+                    probe,
+                    build,
+                    left_keys.clone(),
+                    local_keys,
+                    *join_type,
+                    Arc::clone(ctx),
+                )
+                // ★ join 输出投影下推（P1⑥）：只物化下游真读的列（见 `annotate_join_needs`）
+                .with_needed(needed.clone()),
+            ))
         }
     }
 }
@@ -1019,6 +1038,123 @@ fn try_project_join(
     ))))
 }
 
+/// 把"**只需物化这些输出位置**"标注到 `Aggregate` 之下的 join 链上（P1⑥）。
+///
+/// ## 为什么敢说"这几列没人读"
+///
+/// 只在 `Aggregate` 的输入链上做，而这条链**只有一个读者**：聚合自己。
+/// 它要读的位置 = `group` ∪ 各 `agg.arg` 里的列，**可枚举**；链上若有 `Filter`
+/// （WHERE 落在 join 之上），它是**恒等 schema 的透传**，把谓词引用的位置一并算上。
+///
+/// 一遇到别的形状（`Project` / `Sort` / `Window` / `SetOp` / semi join / CTE…）
+/// **就地停手**——那些节点的读取集合不是"几条表达式"能枚举干净的，
+/// 而**判错一列就是静默错值**（那一列会被 join 填成 NULL，且不报错）。
+/// 停手 = 今天的全列行为，只是不优化。**宁可慢，不许悄悄错。**
+///
+/// ## 子 join 怎么往下传
+///
+/// `((t⋈d)⋈d2)` 里外层 join 的 probe **就是**内层 join 的输出，而 join 输出 = 左 ++ 右
+/// ⇒ 外层要的位置 `p < 左宽` **原样对应**内层输出的位置 `p`。再加上外层用到的连接键
+/// 位置，就是内层要产出的集合。右键同理（全局位置减左宽转局部）。
+///
+/// ⚠️ 实测依据（2026-10-14，.14）：join 输出宽 10 列 → 5 列，**时间减半**
+/// （1.33s → 0.63s，峰值 RSS 300MB → 111MB）。基准那句聚合只读 2 列。
+fn annotate_join_needs(plan: &LogicalPlan, group: &[PhysExpr], aggs: &[AggExpr]) -> LogicalPlan {
+    let mut needed: Vec<usize> = Vec::new();
+    for g in group {
+        g.collect_columns(&mut needed);
+    }
+    for a in aggs {
+        if let Some(arg) = &a.arg {
+            arg.collect_columns(&mut needed);
+        }
+    }
+    // 一列都不读（如 `count(*)` + 纯过滤）：**不标**。空掩码会把所有列填 NULL，
+    // 虽然按定义也没人读，但"整行都是 NULL"这种状态没有实测支撑，不值得为它冒险。
+    if needed.is_empty() || std::env::var("QSDB_JOIN_NO_PROJ").is_ok() {
+        return plan.clone();
+    }
+    let needed: Vec<u32> = needed.into_iter().map(|i| i as u32).collect();
+    annotate_walk(plan, &needed)
+}
+
+/// 见 [`annotate_join_needs`]。`needed` = **本子树输出**里必须真实产出的位置。
+fn annotate_walk(plan: &LogicalPlan, needed: &[u32]) -> LogicalPlan {
+    match plan {
+        // Filter 是恒等 schema 的透传：它读的位置也必须在
+        LogicalPlan::Filter { input, predicate } => {
+            let mut n = needed.to_vec();
+            let mut cols = Vec::new();
+            predicate.collect_columns(&mut cols);
+            for c in cols {
+                let c = c as u32;
+                if !n.contains(&c) {
+                    n.push(c);
+                }
+            }
+            LogicalPlan::Filter {
+                input: Box::new(annotate_walk(input, &n)),
+                predicate: predicate.clone(),
+            }
+        }
+        LogicalPlan::Join {
+            left,
+            right,
+            left_keys,
+            right_keys,
+            join_type,
+            needed: _,
+        } if !join_type.is_semi_family() => {
+            let Some(lw) = super::translate::plan_output_columns(left)
+                .ok()
+                .map(|c| c.len())
+            else {
+                return plan.clone(); // 宽度拿不到 ⇒ 不标（保守）
+            };
+            let mut ln: Vec<u32> = needed
+                .iter()
+                .copied()
+                .filter(|&p| (p as usize) < lw)
+                .collect();
+            let mut lk = Vec::new();
+            for k in left_keys {
+                k.collect_columns(&mut lk);
+            }
+            for c in lk {
+                let c = c as u32;
+                if !ln.contains(&c) {
+                    ln.push(c);
+                }
+            }
+            let mut rn: Vec<u32> = needed
+                .iter()
+                .filter(|&&p| p as usize >= lw)
+                .map(|&p| p - lw as u32)
+                .collect();
+            let mut rk = Vec::new();
+            for k in right_keys {
+                k.collect_columns(&mut rk);
+            }
+            for c in rk {
+                let c = (c.saturating_sub(lw)) as u32; // 全局序 → 右局部序
+                if !rn.contains(&c) {
+                    rn.push(c);
+                }
+            }
+            LogicalPlan::Join {
+                left: Box::new(annotate_walk(left, &ln)),
+                right: Box::new(annotate_walk(right, &rn)),
+                left_keys: left_keys.clone(),
+                right_keys: right_keys.clone(),
+                join_type: *join_type,
+                needed: Some(Arc::new(needed.to_vec())),
+            }
+        }
+        // 其它形状：读取集合无法枚举 ⇒ 停手（= 全列 = 今天的行为）
+        other => other.clone(),
+    }
+}
+
 /// 聚合构建：含 UDAF → 串行物化路径；可分片源 → 并行 partial/merge；否则串行。
 fn build_aggregate(
     db: &Qsdb,
@@ -1055,6 +1191,7 @@ fn build_aggregate(
             left_keys,
             right_keys,
             join_type,
+            ..
         } = input
         {
             // INNER：Σ匹配数；LEFT：Σ max(匹配数, 1)（未匹配行补 NULL 仍计 1）
@@ -1687,6 +1824,7 @@ fn try_shard_source(
                 left_keys,
                 right_keys,
                 join_type,
+                ..
             } if join_type.is_semi_family() => {
                 semis.push(SemiStage {
                     left_keys: left_keys.clone(),

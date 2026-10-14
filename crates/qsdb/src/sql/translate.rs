@@ -95,6 +95,21 @@ pub enum LogicalPlan {
         left_keys: Vec<PhysExpr>,
         right_keys: Vec<PhysExpr>,
         join_type: crate::exec::join::JoinType,
+        /// **只需物化这些输出位置**（`None` = 全部，即今天的行为）。
+        ///
+        /// 位置序 = 输出序（左全列 ++ 右全列），与 `HashJoinExec::schema()` 一致；
+        /// 不在表里的位置**填 NULL**（列还在、schema 不变，只是没人读）。
+        ///
+        /// **为什么要有它**（2026-10-14 实测）：join 输出宽 = 左全列 + 右全列，
+        /// 而下游聚合往往只读其中一两列。基准那句 `t×d + GROUP BY` 产出 **1000 万行
+        /// × 10 列**（含 4 个字符串列），聚合只读 2 列 —— 单线程 1.27s 里约
+        /// **0.85s 白花在"物化 10 列再丢掉 8 列"**。等价的列宽实验：
+        /// 输出 10 列 → 5 列，**时间直接减半**（1.33s → 0.63s，RSS 300MB → 111MB）。
+        ///
+        /// ⚠️ **它只许"收窄到能证明没人读的列"**：判错一列 = 那一列读出 NULL =
+        /// **静默错值**。故标注逻辑（`exec_builder::annotate_join_needs`）只在
+        /// "join 输出**唯一**的读者可枚举"时才动手，其余一律 `None`。
+        needed: Option<std::sync::Arc<Vec<u32>>>,
     },
     /// 单行零列源（无 FROM SELECT）
     OneRow,
@@ -1886,6 +1901,7 @@ fn build_exists_semi_join(
         left_keys,
         right_keys,
         join_type,
+        needed: None,
     })
 }
 
@@ -1941,6 +1957,7 @@ fn build_in_semi_join(
         left_keys: vec![outer_key],
         right_keys: vec![right_key],
         join_type,
+        needed: None,
     })
 }
 
@@ -2559,6 +2576,7 @@ fn translate_select_inner(
                     left_keys: vec![lkey],
                     right_keys: vec![rkey],
                     join_type: jt,
+                    needed: None,
                 };
             }
             Err(_) if jt == crate::exec::join::JoinType::Inner => {

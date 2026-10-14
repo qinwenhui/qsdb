@@ -209,6 +209,9 @@ pub struct HashJoinExec {
     cur_build: Option<BuildState>,
     /// 当前分区待探测的行（从磁盘读回，逐批流式）
     cur_probe: Option<std::vec::IntoIter<RecordBatch>>,
+    /// **只需物化这些输出位置**（`None` = 全部）。见 `LogicalPlan::Join::needed`：
+    /// 不在表里的位置**填 NULL**（列还在、schema 不变，只是没人读）。
+    needed: Option<Arc<Vec<u32>>>,
 }
 
 struct BuildState {
@@ -353,7 +356,14 @@ impl HashJoinExec {
             spill_part: 0,
             cur_build: None,
             cur_probe: None,
+            needed: None,
         }
+    }
+
+    /// 只物化这些输出位置（不在表里的填 NULL）。见 `LogicalPlan::Join::needed`。
+    pub fn with_needed(mut self, needed: Option<Arc<Vec<u32>>>) -> Self {
+        self.needed = needed;
+        self
     }
 
     fn build_phase(&mut self) -> Result<()> {
@@ -785,9 +795,17 @@ impl HashJoinExec {
             }
             let out_schema = Arc::clone(&self.schema);
             let probe_keys = self.probe_keys.clone();
+            let needed = self.needed.clone();
             let join_type = self.join_type;
             let build = self.cur_build.as_ref()?;
-            match join_batch(&batch, build, &probe_keys, &out_schema, join_type) {
+            match join_batch(
+                &batch,
+                build,
+                &probe_keys,
+                &out_schema,
+                join_type,
+                needed.as_ref().map(|v| v.as_slice()),
+            ) {
                 Ok(Some(b)) => return Some(Ok(b)),
                 Ok(None) => continue,
                 Err(e) => return Some(Err(e)),
@@ -819,6 +837,7 @@ impl ExecNode for HashJoinExec {
         let join_type = self.join_type;
         let out_schema = Arc::clone(&self.schema);
         let probe_keys = self.probe_keys.clone();
+        let needed = self.needed.clone();
         if join_type.is_semi_family() {
             let exists = self.exists_state.as_ref().unwrap();
             loop {
@@ -853,7 +872,14 @@ impl ExecNode for HashJoinExec {
             if batch.num_rows() == 0 {
                 continue;
             }
-            let out = match join_batch(&batch, build, &probe_keys, &out_schema, join_type) {
+            let out = match join_batch(
+                &batch,
+                build,
+                &probe_keys,
+                &out_schema,
+                join_type,
+                needed.as_ref().map(|v| v.as_slice()),
+            ) {
                 Ok(Some(b)) => b,
                 Ok(None) => continue, // 无匹配且非 LEFT
                 Err(e) => return Some(Err(e)),
@@ -884,6 +910,7 @@ fn join_batch(
     probe_keys: &[PhysExpr],
     out_schema: &SchemaRef,
     join_type: JoinType,
+    needed: Option<&[u32]>,
 ) -> Result<Option<RecordBatch>> {
     let n = probe_batch.num_rows();
     // probe 键求值
@@ -949,8 +976,17 @@ fn join_batch(
     }
     let indices = UInt32Array::from(all_probe);
     let mut cols: Vec<ArrayRef> = Vec::with_capacity(n_probe_cols + n_build_cols);
+    // **只需这些输出位置**（`None` = 全部）：不在表里的列**填 NULL**，不 take。
+    // 省的是"整列 × 全部输出行"的拷贝——实测 join 输出 10 列 → 5 列时间减半。
+    // 判错的后果是静默错值，所以标注侧（`annotate_join_needs`）只在
+    // "读取集合可枚举"时才动手；这里只负责照做。
+    let want = |pos: usize| needed.is_none_or(|n| n.contains(&(pos as u32)));
     if !probe_idx.is_empty() || emit_unmatched {
         for c in 0..n_probe_cols {
+            if !want(c) {
+                cols.push(new_null_like(probe_batch.column(c).as_ref(), total_rows));
+                continue;
+            }
             let taken = take(probe_batch.column(c), &indices, None)
                 .map_err(|e| QsdbError::invalid(format!("join take: {e}")))?;
             cols.push(taken);
@@ -964,6 +1000,10 @@ fn join_batch(
     if total_rows > 0 {
         let build_indices = UInt32Array::from(build_idx);
         for c in 0..n_build_cols {
+            if !want(n_probe_cols + c) {
+                cols.push(new_null_like(state.table.column(c).as_ref(), total_rows));
+                continue;
+            }
             let taken = take(state.table.column(c), &build_indices, None)
                 .map_err(|e| QsdbError::invalid(format!("join take: {e}")))?;
             if emit_unmatched {
