@@ -321,6 +321,40 @@ fn 逗号连接() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// `FULL [OUTER] JOIN` 没有实现，**但有等价配方**吗？
+///
+/// `RIGHT JOIN` 可以改写成 `LEFT JOIN`（交换两侧），FULL 不行——它要
+/// "左未匹配 ∪ 右未匹配"，得自己拼。这条用例就是来**验**这个说法的：
+/// 构件是 `LEFT JOIN` + `NOT EXISTS` + `UNION ALL` + `CAST(NULL AS …)`，
+/// 四件我们都支持，但**支持不等于拼得通**（类型要对齐、UNION 两侧列数要一致），
+/// 所以必须实测，不能写在文档里当传说。
+///
+/// 期望：a(1,2,3) 与 b(2,3,4) 全外连 = 4 行（k=1 只左、k=4 只右）。
+#[test]
+fn full_outer_join_的等价拼法() {
+    let (db, root) = seeded("full_recipes");
+    let sql = "SELECT count(*) FROM (
+                 SELECT a.k AS k FROM a LEFT JOIN b ON a.k = b.k
+                 UNION ALL
+                 SELECT b.k AS k FROM b WHERE NOT EXISTS (SELECT 1 FROM a WHERE a.k = b.k)
+               )";
+    match db.sql(sql) {
+        Ok(_) => assert_eq!(
+            count1(&db, sql),
+            4,
+            "FULL OUTER 的等价拼法：左全 + 右未匹配，a(1,2,3)×b(2,3,4) 应当是 4 行"
+        ),
+        Err(e) => {
+            // 拼不通也要**说清楚**：那"用 LEFT+NOT EXISTS 拼 FULL"这句建议就不成立
+            eprintln!("[配方不成立] FULL OUTER 的等价拼法跑不通：{e}");
+            panic!("FULL OUTER 没有实现、又没有可用配方 —— 这是真实的表达力缺口，应当进文档/队列");
+        }
+    }
+    // 反向：真写 FULL 仍然必须是**明确拒绝**（不是静默给个错结果）
+    rejected(&db, "SELECT count(*) FROM a FULL OUTER JOIN b ON a.k = b.k");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn 行元组_in_与_any() {
     let (db, root) = seeded("tuple");

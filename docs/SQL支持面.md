@@ -58,7 +58,8 @@
 |---|---|---|
 | 多表逗号连接（`FROM a, b`） | ✋ | `unsupported: multi-FROM (comma join) not supported` |
 | `INNER JOIN`（`JOIN` 同义）/ `LEFT [OUTER] JOIN` + `ON <等值>` | ✅ | 哈希 join；三表以上链式等值同样走它 |
-| `RIGHT JOIN` / `FULL [OUTER] JOIN` | ✋ | `JOIN type Right/FullOuter(…) not supported (INNER/LEFT only)`。**注意**：`JoinType` 枚举里没有这两个变体 ⇒ 是**结构性缺失**（要做得连执行层一起加），不是"没接上线"。`A RIGHT JOIN B` 可改写成 `B LEFT JOIN A`（列序自己重排）；**FULL 没有等价改写** |
+| `RIGHT JOIN` / `FULL [OUTER] JOIN` | ✋ | `JOIN type Right/FullOuter(…) not supported (INNER/LEFT only)`。**注意**：`JoinType` 枚举里没有这两个变体 ⇒ 是**结构性缺失**（要做得连执行层一起加），不是"没接上线" |
+| ↑ 这两种的**替代写法**（实测通过，见 `join_surface.rs`） | ✅ | `A RIGHT JOIN B` ≡ `B LEFT JOIN A`（列序自己重排）。`FULL OUTER` 拼出来是：<br>`SELECT a.k FROM a LEFT JOIN b ON a.k = b.k`<br>`UNION ALL`<br>`SELECT b.k FROM b WHERE NOT EXISTS (SELECT 1 FROM a WHERE a.k = b.k)`<br>（左全 + 右未匹配；**列数/类型要对齐**，右侧补的列写 `CAST(NULL AS <类型>)`） |
 | `JOIN … USING (…)` / `NATURAL JOIN` | ✋ | `JOIN ... ON <equi-cond> required`（静默当叉积会**炸行数**，故必须拒） |
 | 非等值 `ON` + `INNER` | ✅ | 走 `CrossJoinFilter`（叉积 + 过滤）。代价 = **左行数 × 右行数**，只适合小表 |
 | 非等值 `ON` + `LEFT` | ✋ | `non-equi LEFT JOIN lands later`（**绝不能按 INNER 跑**——那会静默丢掉未匹配行） |
