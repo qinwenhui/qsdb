@@ -71,7 +71,8 @@
 | `BETWEEN` / `IN (…)` / `IN (子查询)` / `EXISTS` / 标量子查询 | ✅ | |
 | `CASE` / `CAST` / `TRY_CAST` / `::` / 类型化字面量（`DATE '…'`） | ✅ | |
 | 聚合 `count/sum/avg/min/max`（含 `count(*)`） | ✅ | |
-| 聚合 `DISTINCT`（`count(DISTINCT x)`） | ✋ | 此前**静默当成不带 DISTINCT** ⇒ 回错数字。等价改写：`SELECT count(*) FROM (SELECT DISTINCT … )` |
+| 聚合 `DISTINCT`（`count/sum/avg/min/max(DISTINCT x)`） | ✅ | 2026-10-14 实现（原生：绑定层等价改写 + 单遍融合计数）。**此前**静默当成不带 DISTINCT ⇒ 回错数字 |
+| └ `DISTINCT` 与非 `DISTINCT` **混用**、或多个 DISTINCT 聚合**参数不同** | ✋ | 一次去重会改掉另外那些聚合的输入（`sum(y)` 会少算行），**显式拒绝**不硬猜 |
 | 聚合 `FILTER (WHERE …)` | ✋ | 此前**静默忽略** ⇒ 回全量聚合（错值） |
 | 函数参数内的 `ORDER BY` / `LIMIT` / `SEPARATOR` | ✋ | |
 | `WITHIN GROUP (ORDER BY …)` | ✋ | |
