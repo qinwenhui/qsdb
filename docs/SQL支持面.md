@@ -51,12 +51,19 @@
 | 语法 | 状态 | 说明 |
 |---|---|---|
 | 单表 / 派生表 `/ CTE` 引用 / 表函数（`read_parquet` / `read_csv`） | ✅ | |
-| 多表逗号连接（`FROM a, b`） | ✋ | 用显式 `JOIN` |
-| `INNER JOIN` / `LEFT [OUTER] JOIN` + `ON <等值>` | ✅ | |
-| `RIGHT JOIN` / `FULL JOIN` / `SEMI` / `ANTI` | ✋ | |
-| `JOIN … USING (…)` / `NATURAL JOIN` | ✋ | 用 `ON`（静默当叉积会**炸行数**，故必须拒） |
-| 非等值 `ON`（INNER） | ✅ | 走 cross join + 过滤 |
-| `CROSS JOIN` | ✅ | |
+> 本节每条都由 `crates/qsdb/tests/join_surface.rs` **实测**钉住（✅ 的断言**值**、
+> ✋ 的断言**报错文案**）。正文里那些引号中的话就是引擎原话。
+
+| 语法 | 状态 | 说明 |
+|---|---|---|
+| 多表逗号连接（`FROM a, b`） | ✋ | `unsupported: multi-FROM (comma join) not supported` |
+| `INNER JOIN`（`JOIN` 同义）/ `LEFT [OUTER] JOIN` + `ON <等值>` | ✅ | 哈希 join；三表以上链式等值同样走它 |
+| `RIGHT JOIN` / `FULL [OUTER] JOIN` | ✋ | `JOIN type Right/FullOuter(…) not supported (INNER/LEFT only)`。**注意**：`JoinType` 枚举里没有这两个变体 ⇒ 是**结构性缺失**（要做得连执行层一起加），不是"没接上线"。`A RIGHT JOIN B` 可改写成 `B LEFT JOIN A`（列序自己重排）；**FULL 没有等价改写** |
+| `JOIN … USING (…)` / `NATURAL JOIN` | ✋ | `JOIN ... ON <equi-cond> required`（静默当叉积会**炸行数**，故必须拒） |
+| 非等值 `ON` + `INNER` | ✅ | 走 `CrossJoinFilter`（叉积 + 过滤）。代价 = **左行数 × 右行数**，只适合小表 |
+| 非等值 `ON` + `LEFT` | ✋ | `non-equi LEFT JOIN lands later`（**绝不能按 INNER 跑**——那会静默丢掉未匹配行） |
+| `CROSS JOIN` | ✋ | `JOIN type CrossJoin(None) not supported (INNER/LEFT only)`。⚠️ **本表此前把它写成 ✅，是错的**（2026-10-15 实测纠正；`docs/error-codes.md` 的 `UNSUPPORTED` 条目一直拿它当例子——那边是对的）。要笛卡尔积请写 `JOIN b ON TRUE`（走非等值 INNER 那条路） |
+| `IN (子查询)` / `EXISTS` / `NOT IN` / `NOT EXISTS` | ✅ | 走 semi/anti 族（存在集，非物化整行）。`NOT IN` 有专门的三值语义实现 |
 | 派生表列别名 `… AS d(a,b)` | ✋ | 此前**别名被丢掉**，之后报"列不存在"（误导） |
 | 表因子列别名 `FROM t AS x(a,b)` | ✋ | 同样被静默丢掉。⚠️ 真实踩坑：`SELECT * FROM t EXCLUDE (b)` 会被解析成「别名 `exclude` + 列清单」⇒ 拿到**全列**（Snowflake 用户会中招） |
 | `TABLESAMPLE` | ✋ | |
