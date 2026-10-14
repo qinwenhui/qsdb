@@ -171,6 +171,16 @@ fn cases() -> Vec<(&'static str, &'static str, &'static str)> {
             "全表扫描 → Parquet 文件（内核暂无导出原语，见 docs §F9）",
         ),
         ("export_csv", "导出", "全表扫描 → CSV 文件"),
+        (
+            "export_scan_only",
+            "导出",
+            // **诊断用，不是对比格**：把"导出"拆成扫描与写段两半。
+            // 两侧的口径本来就不对等——DuckDB 跑的是内核原语 `COPY … TO`（并行、
+            // 自带压缩调优），我们跑的是"内核并行扫描 + bench 工具里 arrow-rs 的
+            // 通用单线程 writer"。不拆开就分不清慢在**内核扫描**还是**客户端写段**，
+            // 而两者该对症的方向完全不同（前者是内核缺口，后者是 F9 导出原语）。
+            "只扫描不写（导出耗时的下界）",
+        ),
         ("simple_count", "简单", "count(*)"),
         ("simple_filter", "简单", "过滤 + 聚合（g < 1000）"),
         (
@@ -769,6 +779,22 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
             let n = scan_to_csv(&db, &out, "SELECT * FROM t");
             let dt = t0.elapsed();
             (n, dt.as_millis() as u64)
+        }
+        "export_scan_only" => {
+            let t0 = Instant::now();
+            let req = qsdb::ScanRequest {
+                table: "t".into(),
+                db: None,
+                projection: None,
+                predicate: None,
+                limit: None,
+            };
+            let it = db.scan(req).expect("scan");
+            let mut n = 0u64;
+            for b in it {
+                n += b.expect("scan batch").num_rows() as u64;
+            }
+            (n, t0.elapsed().as_millis() as u64)
         }
         // ---- 简单分析 ----
         //
