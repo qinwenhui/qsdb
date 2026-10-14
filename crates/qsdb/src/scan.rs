@@ -1631,6 +1631,54 @@ impl Scan {
         })
     }
 
+    /// **按新投影重建同一个分片**（文件划分、缓存、上下文全部保留）。
+    ///
+    /// ## 它是**安全网**，不是当前路径的必需品（2026-10-14 实测确认）
+    ///
+    /// 危险来自"**同一个 `LogicalPlan::Scan` 在不同调用点被要求不同投影**"：
+    /// 分片是按外层投影造的，若拿它去满足一个更窄的投影，`build_inner` 按新投影
+    /// 算出的键列序号（`k` → 0）会落在分片批的**外层列序**上（`a, k, v` → 0 是 `a`）
+    /// ⇒ **静默连错列**（不报错、结果错）。同理会带歪 join 建臂用来换算右键序号的
+    /// `probe.schema().fields().len()`。
+    ///
+    /// **但今天走不到**：INNER/LEFT 的建臂对 probe 传的是 `None`
+    /// （`exec_builder` 里那条 `if join_type.is_semi_family() { scan_proj } else { None }`），
+    /// 而真正做键列下推的是 `count(*)` 的 `JoinCountExec` 融合路径——它在
+    /// `try_shard_source` **之前**就 return 了。反向验证过：把这一行换成直接用分片，
+    /// `join_agg_parallel::key_column_projection_does_not_shift` **仍然是绿的**。
+    ///
+    /// 那为什么留着：它把"将来谁给 INNER 建臂也加键列下推"这件事的成本
+    /// 从**静默错列**降成**零**（那种优化很自然、也很容易被写出来）。
+    /// 一个测试当绊线、这一行当兜底，两样加起来才叫防住。
+    ///
+    /// 只重建 `ScanPlan`：`files` 沿用分片划好的那一份，不重新裁剪
+    /// （谓词相同 ⇒ 裁剪结论相同；刻意不重算，免得两处裁剪逻辑漂移）。
+    pub fn with_projection(&self, projection: Option<Vec<String>>) -> Result<Self> {
+        let plan = ScanPlan::build(
+            Arc::clone(&self.plan.def),
+            projection,
+            self.plan.predicate.clone(),
+            None,
+        )?;
+        Ok(Self {
+            plan: Arc::new(plan),
+            files: self.files.clone(),
+            current: None,
+            // miss/外表 cast 列在读批时按需重算，换投影后清空即安全
+            missing_cols: Vec::new(),
+            cast_cols: Vec::new(),
+            pending_collector: None,
+            remaining: self.remaining,
+            cache: self.cache.clone(),
+            ctx: Arc::clone(&self.ctx),
+            store: Arc::clone(&self.store),
+            file_cache: self.file_cache.clone(),
+            is_shard: true, // 分片自身不再并行（避免嵌套）
+            par: None,
+            par_tried: true,
+        })
+    }
+
     /// 外表扫描（read_parquet，M6-2）：显式文件列表，无分区列。
     /// 每文件 footer row group 裁剪（远端 = range GET footer）。
     #[allow(clippy::too_many_arguments)]

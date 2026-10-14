@@ -13,6 +13,59 @@ use crate::expr::{AggExpr, PhysExpr};
 
 use super::translate::LogicalPlan;
 
+// 分片重写：本线程上"某个实表名 → 该分片"的一次性覆盖。
+//
+// **为什么需要**（2026-10-14：join 之后的分聚合）：并行分片只切**最底下那个 Scan**，
+// 但它上面可能还有 join —— 那些层必须**每片各建一遍**（与既有 semi 分片同款权衡：
+// 墙钟不变、内存 × 分片数）。所以分片不能只喂给 `ScanExec`，得让 `build_inner`
+// **在正常建计划的过程中**把最底下那个 Scan 换成分片。
+//
+// **取用一次即失效**（`take`）：`build_inner` 建 join 时**先建 probe（左）再建 build（右）**，
+// 而 `try_shard_source` 是沿**左脊柱**剥到底的 ⇒ 第一个被建的 Scan 必是那个分片。
+// 万一哪天顺序变了，`ShardScope::taken()` 会为 false，调用方**显式报错**
+// （宁可报错，也不许静默变成"全表扫 + 结果错"）。
+thread_local! {
+    static SHARD_OVERRIDE: std::cell::RefCell<Option<(String, crate::scan::Scan)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 作用域守卫：生效期间 `build_inner` 把该表的 Scan 换成分片；drop 即失效（含 panic 展开）。
+pub struct ShardScope;
+
+impl ShardScope {
+    /// 进入"表 `table` 的分片 = `shard`"的作用域。
+    pub fn set(table: &str, shard: crate::scan::Scan) -> Self {
+        SHARD_OVERRIDE.with(|c| *c.borrow_mut() = Some((table.to_string(), shard)));
+        Self
+    }
+
+    /// 该作用域内的分片**是否真的被 `build_inner` 取走了**。
+    ///
+    /// 为 false 说明"剥出来的左脊柱"与"`build_inner` 实际建的树"对不上
+    /// （计划形状变了 / 建序变了）——此时若继续，跑的就是**全表扫**：
+    /// 结果仍对但白算一遍，更糟的是它**不报错**。调用方据此显式失败。
+    pub fn taken(&self) -> bool {
+        SHARD_OVERRIDE.with(|c| c.borrow().is_none())
+    }
+}
+
+impl Drop for ShardScope {
+    fn drop(&mut self) {
+        SHARD_OVERRIDE.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// 取用分片覆盖（表名匹配才取；取走即失效）。
+fn take_shard_override(table: &str) -> Option<crate::scan::Scan> {
+    SHARD_OVERRIDE.with(|c| {
+        let mut b = c.borrow_mut();
+        match b.as_ref() {
+            Some((name, _)) if name == table => b.take().map(|(_, s)| s),
+            _ => None,
+        }
+    })
+}
+
 // CTE 批缓存（execute_sql 物化后注入；build 期间读取）。
 //
 // **生命周期由 `CteScope` 管**（RAII）：查询开始 `set_cte_batches` 重置、
@@ -496,6 +549,15 @@ fn build_inner(
 ) -> Result<Box<dyn ExecNode>> {
     match plan {
         LogicalPlan::Scan { def, predicate } => {
+            // 分片重写（见 `ShardScope`）：命中就用分片，**按当前调用点的投影重建**
+            // （join 的键列投影下推会让同一 Scan 在不同调用点要不同的投影；
+            // 直接复用会列错位——`Scan::with_projection` 的注释里有详细说明）。
+            // 分片任务内**串行**拉取（ScanExec，不用 ParScanExec）：嵌套并行会与
+            // 分片任务互锁同一 rayon 池（M4 教训）。
+            if let Some(shard) = take_shard_override(&def.name) {
+                let scan = shard.with_projection(scan_proj)?;
+                return Ok(Box::new(ScanExec::new(scan)));
+            }
             let scan = db.scan(ScanRequest {
                 table: def.name.clone(),
                 predicate: predicate.clone(),
@@ -1094,7 +1156,14 @@ fn build_aggregate(
             Arc::clone(ctx),
         )));
     }
-    let Some((shards, semis, filters)) = try_shard_source(db, input, scan_proj, ctx) else {
+    let Some(ShardSource {
+        shards,
+        semis,
+        filters,
+        joins,
+        table,
+    }) = try_shard_source(db, input, scan_proj, ctx)
+    else {
         return Ok(Box::new(HashAggExec::new(
             build_inner(db, input, scan_proj.clone(), ctx)?,
             group.to_vec(),
@@ -1121,7 +1190,11 @@ fn build_aggregate(
 
     // ── semi/anti 融合路径：存在集 build 一次全分片共享；probe 批上
     // 直接求掩码 → 行选择 → 掩码摄入聚合（零中间物化、零 take）──
-    if !semis.is_empty() {
+    //
+    // ⚠️ **只在没穿过 join 时可用**（`joins == 0`）：融合的前提是"剥到的
+    // filters/semis 都能压到扫描批上"，而穿过 INNER/LEFT 之后，上层的谓词
+    // 可能引用 join 之后才存在的列。那种情况走下面的 join 分片路径。
+    if joins == 0 && !semis.is_empty() {
         let probes: Vec<SemiProbe> = semis
             .iter()
             .map(|st| {
@@ -1150,10 +1223,53 @@ fn build_aggregate(
         crate::memory::Reservation,
         Option<crate::exec::agg_spill::AggSpill>,
     );
-    let partials: Vec<Partial> = shards
-        .into_par_iter()
-        .map(|s| run_partial(db, s, &semis, &filters, &group, &aggs, ctx))
-        .collect::<Result<Vec<_>>>()?;
+    // 诊断（与 `QSDB_JOIN_PROF` 同风格）：证明**分片路径真被走到**——
+    // 否则"测了并行"与"测了串行"从外面看不出来，回归会变成空转。
+    if joins > 0 && std::env::var("QSDB_JOIN_SHARD_PROF").is_ok() {
+        eprintln!(
+            "[join-shard] table={table} joins={joins} shards={} group_by={} aggs={}",
+            shards.len(),
+            group.len(),
+            aggs.len()
+        );
+    }
+    let partials: Vec<Partial> = if joins > 0 {
+        // ★ **穿过了 join 的分片**：每片把"整棵子树（含 join）"在 `ShardScope`
+        // 下建一遍，最底下那个 Scan 被换成分片。这一层 join 是此前整条管线
+        // 退回单线程的原因（`complex_three_way` 9.9× / `complex_join_group` 5.8×）。
+        // `semis`/`filters` **传空**：它们已经在那棵子树里，再叠一次就是重复过滤。
+        shards
+            .into_par_iter()
+            .map(|s| {
+                let scope = ShardScope::set(&table, s);
+                let node = build_inner(db, input, scan_proj.clone(), ctx)?;
+                if !scope.taken() {
+                    // 分片没被取走 ⇒ 剥出来的路径与 build_inner 建的树对不上。
+                    // 继续跑会**静默变成全表扫**（结果对、白算一遍），故显式失败。
+                    return Err(crate::error::QsdbError::invalid(format!(
+                        "join 分片未生效：{} 的 Scan 未出现在重建的计划里（计划形状与分片剥离不一致）",
+                        table
+                    )));
+                }
+                run_partial(db, node, &[], &[], &group, &aggs, ctx)
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        shards
+            .into_par_iter()
+            .map(|s| {
+                run_partial(
+                    db,
+                    Box::new(ScanExec::new(s)),
+                    &semis,
+                    &filters,
+                    &group,
+                    &aggs,
+                    ctx,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
     // 分片表的内存预留活到 merge 结束（峰值 = N 张分片表 + 合并中的分区）
     let mut tables = Vec::with_capacity(partials.len());
     let mut _hold = Vec::with_capacity(partials.len());
@@ -1436,9 +1552,15 @@ struct SemiStage {
     join_type: crate::exec::join::JoinType,
 }
 
+/// 单个分片的 partial 聚合。
+///
+/// `node` 是**该分片的输入节点**，由调用方决定怎么造：
+/// - 纯 `Scan(/Filter)` 链 → `ScanExec(分片)`（既有路径）；
+/// - 穿过了 join 的分片 → `build_inner` 在 `ShardScope` 下建出的整棵子树
+///   （此时 `semis`/`filters` 传空：它们已经在子树里了，再叠一次就是重复过滤）。
 fn run_partial(
     db: &Qsdb,
-    scan: crate::scan::Scan,
+    mut node: Box<dyn ExecNode>,
     semis: &[SemiStage],
     filters: &[PhysExpr],
     group: &[PhysExpr],
@@ -1449,7 +1571,6 @@ fn run_partial(
     crate::memory::Reservation,
     Option<crate::exec::agg_spill::AggSpill>,
 )> {
-    let mut node: Box<dyn ExecNode> = Box::new(ScanExec::new(scan));
     // semi 阶段按「自底向上」应用（try_shard_source 剥离序为自顶向下）
     for st in semis.iter().rev() {
         let build = build_inner(db, &st.right, None, ctx)?;
@@ -1490,16 +1611,68 @@ fn run_partial(
     Ok((table, res, spill))
 }
 
-/// 源分片：`(Scan | Filter)+` 链且 scan 可切多片 → Some((分片, 逆序 filters))。
+/// 分片源：剥出来的分片 + 沿途的过滤/semi 阶段 + **穿过的 INNER/LEFT join 层数**。
+struct ShardSource {
+    shards: Vec<crate::scan::Scan>,
+    /// 自顶向下剥到的 Filter 谓词（只有 `joins == 0` 时才可直接压到扫描批上）
+    filters: Vec<PhysExpr>,
+    /// 自顶向下剥到的 semi/anti 阶段（同上）
+    semis: Vec<SemiStage>,
+    /// **穿过**的 INNER/LEFT OUTER 层数。>0 = 分片里必须带上 join，
+    /// 此时 `filters`/`semis` 不可单独压扫描批（它们的列可能来自 join 结果）。
+    joins: usize,
+    /// 被分片的实表名（`ShardScope` 据此认领）
+    table: String,
+}
+
+/// 分片时"建侧"允许的最大行数。
+///
+/// **为什么有这道闸**：穿过 join 的分片会让**每一片各建一次 build 侧 hash 索引**
+/// （与既有 semi 分片同款权衡：N 片并行建 ⇒ 墙钟 ≈ 建一次，但**内存 × N**）。
+/// 大表互连时 × N 的内存可能把小预算的查询从"慢慢跑完"变成 `MEMORY_PRESSURE`，
+/// 那是实打实的退步。故只对**小维表**分片；拿不到行数就不分（保守）。
+const JOIN_SHARD_MAX_BUILD_ROWS: u64 = 2_000_000;
+
+/// 分片数。**上限 4**，2026-10-14 在 .14 重测确认（下面有数）。
+///
+/// 旧注释给的上限 4 依据是"89 万组：4 片 0.953s / 8 片 1.407s / 16 片 2.212s"，
+/// 但那段还写着"原本**单线程串行 merge** 是高组数下的瓶颈"——**那份测量早于
+/// 分区并行 merge**，结论本可能过期。故加了 `QSDB_SHARDS` 旋钮重量一遍（5M 行）：
+///
+/// | 分片 | `t×d` 聚合 墙钟/CPU/峰值RSS | 三表链 墙钟/CPU | 10 万组聚合 墙钟/CPU |
+/// |---|---|---|---|
+/// | 1 | 1.29s / 1.29s / 307MB | 2.12s / 2.12s | 0.34s / 0.39s |
+/// | 4 | **0.53s** / 1.74s / 419MB | **0.81s** / 2.97s | **0.20s** / 0.72s |
+/// | 8 | 0.47s / 2.63s / 530MB | 0.65s / 3.83s | 0.21s / 1.23s |
+/// | 16 | 0.45s / **5.78s** / **746MB** | 0.61s / 7.33s | **0.26s（回退）** / 2.69s |
+///
+/// **4 片是拐点**，旧结论在并行 merge 之后**依然成立**：4→16 只再快 1.2×，
+/// 代价是 CPU ×3.3、峰值 RSS ×1.8，而**高基数聚合在 16 片反而变慢**。
+///
+/// 墙钟模型：`墙钟 ≈ P/N + B`（P = 可并行的扫描+探测+聚合，B = **每片固定成本**）。
+/// 实测 CPU 随 N 明显上涨（1.29→5.78）说明 **B 主要是"每片各建一次建侧 hash 索引"**
+/// ——这正是下一步（P0③ 后半）要拿掉的东西：**共享建侧**。拿掉之后 N 才能往 16 走，
+/// 那时墙钟才可能从 0.53s 量级掉到 0.2s 量级。
+fn shard_count() -> usize {
+    if let Ok(v) = std::env::var("QSDB_SHARDS") {
+        if let Ok(n) = v.parse::<usize>() {
+            return n.clamp(1, 64);
+        }
+    }
+    rayon::current_num_threads().clamp(1, 4)
+}
+
+/// 源分片：`(Scan | Filter | Join)+` 链且最底下的 scan 可切多片 → Some。
 #[allow(clippy::too_many_arguments)]
 fn try_shard_source(
     db: &Qsdb,
     plan: &LogicalPlan,
     scan_proj: &Option<Vec<String>>,
     ctx: &Arc<crate::query::QueryContext>,
-) -> Option<(Vec<crate::scan::Scan>, Vec<SemiStage>, Vec<PhysExpr>)> {
+) -> Option<ShardSource> {
     let mut filters: Vec<PhysExpr> = Vec::new();
     let mut semis: Vec<SemiStage> = Vec::new();
+    let mut joins = 0usize;
     let mut cur = plan;
     loop {
         match cur {
@@ -1523,6 +1696,34 @@ fn try_shard_source(
                 });
                 cur = left;
             }
+            // ★ INNER/LEFT：左链继续分片，这一层**随分片一起重建**。
+            //
+            // 正确性：分片是左输入的不相交划分 ⇒ 每一行左数据只出现在一片里，
+            // INNER 与 LEFT OUTER 的结果按片求并 = 整体结果（LEFT 的未匹配行
+            // 也各自只在自己那片发射一次）。semi 族同理（既有路径已这么做）。
+            LogicalPlan::Join {
+                left,
+                right,
+                join_type:
+                    crate::exec::join::JoinType::Inner | crate::exec::join::JoinType::LeftOuter,
+                ..
+            } => {
+                // 建侧必须能"估得出且不太大"（见 JOIN_SHARD_MAX_BUILD_ROWS）。
+                // 限定无谓词实表：一是能拿 metadata 行数，二是这类维表连接正是目标形态。
+                let LogicalPlan::Scan {
+                    def: rdef,
+                    predicate: None,
+                } = &**right
+                else {
+                    return None;
+                };
+                let rows = db.scan_metadata_count(&rdef.name, None).ok()??;
+                if rows > JOIN_SHARD_MAX_BUILD_ROWS {
+                    return None;
+                }
+                joins += 1;
+                cur = left;
+            }
             LogicalPlan::Scan { def, predicate } => {
                 let scan = db
                     .scan_with_context(
@@ -1535,13 +1736,15 @@ fn try_shard_source(
                         Arc::clone(ctx),
                     )
                     .ok()?;
-                // 分片数上限 4：每分片建独立组表，merge 成本 = 组数 × 分片数，
-                // 实测倒 U 型——89 万组：4 分片 0.953s / 8 分片 1.407s / 16 分片 2.212s；
-                // 低基数（1K 组）：4 分片 0.015s / 8 分片 0.013s（仅差 15%）。
-                // 4 在两个场景都接近最优（高基数收益 48% 远大于低基数损失 15%）。
-                let threads = rayon::current_num_threads().clamp(1, 4);
+                let threads = shard_count();
                 let shards = scan.shard(threads, false)?;
-                return Some((shards, semis, filters));
+                return Some(ShardSource {
+                    shards,
+                    filters,
+                    semis,
+                    joins,
+                    table: def.name.clone(),
+                });
             }
             LogicalPlan::ExternalScan {
                 def,
@@ -1557,13 +1760,15 @@ fn try_shard_source(
                         Arc::clone(ctx),
                     )
                     .ok()?;
-                // 分片数上限 4：每分片建独立组表，merge 成本 = 组数 × 分片数，
-                // 实测倒 U 型——89 万组：4 分片 0.953s / 8 分片 1.407s / 16 分片 2.212s；
-                // 低基数（1K 组）：4 分片 0.015s / 8 分片 0.013s（仅差 15%）。
-                // 4 在两个场景都接近最优（高基数收益 48% 远大于低基数损失 15%）。
-                let threads = rayon::current_num_threads().clamp(1, 4);
+                let threads = shard_count();
                 let shards = scan.shard(threads, false)?;
-                return Some((shards, semis, filters));
+                return Some(ShardSource {
+                    shards,
+                    filters,
+                    semis,
+                    joins,
+                    table: def.name.clone(),
+                });
             }
             _ => return None,
         }
