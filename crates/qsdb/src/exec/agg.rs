@@ -338,12 +338,80 @@ enum SumCol {
     Dec(Vec<i256>),
 }
 
+/// `by_hash` 的桶值：**内联一格**的小向量（零新依赖，就一个 enum）。
+///
+/// 动机来自 `perf` 实录（2026-10-14，`count(DISTINCT gs)` 5M 行 / 2.801s）：
+/// **哈希查找 36.7% + libc 分配器 18.9%**，两者都长在这个结构上。
+/// `HashMap<u64, Vec<u32>>` 在**高基数**下每个桶只装一个 gid，却要付两次代价：
+/// ① 每组一次 `Vec` 堆分配；② 查找时多追一次指针（数据在别处，又一条 cache line）。
+///
+/// `One` 把那个 gid 直接放在哈希桶里 ⇒ **不分配**，且与键相邻、同一条 cache line。
+/// 低基数（多 gid 落同一哈希）才退到 `Many(Vec<u32>)`，行为与原来一致、不回退。
+///
+/// ⚠️ 值变大到 32 字节（原 `Vec` 是 24），但省掉了**每组一次堆分配**与它带的
+/// 头开销：250 万组时实测总内存反而降（见 `docs/真机基准对账.md` §二之四）。
+#[derive(Clone)]
+enum Bucket {
+    One(u32),
+    Many(Vec<u32>),
+}
+
+impl Bucket {
+    /// 追加一个 gid；**返回本次新增的堆字节**（供 `payload_bytes` 增量记账）。
+    #[inline]
+    fn push(&mut self, gid: u32) -> u64 {
+        match self {
+            // 1 → 2：这一跳才真正要堆（低基数路径；高基数永远停在 One）
+            Bucket::One(cur) => {
+                let mut v = Vec::with_capacity(4);
+                v.push(*cur);
+                v.push(gid);
+                let heap = v.capacity() as u64 * 4;
+                *self = Bucket::Many(v);
+                heap
+            }
+            Bucket::Many(v) => {
+                let before = v.capacity();
+                v.push(gid);
+                (v.capacity() - before) as u64 * 4
+            }
+        }
+    }
+
+    /// 桶里第一个满足 `pred` 的 gid。
+    ///
+    /// 调用方拿它做"键字节比对"（`key_of(gid) == key`）——**不能只看哈希**，
+    /// 那是有碰撞概率的**静默错值**。
+    #[inline]
+    fn find(&self, mut pred: impl FnMut(u32) -> bool) -> Option<u32> {
+        match self {
+            Bucket::One(g) => {
+                if pred(*g) {
+                    Some(*g)
+                } else {
+                    None
+                }
+            }
+            Bucket::Many(v) => v.iter().copied().find(|&g| pred(g)),
+        }
+    }
+
+    /// 这个桶**额外占用的堆字节**（`One` 不占堆 ⇒ 0）。
+    #[inline]
+    fn heap_bytes(&self) -> u64 {
+        match self {
+            Bucket::One(_) => 0,
+            Bucket::Many(v) => v.capacity() as u64 * 4,
+        }
+    }
+}
+
 /// 分组聚合表（SoA：key 单一 arena + 偏移，聚合状态按列稠密——
 /// 百万级组数时散布步长 8~40B，不再逐组堆分配；P3 性能重做）。
 #[derive(Default)]
 
 pub struct GroupTable {
-    by_hash: HashMap<u64, Vec<u32>, crate::exec::join::BuildI64Hasher>,
+    by_hash: HashMap<u64, Bucket, crate::exec::join::BuildI64Hasher>,
     pending_arity: Option<usize>,
     /// Int64 fast path 的持久化开放寻址索引（(hash, gid)；跨批存活）
     fast_slots: Vec<(u64, u32)>,
@@ -434,21 +502,28 @@ impl GroupTable {
     /// 实测（2026-10-14）`SELECT DISTINCT gs` 250 万字符串组占 4.4GB，
     /// 而 500 万 int64 组只占 569MB —— 差的就是这张表要指出的东西。
     pub fn profile_bytes(&self) -> Vec<(&'static str, u64)> {
-        let vec_hdr = std::mem::size_of::<Vec<u32>>() as u64;
         vec![
             ("key_arena", self.key_arena.len() as u64),
             ("key_arena_cap", self.key_arena.capacity() as u64),
             ("key_off", self.key_off.len() as u64 * 4),
             ("key_off_cap", self.key_off.capacity() as u64 * 4),
-            ("by_hash_buckets", self.by_hash.capacity() as u64 * 33),
+            (
+                "by_hash_buckets",
+                self.by_hash.capacity() as u64 * (std::mem::size_of::<(u64, Bucket)>() as u64 + 1),
+            ),
             ("by_hash_len", self.by_hash.len() as u64),
             (
                 "by_hash_payload",
+                // 同 `bucket_push` 口径：只有 `Many` 占堆
+                self.by_hash.values().map(Bucket::heap_bytes).sum(),
+            ),
+            ("by_hash_one", {
+                // 高基数场景下这里应接近 `by_hash_len`（每个桶一个 gid）
                 self.by_hash
                     .values()
-                    .map(|v| v.capacity() as u64 * 4 + vec_hdr)
-                    .sum(),
-            ),
+                    .filter(|b| matches!(b, Bucket::One(_)))
+                    .count() as u64
+            }),
             ("fast_slots_cap", self.fast_slots.capacity() as u64 * 16),
             (
                 "fast_slots_inline_cap",
@@ -483,11 +558,8 @@ impl GroupTable {
     /// `group_lits` 容量等**本来就 O(1)** 的项，拿整条估计值来比会误判成"不一致"。
     #[cfg(test)]
     pub fn payload_bytes_full(&self) -> u64 {
-        let vec_hdr = std::mem::size_of::<Vec<u32>>() as u64;
-        self.by_hash
-            .values()
-            .map(|v| v.capacity() as u64 * 4 + vec_hdr)
-            .sum()
+        // 与 `bucket_push` 同口径：只有 `Many` 占堆（`One` 的 gid 在桶里）
+        self.by_hash.values().map(Bucket::heap_bytes).sum()
     }
 
     pub fn estimated_bytes(&self) -> u64 {
@@ -499,7 +571,7 @@ impl GroupTable {
         b += self.int_slots.capacity() as u64 * 16; // count-only 单 Int64 列内联槽
         // HashMap<u64, Vec<u32>>：桶 + 每组一个 Vec 头
         let vec_hdr = std::mem::size_of::<Vec<u32>>() as u64;
-        b += self.by_hash.capacity() as u64 * (std::mem::size_of::<(u64, Vec<u32>)>() as u64 + 1);
+        b += self.by_hash.capacity() as u64 * (std::mem::size_of::<(u64, Bucket)>() as u64 + 1);
         // **增量维护**（见 `payload_bytes` 的注释）：这里以前是全量遍历，
         // 每批一次 ⇒ 组数 × 批数，是 `SELECT DISTINCT` 高基数下的平方级热点。
         b += self.payload_bytes;
@@ -1257,23 +1329,25 @@ impl GroupTable {
     ///
     /// 见该字段的注释：这一项以前是"每次 `estimated_bytes` 全量重算"，是平方级开销。
     fn bucket_push(&mut self, h: u64, gid: u32) {
-        const VEC_HDR: u64 = std::mem::size_of::<Vec<u32>>() as u64;
-        let v = self.by_hash.entry(h).or_default();
-        if v.capacity() == 0 {
-            self.payload_bytes += VEC_HDR;
+        use std::collections::hash_map::Entry;
+        // `One` 的首个 gid **不进堆** ⇒ 载荷只在 `Many` 上累加（原实现是
+        // "每组一个 Vec 头"，那正是 perf 里 18.9% 分配器的一部分）。
+        match self.by_hash.entry(h) {
+            Entry::Vacant(e) => {
+                e.insert(Bucket::One(gid));
+            }
+            Entry::Occupied(mut e) => {
+                let added = e.get_mut().push(gid);
+                self.payload_bytes += added;
+            }
         }
-        let before = v.capacity() as u64;
-        v.push(gid);
-        self.payload_bytes += (v.capacity() as u64 - before) * 4;
     }
 
     fn group_id(&mut self, key: &[u8], arrays: &[ArrayRef], row: usize) -> u32 {
         let h = fxhash_bytes(key);
-        if let Some(cands) = self.by_hash.get(&h) {
-            for &gid in cands {
-                if self.key_of(gid as usize) == key {
-                    return gid;
-                }
+        if let Some(b) = self.by_hash.get(&h) {
+            if let Some(gid) = b.find(|gid| self.key_of(gid as usize) == key) {
+                return gid;
             }
         }
         // 新组（count-only 不建 literal —— 这是该模式省下的主要内存与拷贝）
@@ -1406,11 +1480,9 @@ impl GroupTable {
         self.int_slots.clear();
         self.count_only_null_gid = None;
         let h = fxhash_bytes(key);
-        if let Some(cands) = self.by_hash.get(&h) {
-            for &gid in cands {
-                if self.key_of(gid as usize) == key {
-                    return gid;
-                }
+        if let Some(b) = self.by_hash.get(&h) {
+            if let Some(gid) = b.find(|gid| self.key_of(gid as usize) == key) {
+                return gid;
             }
         }
         let gid = self.push_group(key, &[]);
@@ -1446,12 +1518,11 @@ impl GroupTable {
             key_buf.extend_from_slice(other.key_of(og));
             let key: &[u8] = &key_buf;
             let h = fxhash_bytes(key);
-            let gid = match self.by_hash.get(&h).and_then(|cands| {
-                cands
-                    .iter()
-                    .copied()
-                    .find(|&g| self.key_of(g as usize) == key)
-            }) {
+            let gid = match self
+                .by_hash
+                .get(&h)
+                .and_then(|b| b.find(|g| self.key_of(g as usize) == key))
+            {
                 Some(g) => g,
                 None => {
                     // 列状态种类未初始化（**还没有任何组**）：从 other 继承结构。
