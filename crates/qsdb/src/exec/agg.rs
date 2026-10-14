@@ -358,6 +358,18 @@ pub struct GroupTable {
     key_off: Vec<u32>,
     /// 组键 literal（[分组列][gid]，建组时按 gid 顺序追加）
     group_lits: Vec<Vec<Literal>>,
+    /// `by_hash` 各桶的**载荷字节**（`capacity()*4 + Vec 头`）**增量累计值**。
+    ///
+    /// 为什么要单独存：`estimated_bytes` 原先每调一次就
+    /// `by_hash.values().map(...).sum()` 遍历**全部条目**——**每批调一次**，
+    /// 于是成本是 `组数 × 批数`。实测（2026-10-14）：250 万字符串组 × 610 批
+    /// ≈ 每次流过 **80MB**、合计 **48GB 内存流量 ≈ 5 秒**，
+    /// 这正是 `SELECT DISTINCT gs`（5M 行）6.0s 里的绝大部分
+    /// （对照组：同样 5M 行、500 万**整数**组的 `DISTINCT v` 只要 0.16s
+    /// —— 整数键走 `fast_slots_inline`，`by_hash` 基本是空的，所以没被这条拖累）。
+    ///
+    /// 其余项本来都是 O(1) 的 `capacity()`（或 O(列数)），只有这一项是 O(组数)。
+    payload_bytes: u64,
     /// 聚合列状态种类（首批 ingest 初始化）
     kinds: Vec<crate::expr::AggFunc>,
     /// Count 值 / Sum·Avg 的非空计数
@@ -440,6 +452,19 @@ impl GroupTable {
         ]
     }
 
+    /// **载荷项的全量重算**（仅测试用）：与增量维护的 `payload_bytes` 对拍。
+    ///
+    /// ⚠️ 只重算**载荷那一项**——`estimated_bytes` 还有 `by_hash.capacity()*33`、
+    /// `group_lits` 容量等**本来就 O(1)** 的项，拿整条估计值来比会误判成"不一致"。
+    #[cfg(test)]
+    pub fn payload_bytes_full(&self) -> u64 {
+        let vec_hdr = std::mem::size_of::<Vec<u32>>() as u64;
+        self.by_hash
+            .values()
+            .map(|v| v.capacity() as u64 * 4 + vec_hdr)
+            .sum()
+    }
+
     pub fn estimated_bytes(&self) -> u64 {
         let mut b: u64 = 0;
         b += self.key_arena.capacity() as u64;
@@ -449,11 +474,9 @@ impl GroupTable {
         // HashMap<u64, Vec<u32>>：桶 + 每组一个 Vec 头
         let vec_hdr = std::mem::size_of::<Vec<u32>>() as u64;
         b += self.by_hash.capacity() as u64 * (std::mem::size_of::<(u64, Vec<u32>)>() as u64 + 1);
-        b += self
-            .by_hash
-            .values()
-            .map(|v| v.capacity() as u64 * 4 + vec_hdr)
-            .sum::<u64>();
+        // **增量维护**（见 `payload_bytes` 的注释）：这里以前是全量遍历，
+        // 每批一次 ⇒ 组数 × 批数，是 `SELECT DISTINCT` 高基数下的平方级热点。
+        b += self.payload_bytes;
         let lit = std::mem::size_of::<Literal>() as u64;
         b += self.group_lits.capacity() as u64 * vec_hdr;
         b += self
@@ -1182,6 +1205,20 @@ impl GroupTable {
         slots[idx] = (h, gid);
     }
 
+    /// 往 `by_hash` 的桶里追加一个 gid，并**增量**维护 [`GroupTable::payload_bytes`]。
+    ///
+    /// 见该字段的注释：这一项以前是"每次 `estimated_bytes` 全量重算"，是平方级开销。
+    fn bucket_push(&mut self, h: u64, gid: u32) {
+        const VEC_HDR: u64 = std::mem::size_of::<Vec<u32>>() as u64;
+        let v = self.by_hash.entry(h).or_default();
+        if v.capacity() == 0 {
+            self.payload_bytes += VEC_HDR;
+        }
+        let before = v.capacity() as u64;
+        v.push(gid);
+        self.payload_bytes += (v.capacity() as u64 - before) * 4;
+    }
+
     fn group_id(&mut self, key: &[u8], arrays: &[ArrayRef], row: usize) -> u32 {
         let h = fxhash_bytes(key);
         if let Some(cands) = self.by_hash.get(&h) {
@@ -1197,7 +1234,7 @@ impl GroupTable {
             .map(|a| array_value_to_literal(a, row))
             .collect();
         let gid = self.push_group(key, &lits);
-        self.by_hash.entry(h).or_default().push(gid);
+        self.bucket_push(h, gid);
         gid
     }
 
@@ -1264,7 +1301,7 @@ impl GroupTable {
                     lits_buf.clear();
                     lits_buf.extend(other.group_lits.iter().map(|c| c[og].clone()));
                     let gid = self.push_group(key, &lits_buf);
-                    self.by_hash.entry(h).or_default().push(gid);
+                    self.bucket_push(h, gid);
                     gid
                 }
             };
@@ -1955,6 +1992,53 @@ pub fn build_output_batch_cols(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **增量记账必须恒等于全量重算**——它驱动溢出决策，算错就是"该落盘没落盘"。
+    ///
+    /// 背景：`payload_bytes` 是为了干掉 `estimated_bytes` 里的平方级全量遍历
+    /// （250 万组 × 610 批 ≈ 48GB 内存流量）才改的增量维护。
+    /// 这条测试把它钉在"与重算逐字节相等"上。
+    #[test]
+    fn incremental_payload_matches_full_recompute() {
+        use std::sync::Arc;
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("k", arrow::datatypes::DataType::Utf8, true),
+        ]));
+        let ks: Vec<Option<String>> = (0..5000)
+            .map(|i| {
+                if i % 97 == 0 {
+                    None
+                } else {
+                    Some(format!("k-{}", i % 700))
+                }
+            })
+            .collect();
+        let arr = StringArray::from(ks);
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)]).unwrap();
+        let g = vec![PhysExpr::Column {
+            idx: 0,
+            name: "k".into(),
+            ty: LogicalType::Varchar { max_chars: None },
+        }];
+
+        let mut a = GroupTable::default();
+        a.ingest(&g, &[], &batch).unwrap();
+        assert_eq!(a.len(), 701, "700 个 k-* 组 + 1 个 NULL 组");
+        assert_eq!(a.payload_bytes, a.payload_bytes_full(), "单表 ingest 后");
+        // 整条估计值也得自洽（载荷只是其中一项，其余是 O(1) 的 capacity 项）
+        assert!(a.estimated_bytes() >= a.payload_bytes);
+
+        // merge_subset 也往 by_hash 里插 ⇒ 同样要一致
+        let mut b = GroupTable::default();
+        b.ingest(&g, &[], &batch).unwrap();
+        a.merge_subset(&b, (0..b.len()).collect(), 0);
+        assert_eq!(a.payload_bytes, a.payload_bytes_full(), "merge 后");
+
+        // 空表整体接管（`*self = other`）也不许漏
+        let mut c = GroupTable::default();
+        c.merge(b, 0);
+        assert_eq!(c.payload_bytes, c.payload_bytes_full(), "整体接管后");
+    }
 
     #[test]
     fn fxhash_basic() {
