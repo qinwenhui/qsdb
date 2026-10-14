@@ -234,6 +234,55 @@ fn values_without_spill() {
     check_values("novalue", None);
 }
 
+/// **单 Int64 列的内联槽扩容**：组数跨过初始容量时，命中的 mask 必须逐行重取。
+///
+/// 为什么单独立一条：count-only 的**单 Int64 分组列**走的是 `int_slots`
+/// （键存在槽里、不碰 `key_arena`，实测比通用路径快 5.4×）。而既有的溢出测试
+/// 用的是**字符串**列——字符串走不了这条内联路径 ⇒ **扩容逻辑一条测试都没盖到**。
+/// 实测代价：mask 提到循环外之后，扩容后探测只在老区间走 ⇒ 已有键一律找不到
+/// ⇒ 每行新建组（**静默多数 + 内存雪崩**，`.14` 上 500 万行直接跑到超时）。
+#[test]
+fn int_slot_growth_keeps_counts_correct() {
+    let (db, root) = open("growth", None);
+    db.sql("CREATE TABLE t (n BIGINT)").unwrap();
+    // 3000 个不同值、每个重复 2 次 ⇒ 去重 = 3000（跨过初始容量 1024 ⇒ 至少扩容一次）
+    let mut rows: Vec<String> = Vec::new();
+    for i in 0..3000 {
+        rows.push(format!("({i})"));
+        rows.push(format!("({i})"));
+    }
+    db.sql(&format!("INSERT INTO t VALUES {}", rows.join(",")))
+        .unwrap();
+    assert_eq!(
+        scalar(&db, "SELECT count(DISTINCT n) FROM t"),
+        "3000",
+        "扩容后仍必须只回不同值个数"
+    );
+    assert_eq!(
+        scalar(&db, "SELECT count(n) FROM t"),
+        "6000",
+        "不去重 = 6000"
+    );
+
+    // NULL 同样跨扩容：它走的是**单独的槽**（`i64::MIN` 是合法值，不能用哨兵）
+    db.sql("CREATE TABLE u (n BIGINT)").unwrap();
+    let mut rows: Vec<String> = Vec::new();
+    for i in 0..3000 {
+        rows.push(format!("({i})"));
+        rows.push("(NULL)".to_string());
+    }
+    db.sql(&format!("INSERT INTO u VALUES {}", rows.join(",")))
+        .unwrap();
+    // 3000 个不同整数 + NULL 自成一组 = 3001；`count(n)` 跳过 NULL = 3000
+    assert_eq!(
+        scalar(&db, "SELECT count(*) FROM (SELECT DISTINCT n FROM u)"),
+        "3001"
+    );
+    assert_eq!(scalar(&db, "SELECT count(DISTINCT n) FROM u"), "3000");
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// **溢出重分区**：值必须照样对。
 ///
 /// 这是本文件里最重要的一条 —— 分区口径（键字节）一旦内存侧与批侧不一致，

@@ -379,17 +379,29 @@ pub struct GroupTable {
     minmax: Vec<Vec<Option<Literal>>>,
     /// **只要"组数"、不要组键正文**（`count(DISTINCT x)` 的融合计数节点）。
     ///
-    /// 关掉两样东西：
-    /// 1. `group_lits`（不建）—— 250 万字符串组里，它的 `Literal` 槽 + 每组一次
-    ///    `String` 克隆正是"组表仍胖"的大头，而编码后的键**已经在 `key_arena` 里**；
-    /// 2. **Int64 内联快路径**——它把键存成裸 8 字节，通用路径是 tag+值。融合节点
-    ///    要按**键字节**做溢出分区，两套编码混用会让同一个键分到不同分区
-    ///    ⇒ **静默多数/少数**。统一走通用编码，换来两边口径一致。
-    ///
-    /// ⚠️ 也正因为第 2 条，`assign_groups_fast_inline` 里那段"无 literal 表从
-    /// `key_arena` 回填"的兜底永远不会被 count-only 表触发 —— 那条路径的真值
-    /// 全靠 literal，本来就只对**有 literal 的表**成立。
+    /// 关掉 `group_lits`（不建）—— 250 万字符串组里，它的 `Literal` 槽 + 每组
+    /// 一次 `String` 克隆正是"组表仍胖"的大头，而编码后的键**已经在
+    /// `key_arena` 里**。
     count_only: bool,
+    /// **count-only + 单 Int64 分组列**专用内联槽：槽 = `(键值, gid)`，
+    /// **键存在槽里** ⇒ 命中判定完全不碰 `key_arena`。
+    ///
+    /// 为什么值得单开一张：实测「**每行对 `key_arena` 的一次随机访问**」就是这条
+    /// 路径的全部开销——同一份数据（`DISTINCT v`，100 万组）**0.168s vs 0.913s
+    /// （5.4×）**，差别只在"键存槽里"还是"回 arena 取真值"。
+    /// （见 `docs/真机基准对账.md` §二之四。）
+    ///
+    /// 与既有 [`GroupTable::fast_slots_inline`] 的两点差别，都因为 count-only：
+    /// 1. **NULL 走专门的槽**（`count_only_null_gid`）——**不能用键值哨兵**，
+    ///    `i64::MIN` 是合法值；
+    /// 2. `key_arena` 里存的仍是**规范编码**（`encode_key_row` 的 `[1]+LE8` / `[0]`），
+    ///    因为溢出分区的路由按它算 ⇒ 这张索引是**缓存**，随时可按 arena 重建。
+    ///
+    /// ⚠️ **走不走这条路是类型驱动的**（"分组是单列 Int64"），**不是"这批有没有
+    /// NULL"**：逐批判定会让同一个值在两种编码下各建一次组（**静默多数**）。
+    int_slots: Vec<(i64, u32)>,
+    /// 上面那张表的 NULL 组（count-only 单 Int64 列专用）。
+    count_only_null_gid: Option<u32>,
 }
 
 impl GroupTable {
@@ -484,6 +496,7 @@ impl GroupTable {
         b += self.key_off.capacity() as u64 * 4;
         b += self.fast_slots.capacity() as u64 * 16; // (u64, u32) + padding
         b += self.fast_slots_inline.capacity() as u64 * 16; // (i64, u32) + padding
+        b += self.int_slots.capacity() as u64 * 16; // count-only 单 Int64 列内联槽
         // HashMap<u64, Vec<u32>>：桶 + 每组一个 Vec 头
         let vec_hdr = std::mem::size_of::<Vec<u32>>() as u64;
         b += self.by_hash.capacity() as u64 * (std::mem::size_of::<(u64, Vec<u32>)>() as u64 + 1);
@@ -1046,8 +1059,20 @@ impl GroupTable {
                 None => Ok(None),
             })
             .collect::<Result<_>>()?;
-        // count-only 一律走通用编码（内联快路径的键是裸 8 字节，与溢出分区的
-        // tag+值口径不一致 ⇒ 会**静默分错区**。见 `count_only` 字段说明）。
+        // count-only 的**单 Int64 列**走上表内联槽（键存槽里 ⇒ 不碰 arena，
+        // 实测 5.4×）。注意它与 `fast_slots_inline` **不是同一张表**：那张要求
+        // 逐批无非空才启用，而这里的判定是**类型驱动**的，且 NULL 有专门槽。
+        let count_int = if self.count_only {
+            match group_arrays.as_slice() {
+                [a] if matches!(a.data_type(), DataType::Int64) => {
+                    a.as_any().downcast_ref::<Int64Array>()
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        // 非 count-only 的既有内联快路径（要求逐批全非空）
         let fast_cols = if self.count_only {
             None
         } else {
@@ -1064,7 +1089,9 @@ impl GroupTable {
         // 行 → 组 id
         // fast path：分组列全为非空 Int64 —— 内联 key 拼接 + 开放寻址表
         let mut group_ids: Vec<u32> = Vec::with_capacity(n);
-        if let Some(cols) = fast_cols {
+        if let Some(col) = count_int {
+            self.assign_groups_count_only_int(col, &mut group_ids);
+        } else if let Some(cols) = fast_cols {
             self.assign_groups_fast(&cols, &mut group_ids);
         } else {
             let mut key_buf: Vec<u8> = Vec::with_capacity(64);
@@ -1276,7 +1303,108 @@ impl GroupTable {
     /// 给融合计数节点的**溢出重分区**用：把内存里已建的组按同一个键字节口径
     /// 重新灌进各分区的表。两边必须用同一种编码——所以 count-only 表禁用了
     /// 内联快路径（见该字段说明）。
+    /// 按 `key_arena` 里的**规范编码**回填内联槽（`insert_raw_key` 灌完之后、
+    /// 或首次用到时）。规范编码是确定的（`[1]+LE8` = 非空 / `[0]` = NULL）
+    /// ⇒ 这条重建是**可逆且无歧义**的。
+    fn rebuild_int_slots(&mut self) {
+        const EMPTY: u32 = u32::MAX;
+        let mut cap: usize = 1024;
+        while cap < (self.len() + 1) * 2 {
+            cap <<= 1;
+        }
+        self.int_slots = vec![(0, EMPTY); cap];
+        self.count_only_null_gid = None;
+        for gid in 0..self.len() {
+            let kb = self.key_of(gid);
+            let k = if kb.len() == 9 && kb[0] == 1 {
+                i64::from_le_bytes(kb[1..9].try_into().unwrap())
+            } else if kb.len() == 1 && kb[0] == 0 {
+                self.count_only_null_gid = Some(gid as u32);
+                continue;
+            } else {
+                // count-only + 单 Int64 分组列 ⇒ 键只可能是上面两种形态。
+                // 走到这里说明建组路径与索引口径对不上了 —— **不能默默跳过**
+                // （少一个槽 = 下次 ingest 重复建组 = 计数变大）。
+                debug_assert!(false, "int 槽表遇到非规范编码的组键（长度 {}）", kb.len());
+                continue;
+            };
+            let h = fxhash_bytes(&k.to_le_bytes()) | 1;
+            Self::insert_slot_inline(&mut self.int_slots, h, k, gid as u32);
+        }
+    }
+
+    /// count-only + **单 Int64 分组列**：内联槽建组。
+    ///
+    /// 键**存在槽里** ⇒ 命中判定不碰 `key_arena`（实测这条差别 = 5.4×）。
+    /// NULL 走 `count_only_null_gid`；`key_arena` 里一律写**规范编码**，
+    /// 供溢出分区路由与 `insert_raw_key` 用。
+    fn assign_groups_count_only_int(&mut self, col: &Int64Array, out: &mut Vec<u32>) {
+        const EMPTY: u32 = u32::MAX;
+        if self.int_slots.is_empty() {
+            self.rebuild_int_slots();
+        }
+        for row in 0..col.len() {
+            // ⚠️ **每次都要重取**：表会在下面这个循环里扩容（`len*2 >= cap`），
+            // 把 mask 提到循环外 ⇒ 扩容后仍按老宽度取模，探测只在**老区间**里走，
+            // 已有键一律找不到 ⇒ 每行都新建组（**静默多数 + 内存雪崩**，
+            // `.14` 上 500 万行直接跑到超时）。`assign_groups_fast_inline`
+            // 也是逐行取的，别"优化"掉。
+            let mask = self.int_slots.len() - 1;
+            if col.is_null(row) {
+                let g = match self.count_only_null_gid {
+                    Some(g) => g,
+                    None => {
+                        let g = self.push_group(&[0u8], &[]);
+                        self.count_only_null_gid = Some(g);
+                        g
+                    }
+                };
+                out.push(g);
+                continue;
+            }
+            let k = col.value(row);
+            let h = fxhash_bytes(&k.to_le_bytes()) | 1;
+            let mut idx = (h as usize) & mask;
+            let gid = loop {
+                let (sk, sg) = self.int_slots[idx];
+                if sg == EMPTY {
+                    let mut kb = [0u8; 9];
+                    kb[0] = 1;
+                    kb[1..].copy_from_slice(&k.to_le_bytes());
+                    let g = self.push_group(&kb, &[]);
+                    self.int_slots[idx] = (k, g);
+                    // 负载因子 >= 50% 扩容重排（与其它槽表同款）
+                    if self.len() * 2 >= self.int_slots.len() {
+                        let mut cap = self.int_slots.len() * 2;
+                        while cap < (self.len() + 1) * 2 {
+                            cap <<= 1;
+                        }
+                        let old = std::mem::take(&mut self.int_slots);
+                        self.int_slots = vec![(0, EMPTY); cap];
+                        for (ok, og) in old {
+                            if og != EMPTY {
+                                let oh = fxhash_bytes(&ok.to_le_bytes()) | 1;
+                                Self::insert_slot_inline(&mut self.int_slots, oh, ok, og);
+                            }
+                        }
+                    }
+                    break g;
+                }
+                if sk == k {
+                    break sg;
+                }
+                idx = (idx + 1) & mask;
+            };
+            out.push(gid);
+        }
+    }
+
     pub fn insert_raw_key(&mut self, key: &[u8]) -> u32 {
+        // 原始键是**绕过索引**直接进 `key_arena` 的 ⇒ 内联槽会过期
+        // （同一个键可能已有槽、也可能没有）。清掉即可：下次 `ingest` 会按
+        // arena 的规范编码重建（见 `rebuild_int_slots`）。
+        self.int_slots.clear();
+        self.count_only_null_gid = None;
         let h = fxhash_bytes(key);
         if let Some(cands) = self.by_hash.get(&h) {
             for &gid in cands {
