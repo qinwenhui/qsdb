@@ -711,7 +711,10 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
         }
         "import_csv_parse_only" => {
             let t0 = Instant::now();
-            let sum = scalar_i64(&db, &format!("SELECT sum(v) FROM read_csv('{src}/src/t.csv')"));
+            let sum = scalar_i64(
+                &db,
+                &format!("SELECT sum(v) FROM read_csv('{src}/src/t.csv')"),
+            );
             let ms = t0.elapsed().as_millis() as u64;
             assert!(sum > 0, "解析出 0 行");
             (1u64, ms)

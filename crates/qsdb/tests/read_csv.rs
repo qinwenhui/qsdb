@@ -316,3 +316,213 @@ fn import_csv_into_table() {
     assert_eq!(db.partition_stats("t").unwrap().len(), 3);
     std::fs::remove_dir_all(&root).ok();
 }
+
+// ---------------------------------------------------------------------------
+// ② 重写解析器前的**边界安全网**（2026-10-14）
+//
+// 背景：`crates/qsdb/src/csv.rs` 的字节源是 `BufRead::fill_buf()` + `consume(1)`，
+// 而 `next_record` 逐字节走它 ⇒ **每个输入字节一次 trait 虚调用**。535MB 的
+// 导入文件 = 约 5.35 亿次虚调用（实测解析 3.26s，≈2.7s 在这里）。重写要把字节源
+// 换成"持 `&[u8]` + 游标、只在跨块时 fill_buf"。
+//
+// **跨块**正是重写最容易出静默错值的地方：游标翻块、`\r\n` 被劈成两块、
+// 多字节 UTF-8 被劈成两块、引号态跨块。下面这些用例**在重写前后都必须通过**。
+// ---------------------------------------------------------------------------
+
+/// 末尾**没有换行**的最后一行必须照收（重写的"读完缓冲但还有残留"分支）。
+#[test]
+fn last_line_without_trailing_newline() {
+    let root = tmp_root("nonl");
+    let f = root.join("t.csv");
+    write(&f, "a,b\n1,x\n2,y");
+    let db = db_at(&root);
+    assert_eq!(
+        rows(
+            &db,
+            &format!("SELECT a, b FROM read_csv('{}') ORDER BY a", csv_path(&f))
+        ),
+        vec!["1|x", "2|y"]
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 末行的**引号字段**没有换行收尾（引号态要在 EOF 处正确闭合）。
+#[test]
+fn quoted_field_at_eof_without_newline() {
+    let root = tmp_root("qnonl");
+    let f = root.join("t.csv");
+    write(&f, "a,b\n1,\"has,comma\"");
+    let db = db_at(&root);
+    assert_eq!(
+        rows(
+            &db,
+            &format!("SELECT a, b FROM read_csv('{}')", csv_path(&f))
+        ),
+        vec!["1|has,comma"]
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 孤立 `\r` 也是换行（老 Mac 行尾）；`\r\n` 不能变成两个换行。
+/// 跨块时 `\r` 落在块尾、`\n` 落在下一块开头 —— 重写的经典翻车点。
+#[test]
+fn lone_cr_and_crlf_terminators() {
+    let root = tmp_root("cr");
+    let f = root.join("t.csv");
+    write(&f, "a,b\r1,x\r2,y\r\n3,z\n");
+    let db = db_at(&root);
+    assert_eq!(
+        rows(
+            &db,
+            &format!("SELECT a, b FROM read_csv('{}') ORDER BY a", csv_path(&f))
+        ),
+        vec!["1|x", "2|y", "3|z"]
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 空行（两条 `\n` 相邻、`\r\n` 相邻）跳过，不入结果也不报宽度错。
+#[test]
+fn blank_lines_are_skipped() {
+    let root = tmp_root("blank");
+    let f = root.join("t.csv");
+    write(&f, "a,b\n1,x\n\n2,y\r\n\r\n3,z\n\n");
+    let db = db_at(&root);
+    assert_eq!(
+        rows(
+            &db,
+            &format!("SELECT a, b FROM read_csv('{}') ORDER BY a", csv_path(&f))
+        ),
+        vec!["1|x", "2|y", "3|z"]
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 非引号字段**中部**的引号按字面收（`a"b` → `a"b`），不进入引号态。
+/// 这是"`""` 之后又见引号"的老坑：进了引号态就会把后面的逗号吞掉。
+#[test]
+fn quote_in_the_middle_is_literal() {
+    let root = tmp_root("midq");
+    let f = root.join("t.csv");
+    write(&f, "a,b\n1,x\"y\n2,p\"\"q\n");
+    let db = db_at(&root);
+    assert_eq!(
+        rows(
+            &db,
+            &format!("SELECT a, b FROM read_csv('{}') ORDER BY a", csv_path(&f))
+        ),
+        vec!["1|x\"y", "2|p\"\"q"]
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **跨块**：文件远大于读缓冲，且引号内换行 / 多字节 UTF-8 / 长字段
+/// **散布在各个偏移**上 ⇒ 无论缓冲怎么切，总有记录骑在边界上。
+///
+/// 这条是重写的**主安全网**：只要跨块拼接写错（丢字节、重复字节、
+/// `\r\n` 劈开、UTF-8 劈开），结果就对不上。
+#[test]
+fn records_straddle_read_buffer_boundaries() {
+    let root = tmp_root("straddle");
+    let f = root.join("t.csv");
+    let mut s = String::from("id,text\n");
+    let mut expect: Vec<String> = Vec::new();
+    // 8000 行、每行文本长度不一（1..40 字节），其中每 7 行是**带引号的多行字段**、
+    // 每 11 行掺一个多字节字符 ⇒ 各种长度把记录推过 64KB 边界很多次。
+    for i in 0..8000 {
+        let pad = "x".repeat((i % 40) + 1);
+        let text = if i % 7 == 0 {
+            format!("line1\nline2-{i}")
+        } else if i % 11 == 0 {
+            format!("中文{i}-{pad}")
+        } else {
+            format!("plain-{i}-{pad}")
+        };
+        let quoted = text.contains('\n') || text.contains(',') || text.contains('"');
+        let cell = if quoted {
+            format!("\"{}\"", text.replace('"', "\"\""))
+        } else {
+            text.clone()
+        };
+        // **行尾交替** `\n` / `\r\n` ⇒ 两种结束符都落在各种偏移上
+        // （重写最经典的翻车点：`\r` 在块尾、`\n` 在下一块开头）。
+        let term = if i % 3 == 0 { "\r\n" } else { "\n" };
+        s.push_str(&format!("{i},{cell}{term}"));
+        expect.push(format!("{i}|{text}"));
+    }
+    write(&f, &s);
+    assert!(s.len() > 200_000, "文件要够大才压得住跨块：{}", s.len());
+
+    let db = db_at(&root);
+    let got = rows(
+        &db,
+        &format!(
+            "SELECT id, text FROM read_csv('{}') ORDER BY id",
+            csv_path(&f)
+        ),
+    );
+    assert_eq!(got.len(), expect.len(), "行数不对 = 跨块时丢/多了记录");
+    assert_eq!(got, expect, "逐行比对（中间任何一处错位都会从这里露出来）");
+
+    // 单值也校一遍：证明**没有**把两条记录粘成一条（粘了的话行数会少但内容更长）
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT count(*) FROM read_csv('{}')", csv_path(&f))
+        ),
+        "8000"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 单行**超长字段**（远超读缓冲）：一个字段跨多个块，且中间无任何分隔符。
+#[test]
+fn single_huge_field_spans_many_buffers() {
+    let root = tmp_root("huge");
+    let f = root.join("t.csv");
+    let big = "y".repeat(300_000); // 远大于 64KB 缓冲
+    write(&f, &format!("a,b\n1,{big}\n2,short\n"));
+    let db = db_at(&root);
+    let r = rows(
+        &db,
+        &format!(
+            "SELECT a, length(b) FROM read_csv('{}') ORDER BY a",
+            csv_path(&f)
+        ),
+    );
+    assert_eq!(r, vec!["1|300000", "2|5"]);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 引号内**换行 + 多字节 + CRLF** 的组合，且整体跨块。
+#[test]
+fn quoted_multiline_multibyte_straddling() {
+    let root = tmp_root("qcross");
+    let f = root.join("t.csv");
+    let mut s = String::from("id,text\n");
+    let mut expect: Vec<String> = Vec::new();
+    for i in 0..800 {
+        // 引号内含换行与中文，长度随 i 变化 ⇒ 边界落在任意位置
+        let text = format!(
+            "头{}行\n中间-{}-{}\n尾",
+            i,
+            "中".repeat(i % 30),
+            "z".repeat(i % 17)
+        );
+        s.push_str(&format!("{i},\"{}\"\n", text.replace('"', "\"\"")));
+        expect.push(format!("{i}|{text}"));
+    }
+    write(&f, &s);
+    let db = db_at(&root);
+    assert_eq!(
+        rows(
+            &db,
+            &format!(
+                "SELECT id, text FROM read_csv('{}') ORDER BY id",
+                csv_path(&f)
+            )
+        ),
+        expect
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
