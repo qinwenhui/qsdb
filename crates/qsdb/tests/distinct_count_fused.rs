@@ -374,3 +374,55 @@ fn disable_switch_gives_the_same_answer() {
 
 /// 环境变量类测试的串行锁（同进程内互斥）。
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// **各分区共享键时，计数必须相加（不是求并集）** —— P1⑪ 的核心正确性。
+///
+/// 分区按**键哈希**切 ⇒ 同一个键必落同一分区 ⇒ 各分区键集**不相交**
+/// ⇒ **组数相加是精确的**。这条刻意造**重叠加满**的数据：每批 2 万行、
+/// `s` 的基数也是 2 万 ⇒ **每个分区都含全部 2 万个值**。
+/// 若哪天误按"行"分片再相加，会回 4×2 万 ⇒ 立刻红。
+///
+/// ⚠️ 环境变量是进程级的 ⇒ 用 SERIAL 锁罩住整个测试体。
+#[test]
+fn partitioned_count_sums_disjoint_keys() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    const ROWS: i64 = 400_000;
+    const CARD: i64 = 20_000;
+    let (db, root) = open("parts", None);
+    db.sql("CREATE TABLE t (s STRING)").unwrap();
+    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("s", arrow::datatypes::DataType::Utf8, true),
+    ]));
+    let mut done = 0i64;
+    while done < ROWS {
+        let n = 20_000.min(ROWS - done);
+        let ss: Vec<String> = (done..done + n)
+            .map(|i| format!("v-{:06}", i % CARD))
+            .collect();
+        let b = arrow::record_batch::RecordBatch::try_new(
+            std::sync::Arc::clone(&schema),
+            vec![std::sync::Arc::new(arrow::array::StringArray::from(ss))],
+        )
+        .unwrap();
+        db.append("t", &[b]).unwrap();
+        done += n;
+    }
+    let sql = "SELECT count(*) FROM (SELECT DISTINCT s FROM t)";
+    // 基线：单分区（走单线程路径）
+    unsafe { std::env::set_var("QSDB_DISTINCT_PARTS", "1") };
+    let one = scalar(&db, sql);
+    assert_eq!(one, CARD.to_string(), "基数就是 CARD");
+    // 多分区：**必须同值**。数据刻意让每个分区都含全部值 ——
+    // 按行分片再相加会回 4×CARD，这里是加法正确性的判别点。
+    for n in ["2", "4", "16"] {
+        unsafe { std::env::set_var("QSDB_DISTINCT_PARTS", n) };
+        assert_eq!(
+            scalar(&db, sql),
+            one,
+            "分区数 {n} 必须与单分区同值（键集不相交 ⇒ 相加精确）"
+        );
+    }
+    unsafe { std::env::remove_var("QSDB_DISTINCT_PARTS") };
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}

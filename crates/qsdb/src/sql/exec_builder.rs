@@ -1300,6 +1300,33 @@ fn annotate_walk(plan: &LogicalPlan, needed: &[u32], allow_scan_read: bool) -> L
     }
 }
 
+/// 每行键字节的**保守**估计（分区缓冲）：编码后是 `tag + 长度 + 字节`。
+/// 取 32 是给常见字典键（十几字节）留足余量 —— 估小了会在相 1 中途超额。
+const DISTINCT_SHUFFLE_BYTES_PER_ROW: u64 = 32;
+
+/// 分区数。缺省按核数（去重是**内存延迟受限**的，并行靠多路未命中藏延迟），
+/// 但**封顶 16**：再多只是把每张表切得更碎、合并开销上升。
+fn distinct_parts() -> usize {
+    let forced = std::env::var("QSDB_DISTINCT_PARTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    match forced {
+        Some(n) => n.clamp(1, 64),
+        None => rayon::current_num_threads().clamp(1, 16),
+    }
+}
+
+/// 计划上的行数上界（管理表 `Scan` 的元数据行数）。
+///
+/// 只认能直接拿到元数据行数的形状：`Scan` 及其上**只加不减行**的逐行节点
+/// （`Project`/`Filter`）。`Filter` 会让上界**偏高** —— 估高只是多要一点额度，
+/// 估低才会让相 1 中途超额，所以这里刻意取**保守方向**。
+/// 拿不到（join/派生表/集合操作…）就返回 `None` ⇒ 走单线程路径。
+fn distinct_row_upper_bound(db: &Qsdb, plan: &LogicalPlan) -> Option<u64> {
+    let def = plan_scan_def(plan)?;
+    db.scan_metadata_count(&def.name, None).ok()?
+}
+
 /// `count(*) over DISTINCT` 是否走**融合计数**（[`crate::exec::DistinctCountExec`]）。
 ///
 /// 单独成函数是为了让它**可断言**：融合**静默不触发**只会让性能数字变难看，
@@ -1353,7 +1380,40 @@ fn build_aggregate(
                 ));
             }
             let out_schema = Arc::new(arrow::datatypes::Schema::new(fields));
+            // ── 哈希分区并行（P1⑪，见 `exec::PartitionedDistinctCountExec`）──
+            //
+            // ⚠️ **判定必须在开读之前**：相 1 会把行数据变成分区缓冲，
+            // 一旦开读就回不去了（不像 `DistinctCountExec` 能"读到一半转溢出"）。
+            // 所以这里用**计划上的行数上界**×每行键字节的保守估计先要额度，
+            // 要不到就走原来的单线程路径 —— 预算紧的查询行为与今天完全一致，
+            // **不引入新的失败模式**。
             let node = build_inner(db, input, scan_proj.clone(), ctx)?;
+            // ⚠️ **单 Int64 键不走分区**：那条路单线程下已有一条专用快路
+            // （`GroupTable::int_slots`，键存在槽里 ⇒ 命中不碰 arena，实测 6–10×），
+            // 而分区路径只能走 `insert_raw_key`（通用编码）⇒ 反而慢。
+            // 实测教训（2026-10-15）：没这个闸门时 `simple_distinct_int`
+            // 从 0.132s 退到 **0.444s**（3.4×）。
+            let sc = node.schema();
+            let fs = sc.fields();
+            let single_int_key =
+                fs.len() == 1 && matches!(fs[0].data_type(), arrow::datatypes::DataType::Int64);
+            if !single_int_key {
+                if let Some(rows) = distinct_row_upper_bound(db, input) {
+                    let nparts = distinct_parts();
+                    let reserve = rows.saturating_mul(DISTINCT_SHUFFLE_BYTES_PER_ROW);
+                    if nparts > 1 {
+                        if let Ok(res) = ctx.try_reserve(reserve) {
+                            return Ok(Box::new(crate::exec::PartitionedDistinctCountExec::new(
+                                node,
+                                out_schema,
+                                nparts,
+                                res,
+                                Arc::clone(ctx),
+                            )?));
+                        }
+                    }
+                }
+            }
             return Ok(Box::new(crate::exec::DistinctCountExec::new(
                 node,
                 out_schema,

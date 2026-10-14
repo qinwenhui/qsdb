@@ -30,7 +30,7 @@ use crate::types::{DecimalMeta, Literal, LogicalType};
 const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
 
 #[inline]
-fn fxhash_bytes(bytes: &[u8]) -> u64 {
+pub(crate) fn fxhash_bytes(bytes: &[u8]) -> u64 {
     let mut h = FX_SEED;
     let mut chunks = bytes.chunks_exact(8);
     for c in &mut chunks {

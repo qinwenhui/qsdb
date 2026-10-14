@@ -1161,8 +1161,12 @@ impl DistinctCountExec {
     }
 
     fn one_row(&self, total: u64) -> Result<RecordBatch> {
+        Self::one_row_static(total, &self.schema)
+    }
+
+    pub(crate) fn one_row_static(total: u64, schema: &SchemaRef) -> Result<RecordBatch> {
         let arr = arrow::array::Int64Array::from(vec![total as i64]);
-        RecordBatch::try_new(Arc::clone(&self.schema), vec![Arc::new(arr)])
+        RecordBatch::try_new(Arc::clone(schema), vec![Arc::new(arr)])
             .map_err(|e| QsdbError::unsupported(format!("count() 输出构造失败: {e}")))
     }
 }
@@ -1178,6 +1182,151 @@ impl ExecNode for DistinctCountExec {
         self.emitted = true;
         match self.run() {
             Ok(total) => Some(self.one_row(total)),
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `count(*) over DISTINCT` 的**哈希分区并行**（P1⑪）。
+//
+// 与"行分片 + 键并集"（**实测否决**）的本质区别：这里按**键**切。
+// 同一个键的字节相同 ⇒ 哈希相同 ⇒ **必落同一分区** ⇒ 各分区的键集**不相交**
+// ⇒ **各分区的组数可以直接相加**，不需要求并集。
+// （旧方案按行切，片间键集相交，并集要串行重灌 500 万个键 —— 那正是它输掉的地方。）
+//
+// 两相（刻意选最简形态，不为并发引入新原语）：
+//   相 1（顺序）：逐行算 `part = fxhash(编码键) % N`，把**键字节**追加进该分区的
+//                arena（`Vec<u8>` + `(offset,len)` spans）。**只搬键，不搬整行**。
+//   相 2（并行）：`into_par_iter` 各分区各建一张 count-only 表
+//                （用**已写好并测过**的 `insert_raw_key`），`len()` **相加**。
+//
+// ⚠️ 内存：相 1 的缓冲是这批唯一的额外内存（5M 行 ≈ 135MB）。调用方**必须**
+// 在动手前拿到行数上界并 `try_reserve` 成功才能选这条路 —— 一旦开读，行数据就
+// 变成了分区缓冲，**回不去**（这是它与 [`DistinctCountExec`] 溢出路径最大的不同）。
+pub struct PartitionedDistinctCountExec {
+    input: Box<dyn ExecNode>,
+    /// 去重键 = 输入的全部列（与 `DistinctCountExec` 同口径）
+    keys: Vec<PhysExpr>,
+    nparts: usize,
+    ctx: Arc<crate::query::QueryContext>,
+    /// 相 1 缓冲的内存预留（活到本节点销毁）
+    res: crate::memory::Reservation,
+    accounted: u64,
+    emitted: bool,
+    schema: SchemaRef,
+}
+
+/// 一个分区的键字节：`arena` 里连续放，`spans` 是每个键的 `(offset, len)`。
+#[derive(Default)]
+struct PartBuf {
+    arena: Vec<u8>,
+    spans: Vec<(u32, u32)>,
+}
+
+impl PartBuf {
+    #[inline]
+    fn push(&mut self, key: &[u8]) {
+        let off = self.arena.len() as u32;
+        self.arena.extend_from_slice(key);
+        self.spans.push((off, key.len() as u32));
+    }
+
+    fn bytes(&self) -> u64 {
+        self.arena.capacity() as u64 + self.spans.capacity() as u64 * 8
+    }
+}
+
+impl PartitionedDistinctCountExec {
+    pub fn new(
+        input: Box<dyn ExecNode>,
+        out_schema: SchemaRef,
+        nparts: usize,
+        res: crate::memory::Reservation,
+        ctx: Arc<crate::query::QueryContext>,
+    ) -> Result<Self> {
+        let in_schema = input.schema();
+        let keys: Vec<PhysExpr> = in_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, f)| PhysExpr::Column {
+                idx: i,
+                name: f.name().clone(),
+                ty: crate::types::LogicalType::try_from_arrow(f.data_type())
+                    .unwrap_or(crate::types::LogicalType::Int64),
+            })
+            .collect();
+        Ok(Self {
+            input,
+            keys,
+            nparts: nparts.max(1),
+            ctx,
+            res,
+            accounted: 0,
+            emitted: false,
+            schema: out_schema,
+        })
+    }
+
+    fn run(&mut self) -> Result<u64> {
+        let n = self.nparts;
+        let mut parts: Vec<PartBuf> = (0..n).map(|_| PartBuf::default()).collect();
+        let mut buf: Vec<u8> = Vec::with_capacity(64);
+        while let Some(b) = self.input.next() {
+            self.ctx.check()?;
+            let batch = b?;
+            let arrays: Vec<ArrayRef> = self
+                .keys
+                .iter()
+                .map(|k| eval::eval(k, &batch))
+                .collect::<Result<_>>()?;
+            for row in 0..batch.num_rows() {
+                agg::encode_key_row(&arrays, row, &mut buf);
+                let p = (agg::fxhash_bytes(&buf) % n as u64) as usize;
+                parts[p].push(&buf);
+            }
+            // 逐批记账；**要不到上限也继续**（见类型注释：缓冲已经吃掉行数据，
+            // 回不去 —— 此时拒绝只是把已提交的内存算成没算）。总量由调用方的
+            // 预检（`行数 × 32B`）兜住。
+            let est: u64 = parts.iter().map(PartBuf::bytes).sum();
+            if est > self.accounted && self.res.grow(est - self.accounted).is_ok() {
+                self.accounted = est;
+            }
+        }
+        if std::env::var("QSDB_DISTINCT_PROF").is_ok() {
+            eprintln!(
+                "[distinct-count] 哈希分区并行：{n} 分区，缓冲 {}MB",
+                parts.iter().map(PartBuf::bytes).sum::<u64>() / (1024 * 1024)
+            );
+        }
+        // 相 2：各分区独立去重 —— **键集不相交 ⇒ 组数直接相加**
+        use rayon::prelude::*;
+        let total: u64 = parts
+            .into_par_iter()
+            .map(|p| {
+                let mut t = agg::GroupTable::new_count_only();
+                for &(off, len) in &p.spans {
+                    t.insert_raw_key(&p.arena[off as usize..(off + len) as usize]);
+                }
+                t.len() as u64
+            })
+            .sum();
+        Ok(total)
+    }
+}
+
+impl ExecNode for PartitionedDistinctCountExec {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+    fn next(&mut self) -> Option<Result<RecordBatch>> {
+        if self.emitted {
+            return None;
+        }
+        self.emitted = true;
+        match self.run() {
+            Ok(total) => Some(DistinctCountExec::one_row_static(total, &self.schema)),
             Err(e) => Some(Err(e)),
         }
     }
