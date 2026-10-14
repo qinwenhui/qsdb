@@ -140,6 +140,8 @@ struct Row {
     expect: i64,
     /// 期望的哈希 join 节点数（`None` = 不改计划形状要求）
     want_hash: Option<usize>,
+    /// **尚未实现**：只登记，不断言（实现后改成 `false` → 自动进断言）
+    pending: bool,
 }
 
 #[test]
@@ -151,64 +153,73 @@ fn 常用_join_形态摸底() {
             sql: "SELECT count(*) FROM l JOIN r ON l.k = r.k",
             expect: 2,
             want_hash: Some(1),
+            pending: false,
         },
         Row {
             name: "INNER 复合等值(k,m)",
             sql: "SELECT count(*) FROM l JOIN r ON l.k = r.k AND l.m = r.m",
             expect: 1,
             want_hash: Some(1),
+            pending: false,
         },
         Row {
             name: "INNER 等值+残留谓词",
             sql: "SELECT count(*) FROM l JOIN r ON l.k = r.k AND r.v > 250",
             expect: 1,
             want_hash: Some(1),
+            pending: false,
         },
         Row {
             name: "LEFT 单等值",
             sql: "SELECT count(*) FROM l LEFT JOIN r ON l.k = r.k",
             expect: 3,
             want_hash: Some(1),
+            pending: false,
         },
         Row {
             name: "LEFT 等值+残留谓词",
             sql: "SELECT count(*) FROM l LEFT JOIN r ON l.k = r.k AND r.v > 250",
             expect: 3, // 残留只作用于**匹配对**：k=1 无匹配、k=2 被残留否掉 → 两行补 NULL
             want_hash: Some(1),
+            pending: false,
         },
         Row {
             name: "LEFT 复合等值",
             sql: "SELECT count(*) FROM l LEFT JOIN r ON l.k = r.k AND l.m = r.m",
             expect: 3,
             want_hash: Some(1),
+            pending: false,
         },
         Row {
             name: "RIGHT 单等值",
             sql: "SELECT count(*) FROM l RIGHT JOIN r ON l.k = r.k",
             expect: 3, // r 的 k=4 未匹配 → 补 NULL 保留
             want_hash: None,
+            pending: true,
         },
         Row {
             name: "FULL 单等值",
             sql: "SELECT count(*) FROM l FULL OUTER JOIN r ON l.k = r.k",
             expect: 4, // 两侧孤儿各一行
             want_hash: None,
+            pending: true,
         },
         Row {
             name: "CROSS JOIN",
             sql: "SELECT count(*) FROM l CROSS JOIN r",
             expect: 9,
             want_hash: None,
+            pending: true,
         },
         Row {
             name: "USING(k)",
             sql: "SELECT count(*) FROM l JOIN r USING (k)",
             expect: 2,
             want_hash: Some(1),
+            pending: true,
         },
     ];
 
-    let mut gaps = Vec::new();
     eprintln!(
         "\n{:<26} {:>6} {:>6}   计划(Join/Cross)",
         "形态", "期望", "实测"
@@ -228,34 +239,62 @@ fn 常用_join_形态摸底() {
             Err(_) => "ERR".into(),
         };
         eprintln!("{:<26} {:>6} {:>6}   {}", c.name, c.expect, got, shape);
-        // 值对不上 / 报错 / 该走哈希却退化成叉积 —— 三类都算缺口
-        let ok_value = matches!(v, Ok(n) if n == c.expect);
-        let ok_shape = match c.want_hash {
-            Some(want) => shape == format!("{want}/0"),
-            None => true,
-        };
-        if !ok_value || !ok_shape {
-            gaps.push(format!(
-                "{}：期望 {}，实测 {}（{}{}）",
+        if c.pending {
+            continue; // 尚未实现：不在这里断言，见文件末尾的登记用例
+        }
+        // ✅ 已支持：**值与计划形状都要对**。只断言值等于没测 ——
+        // 退化叉积与哈希 join **结果逐行相同**（这正是它躲过所有既有测试的原因）。
+        assert!(
+            matches!(v, Ok(n) if n == c.expect),
+            "{}：期望 {}，实测 {}（{}）",
+            c.name,
+            c.expect,
+            got,
+            match &v {
+                Err(e) => e.clone(),
+                Ok(_) => String::new(),
+            }
+        );
+        if let Some(want) = c.want_hash {
+            assert_eq!(
+                shape,
+                format!("{want}/0"),
+                "{}：计划形状退了（{}）—— 值可能仍是对的，而那正是**静默退化**",
                 c.name,
-                c.expect,
-                got,
-                match &v {
-                    Err(e) => e.clone(),
-                    Ok(_) => String::new(),
-                },
-                if ok_shape {
-                    String::new()
-                } else {
-                    format!("；计划形状 {shape}，期望 {}/0", c.want_hash.unwrap())
-                }
-            ));
+                shape
+            );
         }
     }
-    eprintln!("\n=== 缺口 {} 条 ===", gaps.len());
-    for g in &gaps {
-        eprintln!("- {g}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 尚未实现的形态（`pending`）——**明确登记**，别让"没实现"看起来像"测过了"。
+///
+/// 实现一条就把上表里它的 `pending` 改成 `false`（断言随即生效），并删掉这里的对应行。
+#[test]
+fn 未实现的形态登记() {
+    let (db, root) = seeded("todo");
+    for (name, sql) in [
+        (
+            "RIGHT 单等值",
+            "SELECT count(*) FROM l RIGHT JOIN r ON l.k = r.k",
+        ),
+        (
+            "FULL 单等值",
+            "SELECT count(*) FROM l FULL OUTER JOIN r ON l.k = r.k",
+        ),
+        ("CROSS JOIN", "SELECT count(*) FROM l CROSS JOIN r"),
+        ("USING(k)", "SELECT count(*) FROM l JOIN r USING (k)"),
+    ] {
+        let e = match db.sql(sql) {
+            Ok(_) => {
+                eprintln!("[已实现?] {name} —— 上表里的 pending 该改成 false 了");
+                continue;
+            }
+            Err(e) => format!("{e}"),
+        };
+        eprintln!("[待办] {name} → {e}");
+        assert!(e.contains("unsupported"), "{name} 报的不是「未实现」：{e}");
     }
     let _ = std::fs::remove_dir_all(&root);
-    // 摸底阶段不断言（缺口是**产出**，不是失败）；跑完把结论写进设计文档
 }
