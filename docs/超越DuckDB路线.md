@@ -42,7 +42,7 @@ DuckDB 是 morsel 驱动的**全算子并行**流水线；我们除"并行聚合
 |---|---|---|---|
 | ① | **并行扫描** | ✅ 已落地（公开 `scan` API 透明并行；`QSDB_SCAN_SERIAL=1` 可关） | 导出 3.48→2.96s |
 | ② | **并行写段** | 段编码（parquet+zstd）单线程 —— **现在是导出/导入的共同天花板** | 多 row-group 并行编码；导出 → ~1s 量级 |
-| ③ | **并行 join** | build 单线程建索引；probe 逐行。**★ 2026-10-14 已定位到具体缺口：INNER/LEFT join 之后整条管线退回单线程**——`exec_builder::try_shard_source` 只穿透 **semi 族** join（INNER 即返回 `None` ⇒ 单节点 `HashAggExec`）。`complex_three_way` 9.9× 与 `complex_join_group` 5.8× **同源于此**（扫描本身是 rayon 并行的，**join 之后的聚合不是**）。做法：把"分片源"推广成**分片源 + 一串 join 阶段**（`SemiStage` 已有雏形）——右键各建一次索引、`Arc` 全分片共享，每分片 `扫描 → 逐阶段 join → partial 聚合`，再走既有的分区 merge。⚠️ **别用 RSS 当这块的收益论据**：bench 报的 1.05GB 里约 300MB 是**热段缓存**（`--cache-mb` 可调、可挤兑），剔除后工作集是 215MB vs 对手 36–42MB（见 `docs/真机基准对账.md` §二之二） | build 分区并行 + probe 分片并行 |
+| ③ | **并行 join** | **前半已落地（`1ab56af`，2026-10-14）**：分片带上整棵 join 子树（`ShardScope`），INNER/LEFT 之后不再退回单线程 —— `complex_join_group` 0.702→**0.481s**（5.8×→3.96×）、`complex_three_way` 1.203→**0.674s**（9.9×→5.55×），并行度实测 3.3–3.8×。<br>**★ 后半（下一步，最大的一块）**：现在还卡在**每片各建一次建侧 hash 索引**。实测分片数曲线（5M 行）：4 片 0.53s / CPU 1.74s，16 片 0.45s / **CPU 5.78s / RSS 746MB**——4→16 只再快 1.2× 而 CPU ×3.3。墙钟模型 `墙钟 ≈ P/N + B`（B = 每片固定成本 = 那次建侧）说明**只有共享建侧，N 才能往 16 走**，那时墙钟才可能从 0.5s 量级掉到 0.2s 量级。做法：把建侧物化+索引做成 `Arc` 共享给全分片（一个 probe 共享态的 `ExecNode`），并在 `build_inner` 的 Join 臂按**确定序**消费预建态（消费计数对不上就显式报错，同 `ShardScope::taken()` 的思路）。⚠️ **别用 RSS 当收益论据**：那 1.06GB 里约 300MB 是**热段缓存**（可挤兑），剔除后工作集 215MB vs 对手 36–42MB | build 分区并行 + probe 分片并行 |
 | ④ | **并行 window** | 整分区物化 + 单线程 | 分区级并行（分区之间天然独立） |
 | ⑤ | **并行 sort/归并** | `RunMerger` k 路归并单线程 | 并行排序 + 并行归并 |
 
