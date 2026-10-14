@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/qsdb", "crates/qsdb-cli", "crates/qsdb-bench"]
+members = ["crates/qsdb", "crates/qsdb-cli", "crates/qsdb-bench", "crates/qsdb-client"]
 
 [workspace.package]
 version = "0.1.0"

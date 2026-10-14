@@ -26,6 +26,11 @@ arrow-flight = { version = "60", optional = true }
 tonic = { version = "0.14", optional = true }
 futures = { version = "0.3", optional = true }
 
+[dev-dependencies]
+## 往返测试用真客户端打真 server（跨实现一致性）。打开 ipc 是为了**连 IPC 通道一起测**
+## ——客户端的 IPC 解码要与内核的编码对死，关着 feature 就等于那条通道没人守。
+qsdb-client = { path = "../qsdb-client", features = ["ipc"] }
+
 [features]
 ## Arrow Flight 数据面（gRPC/h2c，独立监听口）。默认关闭守二进制红线。
 flight = ["dep:arrow-flight", "dep:tonic", "dep:futures"]

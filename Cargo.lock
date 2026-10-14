@@ -2653,12 +2653,22 @@ dependencies = [
  "clap",
  "futures",
  "qsdb",
+ "qsdb-client",
  "rustyline",
  "serde",
  "serde_json",
  "tokio",
  "tokio-util",
  "tonic",
+]
+
+[[package]]
+name = "qsdb-client"
+version = "0.1.0"
+dependencies = [
+ "arrow 60.0.0",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

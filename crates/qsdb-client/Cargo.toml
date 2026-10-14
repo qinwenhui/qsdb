@@ -1,0 +1,23 @@
+[package]
+name = "qsdb-client"
+description = "QSDB 薄客户端：手写 HTTP/1.1，零网络依赖，批式优先"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# **默认不带 arrow**：只有显式打开 `ipc` 才拉。
+# 这就是本 crate 存在的理由 —— 「只想发个 HTTP」不该把内核的
+# arrow/parquet/sqlparser/postcard/rayon/sha2 全拖进编译图。
+arrow = { workspace = true, optional = true }
+
+[features]
+default = []
+## Arrow IPC 通道（列式、直接给出 `RecordBatch`）。打开才引入 arrow 依赖，
+## 并因此与内核的 arrow 版本**锁步** —— 这是显式付费，不是默认成本。
+ipc = ["dep:arrow"]
