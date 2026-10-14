@@ -117,6 +117,20 @@ pub enum LogicalPlan {
         /// **静默错值**。故标注逻辑（`exec_builder::annotate_join_needs`）只在
         /// "join 输出**唯一**的读者可枚举"时才动手，其余一律 `None`。
         needed: Option<std::sync::Arc<Vec<u32>>>,
+        /// **键之外的 ON 条件**（对**已匹配的对**再判；`None` = 没有）。
+        ///
+        /// 例：`LEFT JOIN r ON l.k = r.k AND r.v > 250` —— 键是 `k`，
+        /// 残留是 `r.v > 250`。在**合并 schema**（左 ++ 右）上求值。
+        ///
+        /// ⚠️ **必须在 join 内部求值，不能提到 `WHERE`**：LEFT 的语义是
+        /// "判否 ⇒ 丢弃这个**对**"，未匹配的左行仍要**补 NULL 保留**；
+        /// 提到 WHERE 会把那些行**整体丢掉**（实测口径：3 行变 1 行，**静默少行**）。
+        /// INNER 上两者等价，但为了一条语义路径，这里同样走 join 内部。
+        ///
+        /// ⚠️ 它一旦存在，两处优化要**避开**（否则读出 NULL / 少数行）：
+        /// `annotate_join_needs` 的列掩码、`JoinCountExec` 的 `count(*)` 下推。
+        /// 见各自的注释。
+        residual: Option<PhysExpr>,
     },
     /// 单行零列源（无 FROM SELECT）
     OneRow,
@@ -1910,6 +1924,7 @@ fn build_exists_semi_join(
         right_keys,
         join_type,
         needed: None,
+        residual: None, // semi/anti 族：ON 由 IN/EXISTS 生成，没有"键之外的条件"
     })
 }
 
@@ -1977,6 +1992,7 @@ fn build_in_semi_join(
         right_keys: vec![right_key],
         join_type,
         needed: None,
+        residual: None, // semi/anti 族：ON 由 IN/EXISTS 生成，没有"键之外的条件"
     })
 }
 
@@ -2594,39 +2610,38 @@ fn translate_select_inner(
         for (cn, ct) in &right_cols {
             ctx.cols.push((format!("{right_name}.{cn}"), ct.clone()));
         }
-        match split_equi_condition(on_expr, n_left, &ctx) {
-            Ok((lkey, rkey)) => {
-                plan = LogicalPlan::Join {
-                    left: Box::new(plan),
-                    right: Box::new(right_plan),
-                    left_keys: vec![lkey],
-                    right_keys: vec![rkey],
-                    join_type: jt,
-                    needed: None,
-                };
-            }
-            Err(_) if jt == crate::exec::join::JoinType::Inner => {
-                // 非等值 INNER：cross join + 合并 schema 上过滤原 ON 表达式
-                let combined = bind_expr(on_expr, &ctx)?;
-                if !combined.is_boolean() {
-                    return Err(QsdbError::type_err("JOIN ON must be boolean"));
-                }
-                plan = LogicalPlan::CrossJoinFilter {
-                    left: Box::new(plan),
-                    right: Box::new(right_plan),
-                    predicate: combined,
-                };
-            }
-            Err(e) => {
-                // 非等值只实现了 INNER（走叉积+过滤）。**不能按 INNER 跑**——
-                // 那会静默丢掉左表未匹配的行。文案说清"改怎么写"，别留
-                // `lands later` 这种路线图口吻（对使用者毫无信息）。
-                let _ = e;
-                return Err(QsdbError::unsupported(
-                    "non-equi LEFT JOIN not supported (only non-equi INNER is) — \
-                     put the condition in WHERE for an INNER, or join on an equi key",
-                ));
-            }
+        // `ON` 拆成「键 + 残留」：`ON l.k=r.k AND r.v>1` 从"整条退化成叉积"变成
+        // **多键/单键哈希 join + 残留**（残留必须在 join 内对匹配对求值，
+        // 不能提到 WHERE —— 见 `LogicalPlan::Join::residual`）。
+        let split = split_on_condition(on_expr, n_left, &ctx)?;
+        if !split.keys.is_empty() {
+            let (lk, rk): (Vec<PhysExpr>, Vec<PhysExpr>) = split.keys.into_iter().unzip();
+            plan = LogicalPlan::Join {
+                left: Box::new(plan),
+                right: Box::new(right_plan),
+                left_keys: lk,
+                right_keys: rk,
+                join_type: jt,
+                needed: None,
+                residual: split.residual,
+            };
+        } else if jt == crate::exec::join::JoinType::Inner {
+            // 纯非等值 INNER：cross join + 合并 schema 上过滤整个 ON
+            let combined = split
+                .residual
+                .ok_or_else(|| QsdbError::invalid("JOIN ON must be an equality or boolean"))?;
+            plan = LogicalPlan::CrossJoinFilter {
+                left: Box::new(plan),
+                right: Box::new(right_plan),
+                predicate: combined,
+            };
+        } else {
+            // 纯非等值 INNER 之外的（LEFT/RIGHT/…）：**不能按 INNER 跑**——
+            // 那会静默丢掉未匹配行。文案说清"改怎么写"（别留路线图口吻）。
+            return Err(QsdbError::unsupported(
+                "non-equi LEFT JOIN not supported (only non-equi INNER is) — \
+                 put the condition in WHERE for an INNER, or join on an equi key",
+            ));
         }
     }
 
@@ -3113,23 +3128,94 @@ fn ast_head(debug: &str) -> &str {
     debug[..end].trim()
 }
 
-fn split_equi_condition(
+/// `ON` 的拆分结果：**键**（参与哈希匹配）+ **残留**（对匹配对再判）。
+///
+/// 键为空即"纯非等值 ON"（`ON l.x < r.y`），此时残留就是整个 ON。
+pub(crate) struct OnSplit {
+    /// 等值键对 `(左表达式, 右表达式)`。
+    pub keys: Vec<(PhysExpr, PhysExpr)>,
+    /// 键之外的条件（在**合并 schema** 上求值）。
+    pub residual: Option<PhysExpr>,
+}
+
+/// 把 `ON` 拆成「键 + 残留」。
+///
+/// 规则（**每条都有反例钉着**，见 `tests/join_common.rs`）：
+///
+/// - 顶层按 `AND` 拆开、逐项判定（`ON l.a=r.a AND l.b=r.b AND r.v>1` 是三项）；
+/// - 一项是 `=`、且两侧**分属左右**（且都是列引用）⇒ **键**；
+/// - 其它一切 ⇒ **残留**：同侧等值（`AND l.m = l.m` 不是键——当键会造出恒真键、
+///   还把同侧的列编进哈希）、非等值、表达式键（`l.k + 1 = r.k`）、布尔列……
+///
+/// ⚠️ 残留**不能提到 `WHERE`**（LEFT 的未匹配行会被整体丢掉），见
+/// `LogicalPlan::Join::residual` 的说明。
+///
+/// 返回 `Err` 只表示**真绑定失败**或 ON 不是布尔式；"认不出是键"一律降级成残留，
+/// 不报错——这正是不再把 `ON k=k AND v>1` 整条推向叉积的原因。
+pub(crate) fn split_on_condition(
     e: &sqlparser::ast::Expr,
     n_left: usize,
     ctx: &SchemaCtx,
-) -> Result<(PhysExpr, PhysExpr)> {
-    use sqlparser::ast::Expr as E;
-    let E::BinaryOp { left, op, right } = e else {
-        return Err(QsdbError::unsupported("JOIN ON must be an equality"));
-    };
-    if !matches!(op, sqlparser::ast::BinaryOperator::Eq) {
-        return Err(QsdbError::unsupported(
-            "JOIN ON supports only equality for INNER/LEFT (non-equi INNER goes through a \
-             cross join + filter)",
-        ));
+) -> Result<OnSplit> {
+    let mut conjuncts = Vec::new();
+    flatten_and(e, &mut conjuncts);
+    let mut keys: Vec<(PhysExpr, PhysExpr)> = Vec::new();
+    let mut residual_parts: Vec<PhysExpr> = Vec::new();
+    for c in conjuncts {
+        match as_equi_key(c, n_left, ctx) {
+            Some(k) => keys.push(k),
+            // 绑不动的项在下面 `bind_expr` 里报**确切**的错（列不存在之类）
+            None => residual_parts.push(bind_expr(c, ctx)?),
+        }
     }
-    let lb = bind_expr(left, ctx)?;
-    let rb = bind_expr(right, ctx)?;
+    let residual = match residual_parts.len() {
+        0 => None,
+        1 => Some(residual_parts.pop().expect("长度已判")),
+        _ => Some(and_all(residual_parts)?),
+    };
+    if let Some(r) = &residual {
+        if !r.is_boolean() {
+            return Err(QsdbError::type_err("JOIN ON must be boolean"));
+        }
+    }
+    Ok(OnSplit { keys, residual })
+}
+
+/// 顶层 `AND` 链摊平（`a AND b AND c` → `[a, b, c]`）。
+fn flatten_and<'a>(e: &'a sqlparser::ast::Expr, out: &mut Vec<&'a sqlparser::ast::Expr>) {
+    use sqlparser::ast::{BinaryOperator as B, Expr as E};
+    match e {
+        E::BinaryOp {
+            left,
+            op: B::And,
+            right,
+        } => {
+            flatten_and(left, out);
+            flatten_and(right, out);
+        }
+        // 括号只是分组，摊平不影响语义（`(a AND b) AND c` 与 `a AND (b AND c)` 同）
+        E::Nested(inner) => flatten_and(inner, out),
+        _ => out.push(e),
+    }
+}
+
+/// 一项是不是**跨侧的等值**；是则给出 `(左, 右)`。
+fn as_equi_key(
+    e: &sqlparser::ast::Expr,
+    n_left: usize,
+    ctx: &SchemaCtx,
+) -> Option<(PhysExpr, PhysExpr)> {
+    use sqlparser::ast::{BinaryOperator as B, Expr as E};
+    let E::BinaryOp {
+        left,
+        op: B::Eq,
+        right,
+    } = e
+    else {
+        return None;
+    };
+    let lb = bind_expr(left, ctx).ok()?;
+    let rb = bind_expr(right, ctx).ok()?;
     let side = |x: &PhysExpr| -> Option<bool> {
         match x {
             PhysExpr::Column { idx, .. } => Some(*idx < n_left),
@@ -3137,12 +3223,22 @@ fn split_equi_condition(
         }
     };
     match (side(&lb), side(&rb)) {
-        (Some(true), Some(false)) => Ok((lb, rb)),
-        (Some(false), Some(true)) => Ok((rb, lb)),
-        _ => Err(QsdbError::invalid(
-            "JOIN ON keys must be column references, one from each side",
-        )),
+        (Some(true), Some(false)) => Some((lb, rb)),
+        (Some(false), Some(true)) => Some((rb, lb)),
+        _ => None,
     }
+}
+
+/// 把若干布尔式 `AND` 起来（左结合；残留通常很短，不值得为它做平衡树）。
+fn and_all(mut parts: Vec<PhysExpr>) -> Result<PhysExpr> {
+    let mut acc = parts.remove(0);
+    for p in parts {
+        if !p.is_boolean() {
+            return Err(QsdbError::type_err("JOIN ON must be boolean"));
+        }
+        acc = PhysExpr::And(Box::new(acc), Box::new(p));
+    }
+    Ok(acc)
 }
 
 /// HAVING/ORDER BY 中的 SELECT 别名 → 对应源表达式（AST 级浅替换）。

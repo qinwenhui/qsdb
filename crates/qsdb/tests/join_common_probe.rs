@@ -209,7 +209,10 @@ fn 常用_join_形态摸底() {
     ];
 
     let mut gaps = Vec::new();
-    eprintln!("\n{:<26} {:>6} {:>6}   计划(Join/Cross)", "形态", "期望", "实测");
+    eprintln!(
+        "\n{:<26} {:>6} {:>6}   计划(Join/Cross)",
+        "形态", "期望", "实测"
+    );
     for c in &cases {
         let v = value_of(&db, c.sql);
         let shape = match plan_of(&db, c.sql) {
@@ -224,10 +227,7 @@ fn 常用_join_形态摸底() {
             Ok(n) => format!("{n}"),
             Err(_) => "ERR".into(),
         };
-        eprintln!(
-            "{:<26} {:>6} {:>6}   {}",
-            c.name, c.expect, got, shape
-        );
+        eprintln!("{:<26} {:>6} {:>6}   {}", c.name, c.expect, got, shape);
         // 值对不上 / 报错 / 该走哈希却退化成叉积 —— 三类都算缺口
         let ok_value = matches!(v, Ok(n) if n == c.expect);
         let ok_shape = match c.want_hash {

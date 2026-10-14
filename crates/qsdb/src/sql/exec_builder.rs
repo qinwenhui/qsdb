@@ -426,6 +426,7 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
             right_keys,
             join_type,
             needed,
+            residual,
         } if join_type.is_semi_family() => LogicalPlan::Join {
             left: Box::new(rewrite_plan(left, mapping, all)),
             // 右键为右子计划局部 idx（绑定期约定），裁剪不触碰
@@ -440,6 +441,9 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
             right_keys: right_keys.clone(),
             join_type: *join_type,
             needed: needed.clone(),
+            // 残留与左键同一索引空间 ⇒ 同样无条件重写（semi 族恒为 None，留着是给
+            // 将来复用这条分支时不留坑）
+            residual: residual.as_ref().map(|r| rewrite_expr(r, mapping, all)),
         },
         LogicalPlan::ExternalScan {
             def,
@@ -869,6 +873,7 @@ fn build_inner(
             right_keys,
             join_type,
             needed,
+            residual,
         } => {
             // semi 族：左子继承裁剪投影（build() 对 semi 计划做了列裁剪——
             // 传 None 会读全列使左键 idx 错位；INNER/LEFT 无上游裁剪，None 等价）
@@ -918,7 +923,9 @@ fn build_inner(
                     Arc::clone(ctx),
                 )
                 // ★ join 输出投影下推（P1⑥）：只物化下游真读的列（见 `annotate_join_needs`）
-                .with_needed(needed.clone()),
+                .with_needed(needed.clone())
+                // 键之外的 ON 条件：**必须在 join 内部对匹配对求值**
+                .with_residual(residual.clone()),
             ))
         }
     }
@@ -1219,6 +1226,7 @@ fn annotate_walk(plan: &LogicalPlan, needed: &[u32], allow_scan_read: bool) -> L
             right_keys,
             join_type,
             needed: _,
+            residual,
         } if !join_type.is_semi_family() => {
             let Some(lw) = super::translate::plan_output_columns(left)
                 .ok()
@@ -1256,6 +1264,25 @@ fn annotate_walk(plan: &LogicalPlan, needed: &[u32], allow_scan_read: bool) -> L
                     rn.push(c);
                 }
             }
+            // ⚠️ **残留谓词引用的列也要留住**：它是对"匹配对"求值的，若它读的列
+            // 被掩码填成 NULL，判出来就是错的（而且错得很安静——谓词为 NULL ⇒
+            // 该对不发射 ⇒ **少行**）。与键列同一套索引空间换算。
+            if let Some(r) = residual {
+                let mut rc = Vec::new();
+                r.collect_columns(&mut rc);
+                for c in rc {
+                    if (c as usize) < lw {
+                        if !ln.contains(&(c as u32)) {
+                            ln.push(c as u32);
+                        }
+                    } else {
+                        let lc = (c - lw) as u32;
+                        if !rn.contains(&lc) {
+                            rn.push(lc);
+                        }
+                    }
+                }
+            }
             LogicalPlan::Join {
                 left: Box::new(annotate_walk(left, &ln, allow_scan_read)),
                 right: Box::new(annotate_walk(right, &rn, allow_scan_read)),
@@ -1263,6 +1290,7 @@ fn annotate_walk(plan: &LogicalPlan, needed: &[u32], allow_scan_read: bool) -> L
                 right_keys: right_keys.clone(),
                 join_type: *join_type,
                 needed: Some(Arc::new(needed.to_vec())),
+                residual: residual.clone(),
             }
         }
         // **裸表**：只解码"下游真要的那几列"（列还在、列序不变，其余产出 NULL）。
@@ -1449,12 +1477,19 @@ fn build_aggregate(
             left_keys,
             right_keys,
             join_type,
+            residual,
             ..
         } = input
         {
             // INNER：Σ匹配数；LEFT：Σ max(匹配数, 1)（未匹配行补 NULL 仍计 1）
             let left_outer = matches!(join_type, crate::exec::join::JoinType::LeftOuter);
-            if !left_outer && !matches!(join_type, crate::exec::join::JoinType::Inner) {
+            if residual.is_some() {
+                // ⚠️ **有残留谓词就不能走这条下推**：`JoinCountExec` 只按键计数，
+                // 而残留会**否掉一部分匹配对**（`ON k=k AND r.v>250` 里 v≤250 的对
+                // 不算匹配）⇒ 计数会**偏大**。实测：期望 1、回 2（静默错值）。
+                // 要支持它就得让计数节点自己也求残留；在那之前**宁可放弃这条下推**
+                // —— 像下面那句一样"交给常规路径"（join + 聚合，结果正确、只是慢）。
+            } else if !left_outer && !matches!(join_type, crate::exec::join::JoinType::Inner) {
                 // semi/anti 族等不适用（输出语义不同）——交给常规路径
             } else {
                 // 键列投影：join 只需键列（扫描量 5 列 → 1 列）。

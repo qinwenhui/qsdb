@@ -286,6 +286,8 @@ pub struct HashJoinExec {
     /// **只需物化这些输出位置**（`None` = 全部）。见 `LogicalPlan::Join::needed`：
     /// 不在表里的位置**填 NULL**（列还在、schema 不变，只是没人读）。
     needed: Option<Arc<Vec<u32>>>,
+    /// 键之外的 ON 条件（对**匹配对**求值）。见 [`HashJoinExec::with_residual`]。
+    residual: Option<PhysExpr>,
 }
 
 struct BuildState {
@@ -431,7 +433,17 @@ impl HashJoinExec {
             cur_build: None,
             cur_probe: None,
             needed: None,
+            residual: None,
         }
+    }
+
+    /// 键之外的 ON 条件（对**匹配对**求值）。见 `LogicalPlan::Join::residual`。
+    ///
+    /// ⚠️ 必须在 join 内部求值，**不能**由调用方提到 `WHERE`：LEFT 的未匹配行
+    /// 要补 NULL 保留，提到 WHERE 会把它们整体丢掉（静默少行）。
+    pub fn with_residual(mut self, residual: Option<PhysExpr>) -> Self {
+        self.residual = residual;
+        self
     }
 
     /// 只物化这些输出位置（不在表里的填 NULL）。见 `LogicalPlan::Join::needed`。
@@ -870,6 +882,7 @@ impl HashJoinExec {
             let out_schema = Arc::clone(&self.schema);
             let probe_keys = self.probe_keys.clone();
             let needed = self.needed.clone();
+            let residual = self.residual.clone();
             let join_type = self.join_type;
             let build = self.cur_build.as_ref()?;
             match join_batch(
@@ -879,6 +892,7 @@ impl HashJoinExec {
                 &out_schema,
                 join_type,
                 needed.as_ref().map(|v| v.as_slice()),
+                residual.as_ref(),
             ) {
                 Ok(Some(b)) => return Some(Ok(b)),
                 Ok(None) => continue,
@@ -953,6 +967,7 @@ impl ExecNode for HashJoinExec {
                 &out_schema,
                 join_type,
                 needed.as_ref().map(|v| v.as_slice()),
+                self.residual.as_ref(),
             ) {
                 Ok(Some(b)) => b,
                 Ok(None) => continue, // 无匹配且非 LEFT
@@ -978,6 +993,54 @@ fn build_bytes_index(key_cols: &[ArrayRef], nrows: usize) -> BytesMap<Vec<u32>> 
 }
 
 /// 单个 probe 批的连接。
+/// 残留谓词对**每一对 (probe 行, build 行)** 的判定结果。
+///
+/// 把匹配对儿两侧的列 `take` 出来拼成一个"合并批"（布局 = 左 ++ 右，与 join 输出
+/// 同构），再交给通用表达式求值——这样残留里写的 `r.v > 250` 与用户看到的
+/// 列序完全一致，不需要为它单独造一套求值器。
+///
+/// 代价是每对多一次列拷贝（输出侧还要再 take 一次）。这是**残留 join 才付**的
+/// 成本；为它把求值器做进 take 里，省下的没有"语义只有一处"值钱。
+fn residual_keep_mask(
+    probe_batch: &RecordBatch,
+    build_table: &RecordBatch,
+    probe_idx: &[u32],
+    build_idx: &[u32],
+    residual: &PhysExpr,
+) -> Result<BooleanArray> {
+    let pi = UInt32Array::from(probe_idx.to_vec());
+    let bi = UInt32Array::from(build_idx.to_vec());
+    let mut fields: Vec<arrow::datatypes::FieldRef> =
+        probe_batch.schema().fields().iter().cloned().collect();
+    fields.extend(build_table.schema().fields().iter().cloned());
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(fields.len());
+    for c in 0..probe_batch.num_columns() {
+        cols.push(
+            take(probe_batch.column(c), &pi, None)
+                .map_err(|e| QsdbError::invalid(format!("join residual take: {e}")))?,
+        );
+    }
+    for c in 0..build_table.num_columns() {
+        cols.push(
+            take(build_table.column(c), &bi, None)
+                .map_err(|e| QsdbError::invalid(format!("join residual take: {e}")))?,
+        );
+    }
+    let combined = RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), cols)
+        .map_err(|e| QsdbError::invalid(format!("join residual batch: {e}")))?;
+    let v = eval::eval(residual, &combined)?;
+    let mask = v
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| QsdbError::type_err("JOIN residual must evaluate to boolean"))?
+        .clone();
+    Ok(mask)
+}
+
+/// `residual` = 键之外的 ON 条件（**对匹配对**求值；判否只丢弃那个"对"）。
+/// LEFT 下"全部对都被否掉"的左行**仍要补 NULL 保留** —— 这正是它不能被提到
+/// `WHERE` 的原因（提上去就整体丢行）。见 `LogicalPlan::Join::residual`。
+#[allow(clippy::too_many_arguments)] // 多一个语义参数，比把 8 个参数包成结构体更好读
 fn join_batch(
     probe_batch: &RecordBatch,
     state: &BuildState,
@@ -985,6 +1048,7 @@ fn join_batch(
     out_schema: &SchemaRef,
     join_type: JoinType,
     needed: Option<&[u32]>,
+    residual: Option<&PhysExpr>,
 ) -> Result<Option<RecordBatch>> {
     let n = probe_batch.num_rows();
     // probe 键求值
@@ -1033,6 +1097,44 @@ fn join_batch(
             }
         }
     }
+    // ── 残留谓词：对**匹配对**求值（键之外的条件）──────────────────────────
+    //
+    // ⚠️ 位置很关键：**在"未匹配"定案之前**。LEFT 的语义是"判否只丢弃这个对"，
+    // 若一个左行的所有匹配对都被否掉，它就该**算未匹配、补 NULL 保留**。
+    // 反过来（先定案再判残留，或把残留提到 WHERE）会**整体丢掉那些行** ——
+    // 那是一次静默少行（实测口径：3 行变 1 行）。
+    if let Some(r) = residual {
+        if !probe_idx.is_empty() {
+            let keep = residual_keep_mask(probe_batch, &state.table, &probe_idx, &build_idx, r)?;
+            let mut np: Vec<u32> = Vec::with_capacity(probe_idx.len());
+            let mut nb: Vec<u32> = Vec::with_capacity(build_idx.len());
+            for i in 0..probe_idx.len() {
+                // NULL 结果按"不通过"处理（SQL 三值：UNKNOWN 不是 TRUE）
+                if !keep.is_null(i) && keep.value(i) {
+                    np.push(probe_idx[i]);
+                    nb.push(build_idx[i]);
+                }
+            }
+            if join_type == JoinType::LeftOuter {
+                // 匹配过、但**一对都没活下来**的左行 → 并入未匹配（补 NULL 保留）。
+                // 三个集合都是 O(1) 查：残留路径上 probe_idx 可能有几十万项，
+                // 用 `Vec::contains` 就是 O(n²)（一次误判够毁掉整条查询）。
+                let survived: std::collections::HashSet<u32> = np.iter().copied().collect();
+                let already: std::collections::HashSet<u32> = unmatched.iter().copied().collect();
+                let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+                let mut add: Vec<u32> = Vec::new();
+                for &row in &probe_idx {
+                    if !survived.contains(&row) && !already.contains(&row) && seen.insert(row) {
+                        add.push(row);
+                    }
+                }
+                unmatched.extend(add);
+            }
+            probe_idx = np;
+            build_idx = nb;
+        }
+    }
+
     // LEFT：未匹配行补 NULL build 侧
     let emit_unmatched = join_type == JoinType::LeftOuter && !unmatched.is_empty();
     if probe_idx.is_empty() && !emit_unmatched {
