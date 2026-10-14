@@ -23,7 +23,7 @@
 //! exec_builder 的通用投影下推驱动，省下未选列的类型解析与数组构建。
 
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::Read;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
@@ -181,32 +181,85 @@ fn resolve_kind(k: u8) -> LogicalType {
 // 字节源 + 记录切分
 // ---------------------------------------------------------------------------
 
-/// `BufRead` 上的一字节前看/推进（`fill_buf` 非空即不触发系统调用，摊还 O(1)）。
-struct ByteSrc<R: BufRead> {
+/// 读缓冲大小（与原来的 `BufReader::with_capacity(64*1024)` 同量级）。
+const CSV_CHUNK: usize = 64 * 1024;
+
+/// 字节源：**自有缓冲 + 游标**。
+///
+/// 为什么不用 `BufRead::fill_buf()` + `consume(1)`（原来的写法）：那是
+/// **每个字节一次 trait 虚调用**。535MB 的导入文件 ⇒ 约 **5.35 亿次**，
+/// 实测解析 3.26s 里约 **2.7s** 在这里（`docs/真机基准对账.md` §三之二）。
+/// 改成"按住一块缓冲 + 游标"之后 `bump` 就是一次数组索引，
+/// 只在游标走到块尾时 `refill`。
+struct ByteSrc<R: Read> {
     r: R,
+    buf: Vec<u8>,
+    /// 已消费到的位置（`buf[pos..len]` 是尚未消费的数据）
+    pos: usize,
+    len: usize,
 }
 
-impl<R: BufRead> ByteSrc<R> {
-    fn peek(&mut self) -> Result<Option<u8>> {
-        Ok(self.r.fill_buf()?.first().copied())
+impl<R: Read> ByteSrc<R> {
+    fn new(r: R) -> Self {
+        Self {
+            r,
+            buf: vec![0u8; CSV_CHUNK],
+            pos: 0,
+            len: 0,
+        }
     }
 
-    fn bump(&mut self) -> Result<Option<u8>> {
-        let b = self.r.fill_buf()?;
-        match b.first().copied() {
-            Some(c) => {
-                self.r.consume(1);
-                Ok(Some(c))
-            }
-            None => Ok(None),
+    /// 补充缓冲：**把未消费的残留搬到块首**，再把块读满。
+    ///
+    /// ⚠️ 跨块记录（引号内换行、超长字段、CR 落在块尾而 LF 在下一块）全靠这一步 ——
+    /// 残留**一字节都不能丢**。`pos == 0` 时 `copy_within` 是空操作。
+    fn refill(&mut self) -> Result<()> {
+        if self.pos > 0 {
+            self.buf.copy_within(self.pos..self.len, 0);
+            self.len -= self.pos;
+            self.pos = 0;
         }
+        while self.len < self.buf.len() {
+            match self.r.read(&mut self.buf[self.len..]) {
+                Ok(0) => break,
+                Ok(n) => self.len += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    return Err(QsdbError::parse_err(format!("read_csv: read failed: {e}")));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn peek(&mut self) -> Result<Option<u8>> {
+        if self.pos >= self.len {
+            self.refill()?;
+        }
+        Ok(self.buf.get(self.pos).copied())
+    }
+
+    #[inline]
+    fn bump(&mut self) -> Result<Option<u8>> {
+        if self.pos >= self.len {
+            self.refill()?;
+            if self.pos >= self.len {
+                return Ok(None); // 真的读完了
+            }
+        }
+        let c = self.buf[self.pos];
+        self.pos += 1;
+        Ok(Some(c))
     }
 
     /// 跳过文件首的 UTF-8 BOM（Excel/PowerShell 导出的常见前缀）。
     fn skip_bom(&mut self) -> Result<()> {
-        let b = self.r.fill_buf()?;
-        if b.starts_with(&[0xEF, 0xBB, 0xBF]) {
-            self.r.consume(3);
+        if self.pos >= self.len {
+            self.refill()?; // 块内至少可见 3 字节（不足 3 字节的文件本来也不可能带 BOM）
+        }
+        if self.buf[self.pos..self.len].starts_with(&[0xEF, 0xBB, 0xBF]) {
+            self.pos += 3;
         }
         Ok(())
     }
@@ -214,24 +267,18 @@ impl<R: BufRead> ByteSrc<R> {
 
 /// 记录切分器：一个 `Option<String>` 字段序列 = 一条记录。
 /// `None` = 空字段（NULL）；引号内可含分隔符与换行。
-struct RecordReader<R: BufRead> {
+struct RecordReader<R: Read> {
     src: ByteSrc<R>,
     /// 已产出的记录数（1-based 行号 = 该值 + 1，仅对不含引号内换行的文件精确；
     /// 报错文案用它定位"第几条记录"，比字节偏移对人有用）
     recs: u64,
 }
 
-impl<R: BufRead> RecordReader<R> {
-    fn new(mut r: R) -> Result<Self> {
-        {
-            // 借用结束后才能把 r 移进结构体（`&mut R: BufRead`）
-            let mut src = ByteSrc { r: &mut r };
-            src.skip_bom()?;
-        }
-        Ok(Self {
-            src: ByteSrc { r },
-            recs: 0,
-        })
+impl<R: Read> RecordReader<R> {
+    fn new(r: R) -> Result<Self> {
+        let mut src = ByteSrc::new(r);
+        src.skip_bom()?;
+        Ok(Self { src, recs: 0 })
     }
 
     fn line_no(&self) -> u64 {
@@ -329,12 +376,12 @@ fn field(buf: Vec<u8>) -> Result<Option<String>> {
         .map_err(|e| QsdbError::parse_err(format!("read_csv: field is not valid UTF-8: {e}")))
 }
 
-fn open_local(path: &std::path::Path) -> Result<BufReader<File>> {
-    File::open(path)
-        .map(|f| BufReader::with_capacity(64 * 1024, f))
-        .map_err(|e| {
-            QsdbError::file_not_found(format!("read_csv: open {} failed: {e}", path.display()))
-        })
+/// 打开本地文件。**不再外套 `BufReader`** —— 缓冲已经由 [`ByteSrc`] 自己管，
+/// 再套一层只是多一次拷贝。
+fn open_local(path: &std::path::Path) -> Result<File> {
+    File::open(path).map_err(|e| {
+        QsdbError::file_not_found(format!("read_csv: open {} failed: {e}", path.display()))
+    })
 }
 
 fn width_err(path: &std::path::Path, line: u64, got: usize, want: usize) -> QsdbError {
@@ -349,7 +396,7 @@ fn width_err(path: &std::path::Path, line: u64, got: usize, want: usize) -> Qsdb
 // ---------------------------------------------------------------------------
 
 /// 单文件的批流：表头跳过一次，此后按 `BATCH_ROWS` 攒批。
-struct CsvFileReader<R: BufRead> {
+struct CsvFileReader<R: Read> {
     rec: RecordReader<R>,
     path: std::path::PathBuf,
     /// 表定义列数（全宽，用于行宽校验与列名报错）
@@ -361,7 +408,7 @@ struct CsvFileReader<R: BufRead> {
     header_done: bool,
 }
 
-impl<R: BufRead> CsvFileReader<R> {
+impl<R: Read> CsvFileReader<R> {
     fn new(
         r: R,
         path: std::path::PathBuf,
@@ -525,7 +572,7 @@ pub(crate) struct CsvScanExec {
     /// 表列下标（列裁剪后顺序）
     keep: Vec<usize>,
     schema: SchemaRef,
-    cur: Option<CsvFileReader<BufReader<File>>>,
+    cur: Option<CsvFileReader<File>>,
     next_file: usize,
     ctx: Arc<crate::query::QueryContext>,
 }
