@@ -272,108 +272,157 @@ struct RecordReader<R: Read> {
     /// 已产出的记录数（1-based 行号 = 该值 + 1，仅对不含引号内换行的文件精确；
     /// 报错文案用它定位"第几条记录"，比字节偏移对人有用）
     recs: u64,
+    /// 当前记录的字段字节（**已去转义**；同一记录内连续存放，**跨记录复用**）。
+    ///
+    /// 为什么要有它：原实现是"每字段一个 `Vec<u8>` + `String::from_utf8`"
+    /// ⇒ 5M 行 × 7 列 = **约 7000 万次堆分配**，那是解析 2.86s 里的主要残留。
+    /// 现在字段字节直接写进这块记录级缓冲，字段只记 `(offset, len)` 跨度 ⇒
+    /// **每记录 0 次分配**（缓冲复用）。
+    arena: Vec<u8>,
+    /// 每个字段在 `arena` 里的 `(offset, len)`。
+    /// **`len == 0` 即 NULL** —— 与旧 `field()` 的口径一致（空字段与 `""` 都是 NULL）。
+    spans: Vec<(u32, u32)>,
 }
 
 impl<R: Read> RecordReader<R> {
     fn new(r: R) -> Result<Self> {
         let mut src = ByteSrc::new(r);
         src.skip_bom()?;
-        Ok(Self { src, recs: 0 })
+        Ok(Self {
+            src,
+            recs: 0,
+            arena: Vec::with_capacity(256),
+            spans: Vec::with_capacity(16),
+        })
     }
 
     fn line_no(&self) -> u64 {
         self.recs
     }
 
-    /// 下一条记录；`None` = 文件读完。空行（整行无内容）**跳过**——
-    /// 尾随空行在真实导出文件里极常见，按"1 列空字段"收会撞行宽校验。
-    fn next_record(&mut self) -> Result<Option<Vec<Option<String>>>> {
-        let mut fields: Vec<Option<String>> = Vec::new();
-        let mut buf: Vec<u8> = Vec::new();
+    /// 字段 `i` 的 UTF-8 视图；`None` = 空字段（NULL）。
+    ///
+    /// **非法 UTF-8 在这里报错**（与旧 `field()` 同文案）——不做 lossy 替换：
+    /// 推断结果里没有 BINARY 列，脏字节只会变成一排 U+FFFD 混进字符串列，
+    /// 用户看到的是"查得到但内容是乱码"，比一条明确的报错难排查得多。
+    fn field(&self, i: usize) -> Result<Option<&str>> {
+        let (o, l) = self.spans[i];
+        if l == 0 {
+            return Ok(None);
+        }
+        let bytes = &self.arena[o as usize..(o + l) as usize];
+        std::str::from_utf8(bytes)
+            .map(Some)
+            .map_err(|e| QsdbError::parse_err(format!("read_csv: field is not valid UTF-8: {e}")))
+    }
+
+    fn nfields(&self) -> usize {
+        self.spans.len()
+    }
+
+    /// 解析下一条记录到 [`Self::spans`]/[`Self::arena`]；`false` = 文件读完。
+    /// 空行（整行无内容）**跳过**——尾随空行在真实导出文件里极常见，
+    /// 按"1 列空字段"收会撞行宽校验。
+    ///
+    /// ⚠️ **这段状态机与逐字节版本逐条对应**（引号态、字段中部引号按字面收、
+    /// CRLF、空行跳过、EOF 处收尾），改动它必须过 `tests/read_csv.rs`
+    /// 的跨块边界用例（`records_straddle_read_buffer_boundaries` 等）。
+    fn next_record_spans(&mut self) -> Result<bool> {
+        self.spans.clear();
+        self.arena.clear();
         // 本字段是否以引号开头（防 `""` 之后再进引号态）
         let mut quoted = false;
+        // 当前字段在 arena 里的起点
+        let mut start = 0usize;
         loop {
             match self.src.bump()? {
                 None => {
-                    if fields.is_empty() && buf.is_empty() {
-                        return Ok(None); // 干净的 EOF（末行有换行）
+                    if self.spans.is_empty() && self.arena.len() == start {
+                        return Ok(false); // 干净的 EOF（末行有换行）
                     }
-                    fields.push(field(buf)?);
+                    self.push_span(start);
                     self.recs += 1;
-                    return Ok(Some(fields));
+                    return Ok(true);
                 }
                 Some(b'"') => {
-                    if buf.is_empty() && !quoted {
+                    if self.arena.len() == start && !quoted {
                         quoted = true;
-                        self.read_quoted(&mut buf)?;
+                        Self::read_quoted(&mut self.src, &mut self.arena, self.recs)?;
                     } else {
-                        buf.push(b'"'); // 字段中部的引号：按字面收（见模块头边界）
+                        self.arena.push(b'"'); // 字段中部的引号：按字面收（见模块头边界）
                     }
                 }
                 Some(b',') => {
-                    fields.push(field(std::mem::take(&mut buf))?);
+                    self.push_span(start);
+                    start = self.arena.len();
                     quoted = false;
                 }
                 Some(b'\n') => {
-                    if fields.is_empty() && buf.is_empty() {
+                    if self.spans.is_empty() && self.arena.len() == start {
                         continue; // 空行
                     }
-                    fields.push(field(buf)?);
+                    self.push_span(start);
                     self.recs += 1;
-                    return Ok(Some(fields));
+                    return Ok(true);
                 }
                 Some(b'\r') => {
                     if self.src.peek()? == Some(b'\n') {
                         self.src.bump()?;
                     }
-                    if fields.is_empty() && buf.is_empty() {
+                    if self.spans.is_empty() && self.arena.len() == start {
                         continue; // 空行
                     }
-                    fields.push(field(buf)?);
+                    self.push_span(start);
                     self.recs += 1;
-                    return Ok(Some(fields));
+                    return Ok(true);
                 }
-                Some(c) => buf.push(c),
+                Some(c) => self.arena.push(c),
             }
         }
     }
 
+    #[inline]
+    fn push_span(&mut self, start: usize) {
+        self.spans
+            .push((start as u32, (self.arena.len() - start) as u32));
+    }
+
+    /// **冷路径**（表头 / 类型推断）：把当前记录物化成 `Vec<Option<String>>`。
+    /// 热路径（`next_batch`）不走这里 —— 它直接从 `spans`/`arena` 取 `&str`，
+    /// 免得为每个字段造一个 `String`。
+    fn next_record(&mut self) -> Result<Option<Vec<Option<String>>>> {
+        if !self.next_record_spans()? {
+            return Ok(None);
+        }
+        let mut out = Vec::with_capacity(self.spans.len());
+        for i in 0..self.spans.len() {
+            out.push(self.field(i)?.map(str::to_string));
+        }
+        Ok(Some(out))
+    }
+
     /// 引号态内容：`""` → 字面 `"`，其余（含换行）原样收。
-    fn read_quoted(&mut self, buf: &mut Vec<u8>) -> Result<()> {
+    fn read_quoted(src: &mut ByteSrc<R>, out: &mut Vec<u8>, recs: u64) -> Result<()> {
         loop {
-            match self.src.bump()? {
+            match src.bump()? {
                 None => {
                     return Err(QsdbError::parse_err(format!(
                         "read_csv: unterminated quoted field at record {}",
-                        self.recs + 1
+                        recs + 1
                     )));
                 }
                 Some(b'"') => {
-                    if self.src.peek()? == Some(b'"') {
-                        self.src.bump()?;
-                        buf.push(b'"');
+                    if src.peek()? == Some(b'"') {
+                        src.bump()?;
+                        out.push(b'"');
                     } else {
                         return Ok(());
                     }
                 }
-                Some(c) => buf.push(c),
+                Some(c) => out.push(c),
             }
         }
     }
-}
-
-/// 原始字节 → 字段值：空（含 `""`）→ NULL；非法 UTF-8 → 明确报错。
-///
-/// 为什么非法 UTF-8 要报错而不是 lossy 替换：推断结果里没有 BINARY 列，
-/// 脏字节只会变成一排 U+FFFD 混进字符串列——用户看到的是"查得到但内容是乱码"，
-/// 比一条明确的报错难排查得多。
-fn field(buf: Vec<u8>) -> Result<Option<String>> {
-    if buf.is_empty() {
-        return Ok(None);
-    }
-    String::from_utf8(buf)
-        .map(Some)
-        .map_err(|e| QsdbError::parse_err(format!("read_csv: field is not valid UTF-8: {e}")))
 }
 
 /// 打开本地文件。**不再外套 `BufReader`** —— 缓冲已经由 [`ByteSrc`] 自己管，
@@ -452,28 +501,37 @@ impl<R: Read> CsvFileReader<R> {
         }
         let mut rows = 0usize;
         while rows < BATCH_ROWS {
-            let Some(row) = self.rec.next_record()? else {
+            // **热路径不物化**：字段直接以 `&str` 从记录级 arena 取，
+            // 不再为每个字段造 `String`（见 `RecordReader::arena`）。
+            if !self.rec.next_record_spans()? {
                 break;
-            };
-            if row.len() != self.names.len() {
+            }
+            let nf = self.rec.nfields();
+            if nf != self.names.len() {
                 return Err(width_err(
                     &self.path,
                     self.rec.line_no(),
-                    row.len(),
+                    nf,
                     self.names.len(),
                 ));
             }
-            for (i, cell) in row.iter().enumerate() {
-                if let Some(b) = self.builders[i].as_mut() {
-                    b.push(cell.as_deref()).map_err(|e| {
-                        QsdbError::type_err(format!(
-                            "read_csv: {} record {} column '{}': {e}",
-                            self.path.display(),
-                            self.rec.line_no(),
-                            self.names[i]
-                        ))
-                    })?;
+            let line = self.rec.line_no();
+            for i in 0..nf {
+                if self.builders[i].is_none() {
+                    continue; // 未被选中的列：不解析、也不校验
                 }
+                // `cell` 借的是 `self.rec` 的 arena，`b` 借的是 `self.builders`
+                // —— 两个不相交的字段，借用检查器放行（别改成经由 `self` 的方法取）。
+                let cell = self.rec.field(i)?;
+                let b = self.builders[i].as_mut().expect("上面刚判过 Some");
+                b.push(cell).map_err(|e| {
+                    QsdbError::type_err(format!(
+                        "read_csv: {} record {} column '{}': {e}",
+                        self.path.display(),
+                        line,
+                        self.names[i]
+                    ))
+                })?;
             }
             rows += 1;
         }

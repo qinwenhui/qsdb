@@ -526,3 +526,50 @@ fn quoted_multiline_multibyte_straddling() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// **未被选中的列不做 UTF-8 校验** —— 列裁剪的承诺，模块头写着
+/// "省下未选列的类型解析与数组构建"。旧实现只做到"不建数组"，**每个字段
+/// 仍然走一遍 UTF-8 校验**（`field()` 对全体字段 eager 校验）；改走记录级
+/// arena 之后才是真跳过。
+///
+/// ⚠️ **边界要说清**：**推断窗口内（首文件的表头 + 前 1000 行）仍然全列校验**
+/// —— 那条路径走物化的 `next_record()`，与列裁剪无关。非法字节要落在这之后
+/// 才看得出差别。
+#[test]
+fn unselected_column_skips_utf8_validation() {
+    let root = tmp_root("utf8");
+    let f = root.join("t.csv");
+    let mut buf: Vec<u8> = b"a,b\n".to_vec();
+    for _ in 0..1000 {
+        buf.extend_from_slice(b"1,x\n"); // 推断窗口内：b 是合法 utf8
+    }
+    buf.extend_from_slice(b"2,");
+    buf.push(0xFF); // ← 非法 UTF-8，落在推断窗口之后
+    buf.extend_from_slice(b"\n3,y\n");
+    std::fs::write(&f, &buf).unwrap();
+
+    let db = db_at(&root);
+    // ① 不选中的列：必须成功（这 1001 行之后的脏字节不该拦住 `SELECT a`）
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT count(*) FROM read_csv('{}')", csv_path(&f))
+        ),
+        "1002"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            &format!(
+                "SELECT a FROM read_csv('{}') ORDER BY a LIMIT 2",
+                csv_path(&f)
+            )
+        ),
+        vec!["1", "1"]
+    );
+    // ② 选中那一列：必须**明确报错**，不许 lossy 成 U+FFFD
+    let e = err(&db, &format!("SELECT b FROM read_csv('{}')", csv_path(&f)));
+    assert!(e.contains("not valid UTF-8"), "要明说编码问题: {e}");
+
+    std::fs::remove_dir_all(&root).ok();
+}
