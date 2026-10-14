@@ -790,7 +790,22 @@ struct ScanPlan {
     /// `None` = 分区列（常量重建）；`Some(i)` = 读批的第 i 列
     /// （读批列序 = `read_columns` 序）。bind 期算定，避免组装批时
     /// 每批每列做 `schema.index_of(name)` 字符串查找。
-    proj_src: Vec<Option<usize>>,
+    proj_src: Vec<ProjSrc>,
+}
+
+/// 投影列的来源（见 `ScanPlan::proj_src`）。
+#[derive(Clone, Copy, Debug)]
+enum ProjSrc {
+    /// 分区列：从目录值常量重建（不读文件）
+    Partition,
+    /// 读批的第 i 列（读批列序 = `read_columns` 序）
+    Read(usize),
+    /// **本列不解码**（下游没人读）：按 NULL 产出。
+    ///
+    /// schema 与列序**一概不变**，所以上层索引一个字都不用改——
+    /// 这正是它比"收窄投影"安全的地方（后者要重映射全部索引）。
+    /// 见 `Scan::restrict_read`。
+    Null,
 }
 
 /// 计算 `proj_src`（见 `ScanPlan::proj_src`）。
@@ -798,14 +813,19 @@ fn compute_proj_src(
     def: &TableDef,
     projection: &[String],
     read_columns: &[String],
-) -> Vec<Option<usize>> {
+) -> Vec<ProjSrc> {
     projection
         .iter()
         .map(|name| {
             if def.partition_keys.iter().any(|k| k == name) {
-                None
+                ProjSrc::Partition
             } else {
-                read_columns.iter().position(|c| c == name)
+                match read_columns.iter().position(|c| c == name) {
+                    Some(i) => ProjSrc::Read(i),
+                    // 投影里有、读列里没有：正常构建路径不会发生（read ⊇ 投影）；
+                    // 只有 `restrict_read` 会造出这种组合 ⇒ 那时是"故意不读"。
+                    None => ProjSrc::Null,
+                }
             }
         })
         .collect()
@@ -1464,8 +1484,13 @@ fn assemble_output(
     let mut cols: Vec<ArrayRef> = Vec::with_capacity(plan.projection.len());
     // 用 bind 期算定的 proj_src（原实现每批每列做 schema.index_of 字符串查找）
     for (i, name) in plan.projection.iter().enumerate() {
-        match plan.proj_src.get(i).copied().flatten() {
-            None => {
+        match plan.proj_src.get(i).copied().unwrap_or(ProjSrc::Null) {
+            ProjSrc::Null => {
+                // **本列不解码**：按 NULL 产出，列数与类型照 schema（下游没人读它）
+                let dt = plan.output_schema.field(i).data_type().clone();
+                cols.push(arrow::array::new_null_array(&dt, n));
+            }
+            ProjSrc::Partition => {
                 // 分区列：从目录值常量重建
                 let pv = partition_values
                     .get(name)
@@ -1473,7 +1498,7 @@ fn assemble_output(
                 let c = plan.def.column(name).unwrap();
                 cols.push(constant_array(pv, &c.logical_type.arrow_type(), n)?);
             }
-            Some(idx) => {
+            ProjSrc::Read(idx) => {
                 let col = filtered.column(idx);
                 cols.push(if col.len() == n {
                     Arc::clone(col)
@@ -1677,6 +1702,65 @@ impl Scan {
             par: None,
             par_tried: true,
         })
+    }
+
+    /// **只解码这些列**（其余按 `ProjSrc::Null` 产出——列还在、列序不变、值为 NULL）。
+    ///
+    /// 为什么值得（2026-10-14 实测）：扫描代价几乎线性于**解码列宽**——
+    /// 同一张 5M 行表只读 2 列 **0.18s**、读全 7 列 **0.63s**；
+    /// 而基准那句 join 的 1.19s 里**扫描占 0.63s（53%）**，聚合却只用 2 列。
+    ///
+    /// ⚠️ 与 [`Scan::with_projection`] 的分工（**别混**）：
+    /// - `with_projection`：**改 schema**（列真的变少）⇒ 上层索引必须重映射；
+    /// - `restrict_read`：**不改 schema**（列还在、值是 NULL）⇒ 上层一个字都不用改。
+    ///   后者安全得多，所以"能证明没人读"的场景优先用它。
+    ///
+    /// **谓词引用的列无条件保留**（不保留就没法求值）；分区列本来就不读文件。
+    /// 缓存键含读列集（`CacheSig::projection`）⇒ 少读与全读是不同条目，不会互相毒化。
+    pub fn restrict_read(&self, keep: &[String]) -> Self {
+        let mut need: HashSet<String> = HashSet::new();
+        for k in keep {
+            need.insert(k.to_ascii_lowercase());
+        }
+        if let Some(p) = &self.plan.predicate {
+            let mut s = HashSet::new();
+            p.referenced_columns(&mut s);
+            for c in s {
+                need.insert(c.to_ascii_lowercase());
+            }
+        }
+        let read: Vec<String> = self
+            .plan
+            .read_columns
+            .iter()
+            .filter(|c| need.contains(&c.to_ascii_lowercase()))
+            .cloned()
+            .collect();
+        let proj_src = compute_proj_src(&self.plan.def, &self.plan.projection, &read);
+        let plan = ScanPlan {
+            def: Arc::clone(&self.plan.def),
+            projection: self.plan.projection.clone(),
+            read_columns: read,
+            predicate: self.plan.predicate.clone(),
+            output_schema: Arc::clone(&self.plan.output_schema),
+            proj_src,
+        };
+        Self {
+            plan: Arc::new(plan),
+            files: self.files.clone(),
+            current: None,
+            missing_cols: Vec::new(),
+            cast_cols: Vec::new(),
+            pending_collector: None,
+            remaining: self.remaining,
+            cache: self.cache.clone(),
+            ctx: Arc::clone(&self.ctx),
+            store: Arc::clone(&self.store),
+            file_cache: self.file_cache.clone(),
+            is_shard: self.is_shard,
+            par: None,
+            par_tried: true,
+        }
     }
 
     /// 外表扫描（read_parquet，M6-2）：显式文件列表，无分区列。

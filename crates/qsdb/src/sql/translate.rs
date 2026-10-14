@@ -24,6 +24,13 @@ pub enum LogicalPlan {
     Scan {
         def: Arc<TableDef>,
         predicate: Option<Predicate>,
+        /// **只解码这些列**（`None` = 全部）。列还在、列序不变，未列出的产出 NULL
+        /// ——见 `Scan::restrict_read`。由 `exec_builder::annotate_join_needs`
+        /// 在"能证明下游不读它"时设置（join 之下的聚合链）。
+        ///
+        /// 收益（2026-10-14 实测）：扫描代价几乎线性于解码列宽 —— 同一张 5M 行表
+        /// 只读 2 列 0.18s、读全 7 列 0.63s，而基准那句 join 里扫描占 53%。
+        read: Option<Arc<Vec<String>>>,
     },
     /// 外表 parquet 扫描（read_parquet，M6-2）：文件列表绑定期解析，
     /// schema 取自首文件 footer；无分区列
@@ -1418,6 +1425,7 @@ fn resolve_table_source(
         LogicalPlan::Scan {
             def: Arc::clone(&def),
             predicate: None,
+            read: None,
         },
         SchemaCtx::from_table(&def),
     ))
@@ -2527,6 +2535,7 @@ fn translate_select_inner(
                         LogicalPlan::Scan {
                             def: Arc::clone(&right_def),
                             predicate: None,
+                            read: None,
                         },
                         right_def
                             .columns

@@ -328,9 +328,14 @@ fn build_mapping(all: &[String], proj: &[String]) -> Vec<Option<usize>> {
 /// `all`：表全列名——非表列（聚合输出列如 sum(x)）保持原 idx。
 fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -> LogicalPlan {
     match plan {
-        LogicalPlan::Scan { def, predicate } => LogicalPlan::Scan {
+        LogicalPlan::Scan {
+            def,
+            predicate,
+            read,
+        } => LogicalPlan::Scan {
             def: Arc::clone(def),
             predicate: predicate.clone(),
+            read: read.clone(),
         },
         LogicalPlan::Join {
             left,
@@ -550,22 +555,36 @@ fn build_inner(
     ctx: &Arc<crate::query::QueryContext>,
 ) -> Result<Box<dyn ExecNode>> {
     match plan {
-        LogicalPlan::Scan { def, predicate } => {
+        LogicalPlan::Scan {
+            def,
+            predicate,
+            read,
+        } => {
+            let _ = read;
             // 分片重写（见 `ShardScope`）：命中就用分片，**按当前调用点的投影重建**
             // （join 的键列投影下推会让同一 Scan 在不同调用点要不同的投影；
             // 直接复用会列错位——`Scan::with_projection` 的注释里有详细说明）。
             // 分片任务内**串行**拉取（ScanExec，不用 ParScanExec）：嵌套并行会与
             // 分片任务互锁同一 rayon 池（M4 教训）。
             if let Some(shard) = take_shard_override(&def.name) {
-                let scan = shard.with_projection(scan_proj)?;
+                // 分片沿用分片的文件划分，**投影按当前调用点重建**，再叠"只读这些列"
+                let mut scan = shard.with_projection(scan_proj)?;
+                if let Some(keep) = read {
+                    scan = scan.restrict_read(keep);
+                }
                 return Ok(Box::new(ScanExec::new(scan)));
             }
-            let scan = db.scan(ScanRequest {
+            let mut scan = db.scan(ScanRequest {
                 table: def.name.clone(),
                 predicate: predicate.clone(),
                 projection: scan_proj,
                 ..Default::default()
             })?;
+            // ★ 只解码下游真读的列（见 `annotate_join_needs` / `Scan::restrict_read`）：
+            // schema 与列序不变，未列出的列产出 NULL ⇒ 上层索引一个字都不用改。
+            if let Some(keep) = read {
+                scan = scan.restrict_read(keep);
+            }
             Ok(crate::exec::par_scan::make_scan(scan, ctx))
         }
         LogicalPlan::ExternalScan {
@@ -625,7 +644,8 @@ fn build_inner(
             // ★ join 输出投影下推（P1⑥）：**聚合是 join 输出唯一的读者**，
             // 且它的表达式可枚举 ⇒ "哪几列没人读"是**可证的**（不是猜的）。
             // 标注结果只影响"join 少物化那几列"（填 NULL），schema 与索引**一概不动**。
-            let narrowed = annotate_join_needs(input, group, aggs);
+            // `scan_proj.is_none()` = 计划没被外层裁剪过 ⇒ 位置在全表空间，可下推到 Scan
+            let narrowed = annotate_join_needs(input, group, aggs, scan_proj.is_none());
             build_aggregate(db, &narrowed, group, aggs, &scan_proj, ctx)
         }
         LogicalPlan::Sort { input, keys } => Ok(Box::new(SortExec::new(
@@ -945,10 +965,12 @@ fn try_project_join(
         LogicalPlan::Scan {
             def: ldef,
             predicate: None,
+            ..
         },
         LogicalPlan::Scan {
             def: rdef,
             predicate: None,
+            ..
         },
     ) = (left, right)
     else {
@@ -1059,7 +1081,12 @@ fn try_project_join(
 ///
 /// ⚠️ 实测依据（2026-10-14，.14）：join 输出宽 10 列 → 5 列，**时间减半**
 /// （1.33s → 0.63s，峰值 RSS 300MB → 111MB）。基准那句聚合只读 2 列。
-fn annotate_join_needs(plan: &LogicalPlan, group: &[PhysExpr], aggs: &[AggExpr]) -> LogicalPlan {
+fn annotate_join_needs(
+    plan: &LogicalPlan,
+    group: &[PhysExpr],
+    aggs: &[AggExpr],
+    allow_scan_read: bool,
+) -> LogicalPlan {
     let mut needed: Vec<usize> = Vec::new();
     for g in group {
         g.collect_columns(&mut needed);
@@ -1075,11 +1102,19 @@ fn annotate_join_needs(plan: &LogicalPlan, group: &[PhysExpr], aggs: &[AggExpr])
         return plan.clone();
     }
     let needed: Vec<u32> = needed.into_iter().map(|i| i as u32).collect();
-    annotate_walk(plan, &needed)
+    annotate_walk(plan, &needed, allow_scan_read)
 }
 
 /// 见 [`annotate_join_needs`]。`needed` = **本子树输出**里必须真实产出的位置。
-fn annotate_walk(plan: &LogicalPlan, needed: &[u32]) -> LogicalPlan {
+///
+/// ⚠️ `allow_scan_read` 是**必需**的闸门，不是保守选项：`build()` 的单表列裁剪会
+/// 把整棵计划的索引**重映射到裁剪后的空间**（`rewrite_plan`），而那个空间里的
+/// 位置 **不能**拿去查 `def.columns`（全表序）——查出来是**别的列**。
+/// 实测（2026-10-14）：`SELECT round(sum(score)) FROM t` 因此把 `cnt` 当成了
+/// `score`，扫描读了个空集 ⇒ 聚合回 NULL。**同一个 plan 里位置属于哪个空间，
+/// 是这个优化最容易错的地方**（这次是既有测试抓住的）。
+/// 判据：`scan_proj.is_some()` ⟺ 已被外层裁剪（位置在裁剪空间）。
+fn annotate_walk(plan: &LogicalPlan, needed: &[u32], allow_scan_read: bool) -> LogicalPlan {
     match plan {
         // Filter 是恒等 schema 的透传：它读的位置也必须在
         LogicalPlan::Filter { input, predicate } => {
@@ -1093,7 +1128,7 @@ fn annotate_walk(plan: &LogicalPlan, needed: &[u32]) -> LogicalPlan {
                 }
             }
             LogicalPlan::Filter {
-                input: Box::new(annotate_walk(input, &n)),
+                input: Box::new(annotate_walk(input, &n, allow_scan_read)),
                 predicate: predicate.clone(),
             }
         }
@@ -1142,12 +1177,42 @@ fn annotate_walk(plan: &LogicalPlan, needed: &[u32]) -> LogicalPlan {
                 }
             }
             LogicalPlan::Join {
-                left: Box::new(annotate_walk(left, &ln)),
-                right: Box::new(annotate_walk(right, &rn)),
+                left: Box::new(annotate_walk(left, &ln, allow_scan_read)),
+                right: Box::new(annotate_walk(right, &rn, allow_scan_read)),
                 left_keys: left_keys.clone(),
                 right_keys: right_keys.clone(),
                 join_type: *join_type,
                 needed: Some(Arc::new(needed.to_vec())),
+            }
+        }
+        // **裸表**：只解码"下游真要的那几列"（列还在、列序不变，其余产出 NULL）。
+        // 这是实测最大的一块：扫描代价几乎线性于解码列宽，而基准那句 join 里
+        // 扫描占一半以上、聚合却只用 2 列。见 `Scan::restrict_read`。
+        LogicalPlan::Scan {
+            def,
+            predicate,
+            read: _,
+        } => {
+            // 位置不在全表空间（外层做过列裁剪）⇒ 不能按 `def.columns` 查，停手
+            if !allow_scan_read {
+                return plan.clone();
+            }
+            let mut cols: Vec<String> = Vec::new();
+            for &p in needed {
+                if let Some(c) = def.columns.get(p as usize) {
+                    if !cols.iter().any(|x| x.eq_ignore_ascii_case(&c.name)) {
+                        cols.push(c.name.clone());
+                    }
+                }
+            }
+            // 空（没人读）或没省下东西 ⇒ 维持原样
+            if cols.is_empty() || cols.len() >= def.columns.len() {
+                return plan.clone();
+            }
+            LogicalPlan::Scan {
+                def: Arc::clone(def),
+                predicate: predicate.clone(),
+                read: Some(Arc::new(cols)),
             }
         }
         // 其它形状：读取集合无法枚举 ⇒ 停手（= 全列 = 今天的行为）
@@ -1223,6 +1288,7 @@ fn build_aggregate(
                         let LogicalPlan::Scan {
                             def,
                             predicate: None,
+                            ..
                         } = pl
                         else {
                             return (pl.clone(), keys.to_vec(), None);
@@ -1851,6 +1917,7 @@ fn try_shard_source(
                 let LogicalPlan::Scan {
                     def: rdef,
                     predicate: None,
+                    ..
                 } = &**right
                 else {
                     return None;
@@ -1862,7 +1929,11 @@ fn try_shard_source(
                 joins += 1;
                 cur = left;
             }
-            LogicalPlan::Scan { def, predicate } => {
+            LogicalPlan::Scan {
+                def,
+                predicate,
+                read: _,
+            } => {
                 let scan = db
                     .scan_with_context(
                         ScanRequest {

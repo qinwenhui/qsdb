@@ -563,7 +563,12 @@ fn metadata_shortcut_count(
         return Ok(None);
     }
     // Scan：谓词仅引用分区列
-    let LogicalPlan::Scan { def, predicate } = input else {
+    let LogicalPlan::Scan {
+        def,
+        predicate,
+        read: _,
+    } = input
+    else {
         return Ok(None);
     };
     // 无分区表：无谓词 → footer 元数据（parquet num_rows，零解码，DuckDB 同款）；
