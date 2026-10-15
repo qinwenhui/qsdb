@@ -145,7 +145,8 @@
 | `TRUNCATE TABLE` | ✅ | |
 | `CREATE TABLE`（含 `PARTITIONED BY`、`NOT NULL`、`CHECK`、`COMMENT`） | ✅ | **分区表至少要有一个非分区列**（否则数据文件零列，见 `docs/进度与待办.md` §三之四） |
 | 列 `DEFAULT` 值 | ✋ | 静默忽略会写入 NULL 而非默认值 |
-| `CREATE TABLE … AS SELECT`（CTAS） | ✋ | `unsupported: CREATE TABLE … AS SELECT (CTAS) 未实现 —— 用 \`CREATE TABLE\` + \`INSERT INTO … SELECT …\``。<br>⚠️ 2026-10-15 实测：此前报的仍是 **`invalid argument: table needs at least one column`**（把"没实现"说成"你建表建错了"），而本表当时**声称**"文案已明确" —— **那条自述根本没落地**（与 F29② 同款失败模式）。现已修 |
+| `CREATE TABLE … AS SELECT`（CTAS） | ✅ | 2026-10-15 实现（生态功能批次 4）。**列名与类型由 SELECT 的输出推导**（`SELECT *` / 表达式 / JOIN 都行）；也支持写显式列清单（`CREATE TABLE t (g BIGINT, n BIGINT) AS SELECT …`，列数须与查询一致）。支持 `PARTITIONED BY`。源可以是 CTE / 派生表 / JOIN。<br>⚠️ **表达式列名会被拒**：`SELECT g, count(*)` 推导出 `count(*)`，那不是合法表列名（限 `[A-Za-z_][A-Za-z0-9_]*`）⇒ 报错并指路（`… AS n` 别名，或写显式列清单）。**本仓不替用户改名** —— PG 会改成 `count`，那是另一种静默（表里出现你没写过的列名）。<br>⚠️ JOIN 的**限定名会剥掉表限定**（`a.g` ⇒ `g`，与 PG 一致）；剥完重名（`SELECT a.g, b.g`）会报出来。<br>⚠️ **失败会回滚**（把刚建的表删掉）—— PG 的 CTAS 是全有全无。但**表已存在**时是 `AlreadyExists`，**不会**动旧表。<br>⚠️ `WITH … CREATE TABLE …`（CTE 在前）sqlparser 不认，写成 `CREATE TABLE … AS WITH … SELECT …`。<br>值级验收 `tests/create_table_as.rs` |
+| `CREATE OR REPLACE TABLE … AS SELECT` | ✋ | 与不带 `AS SELECT` 的形态一样拒（判断在 CTAS 分支**之前**）。先 `DROP TABLE` 再 `CREATE`；只想换数据用 `INSERT OVERWRITE` |
 | `CREATE OR REPLACE TABLE` | ✋ | `unsupported: CREATE OR REPLACE TABLE 未实现 —— 先 \`DROP TABLE\` 再 \`CREATE\``（2026-10-15 修；此前报 `already exists`，误导） |
 | `ALTER TABLE … ADD COLUMN` | ✅ | |
 | `ALTER TABLE … DROP COLUMN` | ✋ | |
