@@ -41,7 +41,7 @@
 | import_parquet | 写段 |
 | import_csv | **CSV 解析** |
 | export_parquet | ✅ **已有导出原语**（A3 `COPY … TO`，分块并行编码） |
-| export_csv | **没有 CSV 导出原语**（只支持 parquet） |
+| export_csv | ✅ **已有导出原语**（`FORMAT CSV`，分块并行格式化 + 按序写单文件） |
 
 **规律（一句话）**：**我们赢在"少干活"，输在"要干活但没并行 / 没原语"。**
 DuckDB 是 morsel 驱动的**全算子并行**流水线；我们的算子与写路径历史上多是单线程串行
