@@ -1189,22 +1189,6 @@ fn insert_values(
 /// 已知边界：SELECT 返回 0 行时 OVERWRITE 是**无操作**（没有行 → 推不出要替换
 /// 哪个分区）；`INSERT OVERWRITE t SELECT … WHERE false` 不会清空目标分区。
 /// CTAS 推导列名时**去掉表限定**：`a.g` ⇒ `g`（与 PG 一致）。
-///
-/// 为什么必须剥：JOIN 场景下本仓的列名是**限定名**（`a.g` —— 裸名恒解析到左表，
-/// 右表列必须限定，见 `SQL支持面.md` §二），而表列名不允许 `.`
-/// ⇒ 不剥的话 `CREATE TABLE j AS SELECT a.g, b.v FROM t a JOIN t b …` 必被拒，
-/// 而那是最普通的写法之一。
-///
-/// 只在**形如 `标识符.标识符`** 时剥：表列名限 `[A-Za-z_][A-Za-z0-9_]*`，
-/// 所以带 `.` 的推导名**只可能**是限定引用（不可能是"某个列本来就叫 a.b"）。
-/// 剥完若重名（`SELECT a.g, b.g`），下游的重复检查会报出来。
-fn strip_table_qualifier(n: &str) -> &str {
-    match n.rsplit_once('.') {
-        Some((q, c)) if crate::catalog::ident_ok(q) && crate::catalog::ident_ok(c) => c,
-        _ => n,
-    }
-}
-
 /// `CREATE TABLE … AS SELECT …`：**派 schema → 建表 → 跑查询落表**，失败则回滚。
 ///
 /// 与"手工两步"（`CREATE TABLE` + `INSERT INTO … SELECT …`）的差别只有两条：
@@ -1294,7 +1278,7 @@ fn create_table_as(
         // 静默** —— 表里会出现一个他从没写过的列名，而"改名"这件事本身还可能撞车。
         let out: Vec<(String, crate::types::LogicalType)> = out
             .into_iter()
-            .map(|(n, t)| (strip_table_qualifier(&n).to_string(), t))
+            .map(|(n, t)| (translate::strip_table_qualifier(&n).to_string(), t))
             .collect();
         for (i, (n, _)) in out.iter().enumerate() {
             if !crate::catalog::ident_ok(n) {

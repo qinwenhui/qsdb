@@ -1686,11 +1686,51 @@ impl SchemaCtx {
         }
     }
 
+    /// 内部探测用：有这一列吗？（**命中多个取第一个**）
+    ///
+    /// ⚠️ 只给"这个 ctx 里有没有 X"这类判断用。**解析用户写的列名一律走
+    /// [`SchemaCtx::resolve_opt`]** —— 它重名会报错，这条是 F30 的核心
+    /// （见 `docs/结果集列名口径.md` §三）。
     pub fn index_of(&self, name: &str) -> Option<usize> {
         let lower = name.to_ascii_lowercase();
         self.cols
             .iter()
             .position(|(n, _)| n.to_ascii_lowercase() == lower)
+    }
+
+    /// **解析用户写的列名**（F30）。
+    ///
+    /// - `Ok(Some(i))`：唯一命中。
+    /// - `Ok(None)`：没有这一列（调用方自己组织文案，好带上各自的上下文）。
+    /// - `Err(…)`：**重名 ⇒ 显式报错**。
+    ///
+    /// ★ 为什么重名必须报错而不是取第一个：剥掉表限定之后，`SELECT a.v, b.v
+    /// FROM a JOIN b` 的结果集列名就是两个 `v` —— 而"JOIN 两侧同名列"是**极常见**
+    /// 的形状。取第一个 = 把一个本来能跑的查询变成**静默错值**。
+    /// PG 在这里的措辞是 `column reference "v" is ambiguous`。
+    ///
+    /// ⚠️ 重名只可能来自**派生表 / CTE**（基表与 join 的 ctx 天然无重名：左裸右
+    /// 限定，且列名不许带 `.`）⇒ 这条检查不会误伤正常查询。
+    pub fn resolve_opt(&self, name: &str) -> Result<Option<usize>> {
+        let lower = name.to_ascii_lowercase();
+        let mut hit: Option<usize> = None;
+        for (i, (n, _)) in self.cols.iter().enumerate() {
+            if n.to_ascii_lowercase() != lower {
+                continue;
+            }
+            if hit.is_some() {
+                // ⚠️ 这里**不能**建议"用表限定名" —— 重名只发生在派生表/CTE 的
+                //    输出上，而那一层的限定名（`a.id`）根本不在 ctx 里，写了也没用。
+                //    唯一的出路是在**产生重名的那个子查询**里起别名。
+                return Err(QsdbError::invalid(format!(
+                    "column reference '{name}' is ambiguous —— 这个查询的输出里有多个\
+                     叫 `{name}` 的列。请在**产生它们的那一层**给其中一列起别名\
+                     （如 `SELECT a.{name} AS {name}_a, b.{name} … FROM …`）"
+                )));
+            }
+            hit = Some(i);
+        }
+        Ok(hit)
     }
 
     pub fn ty_of(&self, idx: usize) -> &LogicalType {
@@ -3383,17 +3423,28 @@ fn translate_select_inner(
     struct ProjItem {
         sql: Expr,
         name: String,
+        /// `SELECT *` 展开出来的项：**按下标绑定**，不走名字解析。
+        ///
+        /// 理由（F30）：剥掉表限定之后，派生表里会出现重名（`SELECT a.id, b.id …`
+        /// 的输出就是两个 `id`），而 `SELECT *` 恰恰要**原样透传**它们 ——
+        /// `SELECT * FROM (SELECT a.id, b.id …) x` 在 PG 里就出两个同名列。
+        /// 按名字绑会在那里报 "ambiguous"，可那**不是用户在引用一个名字**，
+        /// 是通配展开 —— 按下标才是它本来的语义。
+        wild_idx: Option<usize>,
     }
     let mut items = Vec::new();
     for (i, item) in select.projection.iter().enumerate() {
         match item {
             SelectItem::UnnamedExpr(e) => items.push(ProjItem {
                 sql: proj_extracted[i].clone().expect("scalar-sub extracted"),
-                name: expr_display(e),
+                // F30：裸列引用剥表限定（`t.v` ⇒ `v`）；表达式原样
+                name: output_name_of(e),
+                wild_idx: None,
             }),
             SelectItem::ExprWithAlias { alias, .. } => items.push(ProjItem {
                 sql: proj_extracted[i].clone().expect("scalar-sub extracted"),
                 name: alias.value.clone(),
+                wild_idx: None,
             }),
             SelectItem::Wildcard(_) => {
                 if !group_exprs.is_empty() {
@@ -3401,10 +3452,11 @@ fn translate_select_inner(
                         "SELECT * with GROUP BY not supported; list group columns explicitly",
                     ));
                 }
-                for (name, _) in &ctx.cols {
+                for (wi, (name, _)) in ctx.cols.iter().enumerate() {
                     items.push(ProjItem {
                         sql: Expr::Identifier(Ident::new(name.clone())),
-                        name: name.clone(),
+                        name: strip_table_qualifier(name).to_string(),
+                        wild_idx: Some(wi),
                     });
                 }
             }
@@ -3418,6 +3470,12 @@ fn translate_select_inner(
             }
         }
     }
+
+    // 投影表达式的**原文**（F30）：`ORDER BY` 认列时要用它 —— 投影名剥了表限定
+    // 之后，`ORDER BY d.label` 按名再也比不中（见 ORDER BY 那段）。
+    // ⚠️ 用 AST 的 `expr_display`（`t.v + 1`），**不能**用 `PhysExpr::display()`
+    //    （后者带括号 `(t.v + 1)`）—— 两个渲染器永远比不中，本仓栽过一次。
+    let proj_display: Vec<String> = items.iter().map(|it| expr_display(&it.sql)).collect();
 
     // 聚合检测与收集
     let mut aggs: Vec<AggExpr> = Vec::new();
@@ -3543,7 +3601,22 @@ fn translate_select_inner(
             } else {
                 it.sql.clone()
             };
-            proj_exprs.push(bind_expr(&sub, &proj_ctx)?);
+            // `SELECT *` 展开的项**按下标绑**（见 `ProjItem::wild_idx` 的说明）
+            let bound = match it.wild_idx {
+                Some(i) => {
+                    let (n, t) = proj_ctx
+                        .cols
+                        .get(i)
+                        .ok_or_else(|| QsdbError::invalid("内部错误：通配展开的下标越界"))?;
+                    PhysExpr::Column {
+                        idx: i,
+                        name: n.clone(),
+                        ty: t.clone(),
+                    }
+                }
+                None => bind_expr(&sub, &proj_ctx)?,
+            };
+            proj_exprs.push(bound);
             proj_names.push(it.name.clone());
         }
         plan = LogicalPlan::Project {
@@ -3601,8 +3674,12 @@ fn translate_select_inner(
             };
             // 别名/输出名优先：Identifier 查输出名；纯数字字面量 = 输出序号
             //（1-based，SQL 标准）；其他表达式按 display 匹配投影
+            //
+            // ⚠️ 走 `resolve_opt`（重名报错）而不是 `index_of`：`ORDER BY v` 撞上
+            //    两个 `v` 时，PG 报的就是 `ORDER BY "v" is ambiguous` —— 静默按第一个
+            //    排序等于**排错还没人知道**。
             let by_output = match key_expr {
-                Expr::Identifier(id) => out_ctx.index_of(&id.value),
+                Expr::Identifier(id) => out_ctx.resolve_opt(&id.value)?,
                 Expr::Value(v) => match &v.value {
                     // 纯数字 = 输出列序号（1-based，SQL 标准）。
                     // **越界/非整数必须显式拒**：悄悄退回"当常量"等于**不排序**
@@ -3628,8 +3705,18 @@ fn translate_select_inner(
                     _ => None,
                 },
                 other => {
+                    // F30：投影名现在**剥了表限定**（`SELECT d.label` ⇒ `label`），
+                    // 而 ORDER BY 写的还是 `d.label` ⇒ 按**名**比对不上。
+                    //
+                    // ⚠️ 这里匹配的是**投影表达式**（`items[i].sql` 的原文），不是
+                    //    "按末段再匹配一次名"。差别很要紧：后者会把 `ORDER BY b.id`
+                    //    匹配到碰巧叫 `id` 的**另一个**投影列（`a.id`）—— 值全对、
+                    //    **顺序错**，最难发现的一类。按表达式原文比就不会串。
                     let d = expr_display(other);
-                    proj_names.iter().position(|n| n.eq_ignore_ascii_case(&d))
+                    proj_names
+                        .iter()
+                        .position(|n| n.eq_ignore_ascii_case(&d))
+                        .or_else(|| proj_display.iter().position(|p| p.eq_ignore_ascii_case(&d)))
                 }
             };
             match by_output {
@@ -4524,6 +4611,67 @@ fn expr_display(e: &sqlparser::ast::Expr) -> String {
     e.to_string()
 }
 
+/// 剥掉表限定：`t.v` ⇒ `v`（**段数不匹配就原样返回**，不猜）。
+///
+/// F30（`docs/结果集列名口径.md`）：结果集的列名与 PG 对齐 —— **只剥限定符**。
+/// 分界线是「**剥掉限定符 ≠ 编造名字**」：
+/// - `t.v` ⇒ `v`：`v` 就是用户写的列名，去掉的只是**消歧用的表限定** —— 该做；
+/// - `count(*)` ⇒ `count`：`count` 用户从没写过 —— **不做**（那正是本仓一路在
+///   消灭的"静默"，CTAS 里也据此明确拒过）。
+///
+/// 只在 `q`/`c` 都是合法标识符时才剥，避免把真的含点的名字（本仓列名不许带
+/// `.`，所以这是防御）剥坏。
+pub(crate) fn strip_table_qualifier(n: &str) -> &str {
+    match n.rsplit_once('.') {
+        Some((q, c)) if crate::catalog::ident_ok(q) && crate::catalog::ident_ok(c) => c,
+        _ => n,
+    }
+}
+
+/// **投影输出名**：裸列引用剥限定符，其余（表达式）原样。
+///
+/// ⚠️ 只用于**输出名**。绑定用的 `SchemaCtx::cols` 里仍然保留限定名
+/// （`t.v` 是它消歧的手段），两条路必须分开 —— 混了会让 `t.v` 绑不上。
+fn output_name_of(e: &sqlparser::ast::Expr) -> String {
+    use sqlparser::ast::Expr as E;
+    match e {
+        // `SELECT v` / `SELECT t.v` / `SELECT db.t.v` —— 都是"取这一列"
+        E::Identifier(id) => id.value.clone(),
+        E::CompoundIdentifier(parts) => match parts.last() {
+            Some(last) => last.value.clone(),
+            None => expr_display(e),
+        },
+        // `count(*)` / `t.v + 1` / `sum(v)` —— **原样**（见本函数的文档）
+        _ => expr_display(e),
+    }
+}
+
+/// 列名没解析到时的报错。
+///
+/// **JOIN 右表的列只以限定名注册**（见 `translate_select_inner` 里 ctx 扩展处的
+/// 注释）：裸名恒解析到左表。所以"没找到"若其实是右侧的列，直接说清该怎么写 ——
+/// 否则用户只会看到"列不存在"而去怀疑列名拼错。
+///
+/// ⚠️ 判据必须要求那名**带限定符**（`n.rsplit_once('.')`）。F30 实测踩过：
+/// 这条提示原本只看"尾名相同"，于是对着**派生表**（输出名恰好叫 `t.v` 那种历史
+/// 形态）也会说 "a JOIN right-side column exists" —— **那句里根本没有 JOIN**，
+/// 用户会往完全错误的方向排查。剥限定符之后这种 ctx 不存在了，但仍保留判据，
+/// 因为"尾名相同但不是限定名"还能来自别处。
+fn not_found_with_hint(ctx: &SchemaCtx, name: &str) -> QsdbError {
+    let hint = ctx
+        .cols
+        .iter()
+        .find(|(n, _)| n.rsplit_once('.').is_some_and(|(_, c)| c == name))
+        .map(|(n, _)| {
+            format!(
+                " (a JOIN right-side column with this name exists — qualify it as `{n}`: \
+                 unqualified names resolve to the left input only)"
+            )
+        })
+        .unwrap_or_default();
+    QsdbError::column_not_found(format!("column '{name}'{hint}"))
+}
+
 // ---------------------------------------------------------------------------
 // 表达式绑定（无聚合上下文）
 // ---------------------------------------------------------------------------
@@ -4537,22 +4685,10 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
     use sqlparser::ast::Expr as E;
     match e {
         E::Identifier(id) => {
-            let idx = ctx.index_of(&id.value).ok_or_else(|| {
-                // **JOIN 右表的列只以限定名注册**（见 `translate_select_inner` 里
-                // ctx 扩展处的注释）：裸名恒解析到左表。所以"没找到"若其实是右侧的列，
-                // 直接说清该怎么写——否则用户只会看到"列不存在"而去怀疑列名拼错。
-                let hint = ctx
-                    .cols
-                    .iter()
-                    .find(|(n, _)| n.rsplit_once('.').is_some_and(|(_, c)| c == id.value))
-                    .map(|(n, _)| {
-                        format!(
-                            " (a JOIN right-side column with this name exists — qualify it as `{n}`:                              unqualified names resolve to the left input only)"
-                        )
-                    })
-                    .unwrap_or_default();
-                QsdbError::column_not_found(format!("column '{}'{hint}", id.value))
-            })?;
+            // `resolve_opt`：**重名会 Err**（F30），不再静默取第一个
+            let idx = ctx
+                .resolve_opt(&id.value)?
+                .ok_or_else(|| not_found_with_hint(ctx, &id.value))?;
             Ok(PhysExpr::Column {
                 idx,
                 name: ctx.cols[idx].0.clone(),
@@ -4561,13 +4697,14 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
         }
         E::CompoundIdentifier(parts) if parts.len() == 2 => {
             let qual = format!("{}.{}", parts[0].value, parts[1].value);
-            // 限定名优先（JOIN 右表列以 table.col 注册）；无则退回裸列名
-            let idx = ctx
-                .index_of(&qual)
-                .or_else(|| ctx.index_of(&parts[1].value))
-                .ok_or_else(|| {
-                    QsdbError::column_not_found(format!("column '{}'", parts[1].value))
-                })?;
+            // 限定名优先（JOIN 右表列以 table.col 注册）；**只有"根本没有"才**退回
+            // 裸列名 —— 重名（Err）必须原样上抛，别被这条退路吞掉。
+            let idx = match ctx.resolve_opt(&qual)? {
+                Some(i) => i,
+                None => ctx
+                    .resolve_opt(&parts[1].value)?
+                    .ok_or_else(|| not_found_with_hint(ctx, &parts[1].value))?,
+            };
             Ok(PhysExpr::Column {
                 idx,
                 name: ctx.cols[idx].0.clone(),

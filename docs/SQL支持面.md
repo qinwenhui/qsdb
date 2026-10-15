@@ -25,6 +25,7 @@
 | `SELECT *` | ✅ | |
 | `SELECT t.*`（限定通配） | ✋ | |
 | `SELECT * EXCLUDE/EXCEPT/REPLACE/RENAME/ILIKE` | ✋ | |
+| **结果集列名**（未起别名时） | ✅ | **2026-10-15（F30）**。**裸列引用剥表限定**：`SELECT t.v FROM t` ⇒ 列名 **`v`**；`SELECT * FROM t JOIN u …` ⇒ `id, v, id, name`（原来左裸右限定）。**表达式列名原样**（`count(*)` / `sum(v)` / `t.v + 1`）—— **不编造** `count` 那种用户没写过的名字（PG 会给，本仓明确不做；要短名请写 `AS`）。<br>⚠️ **重名列被引用 ⇒ 报错**：`SELECT v FROM (SELECT 1 AS v, 2 AS v) x` → `column reference 'v' is ambiguous`。此前**静默取第一个**（静默错值）—— 剥限定符后 `SELECT a.v, b.v FROM a JOIN b` 就是两个 `v`，不报错等于制造错值。`SELECT *` **不受影响**（通配展开照旧透传重名列）。<br>⚠️ 派生表里的**限定名不再可引用**（`SELECT u.name FROM (SELECT * FROM t JOIN u …) x` 现在不行）—— 与 PG 一致。<br>设计 `docs/结果集列名口径.md`；验收 `tests/result_column_names.rs` |
 | `WHERE` / `HAVING` / `GROUP BY` / `ORDER BY` | ✅ | |
 | `GROUP BY` 位置序号（`GROUP BY 1`） | ✅ | 2026-10-15 实现（生态功能批次 #2）。裸整数 = **投射第 n 个表达式**（1 起，与 `ORDER BY 1` 同一套标准），不是常量。**显式拒**：越界（`GROUP BY 0` / 超出列数）、非整数（`GROUP BY 1.5`）、指向聚合（不能当分组键）、指向 `SELECT *`（通配展不成"第 n 个表达式"）。值级验收 `tests/group_by_ordinal.rs` |
 | `GROUP BY <表达式>`（`upper(s)` / `v % 2` / `CAST(…)` / `CASE WHEN …` / `a ‖ b` …） | ✅ | 2026-10-15 **修**：此前**全都不工作**（报"列 's' 必须出现在 GROUP BY 里"，把"没实现"说成"你写错了"）。根因是判据拿 AST 的 `to_string()` 去比 `PhysExpr::display()`（后者带括号，`(g + 1)` vs `g + 1`）**永远比不中**。本表此前把 `GROUP BY` 整行标 ✅，**是虚的** |

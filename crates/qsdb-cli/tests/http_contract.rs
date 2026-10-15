@@ -1610,3 +1610,59 @@ fn copy_to_export_over_http() {
 
     let _ = std::fs::remove_dir_all(&out);
 }
+
+/// **结果集列名（F30）在网线上也一致**。
+///
+/// 契约文档把「列名」当协议面（JDBC/ODBC 元数据就是它），所以内核改了必须在
+/// **网线上**再钉一遍 —— 别只在内核测试里绿。这里同时钉住两条最容易漏的：
+/// ① 限定符剥掉（`t.v` ⇒ `v`）；② **重名引用显式报错**而不是静默取一个。
+#[test]
+fn result_column_names_over_http() {
+    let srv = Server::start(&[]);
+    let p = srv.port;
+    assert_eq!(
+        query(p, "CREATE TABLE t (id BIGINT, v BIGINT)", None).status,
+        200
+    );
+    assert_eq!(query(p, "CREATE TABLE u (id BIGINT)", None).status, 200);
+    assert_eq!(
+        query(p, "INSERT INTO t VALUES (1,10),(2,20)", None).status,
+        200
+    );
+    assert_eq!(query(p, "INSERT INTO u VALUES (1),(2)", None).status, 200);
+
+    // ① 限定符剥掉、表达式名原样
+    let cols = |sql: &str| -> Vec<String> {
+        let r = query(p, sql, None);
+        assert_eq!(r.status, 200, "{sql}: {}", String::from_utf8_lossy(&r.body));
+        r.json()["schema"]
+            .as_array()
+            .expect("schema")
+            .iter()
+            .map(|f| f["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(cols("SELECT t.v FROM t"), vec!["v"]);
+    assert_eq!(
+        cols("SELECT t.id, u.id FROM t JOIN u ON t.id = u.id"),
+        vec!["id", "id"]
+    );
+    // ★ 表达式列名**不编造**（PG 给 `count`，那是用户从没写过的名字）
+    assert_eq!(cols("SELECT count(*) FROM t"), vec!["count(*)"]);
+
+    // ② 重名引用 ⇒ 显式报错（不是静默取第一个）
+    let r = query(
+        p,
+        "SELECT id FROM (SELECT t.id, u.id FROM t JOIN u ON t.id = u.id) x",
+        None,
+    );
+    assert_eq!(r.status, 400, "{}", String::from_utf8_lossy(&r.body));
+    assert!(
+        r.json()["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("ambiguous"),
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+}
