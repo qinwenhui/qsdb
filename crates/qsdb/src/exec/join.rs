@@ -1296,6 +1296,11 @@ fn residual_keep_mask(
     let combined = RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), cols)
         .map_err(|e| QsdbError::invalid(format!("join residual batch: {e}")))?;
     let v = eval::eval(residual, &combined)?;
+    // 常量残留（`ON a.k = b.k AND true` 里那个 `true`，以及 `ON TRUE` 的叉积）
+    // 产**长度 1** 的数组，而下游按**匹配对**索引它 ⇒ 不广播就
+    // `Trying to access an element at index 1 from a BooleanArray of length 1`。
+    // 与 `ProjectExec` / 聚合键 / 聚合参数同一个坑，共用一份 `broadcast_const`。
+    let v = super::broadcast_const(&v, probe_idx.len())?;
     let mask = v
         .as_any()
         .downcast_ref::<BooleanArray>()

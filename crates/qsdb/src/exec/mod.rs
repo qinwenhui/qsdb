@@ -142,35 +142,48 @@ impl ExecNode for ProjectExec {
             Ok(b) => b,
             Err(e) => return Some(Err(e)),
         };
-        let mut cols = Vec::with_capacity(self.exprs.len());
+        let n = batch.num_rows();
+        let mut cols: Vec<ArrayRef> = Vec::with_capacity(self.exprs.len());
         for e in &self.exprs {
             match eval::eval(e, &batch) {
+                // 常量表达式产**长度 1** 的数组 ⇒ 就地广播到批长。
+                //
+                // ⚠️ 必须在 `try_new` **之前**：各列长度不一致时 `try_new` 直接失败，
+                // 而"常量 + 列"的混合投影（`SELECT 1, g FROM t`）是最普通的写法 ——
+                // 此前它**必炸**，报的还是 Arrow 的内部话术（`all columns in a
+                // record batch must have the same length`）；全常量
+                // （`SELECT 1 FROM t`）靠事后那段广播侥幸过得去，于是这个洞
+                // **只对"混合"这一种形态显形**，一直没被撞见。
+                // `n == 0` 也走这里（广播到 0 列长），否则空结果同样对不齐。
+                Ok(a) if a.len() == 1 && n != 1 => match broadcast_const(&a, n) {
+                    Ok(b) => cols.push(b),
+                    Err(err) => return Some(Err(err)),
+                },
                 Ok(a) => cols.push(a),
                 Err(err) => return Some(Err(err)),
             }
         }
-        let n = batch.num_rows();
-        let out = RecordBatch::try_new(self.schema(), cols)
-            .map_err(|e| QsdbError::invalid(format!("project failed: {e}")))
-            .and_then(|b| {
-                // 常量表达式产 1 行 → 广播到批长
-                if b.num_rows() == 1 && n > 1 {
-                    let mut cols = Vec::with_capacity(b.num_columns());
-                    for c in b.columns() {
-                        let idx: Vec<(usize, usize)> = vec![(0, 0); n];
-                        cols.push(
-                            arrow::compute::interleave(&[c.as_ref()], &idx)
-                                .map_err(|e| QsdbError::invalid(format!("broadcast: {e}")))?,
-                        );
-                    }
-                    RecordBatch::try_new(self.schema(), cols)
-                        .map_err(|e| QsdbError::invalid(format!("project failed: {e}")))
-                } else {
-                    Ok(b)
-                }
-            });
-        Some(out)
+        Some(
+            RecordBatch::try_new(self.schema(), cols)
+                .map_err(|e| QsdbError::invalid(format!("project failed: {e}"))),
+        )
     }
+}
+
+/// 常量数组（长度 1）广播到 `n` 行（同一元素取 `n` 次；`n == 0` 得空数组）。
+///
+/// **为什么值得一个公共函数**：`eval` 对常量表达式返回**长度 1** 的数组，而下游
+/// 处处按"批内行号"索引它 ⇒ 不广播就有两种下场，都很难看：
+/// `RecordBatch::try_new` 报各列长度不一致（`SELECT 1, g FROM t`），
+/// 或者**直接越界 panic**（`GROUP BY 'k'` 这类常量分组键）。
+/// 这是同一族坑，收口到一处，别再各写各的。
+pub(crate) fn broadcast_const(a: &ArrayRef, n: usize) -> Result<ArrayRef> {
+    if a.len() == n {
+        return Ok(Arc::clone(a));
+    }
+    let idx: Vec<(usize, usize)> = vec![(0, 0); n];
+    arrow::compute::interleave(&[a.as_ref()], &idx)
+        .map_err(|e| QsdbError::invalid(format!("const broadcast: {e}")))
 }
 
 /// 内存批源（CTE 物化体；批由外部注入）。

@@ -1065,13 +1065,11 @@ fn backfill_segments<T: Copy>(out: &mut [T], seg_start: &[bool]) {
 }
 
 /// 常量（长度 1）数组广播到 n 行（lag/lead 的字面量参数/default）。
+///
+/// 与 `ProjectExec` / 聚合分组键**共用一份实现**（[`super::broadcast_const`]）——
+/// 这族坑（"常量数组按行号索引"）已经在三处各咬过一次，不再各写各的。
 fn broadcast_const(arr: ArrayRef, n: usize) -> Result<ArrayRef> {
-    if arr.len() == n || n == 0 {
-        return Ok(arr);
-    }
-    let pick: Vec<(usize, usize)> = vec![(0, 0); n];
-    interleave(&[arr.as_ref()], &pick)
-        .map_err(|e| QsdbError::invalid(format!("window const broadcast: {e}")))
+    super::broadcast_const(&arr, n)
 }
 
 /// 两行在同一数组上是否相等（null == null 为 true 用于分区边界）。

@@ -2579,6 +2579,58 @@ fn cast_setop_side(
     }
 }
 
+/// `GROUP BY <裸整数>` ⇒ **投射位置序号**（标准 SQL：`GROUP BY 1` ≡ 第一列），
+/// 换算成投射里那个表达式再绑定。不是序号的表达式原样借回。
+///
+/// 为什么必须换算而不是当常量：裸整数当常量会把全表并成一组（**静默错值**），
+/// 而当序号才是用户的意思。`ORDER BY 序号` 走的是同一套标准。
+///
+/// 四类显式拒（都是"照着跑必然给错值/给不出值"）：
+/// - 序号越界（`GROUP BY 0` / 超出投射列数）—— 报出来比默默回一个组好；
+/// - 数字不是整数（`GROUP BY 1.5`）—— 标准如此（PG 也拒），而它几乎必然是笔误；
+/// - 序号指向 `SELECT *` —— 通配没有"第 n 个表达式"，指不出来；
+/// - 序号指向聚合（`SELECT count(*) … GROUP BY 1`）—— 聚合不能当分组键。
+fn group_key_expr<'a>(
+    e: &'a sqlparser::ast::Expr,
+    proj: &'a [Option<sqlparser::ast::Expr>],
+) -> Result<&'a sqlparser::ast::Expr> {
+    let sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan {
+        value: sqlparser::ast::Value::Number(n, _),
+        ..
+    }) = e
+    else {
+        return Ok(e);
+    };
+    let pos: i64 = n.parse().map_err(|_| {
+        QsdbError::unsupported(format!(
+            "GROUP BY `{n}` —— 裸数字按标准是**投射位置序号**，必须写成整数（如 GROUP BY 1）；\
+             当常量分组请显式加括号或写表达式"
+        ))
+    })?;
+    if pos < 1 || pos as usize > proj.len() {
+        return Err(QsdbError::invalid(format!(
+            "GROUP BY 序号 {pos} 超出投射列范围（SELECT 里有 {} 列，序号从 1 起）",
+            proj.len()
+        )));
+    }
+    let target = proj[pos as usize - 1].as_ref().ok_or_else(|| {
+        QsdbError::unsupported(
+            "GROUP BY 序号不能与 `SELECT *` 同用 —— 通配展不成“第 n 个表达式”，\
+             请把分组列写出来",
+        )
+    })?;
+    if let sqlparser::ast::Expr::Function(f) = target {
+        if is_agg_name(&fn_name(f)) {
+            return Err(QsdbError::invalid(format!(
+                "GROUP BY 序号 {pos} 指向的是聚合（`{}`）—— 聚合不能当分组键，\
+                 分组键要写原始列或表达式",
+                expr_display(target)
+            )));
+        }
+    }
+    Ok(target)
+}
+
 fn translate_select_inner(
     q: sqlparser::ast::Query,
     resolver: &TableResolver,
@@ -3074,12 +3126,12 @@ fn translate_select_inner(
         }
     }
 
-    // GROUP BY
+    // GROUP BY（裸整数先按标准换算成**投射位置序号**，见 `group_key_expr`）
     let group_exprs: Vec<PhysExpr> = match &select.group_by {
         GroupByExpr::All(_) => return Err(QsdbError::unsupported("GROUP BY ALL")),
         GroupByExpr::Expressions(exprs, _) => exprs
             .iter()
-            .map(|e| bind_expr(e, &ctx))
+            .map(|e| bind_expr(group_key_expr(e, &proj_extracted)?, &ctx))
             .collect::<Result<_>>()?,
     };
 
@@ -3308,10 +3360,27 @@ fn translate_select_inner(
             let by_output = match key_expr {
                 Expr::Identifier(id) => out_ctx.index_of(&id.value),
                 Expr::Value(v) => match &v.value {
-                    sqlparser::ast::Value::Number(n, _) => n
-                        .parse::<usize>()
-                        .ok()
-                        .and_then(|i| i.checked_sub(1).filter(|i| *i < proj_names.len())),
+                    // 纯数字 = 输出列序号（1-based，SQL 标准）。
+                    // **越界/非整数必须显式拒**：悄悄退回"当常量"等于**不排序**
+                    //（常量排序键），用户以为排了、其实没有 —— 静默无效。
+                    // 此前是靠"常量排序键会让 `RecordBatch` 列长对不齐而报错"侥幸
+                    // 拦住的，那是**借了 ProjectExec 那个 bug 的力**；2026-10-15 把
+                    // 常量广播修好之后它就漏了（`sql_gaps::order_by_ordinal` 当场
+                    // 抓到 —— 那条断言 `ORDER BY 5` 报错的用例一直是"借 bug 通过"）。
+                    sqlparser::ast::Value::Number(n, _) => {
+                        let i: usize = n.parse().map_err(|_| {
+                            QsdbError::unsupported(format!(
+                                "ORDER BY `{n}` —— 裸数字是**输出列序号**（从 1 起），必须写成整数"
+                            ))
+                        })?;
+                        if i < 1 || i > proj_names.len() {
+                            return Err(QsdbError::invalid(format!(
+                                "ORDER BY 序号 {i} 超出输出列范围（SELECT 里有 {} 列）",
+                                proj_names.len()
+                            )));
+                        }
+                        Some(i - 1)
+                    }
                     _ => None,
                 },
                 other => {
@@ -5556,6 +5625,22 @@ fn collect_aggs(e: &sqlparser::ast::Expr, ctx: &SchemaCtx, aggs: &mut Vec<AggExp
 }
 
 /// 聚合输出上的重绑定：聚合调用 → agg 列；裸列/表达式 → 匹配 group 键。
+/// 这个（子）表达式**就是**某个 GROUP BY 键吗？是则给出它在键里的位置。
+///
+/// **判据必须两边都绑定成 `PhysExpr` 再比 `display()`**（同一个渲染器）。
+/// 2026-10-15 修：此前拿 AST 的 `to_string()`（`expr_display`）去比
+/// `PhysExpr::display()` —— 后者带括号（`(g + 1)` vs `g + 1`）⇒ **永远比不中**，
+/// 于是**所有表达式分组键**（`GROUP BY upper(s)` / `GROUP BY v % 2` /
+/// `GROUP BY CAST(v AS …)` / `GROUP BY CASE WHEN …` …）都掉进递归、最后报
+/// "列 's' 不在 GROUP BY 里" —— 把"没实现"说成了"你写错了"（F29 同一族）。
+///
+/// 绑定失败（例如子树里含聚合）⇒ `None`，交给调用方的递归继续走。
+fn group_key_pos(e: &sqlparser::ast::Expr, ctx: &SchemaCtx, group: &[PhysExpr]) -> Option<usize> {
+    let bound = bind_expr(e, ctx).ok()?;
+    let d = bound.display();
+    group.iter().position(|g| g.display() == d)
+}
+
 fn rebind_over_agg(
     e: &sqlparser::ast::Expr,
     ctx: &SchemaCtx,
@@ -5575,6 +5660,15 @@ fn rebind_over_agg(
                     idx: group.len() + idx,
                     name: agg.out_name.clone(),
                     ty: agg.out_ty,
+                });
+            }
+            // 整个函数调用**就是**某个分组键（`GROUP BY upper(s)`）⇒ 直接引用键。
+            // 不先判这一下就会递归进参数，最后报"列 's' 不在 GROUP BY 里"。
+            if let Some(gi) = group_key_pos(e, ctx, group) {
+                return Ok(PhysExpr::Column {
+                    idx: gi,
+                    name: group[gi].display(),
+                    ty: group[gi].data_type(),
                 });
             }
             bind_scalar_fn_over(e, f, ctx, group, aggs, agg_ctx)
@@ -5605,30 +5699,26 @@ fn rebind_over_agg(
                     name: group[gi].display(),
                     ty: group[gi].data_type(),
                 }),
-                None => {
-                    // **F29②（qsdb-sync 实测）**：`GROUP BY 1` 走到这里会报"列不在
-                    // GROUP BY 里" —— **误导**（用户写的不是列名）。GROUP BY 里的
-                    // 裸整数按标准 SQL 是**位置序号**，我们没实现 ⇒ 必须**指名道姓**
-                    // 地拒（与 `ORDER BY 1` 是 ✅ 形成的不对称正是不满的来源）。
-                    if group.iter().any(|g| {
-                        matches!(
-                            g,
-                            PhysExpr::Lit(Literal::Int64(_)) | PhysExpr::Lit(Literal::Int32(_))
-                        )
-                    }) {
-                        return Err(QsdbError::unsupported(
-                            "GROUP BY 位置序号（`GROUP BY 1`）暂不支持 —— 请写列名（`ORDER BY 1` 是支持的，见 docs/SQL支持面.md）",
-                        ));
-                    }
-                    Err(QsdbError::invalid(format!(
-                        "column '{}' must appear in GROUP BY or inside an aggregate",
-                        id.value
-                    )))
-                }
+                // **F29②（qsdb-sync 实测）** 的旧痕已消：`GROUP BY 1` 当时报的是
+                // "列不在 GROUP BY 里"（把"没实现"说成"你写错了"）。序号现在**已实现**
+                //（`group_key_expr`，绑定前就换算成投射表达式）⇒ 走到这里的裸整数
+                // 只可能是"投射那一列本身就是常量"（如 `SELECT 1, x … GROUP BY 1`），
+                // 此时"x 不在 GROUP BY 里"是**准确**的报错，直接给通用文案。
+                None => Err(QsdbError::invalid(format!(
+                    "column '{}' must appear in GROUP BY or inside an aggregate",
+                    id.value
+                ))),
             }
         }
-        // 复合表达式：与 group 表达式 display 匹配
+        // 复合表达式：先按**绑定结果**比分组键，再退回**源文本**比。
         other => {
+            if let Some(gi) = group_key_pos(other, ctx, group) {
+                return Ok(PhysExpr::Column {
+                    idx: gi,
+                    name: group[gi].display(),
+                    ty: group[gi].data_type(),
+                });
+            }
             let display = expr_display(other);
             if let Some(gi) = group.iter().position(|g| g.display() == display) {
                 return Ok(PhysExpr::Column {

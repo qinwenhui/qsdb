@@ -50,7 +50,42 @@ pub(crate) fn fxhash_bytes(bytes: &[u8]) -> u64 {
 // group key 编码（复用 buffer）
 // ---------------------------------------------------------------------------
 
+/// 聚合参数求值 + **常量参数广播**（`sum(1)` 这类：下游同样按**行号**索引参数
+/// 数组，常量参数不广播就同样越界 panic —— 与分组键同一个坑）。
+fn eval_agg_arrays(aggs: &[AggExpr], batch: &RecordBatch) -> Result<Vec<Option<ArrayRef>>> {
+    let n = batch.num_rows();
+    aggs.iter()
+        .map(|a| -> Result<Option<ArrayRef>> {
+            match &a.arg {
+                Some(e) => Ok(Some(crate::exec::broadcast_const(
+                    &eval::eval(e, batch)?,
+                    n,
+                )?)),
+                None => Ok(None),
+            }
+        })
+        .collect()
+}
+
+/// 分组键求值 + **常量键广播**。
+///
+/// `eval` 对常量键（`GROUP BY 'k'`，或 `GROUP BY 1` 指向的那个常量）返回**长度 1**
+/// 的数组，而下游一律按**批内行号**索引键数组 ⇒ 不广播就**越界 panic**
+/// （实测 `Trying to access an element at index 1 from a StringArray of length 1`，
+/// 被 panic 隔离层兜住，用户看到的是"查询 panic"）。同一族坑还有
+/// `SELECT 1, g FROM t`（见 `ProjectExec`）—— 常量数组走到哪里都要先对齐长度。
+fn eval_group_arrays(group: &[PhysExpr], batch: &RecordBatch) -> Result<Vec<ArrayRef>> {
+    let n = batch.num_rows();
+    group
+        .iter()
+        .map(|g| crate::exec::broadcast_const(&eval::eval(g, batch)?, n))
+        .collect()
+}
+
 /// 把一行各 group 列编码进 buf（tag + bytes）；失败列按 raw 字符串兜底。
+///
+/// ⚠️ 按**行号**索引 `arrays`：调用方须保证它是**批长**的（常量键先过
+/// [`eval_group_arrays`] 广播），否则越界 panic。
 pub(crate) fn encode_key_row(arrays: &[ArrayRef], row: usize, buf: &mut Vec<u8>) {
     buf.clear();
     for a in arrays {
@@ -864,17 +899,8 @@ impl GroupTable {
         if sel.is_empty() {
             return Ok(());
         }
-        let group_arrays: Vec<ArrayRef> = group
-            .iter()
-            .map(|g| eval::eval(g, batch))
-            .collect::<Result<_>>()?;
-        let agg_arrays: Vec<Option<ArrayRef>> = aggs
-            .iter()
-            .map(|a| match &a.arg {
-                Some(e) => eval::eval(e, batch).map(Some),
-                None => Ok(None),
-            })
-            .collect::<Result<_>>()?;
+        let group_arrays = eval_group_arrays(group, batch)?;
+        let agg_arrays = eval_agg_arrays(aggs, batch)?;
         self.init_cols(group, aggs, &agg_arrays);
 
         // 全选 + 全局聚合 → 零迭代快路径（O(1) 计数 + SIMD 列和）
@@ -1120,17 +1146,8 @@ impl GroupTable {
                 MAXB.load(std::sync::atomic::Ordering::Relaxed)
             );
         }
-        let group_arrays: Vec<ArrayRef> = group
-            .iter()
-            .map(|g| eval::eval(g, batch))
-            .collect::<Result<_>>()?;
-        let agg_arrays: Vec<Option<ArrayRef>> = aggs
-            .iter()
-            .map(|a| match &a.arg {
-                Some(e) => eval::eval(e, batch).map(Some),
-                None => Ok(None),
-            })
-            .collect::<Result<_>>()?;
+        let group_arrays = eval_group_arrays(group, batch)?;
+        let agg_arrays = eval_agg_arrays(aggs, batch)?;
         // count-only 的**单 Int64 列**走上表内联槽（键存槽里 ⇒ 不碰 arena，
         // 实测 5.4×）。注意它与 `fast_slots_inline` **不是同一张表**：那张要求
         // 逐批无非空才启用，而这里的判定是**类型驱动**的，且 NULL 有专门槽。
