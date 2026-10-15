@@ -659,6 +659,21 @@ fn translate_statement(stmt: SqlStatement, raw: &str) -> Result<ParsedStatement>
     match stmt {
         SqlStatement::CreateTable(ct) => {
             let table = object_name_single(ct.name.clone())?;
+            // **CTAS**：此前会掉进"零列"检查、报 `table needs at least one column`
+            // （把"没实现"说成"你建表建错了"）。docs/SQL支持面.md 曾声称这条
+            // "报错文案已明确" —— 实测**根本没落地**（2026-10-15，`support_claims.rs`，
+            // 与 F29② 同款的失败模式）。这里按实情拒。
+            if ct.query.is_some() {
+                return Err(QsdbError::unsupported(
+                    "CREATE TABLE … AS SELECT (CTAS) 未实现 —— 用 `CREATE TABLE` + `INSERT INTO … SELECT …`（见 docs/SQL支持面.md §五）",
+                ));
+            }
+            // `CREATE OR REPLACE TABLE`：此前报 `already exists`（文档自认误导）。
+            if ct.or_replace {
+                return Err(QsdbError::unsupported(
+                    "CREATE OR REPLACE TABLE 未实现 —— 先 `DROP TABLE` 再 `CREATE`（要原子替换分区内容用 `INSERT OVERWRITE`）",
+                ));
+            }
             let mut defs = Vec::with_capacity(ct.columns.len());
             for c in &ct.columns {
                 let ty = ast_type_to_logical(&c.data_type)?;
@@ -873,9 +888,16 @@ fn translate_statement(stmt: SqlStatement, raw: &str) -> Result<ParsedStatement>
             })
         }
         SqlStatement::Query(q) => Ok(ParsedStatement::Select(q)),
-        other => Err(QsdbError::unsupported(format!(
-            "statement {other:?} not supported in this version (SQL-1)"
-        ))),
+        other => {
+            // **不许 Debug-print 整棵语句树**（`PREPARE` 那条实测 dump 出几百字符，
+            // 把整条嵌套查询连 `Span(Location(1,9)..)` 一起打出来）——
+            // 与 batch 1 清掉的那几处同源，这处当时漏了。`ast_head` 只留变体名。
+            let d = format!("{other:?}");
+            Err(QsdbError::unsupported(format!(
+                "statement `{}` not supported in this version (SQL-1)",
+                ast_head(&d)
+            )))
+        }
     }
 }
 

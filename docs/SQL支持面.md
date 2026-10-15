@@ -106,7 +106,7 @@
 | `INTERVAL` / `AT TIME ZONE` / `COLLATE` / `SIMILAR TO` | ✋ | |
 | 行元组 `(a,b) IN (…)` | ✋ | `row-value comparison `(a, b) IN (subquery)` not supported — write it as EXISTS (SELECT 1 FROM … WHERE … AND …)`（**归类 `UNSUPPORTED`**，改写法即可） |
 | `= ANY(...)` / `= ALL(...)` | ✋ | `` `= ANY/ALL (subquery)` not supported — use IN / EXISTS, or an explicit OR/AND chain `` |
-| 位置参数 `?` | ✋ | 本仓走 HTTP/API 层参数化，不做服务端占位符 |
+| 位置参数 `?` / `PREPARE` / `$1` | ✋ | `unsupported: literal Placeholder("?") not supported`。⚠️ **2026-10-15 修正措辞**：本表此前写"本仓走 **HTTP/API 层参数化**" —— **那是假的**（协议面是 `{"sql": …}` 纯文本，**没有绑定参数**）。真实情况：客户端要么自己拼 SQL（**我们不提供转义助手**），要么走批通道/文件（见 `docs/客户端与嵌入方指南.md`）。参数化在待办里 |
 | 标量函数集 | ✅ | `SELECT abs(1)` 之类报错会**列出支持清单**，以之为准 |
 | `GREATEST` / `LEAST` / `array_agg` 等 | ✋ | 未实现（报错列清单） |
 
@@ -134,8 +134,8 @@
 | `TRUNCATE TABLE` | ✅ | |
 | `CREATE TABLE`（含 `PARTITIONED BY`、`NOT NULL`、`CHECK`、`COMMENT`） | ✅ | **分区表至少要有一个非分区列**（否则数据文件零列，见 `docs/进度与待办.md` §三之四） |
 | 列 `DEFAULT` 值 | ✋ | 静默忽略会写入 NULL 而非默认值 |
-| `CREATE TABLE … AS SELECT`（CTAS） | ✋ | 报错文案已明确（此前是"table needs at least one column"，误导） |
-| `CREATE OR REPLACE TABLE` | ✋ | 目前报 `already exists`（已知误导，排期中改明确文案） |
+| `CREATE TABLE … AS SELECT`（CTAS） | ✋ | `unsupported: CREATE TABLE … AS SELECT (CTAS) 未实现 —— 用 \`CREATE TABLE\` + \`INSERT INTO … SELECT …\``。<br>⚠️ 2026-10-15 实测：此前报的仍是 **`invalid argument: table needs at least one column`**（把"没实现"说成"你建表建错了"），而本表当时**声称**"文案已明确" —— **那条自述根本没落地**（与 F29② 同款失败模式）。现已修 |
+| `CREATE OR REPLACE TABLE` | ✋ | `unsupported: CREATE OR REPLACE TABLE 未实现 —— 先 \`DROP TABLE\` 再 \`CREATE\``（2026-10-15 修；此前报 `already exists`，误导） |
 | `ALTER TABLE … ADD COLUMN` | ✅ | |
 | `ALTER TABLE … DROP COLUMN` | ✋ | |
 | `CREATE INDEX` / 视图 / 用户管理 | ✅ | 见 `docs/对接契约.md` §三 |
