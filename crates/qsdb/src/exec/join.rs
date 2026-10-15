@@ -591,7 +591,22 @@ impl HashJoinExec {
         // 一张大表，那一刻源批与新表**同时活着**（瞬时 2×）—— 右表 32MB 配 64MB
         // 配额（逻辑上绰绰有余）也会被这 2× 顶掉，白跑一趟溢出（INNER/LEFT）
         // 或直接报错（FULL 无溢出通道）。见 [`BuildSide`]。
-        let table = BuildSide::new(batches, self.build.schema());
+        // **能 concat 就 concat**（2026-10-15 A/B 实测的结论）：
+        // 保留分批会让 probe 取数走 `interleave` —— 那是**热路径**，.14 上
+        // `complex_three_way` 0.321s → 0.350s（**+9%**，三次一致、不是噪声），
+        // 换来的只是内存。所以：
+        //   - 额度够付这份峰值 ⇒ 照旧 concat（单批 ⇒ `take` 快路径，性能与改前一致）；
+        //   - 付不起 ⇒ **保留分批**（正是原先会白跑一趟溢出/直接报错的那种情形）。
+        // 于是"性能不变、只是不再因为 2× 峰值而失败"——两头都占到。
+        let schema = self.build.schema();
+        let peak = res.bytes();
+        let table = if res.grow(peak).is_ok() {
+            let t = concat_batches(&batches, &schema)?;
+            res.shrink(peak); // 源批随 `batches` 释放，峰值回落
+            BuildSide::new(vec![t], schema)
+        } else {
+            BuildSide::new(batches, schema)
+        };
 
         // 键哈希索引（**逐批构建，行号加全局偏移** —— 与 `BuildSide` 同一口径）
         let index = build_index(&table, &self.build_keys)?;
@@ -909,9 +924,10 @@ impl HashJoinExec {
                 if rows.is_empty() {
                     continue; // 该分区 build 侧为空 → 无匹配（LEFT 也无需发射）
                 }
-                // 同样**不 concat**（见 `BuildSide`）：分区的 build 侧也保留分批，
-                // 否则每个分区再各吃一次 2× 峰值。
-                let table = BuildSide::new(rows, self.build.schema());
+                // 同 `build_phase`：**能 concat 就 concat**（保 probe 侧快路径）。
+                // 分区路径走 `reserve_spill`，额度口径不同 —— 这里先记账再决定。
+                let schema = self.build.schema();
+                let table = BuildSide::new(rows, schema);
                 // 分区表也记账：正常情况 ≈ build 总量 / P，但**键倾斜**时可能
                 // 仍很大——那时要不到额度就如实报错（不再往下切分），
                 // 而不是让它无界涨上去。
@@ -1158,6 +1174,29 @@ fn unmatched_build_batch(
     )
     .map(Some)
     .map_err(|e| QsdbError::invalid(format!("full join output: {e}")))
+}
+
+/// 把若干批拼成一张表（**只在峰值额度付得起时**调用，见 `build_phase` 的说明）。
+fn concat_batches(batches: &[RecordBatch], schema: &SchemaRef) -> Result<RecordBatch> {
+    if batches.is_empty() {
+        return Ok(RecordBatch::new_empty(Arc::clone(schema)));
+    }
+    if batches.len() == 1 {
+        return Ok(batches[0].clone());
+    }
+    let n_cols = schema.fields().len();
+    let mut cols = Vec::with_capacity(n_cols);
+    for c in 0..n_cols {
+        let parts: Vec<&dyn Array> = batches.iter().map(|b| b.column(c).as_ref()).collect();
+        cols.push(concat(&parts).map_err(|e| QsdbError::invalid(format!("concat: {e}")))?);
+    }
+    let n: usize = batches.iter().map(|b| b.num_rows()).sum();
+    RecordBatch::try_new_with_options(
+        Arc::clone(schema),
+        cols,
+        &RecordBatchOptions::new().with_row_count(Some(n)),
+    )
+    .map_err(|e| QsdbError::invalid(format!("concat batch: {e}")))
 }
 
 /// build 侧键索引（**逐批**构建，行号是**跨批全局行号**）。
