@@ -216,7 +216,7 @@ fn 常用_join_形态摸底() {
             sql: "SELECT count(*) FROM l JOIN r USING (k)",
             expect: 2,
             want_hash: Some(1),
-            pending: true,
+            pending: false,
         },
     ];
 

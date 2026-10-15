@@ -354,10 +354,15 @@ fn 非等值_left_join() {
 }
 
 #[test]
-fn using_与_natural() {
+fn using_已支持_natural_仍拒() {
     let (db, root) = seeded("using");
-    // 这两条**必须**拒：若被当成叉积，行数会从 3 炸成 9（静默错行数）
-    rejected(&db, "SELECT count(*) FROM a JOIN b USING (k)");
+    // `USING (k)` ≡ `ON a.k = b.k` **且输出合并那一列**（值级验收在 `join_using.rs`）
+    assert_eq!(
+        count1(&db, "SELECT count(*) FROM a JOIN b USING (k)"),
+        2,
+        "与 `ON a.k = b.k` 同值"
+    );
+    // `NATURAL` 仍**明确拒绝**：它按同名列隐式匹配，两侧加一列就可能静默改语义
     rejected(&db, "SELECT count(*) FROM a NATURAL JOIN b");
     let _ = std::fs::remove_dir_all(&root);
 }

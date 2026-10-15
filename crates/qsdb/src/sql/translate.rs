@@ -2506,6 +2506,8 @@ fn translate_select_inner(
         .map(|t| t.joins.as_slice())
         .unwrap_or_else(|| no_joins.as_slice());
     for join in joins {
+        // `USING (cols)` 的列名（`None` = 不是 USING 写法）
+        let mut using_names: Option<Vec<String>> = None;
         // `swap` = 换边规划（RIGHT 用）：右侧当 probe、左侧当 build。
         let (jt, constraint, swap) = match &join.join_operator {
             sqlparser::ast::JoinOperator::Inner(c) | sqlparser::ast::JoinOperator::Join(c) => {
@@ -2617,18 +2619,30 @@ fn translate_select_inner(
         // 仍是明确拒绝（当叉积会炸行数）——两者都在这条分派里。
         let on_expr = match constraint {
             Some(sqlparser::ast::JoinConstraint::On(e)) => Some(e),
-            Some(sqlparser::ast::JoinConstraint::Using(_)) => {
-                return Err(QsdbError::unsupported(
-                    "JOIN ... USING (cols) not supported — write `ON l.c = r.c` (USING also merges the output column; this engine's join does not)",
-                ));
+            // `USING (cols)`：键由列名给（两侧同名），**且输出要合并那一列** ——
+            // 见 `using_names` 与下面 `build_using_merge_project` 的说明。
+            Some(sqlparser::ast::JoinConstraint::Using(names)) => {
+                let names: Vec<String> = names
+                    .iter()
+                    .map(|n| {
+                        n.0.last()
+                            .and_then(|p| p.as_ident())
+                            .map(|i| i.value.clone())
+                            .ok_or_else(|| {
+                                QsdbError::invalid("USING: column name must be identifiers")
+                            })
+                    })
+                    .collect::<Result<_>>()?;
+                using_names = Some(names);
+                None
             }
+            // `NATURAL JOIN`：**明确不做**（它按"同名同类型列"隐式匹配，两侧
+            // 加一列就可能**静默改变连接语义**）—— 与本仓"拼错就报错"的纪律相反。
             Some(sqlparser::ast::JoinConstraint::Natural) => {
                 return Err(QsdbError::unsupported(
-                    "NATURAL JOIN not supported（隐式按同名列匹配，加一列就可能静默改语义）—                      write the `ON` explicitly",
+                    "NATURAL JOIN not supported（隐式按同名列匹配，加一列就可能静默改语义）—                      write the `ON`/`USING` explicitly",
                 ));
             }
-            // ⚠️ **裸 `JOIN b`（无 ON/USING）仍然拒绝**：它只是"没写约束"，
-            // 不是"要笛卡尔积"——静默当叉积会**炸行数**（旧行为就是拒，别动它）。
             Some(sqlparser::ast::JoinConstraint::None) => {
                 return Err(QsdbError::unsupported(
                     "JOIN ... ON <equi-cond> required (use CROSS JOIN if you really want a                      cartesian product)",
@@ -2652,6 +2666,90 @@ fn translate_select_inner(
         // `ON` 拆成「键 + 残留」：`ON l.k=r.k AND r.v>1` 从"整条退化成叉积"变成
         // **多键/单键哈希 join + 残留**（残留必须在 join 内对匹配对求值，
         // 不能提到 WHERE —— 见 `LogicalPlan::Join::residual`）。
+        // ── `USING (cols)`：键由列名给，**且输出要把那一列合并成一份** ──
+        //
+        // 合并列取值一律 `COALESCE(l.c, r.c)`：等值键下匹配对的 l.c 与 r.c 相等，
+        // 四种 join 的差别只在**孤儿行**（LEFT 的孤儿 l.c 有值、RIGHT 的 r.c 有值、
+        // FULL 两者各有一半）—— `COALESCE` 正好覆盖全部四种，不必按类型分派。
+        if let Some(names) = using_names {
+            let mut lkeys: Vec<PhysExpr> = Vec::with_capacity(names.len());
+            let mut rkeys: Vec<PhysExpr> = Vec::with_capacity(names.len());
+            let mut pairs: Vec<(usize, usize, LogicalType)> = Vec::with_capacity(names.len());
+            for nm in &names {
+                let li = ctx.cols[..n_left]
+                    .iter()
+                    .position(|(n, _)| n == nm)
+                    .ok_or_else(|| {
+                        QsdbError::not_found(format!(
+                            "USING column '{nm}' not found in the left input"
+                        ))
+                    })?;
+                let ri = right_cols
+                    .iter()
+                    .position(|(n, _)| n == nm)
+                    .ok_or_else(|| {
+                        QsdbError::not_found(format!(
+                            "USING column '{nm}' not found in the right input"
+                        ))
+                    })?;
+                let (ln, lt) = ctx.cols[li].clone();
+                let (rn, rt) = right_cols[ri].clone();
+                lkeys.push(PhysExpr::Column {
+                    idx: li,
+                    name: ln,
+                    ty: lt.clone(),
+                });
+                rkeys.push(PhysExpr::Column {
+                    idx: n_left + ri,
+                    name: format!("{right_name}.{rn}"),
+                    ty: rt,
+                });
+                pairs.push((li, ri, lt));
+            }
+            // RIGHT 要**换边**（`r LEFT JOIN l`）——同非 USING 的路径；换边后
+            // join 的输出序是 `[右 ++ 左]`，合并投影的位置基准随之改变。
+            let joined = if swap {
+                let n_right = right_cols.len();
+                let probe_keys: Vec<PhysExpr> = rkeys
+                    .iter()
+                    .map(|k| shift_col_idx(k, -(n_left as isize)))
+                    .collect();
+                let build_keys: Vec<PhysExpr> = lkeys
+                    .iter()
+                    .map(|k| shift_col_idx(k, n_right as isize))
+                    .collect();
+                LogicalPlan::Join {
+                    left: Box::new(right_plan),
+                    right: Box::new(plan),
+                    left_keys: probe_keys,
+                    right_keys: build_keys,
+                    join_type: jt,
+                    needed: None,
+                    residual: None,
+                }
+            } else {
+                LogicalPlan::Join {
+                    left: Box::new(plan),
+                    right: Box::new(right_plan),
+                    left_keys: lkeys,
+                    right_keys: rkeys,
+                    join_type: jt,
+                    needed: None,
+                    residual: None,
+                }
+            };
+            // 位置基准：非换边 = [左 0..n_left, 右 n_left..]；换边 = [右 0..n_right, 左 n_right..]
+            let (left_base, right_base) = if swap {
+                (right_cols.len(), 0usize)
+            } else {
+                (0usize, n_left)
+            };
+            let (proj, cols) =
+                using_merge_project(joined, &pairs, &ctx, n_left, left_base, right_base)?;
+            plan = proj;
+            ctx.cols = cols;
+            continue;
+        }
         let Some(on_expr) = on_expr else {
             // **`CROSS JOIN`**：笛卡尔积 = 谓词恒真的非等值 INNER
             plan = LogicalPlan::CrossJoinFilter {
@@ -3259,6 +3357,87 @@ fn reorder_after_swap(
         exprs,
         names,
     }
+}
+
+/// `USING (cols)` 的**输出合并投影 + 新可见列集**。
+///
+/// `USING` 不是纯语法糖：`SELECT *` 里那一列**只出一份**（标准 SQL），
+/// 所以 join 的输出（左 ++ 右，那一列出现两次）之上必须再套一层投影，
+/// 并且 `ctx.cols`（绑定与 `SELECT *` 展开的唯一依据）要换成新的列序。
+///
+/// 新列序 = `[合并列…] ++ [左侧其余列…] ++ [右侧其余列…]`；
+/// 合并列取 `COALESCE(l.c, r.c)`（等值键下匹配对相等，孤儿行各自有值 ——
+/// 四种 join 一套覆盖，见调用点的说明）。
+///
+/// ⚠️ **代价（如实说明）**：合并之后，`a.c` / `b.c` 这种**限定名不再可解析**
+/// （它们已不在可见列集里）—— 与 PostgreSQL 不同（那边两者并存）。本仓选择
+/// "宁可不支持，也不静默给错的列"：写 `a.c` 会明确报"列不存在"。
+#[allow(clippy::too_many_arguments)]
+fn using_merge_project(
+    joined: LogicalPlan,
+    pairs: &[(usize, usize, LogicalType)],
+    ctx: &SchemaCtx,
+    n_left: usize,
+    left_base: usize,
+    right_base: usize,
+) -> Result<(LogicalPlan, Vec<(String, LogicalType)>)> {
+    let mut exprs: Vec<PhysExpr> = Vec::new();
+    let mut cols: Vec<(String, LogicalType)> = Vec::new();
+    let merged_left: Vec<usize> = pairs.iter().map(|(li, _, _)| *li).collect();
+    let merged_right: Vec<usize> = pairs.iter().map(|(_, ri, _)| *ri).collect();
+    // ① 合并列（按 USING 里写的顺序）
+    for (li, ri, ty) in pairs {
+        let (ln, _) = ctx.cols[*li].clone();
+        let rn = ctx.cols[n_left + *ri].0.clone();
+        exprs.push(PhysExpr::Coalesce(
+            vec![
+                PhysExpr::Column {
+                    idx: left_base + *li,
+                    name: ln.clone(),
+                    ty: ty.clone(),
+                },
+                PhysExpr::Column {
+                    idx: right_base + *ri,
+                    name: rn,
+                    ty: ty.clone(),
+                },
+            ],
+            ty.clone(),
+        ));
+        cols.push((ln, ty.clone()));
+    }
+    // ② 左侧其余列（名字沿用左输入的 —— 多表链时可能已带限定名）
+    for (i, (n, t)) in ctx.cols[..n_left].iter().enumerate() {
+        if merged_left.contains(&i) {
+            continue;
+        }
+        exprs.push(PhysExpr::Column {
+            idx: left_base + i,
+            name: n.clone(),
+            ty: t.clone(),
+        });
+        cols.push((n.clone(), t.clone()));
+    }
+    // ③ 右侧其余列（限定名，与本仓"裸名 = 左侧、右表须限定"的规则一致）
+    for (i, (n, t)) in ctx.cols[n_left..].iter().enumerate() {
+        if merged_right.contains(&i) {
+            continue;
+        }
+        exprs.push(PhysExpr::Column {
+            idx: right_base + i,
+            name: n.clone(),
+            ty: t.clone(),
+        });
+        cols.push((n.clone(), t.clone()));
+    }
+    Ok((
+        LogicalPlan::Project {
+            input: Box::new(joined),
+            exprs,
+            names: cols.iter().map(|(n, _)| n.clone()).collect(),
+        },
+        cols,
+    ))
 }
 
 /// `JoinOperator` → **用户写的那种写法**（用于拒绝文案）。
