@@ -101,7 +101,10 @@
 | 聚合 `count/sum/avg/min/max`（含 `count(*)`） | ✅ | |
 | 聚合 `DISTINCT`（`count/sum/avg/min/max(DISTINCT x)`） | ✅ | 2026-10-14 实现（原生：绑定层等价改写 + 单遍融合计数）。**此前**静默当成不带 DISTINCT ⇒ 回错数字 |
 | └ `DISTINCT` 与非 `DISTINCT` **混用**、或多个 DISTINCT 聚合**参数不同** | ✋ | 一次去重会改掉另外那些聚合的输入（`sum(y)` 会少算行），**显式拒绝**不硬猜 |
-| 聚合 `FILTER (WHERE …)` | ✋ | 此前**静默忽略** ⇒ 回全量聚合（错值） |
+| 聚合 `FILTER (WHERE …)` | ✅ | 2026-10-15 实现（生态功能批次 3）。此前**静默忽略** ⇒ 回全量聚合（错值）。<br>语义按 SQL 标准：**只有谓词为 TRUE 的行**喂给该聚合（NULL/UNKNOWN 不通过）；谓词**不影响分组** —— 一个全不匹配的组照样出现、回 `0`/`NULL`。谓词可引用任意列（不必是聚合参数）。<br>掩码**逐聚合**：同一条 SELECT 里两个聚合可各有各的谓词。<br>值级验收 `tests/agg_filter.rs` |
+| └ 窗口函数上的 `FILTER` | ✋ | 未实现 ⇒ 显式拒（静默丢掉 = 回全量）。改写：`sum(CASE WHEN c THEN x END) OVER (…)` |
+| └ `DISTINCT` + `FILTER` 同时写 | ✋ | 显式拒：去重改写会换掉输入，谓词引用的列就不在了。拆成子查询（先 `WHERE` 再 `DISTINCT`） |
+| └ `FILTER` 用在标量函数上 / 谓词非布尔 / `WHERE NULL` | ✋ | 都是显式拒（后两者几乎必然是笔误） |
 | 函数参数内的 `ORDER BY` / `LIMIT` / `SEPARATOR` | ✋ | |
 | `WITHIN GROUP (ORDER BY …)` | ✋ | |
 | `IGNORE/RESPECT NULLS` | ✋ | 静默忽略会改窗口函数结果 |
@@ -173,3 +176,9 @@
    2026-10-15 一次性清掉**四个**落点（投影 / 聚合分组键 / 聚合参数 / JOIN 残留），
    其中 `SELECT 1, g FROM t` 这种最普通的写法**此前必炸**。回归
    `tests/const_broadcast.rs`。**新写"按行索引数组"的代码时先问一句：它会不会是常量？**
+7. **加一条"整表行数"式的捷径时，先问它绕过了什么**：`count(*)` 有**三条**独立捷径
+   （元数据 footer / join 按键计数下推 / distinct 融合计数），每条都**不看行**。
+   2026-10-15 加聚合 `FILTER` 时，三条**各自**让谓词静默失效（回全量大数）。
+   与"有残留谓词就不能下推 join 计数"是同一个坑 —— 那次也栽过一遍。
+   凡聚合的语义维度增加（`DISTINCT` / `FILTER` / 将来的 `ORDER BY`），
+   都要**逐条**回去检查每个捷径的准入条件。
