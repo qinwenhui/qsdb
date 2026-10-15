@@ -268,13 +268,17 @@ fn 常用_join_形态摸底() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// 尚未实现的形态（`pending`）——**明确登记**，别让"没实现"看起来像"测过了"。
+/// 尚未实现的形态登记 —— **当前为空**（10 条常用形态全部落地）。
 ///
 /// 实现一条就把上表里它的 `pending` 改成 `false`（断言随即生效），并删掉这里的对应行。
 #[test]
 fn 未实现的形态登记() {
     let (db, root) = seeded("todo");
-    for (name, sql) in [("USING(k)", "SELECT count(*) FROM l JOIN r USING (k)")] {
+    // **空清单**：10 条常用形态全部落地（第 1–4 批）。
+    // 留这个壳是为了下一个"已知缺口"有地方登记 —— 未实现的形态在这里断言
+    // "报的是 `unsupported`"，而不是让"没实现"看起来像"测过了"。
+    let 未实现: [(&str, &str); 0] = [];
+    for (name, sql) in 未实现 {
         let e = match db.sql(sql) {
             Ok(_) => {
                 eprintln!("[已实现?] {name} —— 上表里的 pending 该改成 false 了");
