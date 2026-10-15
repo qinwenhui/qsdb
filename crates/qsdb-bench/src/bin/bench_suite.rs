@@ -187,7 +187,11 @@ fn cases() -> Vec<(&'static str, &'static str, &'static str)> {
             "导出",
             "COPY (SELECT * FROM t) TO '<目录>' (FORMAT PARQUET) —— 走内核导出原语",
         ),
-        ("export_csv", "导出", "全表扫描 → CSV 文件"),
+        (
+            "export_csv",
+            "导出",
+            "COPY (SELECT * FROM t) TO '<文件>' (FORMAT CSV, HEADER) —— 走内核导出原语",
+        ),
         (
             "export_scan_only",
             "导出",
@@ -834,11 +838,27 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
             };
             (n, dt.as_millis() as u64)
         }
+        // **2026-10-15 换口径**：与 `export_parquet` 同理 —— 走**内核导出原语**
+        // （`COPY … TO (FORMAT CSV)`），与 DuckDB 那侧同一个形状。
+        // 此前跑的是 bench 工具里 arrow 的单线程 writer ⇒ 两侧口径不对等。
         "export_csv" => {
             let out = dir.join("out_qsdb.csv");
+            // 内核**拒绝覆盖已存在的目标**（不做静默覆盖）—— 清理放在计时之外。
+            std::fs::remove_file(&out).ok();
+            let sql = format!(
+                "COPY (SELECT * FROM t) TO '{}' (FORMAT CSV, HEADER)",
+                out.to_string_lossy().replace('\\', "/")
+            );
             let t0 = Instant::now();
-            let n = scan_to_csv(&db, &out, "SELECT * FROM t");
+            let r = db.sql(&sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
             let dt = t0.elapsed();
+            let n = match r {
+                qsdb::sql::SqlResult::Ok {
+                    rows_affected: Some(n),
+                    ..
+                } => n,
+                other => panic!("COPY … TO 该回 Ok(rows_affected)，实得 {other:?}"),
+            };
             (n, dt.as_millis() as u64)
         }
         "export_scan_only" => {
@@ -1026,31 +1046,6 @@ fn str_at(b: &RecordBatch, c: usize, i: usize) -> String {
         .unwrap()
         .value(i)
         .to_string()
-}
-
-/// 全表扫描 → CSV（**流式** + arrow 的批量 CSV writer）。
-///
-/// 别自己逐值 `array_value_to_string`：那是每个值一次 `String` 分配（5M 行 × 7 列
-/// = 3500 万次，实测 6.4s）——**测出来的是写这段代码的手艺，不是内核**。
-/// arrow 的 `csv::Writer` 走批量格式化，才是"一个正常导出工具"的水平。
-fn scan_to_csv(db: &Qsdb, out: &Path, _sql: &str) -> u64 {
-    let f = std::fs::File::create(out).expect("create out");
-    let mut w = arrow::csv::WriterBuilder::new().with_header(true).build(f);
-    let mut n = 0u64;
-    let req = qsdb::ScanRequest {
-        table: "t".into(),
-        db: None,
-        projection: None,
-        predicate: None,
-        limit: None,
-    };
-    let it = db.scan(req).expect("scan");
-    for b in it {
-        let b = b.expect("scan batch");
-        n += b.num_rows() as u64;
-        w.write(&b).expect("csv write");
-    }
-    n
 }
 
 // ---------------------------------------------------------------------------

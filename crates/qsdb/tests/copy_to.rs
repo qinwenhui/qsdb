@@ -375,13 +375,10 @@ fn 语法拒绝都指路() {
             format!("COPY orders FROM '{o}' (FORMAT PARQUET)"),
             "read_csv",
         ),
+        // 格式**必须显式写**（DuckDB 不写默认 CSV，我们不猜）
         (
             format!("COPY (SELECT id FROM orders) TO '{o}'"),
-            "FORMAT PARQUET",
-        ),
-        (
-            format!("COPY (SELECT id FROM orders) TO '{o}' (FORMAT CSV)"),
-            "PARQUET",
+            "显式写格式",
         ),
         (
             format!("COPY (SELECT id FROM orders) TO '{o}' (FORMAT PARQUET, DELIMITER ',')"),
@@ -466,5 +463,129 @@ fn 导出查询结果而非表() {
         ),
         vec!["cn|70", "us|30"],
     );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ══ ⑦ CSV 导出（`FORMAT CSV`）—— 单文件 ═══════════════════════════════════
+
+/// 端到端：导成 CSV **单文件** → 用 `read_csv` 读回来逐值一致。
+#[test]
+fn csv_导出与读回() {
+    let (db, root) = setup("csv");
+    seed(&db);
+    let out = root.join("out.csv");
+
+    db.sql(&format!(
+        "COPY (SELECT id, amount, region FROM orders) TO '{}' (FORMAT CSV, HEADER)",
+        p(&out)
+    ))
+    .unwrap();
+
+    // 目标是**文件**（不是目录）—— 与 parquet 那条刻意不同
+    assert!(out.is_file(), "CSV 该产出单个文件");
+    let text = std::fs::read_to_string(&out).unwrap();
+    let mut lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines[0], "id,amount,region",
+        "表头 = 剥掉限定符后的列名（F30）"
+    );
+    lines[1..].sort_unstable();
+    assert_eq!(
+        lines[1..],
+        vec!["1,10,cn", "2,20,cn", "3,30,us", "4,40,cn"],
+        "整份文件：{text}"
+    );
+
+    // 闭环：读回来
+    assert_eq!(
+        q(
+            &db,
+            &format!("SELECT id, amount, region FROM read_csv('{}')", p(&out))
+        ),
+        vec!["1|10|cn", "2|20|cn", "3|30|us", "4|40|cn"],
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 不写 `HEADER` ⇒ **没有表头行**（与 DuckDB 默认一致，别猜）。
+#[test]
+fn csv_默认不带表头() {
+    let (db, root) = setup("csvnoheader");
+    seed(&db);
+    let out = root.join("n.csv");
+    db.sql(&format!(
+        "COPY (SELECT id FROM orders) TO '{}' (FORMAT CSV)",
+        p(&out)
+    ))
+    .unwrap();
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(!text.starts_with("id"), "默认不该有表头：{text:?}");
+    assert_eq!(text.lines().count(), 4);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **零行 + HEADER** ⇒ 一份只有表头的文件（不是空文件）。
+/// （靠"用零行批触发 arrow 的 header 分支"实现，这条钉住它。）
+#[test]
+fn csv_零行也要有表头() {
+    let (db, root) = setup("csvempty");
+    seed(&db);
+    let out = root.join("e.csv");
+    db.sql(&format!(
+        "COPY (SELECT id AS a, region AS b FROM orders WHERE id > 999) TO '{}'          (FORMAT CSV, HEADER)",
+        p(&out)
+    ))
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "a,b
+"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// ★ CSV × `PARTITION_BY` **显式拒**（在绑定计划之前）。
+/// 理由是"写得出、读不回"：`read_csv` 没有 hive 目录语义，分区列重建不回来。
+#[test]
+fn csv_带分区要拒并指路() {
+    let (db, root) = setup("csvpart");
+    seed(&db);
+    let m = rejected(
+        &db,
+        &format!(
+            "COPY (SELECT id, dt FROM orders) TO '{}' (FORMAT CSV, PARTITION_BY (dt))",
+            p(&root.join("o"))
+        ),
+    );
+    assert!(m.contains("read_csv") && m.contains("PARQUET"), "{m}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// CSV 的目标是**文件**；写成目录形态（以 `/` 结尾）要指路。
+#[test]
+fn csv_目标写成目录要拒() {
+    let (db, root) = setup("csvdir");
+    seed(&db);
+    let m = rejected(
+        &db,
+        &format!(
+            "COPY (SELECT id FROM orders) TO '{}/' (FORMAT CSV)",
+            p(&root)
+        ),
+    );
+    assert!(m.contains("文件") && m.contains("PARQUET"), "{m}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 目标文件已存在 ⇒ 拒（与 parquet 的"目录非空"同一条纪律：不做静默覆盖）。
+#[test]
+fn csv_目标已存在要拒() {
+    let (db, root) = setup("csvexists");
+    seed(&db);
+    let out = root.join("x.csv");
+    let sql = format!("COPY (SELECT id FROM orders) TO '{}' (FORMAT CSV)", p(&out));
+    db.sql(&sql).unwrap();
+    let m = rejected(&db, &sql);
+    assert!(m.contains("已存在"), "{m}");
     std::fs::remove_dir_all(&root).ok();
 }

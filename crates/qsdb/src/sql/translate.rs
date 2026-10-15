@@ -704,6 +704,7 @@ pub enum ParsedStatement {
         query: Box<sqlparser::ast::Query>,
         target: String,
         partition_by: Vec<String>,
+        format: crate::export::ExportFormat,
     },
 }
 
@@ -908,32 +909,59 @@ fn translate_statement(
             };
             // **格式必须显式写**：DuckDB 不写 FORMAT 时默认是 CSV —— 我们按
             // "没写就报错"处理，免得从 DuckDB 过来的人以为自己在导 CSV。
-            let mut saw_format = false;
+            let mut fmt: Option<crate::export::ExportFormat> = None;
+            let mut header = false;
             for opt in &options {
                 match opt {
                     sqlparser::ast::CopyOption::Format(f)
                         if f.value.eq_ignore_ascii_case("PARQUET") =>
                     {
-                        saw_format = true
+                        fmt = Some(crate::export::ExportFormat::Parquet)
+                    }
+                    sqlparser::ast::CopyOption::Format(f)
+                        if f.value.eq_ignore_ascii_case("CSV") =>
+                    {
+                        fmt = Some(crate::export::ExportFormat::Csv { header: false })
                     }
                     sqlparser::ast::CopyOption::Format(f) => {
                         return Err(QsdbError::unsupported(format!(
-                            "COPY … TO 只支持 FORMAT PARQUET（给的是 `{}`）",
+                            "COPY … TO 只支持 `FORMAT PARQUET` 与 `FORMAT CSV`（给的是 `{}`）",
                             f.value
                         )));
                     }
+                    // `HEADER [true|false]`：sqlparser 本来就有这个变体，不用词法桩。
+                    // 默认**不带**表头（与 DuckDB 一致）。
+                    sqlparser::ast::CopyOption::Header(h) => header = *h,
                     other => {
                         return Err(QsdbError::unsupported(format!(
                             "COPY … TO 不支持选项 `{other}`\
-                             （现在只认 `FORMAT PARQUET` 与 `PARTITION_BY (…)`）"
+                             （现在只认 `FORMAT PARQUET|CSV`、`HEADER` 与 `PARTITION_BY (…)`）"
                         )));
                     }
                 }
             }
-            if !saw_format {
+            let format = match fmt {
+                Some(crate::export::ExportFormat::Csv { .. }) => {
+                    crate::export::ExportFormat::Csv { header }
+                }
+                Some(p) => p,
+                None => {
+                    return Err(QsdbError::unsupported(
+                        "COPY … TO 要显式写格式：`(FORMAT PARQUET)` 或 `(FORMAT CSV)` —— \
+                         不写就等于让调用方猜（DuckDB 不写时默认 CSV，我们**不猜**）",
+                    ));
+                }
+            };
+            // ★ CSV × PARTITION_BY：**在绑定计划之前**就拒（执行期那条更贵）。
+            //   理由见 `ExportFormat::Csv` 的文档：`read_csv` 没有 hive 语义 ⇒
+            //   写得出、读不回。
+            if matches!(format, crate::export::ExportFormat::Csv { .. })
+                && copy_partition_by.is_some_and(|c| !c.is_empty())
+            {
                 return Err(QsdbError::unsupported(
-                    "COPY … TO 要显式写 `(FORMAT PARQUET)` —— 现在只支持这一种格式，\
-                     不写就等于让调用方猜",
+                    "CSV 不支持 PARTITION_BY —— 本仓的 `read_csv` **没有 hive 目录语义**\
+                     （只有 `read_parquet` 有），分区列写出去就重建不回来，等于导出一份\
+                     我们自己读不了的数据。要分区导出请用 `FORMAT PARQUET`（出 + 读闭环）",
                 ));
             }
             if !legacy_options.is_empty() {
@@ -948,6 +976,7 @@ fn translate_statement(
                 query,
                 target: path,
                 partition_by: copy_partition_by.unwrap_or(&[]).to_vec(),
+                format,
             })
         }
         SqlStatement::CreateTable(ct) => {

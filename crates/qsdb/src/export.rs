@@ -36,6 +36,7 @@
 //! 后续两项可做：自适应刷盘、导出后小文件合并。
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -63,6 +64,25 @@ const ROUND_ROWS: u64 = 512 * 1024;
 /// pyarrow/Spark 会把它当隐藏文件跳过。
 const COMMON_METADATA: &str = "_common_metadata";
 
+/// 导出格式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    /// parquet + hive 目录布局（`docs/提交事件订阅与湖导出设计.md` §2.2）。
+    Parquet,
+    /// CSV（`header` 控制表头）。**单文件**。
+    ///
+    /// ⚠️ 与 parquet 的两点不同，都是**刻意的**：
+    ///
+    /// 1. **不支持 `PARTITION_BY`**。本仓的 `read_csv` **没有 hive 目录语义**
+    ///    （只有 `read_parquet` 有）⇒ 带分区写出去的数据**我们自己读不回来**。
+    ///    "写得出、读不回"是本仓一路在拒的形态，不能因为"别的引擎能读"就放行。
+    ///    （`translate` 层就拒，见 `ParsedStatement::CopyTo` 的构造。）
+    /// 2. **只支持本地**。`Store` 的远端写是**整体 PUT**（`put_object(&[u8])`
+    ///    没有流式接口）⇒ 单文件 CSV 要么把整个输出攒在内存、要么先落本地再整体
+    ///    上传，两条都与低占用冲突。远端请用 parquet。
+    Csv { header: bool },
+}
+
 /// 导出结果。
 pub(crate) struct ExportStats {
     pub rows: u64,
@@ -78,6 +98,22 @@ pub(crate) struct ExportStats {
 /// - `partition_by`：分区列名（大小写不敏感匹配 `schema`）。
 /// - `next`：拉下一批（`Ok(None)` = 结束）。由调用方绑着 exec + `ctx.check()`。
 pub(crate) fn write_dataset(
+    store: &Store,
+    target: &str,
+    schema: &SchemaRef,
+    partition_by: &[String],
+    format: ExportFormat,
+    next: &mut dyn FnMut() -> Result<Option<RecordBatch>>,
+) -> Result<ExportStats> {
+    match format {
+        ExportFormat::Parquet => write_parquet_dataset(store, target, schema, partition_by, next),
+        ExportFormat::Csv { header } => {
+            write_csv_dataset(store, target, schema, partition_by, header, next)
+        }
+    }
+}
+
+fn write_parquet_dataset(
     store: &Store,
     target: &str,
     schema: &SchemaRef,
@@ -131,6 +167,140 @@ pub(crate) fn write_dataset(
         bytes,
         partitions: partitions.max(1),
     })
+}
+
+// ---------------------------------------------------------------------------
+// CSV（`FORMAT CSV`）
+// ---------------------------------------------------------------------------
+
+/// CSV 单文件导出。
+///
+/// **为什么是单文件而不是目录**（与 parquet 那条刻意不同）：CSV 的消费者
+/// （Excel / pandas / 别的库的 `LOAD DATA`）要的就是**一个文件**；而 parquet
+/// 那边我们把它做成目录是因为**可能出多个 part**（分块并行编码）——
+/// 这里用"分块并行**格式化**、按序写进同一个文件"绕开了那个必要性。
+fn write_csv_dataset(
+    store: &Store,
+    target: &str,
+    schema: &SchemaRef,
+    partition_by: &[String],
+    header: bool,
+    next: &mut dyn FnMut() -> Result<Option<RecordBatch>>,
+) -> Result<ExportStats> {
+    if !partition_by.is_empty() {
+        // 与 `ExportFormat::Csv` 的文档同一条理由：`read_csv` 没有 hive 目录语义，
+        // 带分区写出去就**我们自己读不回来**。
+        return Err(QsdbError::unsupported(
+            "CSV 不支持 PARTITION_BY —— 本仓的 `read_csv` **没有 hive 目录语义**\n             （只有 `read_parquet` 有），分区列写出去就重建不回来，等于导出一份\n             我们自己读不了的数据。要分区导出请用 `FORMAT PARQUET`（出 + 读闭环）",
+        ));
+    }
+    if !store.is_local() {
+        return Err(QsdbError::unsupported(
+            "远端导出暂不支持 `FORMAT CSV`：Store 的远端写是**整体 PUT**\n             （没有流式接口）⇒ 单文件 CSV 得把整个输出攒在内存里，与低占用冲突。\n             远端请用 `FORMAT PARQUET`",
+        ));
+    }
+    let dest = csv_target(target)?;
+    if store.exists(&dest) {
+        return Err(QsdbError::invalid(format!(
+            "导出目标 `{}` 已存在 —— **不做静默覆盖**（同 parquet 那条）。\n             请先删掉它，或换一个路径",
+            dest.display()
+        )));
+    }
+
+    let tmp = crate::fsutil::tmp_sibling(&dest);
+    let mut rows: u64 = 0;
+    {
+        let mut f = std::fs::File::create(&tmp)
+            .map_err(|e| QsdbError::meta(format!("create {} failed: {e}", tmp.display())))?;
+        // 表头**写一次**（后面的块都不带）—— 用零行批触发 arrow 的 header 分支，
+        // 这样"零行结果 + HEADER"也会得到一份只有表头的文件（而不是空文件）。
+        if header {
+            f.write_all(&encode_csv(
+                &[RecordBatch::new_empty(Arc::clone(schema))],
+                true,
+            )?)
+            .map_err(|e| QsdbError::meta(format!("csv header failed: {e}")))?;
+        }
+
+        // 轮次式：与 parquet 同款 —— 缓冲有界，**格式化并行**。
+        let mut buf: Vec<RecordBatch> = Vec::new();
+        let mut buf_rows: u64 = 0;
+        while let Some(b) = next()? {
+            buf_rows += b.num_rows() as u64;
+            rows += b.num_rows() as u64;
+            buf.push(b);
+            if buf_rows >= ROUND_ROWS {
+                flush_csv_round(&mut f, std::mem::take(&mut buf))?;
+                buf_rows = 0;
+            }
+        }
+        if !buf.is_empty() {
+            flush_csv_round(&mut f, buf)?;
+        }
+        if store.data_sync() {
+            f.sync_all()
+                .map_err(|e| QsdbError::meta(format!("fsync csv failed: {e}")))?;
+        }
+    }
+    store.commit_object(&tmp, &dest)?;
+    if store.data_sync() {
+        crate::fsutil::dir_sync(&dest);
+    }
+    let bytes = store.stat(&dest)?.map(|m| m.size).unwrap_or(0);
+    Ok(ExportStats {
+        rows,
+        files: 1,
+        bytes,
+        partitions: 1,
+    })
+}
+
+/// CSV 目标是**文件**（parquet 那边才是目录）。
+fn csv_target(target: &str) -> Result<PathBuf> {
+    let t = target.trim();
+    if t.is_empty() {
+        return Err(QsdbError::invalid("COPY … TO 的路径是空的"));
+    }
+    if t.ends_with('/') || t.ends_with('\\') {
+        return Err(QsdbError::invalid(format!(
+            "`FORMAT CSV` 的目标是**文件**不是目录（`{t}`）—— CSV 写单个文件。\
+             要产出一个数据集目录请用 `FORMAT PARQUET`"
+        )));
+    }
+    Ok(PathBuf::from(t.replace('\\', "/")))
+}
+
+/// 一轮：切块 → **并行格式化** → **按序**写进同一个文件。
+///
+/// `collect()` 到 `Vec` 保住块间顺序（`par_iter` 本身是无序执行的，
+/// 但 `collect` 会按下标归位）；内存上界 = 一轮编码后的字节数。
+fn flush_csv_round(f: &mut std::fs::File, buf: Vec<RecordBatch>) -> Result<()> {
+    let chunks = chunk_batches(&buf, CHUNK_ROWS);
+    let encoded: Vec<Result<Vec<u8>>> = chunks
+        .into_par_iter()
+        .map(|c| encode_csv(&c, false))
+        .collect();
+    for e in encoded {
+        f.write_all(&e?)
+            .map_err(|e| QsdbError::meta(format!("csv write failed: {e}")))?;
+    }
+    Ok(())
+}
+
+/// 一批 → CSV 字节。**与 bench 里原来那条 `scan_to_csv` 同一个 writer**
+/// （arrow 的 `csv::Writer`）⇒ 换口径前后产出的文件逐字节可比。
+fn encode_csv(batches: &[RecordBatch], header: bool) -> Result<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut w = arrow::csv::WriterBuilder::new()
+            .with_header(header)
+            .build(&mut buf);
+        for b in batches {
+            w.write(b)
+                .map_err(|e| QsdbError::meta(format!("csv encode failed: {e}")))?;
+        }
+    }
+    Ok(buf)
 }
 
 // ---------------------------------------------------------------------------

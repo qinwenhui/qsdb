@@ -484,7 +484,8 @@ fn execute_stmt(
             query,
             target,
             partition_by,
-        } => copy_to(db, *query, &target, &partition_by, ctx),
+            format,
+        } => copy_to(db, *query, &target, &partition_by, format, ctx),
         translate::ParsedStatement::Truncate { table } => {
             let rows = db.truncate_table(&table)?;
             Ok(SqlResult::Ok {
@@ -1207,6 +1208,7 @@ fn copy_to(
     query: sqlparser::ast::Query,
     target: &str,
     partition_by: &[String],
+    format: crate::export::ExportFormat,
     ctx: &Arc<crate::query::QueryContext>,
 ) -> Result<SqlResult> {
     let resolver = translate::TableResolver {
@@ -1224,6 +1226,7 @@ fn copy_to(
         target,
         &schema,
         partition_by,
+        format,
         // 拉批时**每次都查 ctx** —— 大导出是长时间跑的，取消/超时/内存压力
         // 得能中断它（`cancel_latency` 那批的教训：只在入口查一次等于没有）。
         &mut || {
