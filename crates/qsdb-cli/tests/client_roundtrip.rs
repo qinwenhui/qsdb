@@ -13,7 +13,9 @@ use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use qsdb_client::{Auth, Client, Column, Error, Format, Mode, QueryOptions, Value, WriteOptions};
+use qsdb_client::{
+    Auth, Client, Column, Error, Format, Mode, Param, QueryOptions, Value, WriteOptions,
+};
 
 // ---------------------------------------------------------------------------
 // 起真 server（同 `http_contract.rs` 的做法）
@@ -715,4 +717,94 @@ fn 健康检查不需要认证() {
     let c = s.client();
     let v = c.health().unwrap();
     assert!(!v.is_empty(), "版本号不该是空的");
+}
+
+/// **参数化查询**（`docs/参数化查询设计.md`）：客户端只负责把值塞进 `params` 数组 ——
+/// 值在**内核绑定器**里变成 AST 字面量，**从不进入 SQL 文本**。
+///
+/// 这条同时钉住三件事，缺一条都不算数：
+/// ① 三种形态都能过（裸值推类型 / 显式类型 / `?` 占位符）；
+/// ② 参数**个数不对就是 400**（少给、多给都拒 —— 多给尤其要紧：静默忽略会让
+///    调用方以为自己防住了注入，其实有个值压根没绑上）；
+/// ③ ★ **注入串只是数据**：塞一段 `'; DROP TABLE t; --` 进去，表还在、值就是那串文本。
+#[test]
+fn 参数化查询往返() {
+    let s = Server::start();
+    let c = s.client();
+    setup(&c);
+    c.append("t", &sample()).expect("append");
+
+    // ① 裸值推类型（`1` 推成 BIGINT，与 id 列同类型 ⇒ 能比）
+    let t = c
+        .query_params("SELECT id, name FROM t WHERE id = $1", [Param::infer(1i64)])
+        .expect("query_params")
+        .into_bulk()
+        .expect("bulk");
+    assert_eq!(t.num_rows(), 1);
+    assert_eq!(
+        t.value(0, 1).unwrap().to_value(),
+        Value::Utf8("alice".into())
+    );
+
+    // ② 显式类型（`"19000"` 裸值会被推成 STRING，比不过 DATE 列 ⇒ 必须显式）
+    let t = c
+        .query_params(
+            "SELECT id FROM t WHERE d = $1",
+            [Param::typed("DATE", "2022-01-08")],
+        )
+        .expect("typed DATE")
+        .into_bulk()
+        .expect("bulk");
+    assert_eq!(t.num_rows(), 1, "d = 19000 那一行");
+
+    // ③ `?` 占位符（服务端认，驱动**不用改写 SQL**）+ 两个参数
+    let t = c
+        .query_with(
+            "SELECT id FROM t WHERE id >= ? AND id <= ? ORDER BY id",
+            &QueryOptions::default().with_params([Param::infer(1i64), Param::infer(2i64)]),
+        )
+        .expect("? placeholders")
+        .into_bulk()
+        .expect("bulk");
+    assert_eq!(t.num_rows(), 2);
+
+    // ④ 个数对不上 ⇒ 400（少给 / 多给都拒）
+    for params in [
+        vec![],                                       // 少给
+        vec![Param::infer(1i64), Param::infer(2i64)], // 多给
+    ] {
+        let e = c
+            .query_with(
+                "SELECT id FROM t WHERE id = $1",
+                &QueryOptions::default().with_params(params),
+            )
+            .expect_err("参数个数不对该报错");
+        assert!(
+            matches!(e, Error::Api { .. } | Error::Usage(_)),
+            "应当是带 code 的错误，实得 {e:?}"
+        );
+    }
+
+    // ⑤ ★ 注入串**只是数据**：表还在，值就是那串文本本身
+    let evil = "x'; DROP TABLE t; --";
+    let t = c
+        .query_params("SELECT name FROM t WHERE name = $1", [Param::infer(evil)])
+        .expect("注入串该被当数据")
+        .into_bulk()
+        .expect("bulk");
+    assert_eq!(
+        t.num_rows(),
+        0,
+        "没有一行叫这个 —— 但它**没有报错**，也没改任何东西"
+    );
+    let n = c
+        .query("SELECT count(*) AS n FROM t")
+        .expect("表还在")
+        .into_bulk()
+        .expect("bulk");
+    assert_eq!(
+        n.value(0, 0).unwrap().to_value(),
+        Value::I64(3),
+        "表必须还在、且还是 3 行（`DROP` 只是那串文本）"
+    );
 }

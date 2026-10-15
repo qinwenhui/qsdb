@@ -239,6 +239,66 @@ pub struct QueryOptions {
     /// 所以**以响应回显为准**（[`JsonResult::query_id`] / [`ResultSet::query_id`]），
     /// 别拿你发出去的值去取消。
     pub query_id: Option<String>,
+    /// **参数化查询**的值（`docs/参数化查询设计.md`）。
+    ///
+    /// 服务端在**内核绑定器**里把它们变成 AST 字面量 —— **值从不进入 SQL 文本**，
+    /// 所以这里不需要、也**不该**有"转义助手"。
+    ///
+    /// 占位符有两种写法，用哪个都行（**同一句不许混用**）：
+    /// `WHERE g = $1`（显式、可重复引用）或 `WHERE g = ?`（按出现顺序）。
+    pub params: Vec<Param>,
+}
+
+/// 一个参数值。
+///
+/// 两种形态对应服务端协议的两种写法（`params: [...]` 数组的元素）：
+///
+/// ```no_run
+/// # use qsdb_client::Param;
+/// let a = Param::infer(10);                       // 裸值：服务端按 JSON 形态推类型
+/// let b = Param::typed("DATE", "2026-01-01");     // 显式类型：与驱动 setDate 对齐
+/// ```
+///
+/// **显式类型什么时候需要**：JSON 推不出你想要的那个类型时。典型是
+/// `"2026-01-01"` —— 裸值会被推成 STRING，而列是 DATE 时比较会不如你预期；
+/// 以及 `10` 想当 `SMALLINT` / `DECIMAL(10,2)` 这类窄类型。
+/// ⇒ **拿不准就写显式类型**（它是裸值的超集，不会因为将来加类型而改协议）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Param {
+    /// 裸值 —— 服务端按 JSON 形态推类型（`10`⇒BIGINT、`"a"`⇒STRING、`true`⇒BOOLEAN…）
+    Infer(serde_json::Value),
+    /// 显式类型 —— `ty` 走 **DDL 同一套解析器**（`BIGINT` / `DATE` /
+    /// `DECIMAL(10,2)` / `VARCHAR` …），所以名字不会和建表时漂
+    Typed {
+        /// 类型名（走 DDL 同一套解析器：`BIGINT` / `DATE` / `DECIMAL(10,2)` …）
+        ty: String,
+        /// 值（按该类型解析；解析不了**显式报错**，不静默换类型）
+        value: serde_json::Value,
+    },
+}
+
+impl Param {
+    /// 裸值（服务端推类型）。
+    pub fn infer(v: impl Into<serde_json::Value>) -> Self {
+        Param::Infer(v.into())
+    }
+
+    /// 显式类型。`ty` 拼错会**在服务端被拒**（不是静默按别的类型跑）。
+    pub fn typed(ty: impl Into<String>, v: impl Into<serde_json::Value>) -> Self {
+        Param::Typed {
+            ty: ty.into(),
+            value: v.into(),
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            Param::Infer(v) => v.clone(),
+            Param::Typed { ty, value } => {
+                serde_json::json!({ "type": ty, "value": value })
+            }
+        }
+    }
 }
 
 impl QueryOptions {
@@ -259,6 +319,12 @@ impl QueryOptions {
     /// 指定 query id（见字段说明里的回退规则）。
     pub fn with_query_id(mut self, id: impl Into<String>) -> Self {
         self.query_id = Some(id.into());
+        self
+    }
+
+    /// 带上参数（见 [`Param`]）。
+    pub fn with_params(mut self, params: impl IntoIterator<Item = Param>) -> Self {
+        self.params = params.into_iter().collect();
         self
     }
 }
@@ -513,10 +579,30 @@ impl Client {
         self.query_with(sql, &QueryOptions::default())
     }
 
+    /// 跑一条**带参数**的 SQL（等价于 `query_with(sql, &QueryOptions::default().with_params(…))`）。
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), qsdb_client::Error> {
+    /// # let c = qsdb_client::Client::connect("http://127.0.0.1:9430", qsdb_client::Auth::None)?;
+    /// use qsdb_client::Param;
+    /// let rs = c.query_params(
+    ///     "SELECT * FROM t WHERE g = $1 AND dt >= ?",
+    ///     [Param::infer(10), Param::typed("DATE", "2026-01-01")],
+    /// )?;
+    /// # Ok(()) }
+    /// ```
+    pub fn query_params(
+        &self,
+        sql: &str,
+        params: impl IntoIterator<Item = Param>,
+    ) -> Result<ResultSet> {
+        self.query_with(sql, &QueryOptions::default().with_params(params))
+    }
+
     /// 跑一条 SQL（指定通道/超时/query id）。
     pub fn query_with(&self, sql: &str, opts: &QueryOptions) -> Result<ResultSet> {
         let extra = extra_headers(opts);
-        let body = serde_json::json!({ "sql": sql, "format": opts.format.as_str() }).to_string();
+        let body = body_of(sql, opts.format.as_str(), &opts.params);
         let resp = self.http.post_with(
             "/api/v1/query",
             "application/json",
@@ -537,7 +623,7 @@ impl Client {
     /// - 大结果**别用 `query` 再转行式**（那会把整份结果搬进内存），用这个。
     pub fn query_stream(&self, sql: &str, opts: &QueryOptions) -> Result<RowStream> {
         let extra = extra_headers(opts);
-        let body = serde_json::json!({ "sql": sql, "format": "rows" }).to_string();
+        let body = body_of(sql, "rows", &opts.params);
         let (head, mut body) = self.http.post_stream(
             "/api/v1/query",
             "application/json",
@@ -799,6 +885,16 @@ fn dispatch(head: http::Head, body: Vec<u8>, query_id_hdr: Option<&str>) -> Resu
         "不认识的响应 Content-Type: {ct:?}（响应体 {} 字节）",
         body.len()
     )))
+}
+/// 请求体。**只在有参数时才带 `params` 字段** —— 没参数时请求体与从前逐字节相同
+/// （老服务端/老代理看到的报文一个字不变）。
+fn body_of(sql: &str, format: &str, params: &[Param]) -> String {
+    if params.is_empty() {
+        serde_json::json!({ "sql": sql, "format": format }).to_string()
+    } else {
+        let arr: Vec<serde_json::Value> = params.iter().map(Param::to_json).collect();
+        serde_json::json!({ "sql": sql, "format": format, "params": arr }).to_string()
+    }
 }
 
 fn extra_headers(opts: &QueryOptions) -> Vec<(&'static str, String)> {

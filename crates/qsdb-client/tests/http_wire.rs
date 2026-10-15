@@ -75,8 +75,8 @@ impl Step {
 
 struct Fake {
     addr: SocketAddr,
-    /// 每个请求的**请求头**（已小写化），供断言用（如 Authorization）。
-    reqs: Receiver<String>,
+    /// 每个请求的（**请求头**, **请求体**），供断言用（如 Authorization / params）。
+    reqs: Receiver<(String, String)>,
     /// 建过的连接数（复用与否的硬证据）。
     conns: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
@@ -85,6 +85,10 @@ struct Fake {
 
 impl Fake {
     fn next_req(&self) -> String {
+        self.next_req_full().0
+    }
+    /// （头, 体）—— 断请求体（如 `params`）用这个。
+    fn next_req_full(&self) -> (String, String) {
         self.reqs
             .recv_timeout(Duration::from_secs(5))
             .expect("应当收到请求")
@@ -110,7 +114,8 @@ impl Drop for Fake {
 fn fake(script: Vec<Step>) -> Fake {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = l.local_addr().expect("addr");
-    let (tx, reqs): (Sender<String>, Receiver<String>) = channel();
+    #[allow(clippy::type_complexity)] // (头, 体) 元组；起个 type alias 反而绕
+    let (tx, reqs): (Sender<(String, String)>, Receiver<(String, String)>) = channel();
     let conns = Arc::new(AtomicUsize::new(0));
     let conns_srv = Arc::clone(&conns);
     let stop = Arc::new(AtomicBool::new(false));
@@ -125,8 +130,8 @@ fn fake(script: Vec<Step>) -> Fake {
             conns_srv.fetch_add(1, Ordering::SeqCst);
             // 短读超时只为"脚本用完后尽快收摊"——请求都是立刻到的，不影响用例
             s.set_read_timeout(Some(Duration::from_millis(800))).ok();
-            while let Some(head) = read_request(&mut s) {
-                let _ = tx.send(head);
+            while let Some((head, body)) = read_request(&mut s) {
+                let _ = tx.send((head, body));
                 let Some(step) = script.next() else { break };
                 for p in &step.parts {
                     if s.write_all(p).is_err() {
@@ -152,7 +157,7 @@ fn fake(script: Vec<Step>) -> Fake {
 
 /// 读一个请求，返回**原样**的请求头文本（大小写不能改：base64 是大小写敏感的）。
 /// body 一并读掉（否则下一条请求会读到脏数据）。
-fn read_request(s: &mut TcpStream) -> Option<String> {
+fn read_request(s: &mut TcpStream) -> Option<(String, String)> {
     let mut buf: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 4096];
     let head_end = loop {
@@ -168,14 +173,15 @@ fn read_request(s: &mut TcpStream) -> Option<String> {
     let cl = header(&head, "content-length")
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(0);
-    let mut have = buf.len() - head_end;
-    while have < cl {
+    let mut body: Vec<u8> = buf[head_end..].to_vec();
+    while body.len() < cl {
         match s.read(&mut tmp) {
             Ok(0) | Err(_) => break,
-            Ok(n) => have += n,
+            Ok(n) => body.extend_from_slice(&tmp[..n]),
         }
     }
-    Some(head)
+    body.truncate(cl);
+    Some((head, String::from_utf8_lossy(&body).into_owned()))
 }
 
 /// 按名取头（名字大小写无关，**值原样**）。
@@ -433,4 +439,56 @@ fn 超时与_query_id_作为请求头发出() {
     let head = f.next_req();
     assert_eq!(header(&head, "x-qsdb-timeout-ms").as_deref(), Some("1500"));
     assert_eq!(header(&head, "x-qsdb-query-id").as_deref(), Some("cli-9"));
+}
+
+// ── 参数化查询：**请求体的形态**（协议面，值不落 SQL 文本）────────────────────
+
+/// 三种形态各自序列化成协议约定的样子，且**值不在 `sql` 里**。
+#[test]
+fn params_序列化成协议形态() {
+    let f = fake(vec![Step::json(OK1)]);
+    let c = client(&f);
+    c.query_params(
+        "SELECT * FROM t WHERE g = $1 AND d = $2 AND s = $3",
+        [
+            qsdb_client::Param::infer(10i64),
+            qsdb_client::Param::typed("DATE", "2026-01-01"),
+            qsdb_client::Param::infer("x'; DROP TABLE t; --"),
+        ],
+    )
+    .unwrap();
+
+    let (_, body) = f.next_req_full();
+    let v: serde_json::Value = serde_json::from_str(&body).expect("请求体是 JSON");
+    assert_eq!(
+        v["params"],
+        serde_json::json!([
+            10,
+            { "type": "DATE", "value": "2026-01-01" },
+            "x'; DROP TABLE t; --"
+        ]),
+        "实际请求体：{body}"
+    );
+    // ★ 值**只在 `params` 里**；`sql` 原样（还是占位符）
+    assert_eq!(
+        v["sql"],
+        "SELECT * FROM t WHERE g = $1 AND d = $2 AND s = $3"
+    );
+    assert!(
+        !v["sql"].as_str().unwrap().contains("DROP TABLE"),
+        "值不许被拼进 SQL 文本：{body}"
+    );
+}
+
+/// **没有参数时请求体与从前逐字节相同** —— 老服务端/中间代理看到的报文一个字不变。
+#[test]
+fn 无参数时请求体不带_params_字段() {
+    let f = fake(vec![Step::json(OK1)]);
+    let c = client(&f);
+    c.query("SELECT 1").unwrap();
+    let (_, body) = f.next_req_full();
+    assert_eq!(
+        body, r#"{"format":"bulk","sql":"SELECT 1"}"#,
+        "没参数就不该多出 `params` 键"
+    );
 }
