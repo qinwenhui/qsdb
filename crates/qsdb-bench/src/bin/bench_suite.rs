@@ -185,17 +185,18 @@ fn cases() -> Vec<(&'static str, &'static str, &'static str)> {
         (
             "export_parquet",
             "导出",
-            "全表扫描 → Parquet 文件（内核暂无导出原语，见 docs §F9）",
+            "COPY (SELECT * FROM t) TO '<目录>' (FORMAT PARQUET) —— 走内核导出原语",
         ),
         ("export_csv", "导出", "全表扫描 → CSV 文件"),
         (
             "export_scan_only",
             "导出",
             // **诊断用，不是对比格**：把"导出"拆成扫描与写段两半。
-            // 两侧的口径本来就不对等——DuckDB 跑的是内核原语 `COPY … TO`（并行、
-            // 自带压缩调优），我们跑的是"内核并行扫描 + bench 工具里 arrow-rs 的
-            // 通用单线程 writer"。不拆开就分不清慢在**内核扫描**还是**客户端写段**，
-            // 而两者该对症的方向完全不同（前者是内核缺口，后者是 F9 导出原语）。
+            // ⚠️ 这条注释原本的理由是"两侧口径不对等（DuckDB 跑内核原语、
+            // 我们跑 bench 里的单线程 writer）"。**2026-10-15 A3 之后那句不成立了**
+            // —— 我们的 `export_parquet` 也走内核 `COPY … TO` 了。
+            // 这条诊断格的用法随之改变：现在量的是"**同一个引擎内**，扫描占了
+            // 导出耗时的多少"（下界），不再是"我们与对手的口径差"。
             "只扫描不写（导出耗时的下界）",
         ),
         ("simple_count", "简单", "count(*)"),
@@ -366,14 +367,6 @@ CREATE TABLE t_pq AS SELECT * FROM read_parquet('{pq}');"
 // ---------------------------------------------------------------------------
 // 峰值 RSS（Linux VmHWM；其他平台恒 0——本工具的真身跑在 Linux）
 // ---------------------------------------------------------------------------
-
-/// 批的切片感知字节（仅用于打印产出规模）。
-fn nb(b: &RecordBatch) -> u64 {
-    b.columns()
-        .iter()
-        .map(|c| c.to_data().get_slice_memory_size().unwrap_or(0) as u64)
-        .sum()
-}
 
 fn peak_rss_kb() -> u64 {
     if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
@@ -811,14 +804,34 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
             (n, dt.as_millis() as u64)
         }
         // ---- 导出 ----
+        //
+        // **2026-10-15 换口径**：改成走**内核导出原语**（A3 `COPY … TO`），
+        // 与 DuckDB 那侧跑的是同一个形状（它们本来就是 `COPY … TO`）。
+        // 此前这里跑的是 bench 工具里 arrow-rs 的通用单线程 writer —— 那测的是
+        // "客户端写段有多慢"，不是"内核导出有多快"，两侧口径**根本不对等**
+        // （老注释自己写明了这点）。现在两侧都从各自的内核出发。
         "export_parquet" => {
-            let out = dir.join("out_qsdb.parquet");
+            let out = dir.join("out_qsdb");
+            // 目标是**目录**、且内核**拒绝非空目录**（不做静默覆盖：残留的旧
+            // part 会被读成多余的数据）。清理放在**计时之外** —— bench 纪律：
+            // 断言/整理不许进计时区间。
+            std::fs::remove_dir_all(&out).ok();
+            let sql = format!(
+                "COPY (SELECT * FROM t) TO '{}' (FORMAT PARQUET)",
+                out.to_string_lossy().replace('\\', "/")
+            );
             let t0 = Instant::now();
+            let r = db.sql(&sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let dt = t0.elapsed();
             // 返回值的第二项是**毫秒**（`run_once` 的约定）。写错过一次——把"写入字节数"
             // 当成耗时返回，报出 577330s（160 小时）这种一眼假的数；顺手去掉那个误导量。
-            let (n, _bytes) =
-                scan_to_parquet(&db, &out, "SELECT * FROM t", FACT_COLS, fact_schema());
-            let dt = t0.elapsed();
+            let n = match r {
+                qsdb::sql::SqlResult::Ok {
+                    rows_affected: Some(n),
+                    ..
+                } => n,
+                other => panic!("COPY … TO 该回 Ok(rows_affected)，实得 {other:?}"),
+            };
             (n, dt.as_millis() as u64)
         }
         "export_csv" => {
@@ -1013,46 +1026,6 @@ fn str_at(b: &RecordBatch, c: usize, i: usize) -> String {
         .unwrap()
         .value(i)
         .to_string()
-}
-
-/// 全表扫描 → Parquet（内核暂无导出原语，这里是"用内核读 + 标准写"的基线）。
-fn scan_to_parquet(
-    db: &Qsdb,
-    out: &Path,
-    _sql: &str,
-    _cols: &str,
-    schema: arrow::datatypes::SchemaRef,
-) -> (u64, u64) {
-    let f = std::fs::File::create(out).expect("create out");
-    let mut w = ArrowWriter::try_new(f, schema.clone(), None).expect("writer");
-    let mut n = 0u64;
-    let mut bytes = 0u64;
-    // **流式**：走 `scan()`（流式迭代器）而不是 `sql_collect`——后者会把 5M 行
-    // 全部物化后再返回（实测峰值 1.9GB，导出因此慢 3-8 倍）；导出工具要的就是流式读。
-    let req = qsdb::ScanRequest {
-        table: "t".into(),
-        db: None,
-        projection: None,
-        predicate: None,
-        limit: None,
-    };
-    let it = db.scan(req).expect("scan");
-    for b in it {
-        let b = b.expect("scan batch");
-        n += b.num_rows() as u64;
-        bytes += crate::nb(&b);
-        w.write(&b).expect("write");
-    }
-    w.close().expect("close");
-    return (n, bytes);
-    #[allow(unreachable_code)]
-    for b in db.sql_collect(_sql).expect("scan") {
-        n += b.num_rows() as u64;
-        bytes += b.get_array_memory_size() as u64;
-        w.write(&b).expect("write");
-    }
-    w.close().expect("close");
-    (n, bytes)
 }
 
 /// 全表扫描 → CSV（**流式** + arrow 的批量 CSV writer）。

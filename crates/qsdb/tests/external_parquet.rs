@@ -364,3 +364,66 @@ fn f12_hive_directory_semantics() {
     assert_eq!(rows[0][0], "3");
     std::fs::remove_dir_all(&root).ok();
 }
+
+// ── A3 导出当场撞出来的两条读侧修正（2026-10-15）─────────────────────────
+//
+// 两条都是**既有的**、且既有用例覆盖不到的：f12 那批只有一个分区列、
+// 文件也都在子目录里，于是两个洞都恰好绕开了。
+
+/// `**/` 要能匹配**零层目录**（gitignore / globset / DuckDB 都是这个语义）。
+///
+/// 少了这条，`dir/**/*.parquet` **匹配不到 `dir/part-0.parquet`** ——
+/// 而那正是"不分区导出 → 读回来"最自然的写法（A3 验收当场撞上：
+/// 导出成功、读的时候报 0 个文件）。
+#[test]
+fn a3_双星号匹配零层目录() {
+    let root = tmp_root("globstar");
+    let dir = root.join("lake");
+    std::fs::create_dir_all(dir.join("dt=2026-01-01")).unwrap();
+    write_parquet(&dir.join("top.parquet"), 0, 3); // ★ 直接在 base 下
+    write_parquet(&dir.join("dt=2026-01-01/sub.parquet"), 101, 3);
+    let db = db_at(&root);
+
+    let pat = format!("{}/**/*.parquet", dir.to_string_lossy().replace('\\', "/"));
+    let rows = rows_of(
+        &db,
+        &format!("SELECT count(*), sum(amount) FROM read_parquet('{pat}')"),
+    );
+    assert_eq!(rows[0][0], "6", "base 下的 top.parquet 也必须被匹配到");
+
+    // 一层星号仍然只认同层（别把语义放宽过头）
+    let pat1 = format!("{}/*.parquet", dir.to_string_lossy().replace('\\', "/"));
+    let rows = rows_of(&db, &format!("SELECT count(*) FROM read_parquet('{pat1}')"));
+    assert_eq!(rows[0][0], "3");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 多个 hive 分区列时，**列顺序必须是确定的**（= 路径里由外到内）。
+///
+/// 此前 `extract_hive_partitions` 返回 `HashMap`，调用方按它追加列 ⇒
+/// 同一句 `SELECT *` 在不同进程里可能给出不同的列次序（单分区列时看不出来）。
+#[test]
+fn a3_hive_多分区列的列顺序确定() {
+    let root = tmp_root("hiveorder");
+    let lake = root.join("lake");
+    for d in ["dt=2026-01-01/region=cn", "dt=2026-01-02/region=us"] {
+        std::fs::create_dir_all(lake.join(d)).unwrap();
+    }
+    write_parquet(&lake.join("dt=2026-01-01/region=cn/a.parquet"), 0, 2);
+    write_parquet(&lake.join("dt=2026-01-02/region=us/b.parquet"), 10, 2);
+    let db = db_at(&root);
+
+    let pat = format!("{}/**/*.parquet", lake.to_string_lossy().replace('\\', "/"));
+    let b = db
+        .sql_collect(&format!("SELECT * FROM read_parquet('{pat}') LIMIT 1"))
+        .unwrap();
+    let names: Vec<String> = b[0]
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    // 数据文件列 ++ hive 列，hive 列**按路径由外到内**（不是 HashMap 顺序）
+    assert_eq!(names, vec!["tenant", "amount", "score", "dt", "region"]);
+    std::fs::remove_dir_all(&root).ok();
+}

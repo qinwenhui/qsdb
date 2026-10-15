@@ -169,7 +169,7 @@ pub fn check_param_count(expected: usize, given: usize) -> Result<()> {
 /// （实测：`SELECT '含中文内容', ?` 里那个 `?` 报 `C17` —— 按字符数才对得上）。
 /// 所以必须**逐字符走一遍**；直接拿 column 当字节用，会在含中文的 SQL（字符串
 /// 字面量、注释）上错位。
-fn byte_offset(sql: &str, line: u64, col: u64) -> Result<usize> {
+pub(crate) fn byte_offset(sql: &str, line: u64, col: u64) -> Result<usize> {
     let (mut l, mut c) = (1u64, 1u64);
     for (i, ch) in sql.char_indices() {
         if l == line && c == col {

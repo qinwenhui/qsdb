@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use sqlparser::ast::{SetExpr, Statement as SqlStatement};
+use sqlparser::ast::{CopySource, CopyTarget, SetExpr, Statement as SqlStatement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
@@ -692,6 +692,19 @@ pub enum ParsedStatement {
     Truncate {
         table: String,
     },
+    /// `COPY (SELECT …) TO '<目录>' (FORMAT PARQUET [, PARTITION_BY (cols)])`（F9 / A3）。
+    ///
+    /// 目标是**目录**（不是文件）：导出可能产出多个 `part-*.parquet`
+    /// （并行分块写，见 `crate::export`）—— 哪怕没写 `PARTITION_BY` 也一样。
+    ///
+    /// `partition_by` 是**词法层**抽出来的（`sql::copy_options`；sqlparser 的
+    /// `CopyOption` 没有这个变体），列名在这里还没校验 —— 它们必须能在查询输出里
+    /// 找到，那条在 `crate::export` 里做（要看到计划）。
+    CopyTo {
+        query: Box<sqlparser::ast::Query>,
+        target: String,
+        partition_by: Vec<String>,
+    },
 }
 
 pub fn parse_statements(sql: &str) -> Result<Vec<ParsedStatement>> {
@@ -755,10 +768,14 @@ pub fn parse_statements(sql: &str) -> Result<Vec<ParsedStatement>> {
         }
     }
 
-    let ast = Parser::parse_sql(&GenericDialect {}, trimmed)
+    // **`COPY … TO` 的 `PARTITION_BY` 桩**：sqlparser 的 `CopyOption` 没有这个
+    // 变体，所以先把它从文本里摘出来、再让 sqlparser 解析剩下的（详见
+    // `sql::copy_options` 的模块文档）。没有这个子句时是借用、零成本。
+    let (for_parse, copy_pb) = super::copy_options::extract_partition_by(trimmed)?;
+    let ast = Parser::parse_sql(&GenericDialect {}, &for_parse)
         .map_err(|e| QsdbError::parse_err(format!("SQL parse error: {e}")))?;
     ast.into_iter()
-        .map(|stmt| translate_statement(stmt, trimmed))
+        .map(|stmt| translate_statement(stmt, trimmed, copy_pb.as_deref()))
         .collect()
 }
 
@@ -848,8 +865,91 @@ fn validate_check_exprs(def: &TableDef) -> Result<()> {
     Ok(())
 }
 
-fn translate_statement(stmt: SqlStatement, raw: &str) -> Result<ParsedStatement> {
+fn translate_statement(
+    stmt: SqlStatement,
+    raw: &str,
+    copy_partition_by: Option<&[String]>,
+) -> Result<ParsedStatement> {
     match stmt {
+        // `COPY … TO`（F9 / A3）。**只做导出**，且只做 parquet + hive 目录。
+        //
+        // 每条不支持的形态都**显式拒并指路** —— 这些正是"语法合法但没实现"的
+        // 高发区（`COPY t TO 'x'` / `COPY … FROM` / `FORMAT CSV`）。
+        SqlStatement::Copy {
+            source,
+            to,
+            target,
+            options,
+            legacy_options,
+            ..
+        } => {
+            if !to {
+                return Err(QsdbError::unsupported(
+                    "COPY … FROM（导入）未实现 —— 导入请用 `INSERT INTO t SELECT … FROM \
+                     read_csv('…')`，或走 HTTP `/write` 通道（`bulk`/`rows` 批量装载）",
+                ));
+            }
+            let query = match source {
+                CopySource::Query(q) => q,
+                CopySource::Table { .. } => {
+                    return Err(QsdbError::unsupported(
+                        "COPY <表> TO … 未实现 —— 写成 `COPY (SELECT * FROM t) TO '<目录>' \
+                         (FORMAT PARQUET)`",
+                    ));
+                }
+            };
+            let path = match target {
+                CopyTarget::File { filename } => filename,
+                CopyTarget::Stdin | CopyTarget::Stdout | CopyTarget::Program { .. } => {
+                    return Err(QsdbError::unsupported(format!(
+                        "COPY … TO {target} 未实现（只支持文件/目录路径）"
+                    )));
+                }
+            };
+            // **格式必须显式写**：DuckDB 不写 FORMAT 时默认是 CSV —— 我们按
+            // "没写就报错"处理，免得从 DuckDB 过来的人以为自己在导 CSV。
+            let mut saw_format = false;
+            for opt in &options {
+                match opt {
+                    sqlparser::ast::CopyOption::Format(f)
+                        if f.value.eq_ignore_ascii_case("PARQUET") =>
+                    {
+                        saw_format = true
+                    }
+                    sqlparser::ast::CopyOption::Format(f) => {
+                        return Err(QsdbError::unsupported(format!(
+                            "COPY … TO 只支持 FORMAT PARQUET（给的是 `{}`）",
+                            f.value
+                        )));
+                    }
+                    other => {
+                        return Err(QsdbError::unsupported(format!(
+                            "COPY … TO 不支持选项 `{other}`\
+                             （现在只认 `FORMAT PARQUET` 与 `PARTITION_BY (…)`）"
+                        )));
+                    }
+                }
+            }
+            if !saw_format {
+                return Err(QsdbError::unsupported(
+                    "COPY … TO 要显式写 `(FORMAT PARQUET)` —— 现在只支持这一种格式，\
+                     不写就等于让调用方猜",
+                ));
+            }
+            if !legacy_options.is_empty() {
+                return Err(QsdbError::unsupported(
+                    "COPY 的旧式（带括号外）选项未实现 —— 选项请都写进括号里：\
+                     `(FORMAT PARQUET, PARTITION_BY (…))`",
+                ));
+            }
+            // 词法层抽到 PARTITION_BY、但 AST 里没有对应项 —— 两者必须一致，
+            // 不一致说明有人把 `raw` 和 `for_parse` 搞混了（内部错误）。
+            Ok(ParsedStatement::CopyTo {
+                query,
+                target: path,
+                partition_by: copy_partition_by.unwrap_or(&[]).to_vec(),
+            })
+        }
         SqlStatement::CreateTable(ct) => {
             let table = object_name_single(ct.name.clone())?;
             // `CREATE OR REPLACE TABLE` 一律仍拒（含 CTAS 形态）——**先判它**，
@@ -1873,7 +1973,7 @@ fn resolve_read_parquet(path: &str) -> Result<(LogicalPlan, SchemaCtx)> {
                 });
             }
         }
-        hive.keys().cloned().collect()
+        hive.iter().map(|(k, _)| k.clone()).collect()
     } else {
         Vec::new()
     };

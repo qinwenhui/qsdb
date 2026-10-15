@@ -5,6 +5,7 @@
 //! SQL-1：GROUP BY + count/sum/avg/min/max、ORDER BY、DISTINCT、
 //!        CAST、IS [NOT] NULL、标量函数 v1 集、别名
 
+pub mod copy_options;
 pub mod exec_builder;
 pub mod params;
 pub mod translate;
@@ -117,7 +118,11 @@ pub fn check_role_permission(
         | PS::Truncate { .. }
         | PS::CreateUser { .. }
         | PS::DropUser { .. }
-        | PS::AlterUser { .. } => {
+        | PS::AlterUser { .. }
+        // `COPY … TO` 往**任意文件系统路径**写东西（目标不由我们约束）⇒ 归 admin。
+        // 判据照 PG：`COPY TO '<文件>'` 要 superuser（非超级用户只能走 STDOUT）。
+        // 让 writer 角色能写任意路径，等于给网线上的 SQL 一个文件写入原语。
+        | PS::CopyTo { .. } => {
             if role.is_admin() {
                 Ok(())
             } else {
@@ -475,6 +480,11 @@ fn execute_stmt(
                 message: format!("view '{name}' dropped"),
             })
         }
+        translate::ParsedStatement::CopyTo {
+            query,
+            target,
+            partition_by,
+        } => copy_to(db, *query, &target, &partition_by, ctx),
         translate::ParsedStatement::Truncate { table } => {
             let rows = db.truncate_table(&table)?;
             Ok(SqlResult::Ok {
@@ -1201,6 +1211,59 @@ fn strip_table_qualifier(n: &str) -> &str {
 /// ① 列名/类型由 SELECT 的**输出**推导（没写列清单时）；
 /// ② 失败时把刚建的表**删掉** —— PG 的 CTAS 是全有全无的，留一张空表让人以为
 ///    "建好了、只是没数据"比报错更坏。
+/// `COPY (SELECT …) TO '<目录>' (FORMAT PARQUET [, PARTITION_BY (…)])`（F9 / A3）。
+///
+/// 与 `create_table_as` 同构：绑计划 → 建 exec → 拉批。区别只在批的去处 ——
+/// 那边是 `InsertSink`（落表），这边是 `crate::export`（hive 目录 + parquet 文件）。
+///
+/// 分工：**这里只管绑计划与拉批**，分区切分、目录布局、并行编码全在
+/// `crate::export` 里（那部分不依赖执行器，可单测）。
+fn copy_to(
+    db: &Qsdb,
+    query: sqlparser::ast::Query,
+    target: &str,
+    partition_by: &[String],
+    ctx: &Arc<crate::query::QueryContext>,
+) -> Result<SqlResult> {
+    let resolver = translate::TableResolver {
+        resolve: Box::new(|n: &str| db.table_def(n)),
+        views: crate::views::ViewStore::read_all(db.store())?,
+    };
+    let (plan, cte_defs) = translate::translate_select_full_with_ctes(query, &resolver)?;
+    let _cte_scope = exec_builder::CteScope::new();
+    materialize_ctes(db, &cte_defs, ctx)?;
+    ctx.check()?;
+    let mut exec = exec_builder::build(db, &plan, ctx)?;
+    let schema = exec.schema();
+    let stats = crate::export::write_dataset(
+        db.store(),
+        target,
+        &schema,
+        partition_by,
+        // 拉批时**每次都查 ctx** —— 大导出是长时间跑的，取消/超时/内存压力
+        // 得能中断它（`cancel_latency` 那批的教训：只在入口查一次等于没有）。
+        &mut || {
+            ctx.check()?;
+            match exec.next() {
+                Some(b) => Ok(Some(b?)),
+                None => Ok(None),
+            }
+        },
+    )?;
+    Ok(SqlResult::Ok {
+        message: format!(
+            "exported {} rows → {} ({} files, {} partitions, {:.1} MB)",
+            stats.rows,
+            target,
+            stats.files,
+            stats.partitions,
+            stats.bytes as f64 / (1024.0 * 1024.0)
+        ),
+        rows_affected: Some(stats.rows),
+        command: Some("COPY"),
+    })
+}
+
 fn create_table_as(
     db: &Qsdb,
     name: &str,

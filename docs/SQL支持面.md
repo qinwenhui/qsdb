@@ -153,6 +153,8 @@
 | `ALTER TABLE … ADD COLUMN` | ✅ | |
 | `ALTER TABLE … DROP COLUMN` | ✋ | |
 | `CREATE INDEX` / 视图 / 用户管理 | ✅ | 见 `docs/对接契约.md` §三 |
+| **`COPY (SELECT …) TO '<目录>' (FORMAT PARQUET [, PARTITION_BY (列…)])`** | ✅ | 2026-10-15 实现（F9 / A3 湖导出）。产出 hive 布局：`<目录>/dt=2026-01-01/region=cn/part-00000.parquet` + `_common_metadata`；**分区列只在目录名里、不进数据文件**（Spark 惯例），与我们自己的 `read_parquet` hive 语义（F12）正好闭环。<br>⚠️ **目标是目录不是文件**（写了 `.parquet` 后缀会被拒）——哪怕不写 `PARTITION_BY` 也可能出多个 `part-*`（分块并行写）。<br>⚠️ **目标目录必须为空**：不做静默覆盖（残留的旧 `part-*` 会被读成多余的数据）。<br>⚠️ `FORMAT PARQUET` **必须显式写**（DuckDB 不写默认 CSV，我们不猜）。<br>⚠️ 分区列限 **STRING / BIGINT / DATE / BOOLEAN**，且取值形态要一致 —— 目录里只有文本，读侧按首个值推断类型，`FLOAT` 的 `1.5` 会读成 `VARCHAR`、字符串列里的 `'2026-01-01'` 会读成 `DATE` ⇒ 这类"写得出、读不对"的**当场拒**。<br>⚠️ **NULL 分区值拒**（不采 `__HIVE_DEFAULT_PARTITION__`）。<br>⚠️ **admin 专属**（判据同 PG 的 `COPY TO '<文件>'` 要 superuser：那是往任意路径写文件的原语）。<br>值级验收 `tests/copy_to.rs`（导出 → `read_parquet` 读回逐值一致） |
+| `COPY <表> TO …` / `COPY … FROM`（导入）/ `FORMAT CSV` / `STDIN`·`STDOUT`·`PROGRAM` | ✋ | 各给指路文案。导入走 `INSERT INTO t SELECT … FROM read_csv('…')` 或 HTTP `/write` |
 | 多语句（分号分隔） | ✋ | 一次一条（防注入面） |
 
 ---

@@ -398,8 +398,18 @@ impl FileLoc {
 /// F12：从外表文件位置提取 hive 分区（路径含 `k=v` 段 → 列名 → 值列表）。
 /// 返回 None = 无 hive 目录（普通外表）。类型由首个值推断（parse 分区值
 /// 的类型推导链：先试 Date/Int64/Bool，失败回退 Utf8）。
-pub(crate) fn extract_hive_partitions(files: &[FileLoc]) -> Option<HashMap<String, Vec<Literal>>> {
-    let mut hive: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new(); // (name, [(value, base)])
+///
+/// ⚠️ 返回的是 **`Vec` 而不是 `HashMap`**（2026-10-15 改，A3 导出当场撞出来）：
+/// 顺序就是**列顺序**（调用方按它追加列），而 `HashMap` 的迭代序每次进程都可能
+/// 不同 ⇒ 同一句 `SELECT * FROM read_parquet('…/**/*.parquet')` 两个分区的列
+/// **次序会变**。单分区时看不出来（f12 那批就是一个分区列），多分区列一上来就
+/// 变成 flaky。
+///
+/// 顺序取**路径里由外到内**（`dt=a/region=b/…` ⇒ `[dt, region]`）——
+/// 与 `COPY … TO (PARTITION_BY (dt, region))` 的书写顺序一致。
+pub(crate) fn extract_hive_partitions(files: &[FileLoc]) -> Option<Vec<(String, Vec<Literal>)>> {
+    // (name, [(value, base)])，**保序**（首个文件里的出现序 = 由外到内）
+    let mut hive: Vec<(String, Vec<(String, PathBuf)>)> = Vec::new();
     for loc in files {
         // 统一成 owned：`Local`/`Managed` 是**借用**、`S3` 是 owned URL——两臂
         // 类型不一致会让 **`feature s3` 直接编不过**（默认构建不含 S3 臂，故一直
@@ -411,18 +421,23 @@ pub(crate) fn extract_hive_partitions(files: &[FileLoc]) -> Option<HashMap<Strin
             FileLoc::S3(u) => PathBuf::from(u),
             FileLoc::Managed(p) => p.clone(),
         };
-        // 逐段找 k=v
+        // 逐段找 k=v。`ancestors()` 是**由内到外**（先 `region=b` 再 `dt=a`），
+        // 先收下来再反转 ⇒ 得到**由外到内**的顺序（= 目录的书写顺序）。
+        let mut segs: Vec<(&str, &str)> = Vec::new();
         for anc in p.ancestors().skip(1) {
             if let Some(name) = anc.file_name().and_then(|n| n.to_str()) {
                 if let Some((k, v)) = name.split_once('=') {
-                    if k.is_empty() || v.is_empty() {
-                        continue;
+                    if !k.is_empty() && !v.is_empty() {
+                        segs.push((k, v));
                     }
-                    // 记录 (value, 文件本身) 以便后续按文件取值
-                    hive.entry(k.to_string())
-                        .or_default()
-                        .push((v.to_string(), p.clone()));
                 }
+            }
+        }
+        for (k, v) in segs.into_iter().rev() {
+            // 记录 (value, 文件本身) 以便后续按文件取值
+            match hive.iter_mut().find(|(n, _)| n == k) {
+                Some((_, pairs)) => pairs.push((v.to_string(), p.clone())),
+                None => hive.push((k.to_string(), vec![(v.to_string(), p.clone())])),
             }
         }
     }
@@ -430,24 +445,30 @@ pub(crate) fn extract_hive_partitions(files: &[FileLoc]) -> Option<HashMap<Strin
         return None;
     }
     // 每列：推断类型 + 去重值列表（按首次出现序）
-    let mut out: HashMap<String, Vec<Literal>> = HashMap::new();
-    for (k, pairs) in &hive {
-        let first_val = pairs.first().map(|(v, _)| v.as_str()).unwrap_or("");
-        let ty = infer_partition_type(first_val);
-        let mut vals: Vec<Literal> = Vec::new();
-        for (v, _) in pairs {
-            let lit = parse_partition_value(v, &ty).unwrap_or(Literal::Utf8(v.clone()));
-            if !vals.contains(&lit) {
-                vals.push(lit);
+    let out: Vec<(String, Vec<Literal>)> = hive
+        .iter()
+        .map(|(k, pairs)| {
+            let first_val = pairs.first().map(|(v, _)| v.as_str()).unwrap_or("");
+            let ty = infer_partition_type(first_val);
+            let mut vals: Vec<Literal> = Vec::new();
+            for (v, _) in pairs {
+                let lit = parse_partition_value(v, &ty).unwrap_or(Literal::Utf8(v.clone()));
+                if !vals.contains(&lit) {
+                    vals.push(lit);
+                }
             }
-        }
-        out.insert(k.clone(), vals);
-    }
+            (k.clone(), vals)
+        })
+        .collect();
     Some(out)
 }
 
 /// 分区值类型推断（从字符串值）。
-fn infer_partition_type(v: &str) -> crate::types::LogicalType {
+///
+/// ⚠️ **它不只被读侧用**：导出（`crate::export`）要拿它**预演**一遍
+/// "这个值写进目录名之后会被读回什么类型" —— 对不上就当场拒（否则导出会
+/// **静默改类型**：`FLOAT` 列的 `1.5` 读回来是 `VARCHAR`）。
+pub(crate) fn infer_partition_type(v: &str) -> crate::types::LogicalType {
     use crate::types::LogicalType;
     if crate::types::temporal::parse_date(v).is_ok() {
         return LogicalType::Date;
@@ -512,6 +533,13 @@ pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
             if p.len() > 1 && p[1] == '*' {
                 // '**'：任意（含 '/'）——尝试全部吞噬长度
                 let rest = &p[2..];
+                // ★ `**/` 也要匹配**零层目录**（gitignore / globset / DuckDB 都如此：
+                //   `a/**/b` 匹配 `a/b`）。少了这一条，`dir/**/*.parquet` 就**匹配不到
+                //   `dir/part-0.parquet`** —— 而那正是"不分区导出 → 读回来"最自然的
+                //   写法（A3 的验收当场撞上：导出成功、读的时候 0 个文件）。
+                if rest.first() == Some(&'/') && m(&rest[1..], t) {
+                    return true;
+                }
                 (0..=t.len()).any(|i| m(rest, &t[i..]))
             } else {
                 // '*'：段内任意

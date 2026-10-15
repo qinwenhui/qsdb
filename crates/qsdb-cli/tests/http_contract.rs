@@ -1525,3 +1525,88 @@ fn users_export_over_http_roundtrips_into_import() {
     assert_eq!(r.status, 401);
     assert_eq!(r.code(), "UNAUTHORIZED");
 }
+
+/// **`COPY … TO` 走 `/query`**（F9 湖导出）。
+///
+/// 契约文档（`生态能力契约.md`）把湖导出标成"✅ 可用"，那是一条**对生态的
+/// 承诺** —— 按本仓纪律（F24 那条教训：契约写"可用"的端点必须有契约测试钉着），
+/// 这里钉两件事：① 它**真的能从网线上触发**（不是只有嵌入方能用）；
+/// ② **闭环**——导出去的东西经由同一条 `/query` 的 `read_parquet` 读得回来。
+#[test]
+fn copy_to_export_over_http() {
+    let srv = Server::start(&[]);
+    let p = srv.port;
+    assert_eq!(
+        query(
+            p,
+            "CREATE TABLE t (dt DATE, region STRING, id BIGINT)",
+            None
+        )
+        .status,
+        200
+    );
+    assert_eq!(
+        query(
+            p,
+            "INSERT INTO t VALUES \
+             (CAST('2026-01-01' AS DATE), 'cn', 1), \
+             (CAST('2026-01-01' AS DATE), 'cn', 2), \
+             (CAST('2026-01-01' AS DATE), 'us', 3), \
+             (CAST('2026-01-02' AS DATE), 'cn', 4)",
+            None
+        )
+        .status,
+        200
+    );
+
+    // 目标目录必须为空 ⇒ 每次跑用一个新的
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let out = std::env::temp_dir().join(format!("qsdb_copy_http_{}_{}", std::process::id(), uniq));
+    let _ = std::fs::remove_dir_all(&out);
+    let out_s = out.to_string_lossy().replace('\\', "/");
+
+    let r = query(
+        p,
+        &format!(
+            "COPY (SELECT dt, region, id FROM t) TO '{out_s}' \
+             (FORMAT PARQUET, PARTITION_BY (dt, region))"
+        ),
+        None,
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["command"], "COPY");
+    assert_eq!(r.json()["rowsAffected"], 4);
+
+    // hive 布局落到盘上（多分区列 ⇒ 逐级目录）
+    for d in [
+        "dt=2026-01-01/region=cn",
+        "dt=2026-01-01/region=us",
+        "dt=2026-01-02/region=cn",
+    ] {
+        assert!(
+            out.join(d).join("part-00000.parquet").is_file(),
+            "缺 {d}/part-00000.parquet"
+        );
+    }
+
+    // 闭环：同一条 `/query` 把它读回来（分区列由目录名重建）
+    let r = query(
+        p,
+        &format!(
+            "SELECT dt, region, count(*) AS n FROM read_parquet('{out_s}/**/*.parquet') \
+             WHERE dt = DATE '2026-01-01' GROUP BY dt, region ORDER BY region"
+        ),
+        None,
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let rows = r.json();
+    let rows = rows["rows"].as_array().expect("rows").clone();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0][1], "cn");
+    assert_eq!(rows[0][2], 2);
+    assert_eq!(rows[1][1], "us");
+    assert_eq!(rows[1][2], 1);
+
+    let _ = std::fs::remove_dir_all(&out);
+}

@@ -18,6 +18,7 @@ pub mod compact;
 pub mod csv;
 pub mod error;
 pub mod exec;
+pub mod export;
 pub mod expr;
 pub mod filecache;
 pub mod fsutil;
