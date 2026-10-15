@@ -185,16 +185,23 @@ impl TableDef {
     }
 }
 
-/// 标识符：`[A-Za-z_][A-Za-z0-9_]*`，≤64 字符。
-fn validate_ident(name: &str, what: &str) -> Result<()> {
-    let ok = name.len() <= 64
+/// 标识符是否合法：`[A-Za-z_][A-Za-z0-9_]*`，≤64 字符。
+///
+/// 单独成函数是因为 **CTAS 要拿它做"推导出来的列名合不合法"的判据**
+/// （`CREATE TABLE t AS SELECT count(*) …` 推导出的名字是 `count(*)`，
+/// 那种名字建不成表列 —— 得在**建表之前**就拦住并指路，见 `sql::mod` 的 CTAS 分支）。
+pub(crate) fn ident_ok(name: &str) -> bool {
+    name.len() <= 64
         && !name.is_empty()
         && name
             .chars()
             .next()
             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    if ok {
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn validate_ident(name: &str, what: &str) -> Result<()> {
+    if ident_ok(name) {
         Ok(())
     } else {
         Err(QsdbError::invalid(format!(

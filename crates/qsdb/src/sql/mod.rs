@@ -105,7 +105,10 @@ pub fn check_role_permission(
             }
         }
         // DDL + 运维 + 用户管理：Admin
+        // CTAS 也是 DDL（建表）——虽然它顺带写数据，但**建表**才是它的身份；
+        // 不因为"它写了数据"就降级到 writer（那会让 writer 能建表）。
         PS::CreateTable { .. }
+        | PS::CreateTableAs { .. }
         | PS::DropTable { .. }
         | PS::AlterAddColumn { .. }
         | PS::CreateView { .. }
@@ -167,6 +170,12 @@ fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) ->
                 message: "table created".into(),
             })
         }
+        translate::ParsedStatement::CreateTableAs {
+            name,
+            columns,
+            partition_keys,
+            query,
+        } => create_table_as(db, &name, &columns, &partition_keys, *query, ctx),
         translate::ParsedStatement::AlterAddColumn { table, column } => {
             let name = column.name.clone();
             db.alter_add_column(&table, column)?;
@@ -1122,6 +1131,128 @@ fn insert_values(
 ///
 /// 已知边界：SELECT 返回 0 行时 OVERWRITE 是**无操作**（没有行 → 推不出要替换
 /// 哪个分区）；`INSERT OVERWRITE t SELECT … WHERE false` 不会清空目标分区。
+/// CTAS 推导列名时**去掉表限定**：`a.g` ⇒ `g`（与 PG 一致）。
+///
+/// 为什么必须剥：JOIN 场景下本仓的列名是**限定名**（`a.g` —— 裸名恒解析到左表，
+/// 右表列必须限定，见 `SQL支持面.md` §二），而表列名不允许 `.`
+/// ⇒ 不剥的话 `CREATE TABLE j AS SELECT a.g, b.v FROM t a JOIN t b …` 必被拒，
+/// 而那是最普通的写法之一。
+///
+/// 只在**形如 `标识符.标识符`** 时剥：表列名限 `[A-Za-z_][A-Za-z0-9_]*`，
+/// 所以带 `.` 的推导名**只可能**是限定引用（不可能是"某个列本来就叫 a.b"）。
+/// 剥完若重名（`SELECT a.g, b.g`），下游的重复检查会报出来。
+fn strip_table_qualifier(n: &str) -> &str {
+    match n.rsplit_once('.') {
+        Some((q, c)) if crate::catalog::ident_ok(q) && crate::catalog::ident_ok(c) => c,
+        _ => n,
+    }
+}
+
+/// `CREATE TABLE … AS SELECT …`：**派 schema → 建表 → 跑查询落表**，失败则回滚。
+///
+/// 与"手工两步"（`CREATE TABLE` + `INSERT INTO … SELECT …`）的差别只有两条：
+/// ① 列名/类型由 SELECT 的**输出**推导（没写列清单时）；
+/// ② 失败时把刚建的表**删掉** —— PG 的 CTAS 是全有全无的，留一张空表让人以为
+///    "建好了、只是没数据"比报错更坏。
+fn create_table_as(
+    db: &Qsdb,
+    name: &str,
+    columns: &[(String, crate::types::LogicalType)],
+    partition_keys: &[String],
+    query: sqlparser::ast::Query,
+    ctx: &Arc<crate::query::QueryContext>,
+) -> Result<SqlResult> {
+    // ① 先绑计划：schema 要从它推出来，**建表之前**就得有。
+    let resolver = translate::TableResolver {
+        resolve: Box::new(|n: &str| db.table_def(n)),
+        views: crate::views::ViewStore::read_all(db.store())?,
+    };
+    let (plan, cte_defs) = translate::translate_select_full_with_ctes(query, &resolver)?;
+    let out = translate::plan_output_columns(&plan)?;
+    if out.is_empty() {
+        return Err(QsdbError::invalid(
+            "CREATE TABLE … AS SELECT 的查询产出了 0 列 —— 建不出表",
+        ));
+    }
+
+    // ② 定列名/列类型
+    let cols: Vec<(String, crate::types::LogicalType)> = if columns.is_empty() {
+        // 没写列清单 ⇒ 用 SELECT 的输出名。**输出名可以是表达式文本**
+        // （`count(*)` / `a + b`），那种名字建不成表列（`validate_ident` 只认
+        // `[A-Za-z_][A-Za-z0-9_]*`）—— 建表前就拦住并**指路**。
+        // 为什么不替用户改名（PG 会把它们改成 `count` / `?column?`）：那是**另一种
+        // 静默** —— 表里会出现一个他从没写过的列名，而"改名"这件事本身还可能撞车。
+        let out: Vec<(String, crate::types::LogicalType)> = out
+            .into_iter()
+            .map(|(n, t)| (strip_table_qualifier(&n).to_string(), t))
+            .collect();
+        for (i, (n, _)) in out.iter().enumerate() {
+            if !crate::catalog::ident_ok(n) {
+                return Err(QsdbError::invalid(format!(
+                    "CTAS 推导出的第 {} 列名 `{n}` 不是合法表列名（限 [A-Za-z_][A-Za-z0-9_]*、\
+                     ≤64 字符）—— 给表达式起个别名（`… AS col{i}`），或显式写列清单\
+                     （`CREATE TABLE {name} (c1 BIGINT, …) AS SELECT …`）",
+                    i + 1,
+                )));
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        if let Some(dup) = out.iter().find(|(n, _)| !seen.insert(n.clone())) {
+            return Err(QsdbError::invalid(format!(
+                "CTAS 推导出的列名有重复：`{}` 出现两次 —— 请给其中一个起别名",
+                dup.0
+            )));
+        }
+        out
+    } else {
+        // 写了列清单 ⇒ 名字与类型都用用户写的。**列数必须一致**：不一致就是
+        // "你建的表和你要塞的数据对不上"，在建表前说清楚（否则建完才炸，还得回滚）。
+        if columns.len() != out.len() {
+            return Err(QsdbError::invalid(format!(
+                "CREATE TABLE … AS SELECT：列清单 {} 列，而查询产出 {} 列",
+                columns.len(),
+                out.len()
+            )));
+        }
+        columns.to_vec()
+    };
+
+    // ③ 建表（`TableDef::validate` 顺手把分区列的规则也校验了：必须是列、必须
+    //    nullable、类型受限、至少要有一个非分区列）
+    let defs: Vec<crate::catalog::ColumnDef> = cols
+        .iter()
+        .map(|(n, t)| crate::sql::make_column(n, t.clone(), true, None, None))
+        .collect();
+    let def = crate::catalog::TableDef::new(name.to_string(), defs, partition_keys.to_vec())?;
+    db.create_table(def.clone())?;
+
+    // ④ 跑计划 → 落表。**失败就回滚**（表刚建、里面不可能有别人写的数据）。
+    let perm: Vec<usize> = (0..cols.len()).collect();
+    let run = || -> Result<u64> {
+        let _cte_scope = exec_builder::CteScope::new();
+        materialize_ctes(db, &cte_defs, ctx)?;
+        let mut exec = exec_builder::build(db, &plan, ctx)?;
+        let mut sink = InsertSink::new(db, name, &def, &perm, false, ctx)?;
+        while let Some(b) = exec.next() {
+            ctx.check()?;
+            sink.push(&b?)?;
+        }
+        sink.finish()
+    };
+    match run() {
+        Ok(n) => Ok(SqlResult::Ok {
+            rows_affected: Some(n),
+            command: Some("CREATE TABLE AS"),
+            message: format!("table '{name}' created, {n} rows inserted"),
+        }),
+        Err(e) => {
+            // 回滚：删掉刚建的表。删失败也不掩盖**原始**错误（那才是要修的）
+            let _ = db.drop_table(name);
+            Err(e)
+        }
+    }
+}
+
 fn insert_select(
     db: &Qsdb,
     table: &str,

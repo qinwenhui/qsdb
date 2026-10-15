@@ -595,6 +595,21 @@ pub enum ParsedStatement {
     CreateTable {
         def: TableDef,
     },
+    /// `CREATE TABLE … AS SELECT …`（CTAS）。
+    ///
+    /// ⚠️ **列名/列类型的来源分两种，别混**：
+    /// - 没写列清单（`CREATE TABLE t AS SELECT …`）⇒ 用 **SELECT 的输出名与类型**；
+    ///   输出名可能是**表达式文本**（`count(*)` / `a + b`），那不是合法表列名
+    ///   ⇒ 在建表前**显式拒**并指路（见 `sql::mod` 的 CTAS 分支）。
+    /// - 写了列清单（`CREATE TABLE t (g BIGINT, n BIGINT) AS SELECT …`）⇒ 名字与
+    ///   类型都用**用户写的**，列数必须与 SELECT 一致（sqlparser 要求列清单带类型，
+    ///   所以不存在"只给名字"的形态）。
+    CreateTableAs {
+        name: String,
+        columns: Vec<(String, crate::types::LogicalType)>,
+        partition_keys: Vec<String>,
+        query: Box<sqlparser::ast::Query>,
+    },
     DropTable {
         name: String,
         if_exists: bool,
@@ -809,20 +824,35 @@ fn translate_statement(stmt: SqlStatement, raw: &str) -> Result<ParsedStatement>
     match stmt {
         SqlStatement::CreateTable(ct) => {
             let table = object_name_single(ct.name.clone())?;
-            // **CTAS**：此前会掉进"零列"检查、报 `table needs at least one column`
-            // （把"没实现"说成"你建表建错了"）。docs/SQL支持面.md 曾声称这条
-            // "报错文案已明确" —— 实测**根本没落地**（2026-10-15，`support_claims.rs`，
-            // 与 F29② 同款的失败模式）。这里按实情拒。
-            if ct.query.is_some() {
-                return Err(QsdbError::unsupported(
-                    "CREATE TABLE … AS SELECT (CTAS) 未实现 —— 用 `CREATE TABLE` + `INSERT INTO … SELECT …`（见 docs/SQL支持面.md §五）",
-                ));
-            }
-            // `CREATE OR REPLACE TABLE`：此前报 `already exists`（文档自认误导）。
+            // `CREATE OR REPLACE TABLE` 一律仍拒（含 CTAS 形态）——**先判它**，
+            // 因为 `CREATE OR REPLACE TABLE t AS SELECT …` 是最容易让人误以为
+            // "反正要重建，OR REPLACE 无所谓"的写法，得让文案说清为什么不行。
             if ct.or_replace {
                 return Err(QsdbError::unsupported(
                     "CREATE OR REPLACE TABLE 未实现 —— 先 `DROP TABLE` 再 `CREATE`（要原子替换分区内容用 `INSERT OVERWRITE`）",
                 ));
+            }
+            // **CTAS**（2026-10-15 实现，生态功能批次 4）。
+            // 此前会掉进"零列"检查、报 `table needs at least one column`（把"没实现"
+            // 说成"你建表建错了"）；文档一度声称"报错文案已明确"，实测**根本没落地**
+            // （与 F29② 同款）。现在按标准实现：schema 由 SELECT 的输出推导。
+            if let Some(q) = ct.query.clone() {
+                let part_keys = match &ct.hive_distribution {
+                    sqlparser::ast::HiveDistributionStyle::PARTITIONED { columns } => {
+                        columns.iter().map(|c| c.name.value.clone()).collect()
+                    }
+                    _ => parse_partitioned_by(raw)?,
+                };
+                let mut columns = Vec::with_capacity(ct.columns.len());
+                for c in &ct.columns {
+                    columns.push((c.name.value.clone(), ast_type_to_logical(&c.data_type)?));
+                }
+                return Ok(ParsedStatement::CreateTableAs {
+                    name: table,
+                    columns,
+                    partition_keys: part_keys,
+                    query: q,
+                });
             }
             let mut defs = Vec::with_capacity(ct.columns.len());
             for c in &ct.columns {
