@@ -471,6 +471,13 @@ pub struct AggExpr {
     /// ——宁可炸，也不能把 `count(DISTINCT x)` 当成 `count(x)` 跑出个错数字
     /// （这正是 2026-10-13 之前的老行为）。
     pub distinct: bool,
+    /// `FILTER (WHERE …)`：**只有谓词为 TRUE 的行**才喂给这个聚合
+    /// （NULL/UNKNOWN 不通过 —— SQL 三值语义）。
+    ///
+    /// 与 `distinct` 不同，这个语义**落到了执行层**（`exec::agg` 在更新每个聚合
+    /// 之前按自己的掩码筛行）。⚠️ 掩码是**逐聚合**的：同一条 SELECT 里两个聚合
+    /// 可以各有各的 FILTER，所以**不能**在批次层面统一预筛（那会让它们互相污染）。
+    pub filter: Option<PhysExpr>,
 }
 
 impl AggExpr {
@@ -491,6 +498,7 @@ impl AggExpr {
             out_ty,
             udaf: None,
             distinct: false,
+            filter: None,
         })
     }
 
@@ -508,6 +516,7 @@ impl AggExpr {
             out_ty,
             udaf: Some(def),
             distinct: false,
+            filter: None,
         })
     }
 

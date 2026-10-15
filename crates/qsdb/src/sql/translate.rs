@@ -394,8 +394,12 @@ fn audit_function(f: &sqlparser::ast::Function) -> Result<()> {
              (a silently-dropped clause returns wrong results without any error)"
         )))
     };
-    if f.filter.is_some() {
-        return reject("aggregate FILTER (WHERE …)");
+    // `FILTER (WHERE …)` **聚合已实现**（2026-10-15，生态功能批次 3）：谓词只有
+    // TRUE 才把行喂给该聚合。这里只拦**标量函数上的 FILTER**（没有意义）。
+    // ⚠️ 窗口函数**不走 `try_bind_agg`**，所以窗口 + FILTER 要在
+    // `parse_window_fn` 里单独拦 —— 否则它会被静默丢掉（回全量，正是本批要消灭的）。
+    if f.filter.is_some() && !is_agg_name(&fn_name(f)) {
+        return reject("FILTER (WHERE …) on a scalar function");
     }
     if f.null_treatment.is_some() {
         return reject("IGNORE/RESPECT NULLS");
@@ -4148,6 +4152,15 @@ fn parse_window_fn(
 ) -> Result<crate::exec::window::WindowFn> {
     use crate::exec::window::WindowFn as W;
     let name = fn_name(f);
+    // 窗口函数**不走 `try_bind_agg`** ⇒ `audit_function` 放行的聚合 FILTER 会从
+    // 这里漏进来被静默丢掉（回全量聚合 = 错值）。窗口 FILTER 本批没做 ⇒ 显式拒。
+    if f.filter.is_some() {
+        return Err(QsdbError::unsupported(
+            "窗口函数上的 FILTER (WHERE …) 暂未实现 —— 显式拒绝而不是静默丢掉它\
+             （丢掉就等于把 `sum(x) FILTER (WHERE c)` 当成 `sum(x)` 跑，回错值）；\
+             改写：`sum(CASE WHEN c THEN x END) OVER (…)`",
+        ));
+    }
     // 帧先解析（`None` = 没写帧 ⇒ 默认帧）：排名/偏移类带帧在这里就被拒。
     let frame = parse_window_fn_frame(f, &name)?;
     let arg_exprs: Vec<sqlparser::ast::Expr> = fn_args(f)
@@ -5430,10 +5443,41 @@ fn try_bind_agg(f: &sqlparser::ast::Function, ctx: &SchemaCtx) -> Result<Option<
             "{name}(DISTINCT *) is not valid"
         )));
     }
+    // `FILTER (WHERE …)`：谓词必须绑成**布尔**表达式（非布尔直接拒，别让它在
+    // 执行层变成"永远不为 TRUE"而静默回空值）。
+    let filter = match &f.filter {
+        None => None,
+        Some(pred) => {
+            if matches!(
+                pred.as_ref(),
+                sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan {
+                    value: sqlparser::ast::Value::Null,
+                    ..
+                })
+            ) {
+                return Err(QsdbError::invalid(
+                    "FILTER (WHERE NULL) —— 谓词恒 UNKNOWN，聚合会永远回空",
+                ));
+            }
+            let p = bind_expr(pred, ctx)?;
+            if !p.is_boolean() {
+                return Err(QsdbError::type_err(format!(
+                    "FILTER (WHERE …) 的谓词必须是布尔，实得 {:?}",
+                    p.data_type()
+                )));
+            }
+            Some(p)
+        }
+    };
     // `count(DISTINCT x)` 的**显示名**必须与 `count(x)` 不同：`collect_aggs` 按
     // `out_name` 去重，同名会把语义不同的两个聚合合并成一个（少算一列）。
     // PG/DuckDB 对这类列名同样回 `count(DISTINCT x)`。
-    let out_name = format!(
+    //
+    // ⚠️ **FILTER 同理、且更险**：`count(*) FILTER (WHERE a>1)` 与
+    // `count(*) FILTER (WHERE a<5)` 若都叫 `count(*)`，会被去重成**同一个聚合**
+    // ⇒ 两列拿到**同一个数字**，而那个数字只对其中一个谓词成立。
+    // 与窗口帧那次的 `window_spec_sig` 是同一类坑（去重键漏了语义维度）。
+    let mut out_name = format!(
         "{}({}{})",
         name,
         if distinct { "DISTINCT " } else { "" },
@@ -5441,8 +5485,12 @@ fn try_bind_agg(f: &sqlparser::ast::Function, ctx: &SchemaCtx) -> Result<Option<
             .map(|a| a.display())
             .unwrap_or_else(|| "*".into())
     );
+    if let Some(p) = &filter {
+        out_name.push_str(&format!(" FILTER (WHERE {})", p.display()));
+    }
     let mut agg = AggExpr::new(func, arg, out_name)?;
     agg.distinct = distinct;
+    agg.filter = filter;
     Ok(Some(agg))
 }
 
@@ -5474,6 +5522,17 @@ fn rewrite_distinct_aggs(
 ) -> Result<(LogicalPlan, Vec<PhysExpr>, Vec<AggExpr>)> {
     if !aggs.iter().any(|a| a.distinct) {
         return Ok((input, group.to_vec(), aggs.to_vec()));
+    }
+    // **`DISTINCT` + `FILTER` 同时写**：去重改写会把输入换成 `Distinct{[分组键…, 参数]}`，
+    // 那时 FILTER 谓词引用的列**已经不在输入里了**（谓词可以引用任何列，不只是参数）。
+    // 硬做需要把谓词引用的列也塞进去重键 —— 那会**改变去重语义**（多一个列就多一组，
+    // `count(DISTINCT x)` 的个数会变多）。所以显式拒，绝不静默丢弃谓词。
+    if let Some(bad) = aggs.iter().find(|a| a.distinct && a.filter.is_some()) {
+        return Err(QsdbError::unsupported(format!(
+            "`{}` —— `DISTINCT` 与 `FILTER` 同时写暂不支持：去重改写会换掉输入，\
+             FILTER 谓词引用的列就不在了。请拆成子查询（先 WHERE 再 DISTINCT）",
+            bad.out_name
+        )));
     }
     // ① 组合校验（宁可报错，也不猜语义）。
     if let Some(bad) = aggs.iter().find(|a| !a.distinct) {
@@ -5550,6 +5609,8 @@ fn rewrite_distinct_aggs(
             out_ty: a.out_ty.clone(),
             udaf: a.udaf.clone(),
             distinct: false,
+            // DISTINCT + FILTER 已在上面显式拒 ⇒ 走到这里必然无 FILTER
+            filter: None,
         })
         .collect();
     Ok((src, plan_group, plan_aggs))

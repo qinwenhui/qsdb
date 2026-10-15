@@ -562,6 +562,13 @@ fn metadata_shortcut_count(
     if agg.func != crate::expr::AggFunc::Count || agg.arg.is_some() {
         return Ok(None);
     }
+    // ⚠️ **写了 `FILTER` 就不能走元数据短路**（2026-10-15）：这条短路直接回
+    // parquet footer 的行数，压根不看行 —— `count(*) FILTER (WHERE v>15)` 会被
+    // 当成 `count(*)` 回**全量行数**（实测 5 而非 2），而且**一声不响**。
+    // 新加任何"整表行数"式捷径时，都要问一句"这个聚合还带什么逐行条件"。
+    if agg.filter.is_some() {
+        return Ok(None);
+    }
     // Scan：谓词仅引用分区列
     let LogicalPlan::Scan {
         def,

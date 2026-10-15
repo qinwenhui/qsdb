@@ -67,6 +67,47 @@ fn eval_agg_arrays(aggs: &[AggExpr], batch: &RecordBatch) -> Result<Vec<Option<A
         .collect()
 }
 
+/// 每个聚合自己的 `FILTER (WHERE …)` 掩码（按**批内行号**；`None` = 该聚合没写）。
+///
+/// **逐聚合算、逐聚合用**：同一条 SELECT 里两个聚合可以各有各的谓词，所以
+/// **不能**在批次层面统一预筛（那会让它们互相污染）。分组键的形成**不受** FILTER
+/// 影响 —— 谓词只决定"这行要不要喂给某个聚合"，不决定组存不存在
+/// （PG 同样：`count(*) FILTER (…)` 全不匹配的组照样出现，回 0）。
+fn eval_agg_filters(aggs: &[AggExpr], batch: &RecordBatch) -> Result<Vec<Option<BooleanArray>>> {
+    let n = batch.num_rows();
+    aggs.iter()
+        .map(|a| -> Result<Option<BooleanArray>> {
+            let Some(p) = &a.filter else {
+                return Ok(None);
+            };
+            let v = crate::exec::broadcast_const(&eval::eval(p, batch)?, n)?;
+            Ok(Some(
+                v.as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| QsdbError::type_err("FILTER (WHERE …) must be boolean"))?
+                    .clone(),
+            ))
+        })
+        .collect()
+}
+
+/// 按 `mask` 从 `(sel, group_ids)` 里筛出**这一个聚合**要看的行。
+/// 返回两份**等长且对齐**的向量（`update_aggs_sel` 的约定）。
+///
+/// SQL 三值：只有 **TRUE** 通过（NULL / UNKNOWN 不通过）。
+fn filter_rows(mask: &BooleanArray, sel: &[u32], group_ids: &[u32]) -> (Vec<u32>, Vec<u32>) {
+    let mut fs = Vec::with_capacity(sel.len());
+    let mut fg = Vec::with_capacity(sel.len());
+    for (i, &s) in sel.iter().enumerate() {
+        let r = s as usize;
+        if !mask.is_null(r) && mask.value(r) {
+            fs.push(s);
+            fg.push(group_ids[i]);
+        }
+    }
+    (fs, fg)
+}
+
 /// 分组键求值 + **常量键广播**。
 ///
 /// `eval` 对常量键（`GROUP BY 'k'`，或 `GROUP BY 1` 指向的那个常量）返回**长度 1**
@@ -901,11 +942,14 @@ impl GroupTable {
         }
         let group_arrays = eval_group_arrays(group, batch)?;
         let agg_arrays = eval_agg_arrays(aggs, batch)?;
+        let filters = eval_agg_filters(aggs, batch)?;
         self.init_cols(group, aggs, &agg_arrays);
 
-        // 全选 + 全局聚合 → 零迭代快路径（O(1) 计数 + SIMD 列和）
+        // 全选 + 全局聚合 → 零迭代快路径（O(1) 计数 + SIMD 列和）。
+        // **有 FILTER 就不走**：它一上来对整批做 SIMD 求和，压根没有"逐行筛"这一步。
         if group.is_empty()
             && sel.len() == batch.num_rows()
+            && filters.iter().all(|f| f.is_none())
             && self.try_global_fast(aggs, &agg_arrays, batch.num_rows())?
         {
             return Ok(());
@@ -923,7 +967,16 @@ impl GroupTable {
             }
         }
         for (ai, agg) in aggs.iter().enumerate() {
-            self.update_aggs_sel(ai, agg, agg_arrays[ai].as_deref(), &group_ids, sel)?;
+            match &filters[ai] {
+                // 无 FILTER：原路径一字不改（热路径不付任何代价）
+                None => {
+                    self.update_aggs_sel(ai, agg, agg_arrays[ai].as_deref(), &group_ids, sel)?
+                }
+                Some(m) => {
+                    let (s2, g2) = filter_rows(m, sel, &group_ids);
+                    self.update_aggs_sel(ai, agg, agg_arrays[ai].as_deref(), &g2, &s2)?;
+                }
+            }
         }
         Ok(())
     }
@@ -1168,10 +1221,15 @@ impl GroupTable {
             int64_group_columns(&group_arrays)
         };
 
+        let filters = eval_agg_filters(aggs, batch)?;
         self.init_cols(group, aggs, &agg_arrays);
 
-        // 全局聚合零迭代快路径（O(1) 计数 + SIMD 列和；形态不中则原路径）
-        if group.is_empty() && self.try_global_fast(aggs, &agg_arrays, n)? {
+        // 全局聚合零迭代快路径（O(1) 计数 + SIMD 列和；形态不中则原路径）。
+        // **有 FILTER 就不走**（同 `ingest_with_sel`）。
+        if group.is_empty()
+            && filters.iter().all(|f| f.is_none())
+            && self.try_global_fast(aggs, &agg_arrays, n)?
+        {
             return Ok(());
         }
 
@@ -1191,8 +1249,22 @@ impl GroupTable {
             }
         }
         // 各聚合列更新（数组序）
-        for (ai, agg) in aggs.iter().enumerate() {
-            self.update_aggs(ai, agg, agg_arrays[ai].as_deref(), &group_ids)?;
+        if filters.iter().all(|f| f.is_none()) {
+            for (ai, agg) in aggs.iter().enumerate() {
+                self.update_aggs(ai, agg, agg_arrays[ai].as_deref(), &group_ids)?;
+            }
+        } else {
+            // 有 FILTER：**逐聚合**筛行（各自的谓词不同，不能统一预筛）
+            let all: Vec<u32> = (0..n as u32).collect();
+            for (ai, agg) in aggs.iter().enumerate() {
+                match &filters[ai] {
+                    None => self.update_aggs(ai, agg, agg_arrays[ai].as_deref(), &group_ids)?,
+                    Some(m) => {
+                        let (s2, g2) = filter_rows(m, &all, &group_ids);
+                        self.update_aggs_sel(ai, agg, agg_arrays[ai].as_deref(), &g2, &s2)?;
+                    }
+                }
+            }
         }
         Ok(())
     }

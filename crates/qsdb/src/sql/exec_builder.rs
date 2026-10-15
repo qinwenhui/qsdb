@@ -216,6 +216,12 @@ fn collect_plan_columns(plan: &LogicalPlan, out: &mut Vec<String>) {
                 if let Some(arg) = &a.arg {
                     collect_expr_columns(arg, out);
                 }
+                // ⚠️ **FILTER 谓词引用的列也要算**（2026-10-15）：漏了它，扫描投影
+                // 会把谓词要的列裁掉/换位 ⇒ 执行期按**旧索引**取列，越界 panic
+                // （实测 `Trying to access ... len is 1 but the index is 1`）。
+                if let Some(f) = &a.filter {
+                    collect_expr_columns(f, out);
+                }
             }
             collect_plan_columns(input, out);
         }
@@ -485,6 +491,8 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
                     out_ty: a.out_ty.clone(),
                     udaf: a.udaf.clone(),
                     distinct: a.distinct,
+                    // FILTER 谓词引用的是**表列**，与 arg 同一个索引空间，一起重写
+                    filter: a.filter.as_ref().map(&re),
                 })
                 .collect(),
         },
@@ -1202,6 +1210,11 @@ fn annotate_join_needs(
         if let Some(arg) = &a.arg {
             arg.collect_columns(&mut needed);
         }
+        // FILTER 谓词引用的列同样要标（漏了它 = 那些列被填 NULL ⇒ 谓词恒 UNKNOWN
+        // ⇒ 聚合悄悄回空值；与 join 残留谓词那条是同一个坑）
+        if let Some(f) = &a.filter {
+            f.collect_columns(&mut needed);
+        }
     }
     // 一列都不读（如 `count(*)` + 纯过滤）：**不标**。空掩码会把所有列填 NULL，
     // 虽然按定义也没人读，但"整行都是 NULL"这种状态没有实测支撑，不值得为它冒险。
@@ -1384,6 +1397,9 @@ pub fn distinct_fuse_applies(group: &[PhysExpr], aggs: &[AggExpr], input: &Logic
         && aggs.len() == 1
         && matches!(aggs[0].func, crate::expr::AggFunc::Count)
         && aggs[0].arg.is_none()
+        // 融合计数是"整行计数"，没有逐行谓词这一步 ⇒ 有 FILTER 就回常规路径
+        // （`SELECT count(*) FILTER (WHERE …) FROM (SELECT DISTINCT …)`）
+        && aggs[0].filter.is_none()
         && matches!(input, LogicalPlan::Distinct { .. })
 }
 
@@ -1477,6 +1493,11 @@ fn build_aggregate(
         && aggs.len() == 1
         && matches!(aggs[0].func, crate::expr::AggFunc::Count)
         && aggs[0].arg.is_none()
+        // ⚠️ **写了 FILTER 就不能走这条下推**（2026-10-15，与上面"有残留谓词"
+        // 同源）：`JoinCountExec` 只按键计数，压根没有"逐行谓词"这一步 ⇒
+        // `count(*) FILTER (WHERE …)` 会被当成 `count(*)` 回**全量匹配数**。
+        // 交给常规路径（结果正确、只是慢）。
+        && aggs[0].filter.is_none()
     {
         if std::env::var("QSDB_JOIN_PROF").is_ok() {
             eprintln!(

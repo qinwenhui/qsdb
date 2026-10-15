@@ -57,21 +57,36 @@ fn scalar(db: &Qsdb, sql: &str) -> String {
 ///
 /// `FILTER` 是这一批里**最典型的静默错值**：`count(*) FILTER (WHERE a>1)`
 /// 曾返回 4（= `count(*)`）而不是 2。
+///
+/// 2026-10-15：**聚合 FILTER 已实现**（生态功能批次 3）⇒ 这里从"拒绝"改成
+/// **断言值**（2 而不是 4 —— 正是当初那个错值）。只断言"不报错"是不行的：
+/// 将来谁把 FILTER 退回静默丢弃，这条闸门会**静静地放过**，而那正是它存在的理由。
+/// 仍未实现的形态（**窗口 FILTER**、`IGNORE NULLS`）继续拒。
 #[test]
 fn aggregate_filter_and_null_treatment_are_rejected() {
     let (db, root) = setup("filter");
-    // FILTER：投影 / HAVING / 窗口三处路径都要拦
-    rejected(&db, "SELECT count(*) FILTER (WHERE a > 1) FROM t", "FILTER");
-    rejected(&db, "SELECT sum(b) FILTER (WHERE a = 1) FROM t", "FILTER");
-    rejected(
-        &db,
-        "SELECT s FROM t GROUP BY s HAVING count(*) FILTER (WHERE a > 1) > 0",
-        "FILTER",
+    // t = (1,10,'x'),(2,NULL,'y'),(NULL,30,'z'),(3,40,NULL)
+    // a>1 的行有 2 行（a=2、a=3）—— 当初静默丢弃时回的是 4
+    assert_eq!(
+        scalar(&db, "SELECT count(*) FILTER (WHERE a > 1) FROM t"),
+        "2"
     );
+    assert_eq!(scalar(&db, "SELECT count(*) FROM t"), "4");
+    assert_eq!(
+        scalar(&db, "SELECT sum(b) FILTER (WHERE a = 1) FROM t"),
+        "10"
+    );
+    assert_eq!(scalar(&db, "SELECT sum(b) FROM t"), "80");
+    // HAVING 里的 FILTER（同一条重绑路径）
+    let bs = db
+        .sql_collect("SELECT s FROM t GROUP BY s HAVING count(*) FILTER (WHERE a > 1) > 0")
+        .unwrap();
+    assert_eq!(bs.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    // 窗口 FILTER **仍未实现** ⇒ 必须显式拒（静默丢掉 = 回全量）
     rejected(
         &db,
         "SELECT count(*) FILTER (WHERE a > 1) OVER () FROM t",
-        "FILTER",
+        "窗口函数上的 FILTER",
     );
     // IGNORE/RESPECT NULLS（窗口）
     rejected(
@@ -284,10 +299,14 @@ fn gates_cover_nested_queries() {
         "WITH w AS (SELECT a FROM t QUALIFY a > 1) SELECT count(*) FROM w",
         "QUALIFY",
     );
-    rejected(
-        &db,
-        "SELECT (SELECT count(*) FILTER (WHERE a > 1) FROM t) FROM t LIMIT 1",
-        "FILTER",
+    // 嵌套子查询里的 FILTER 闸门同样要走到 —— 但它现在是**已实现**的语法，
+    // 所以这里断言**值**（子查询里 a>1 有 2 行）而不是"被拒"。
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT (SELECT count(*) FILTER (WHERE a > 1) FROM t) FROM t LIMIT 1"
+        ),
+        "2"
     );
     rejected(
         &db,
