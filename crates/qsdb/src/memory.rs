@@ -218,6 +218,13 @@ impl MemoryPool {
     }
 
     /// 归还（只由 [`Reservation::drop`] 调用）。
+    ///
+    /// `fetch_update` 在 rustc **1.99** 起被标 deprecated（改名 `try_update`），
+    /// 但 `try_update` **1.95 才有**，而本工作区声明的 MSRV 是 **1.85**
+    /// （`Cargo.toml` 的 `rust-version`，clippy 的 `incompatible_msrv` 会拦住）
+    /// ⇒ **现在还换不了**，只能先 allow 掉这个提示、留待 MSRV 提到 1.95 时改。
+    /// （实测：`.14` 是 1.99、本地是 1.97，两边都要能编。）
+    #[allow(deprecated)]
     pub(crate) fn release_bytes(&self, bytes: u64) {
         let _ = self
             .exec

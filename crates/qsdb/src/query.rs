@@ -178,6 +178,10 @@ impl QueryContext {
         if let Some(pool) = &self.pool {
             pool.release_bytes(bytes);
         }
+        // `fetch_update` 在 rustc 1.99 起 deprecated（改名 `try_update`），但
+        // `try_update` 要 1.95 而本工作区 MSRV 是 1.85 ⇒ 换不了，先 allow
+        // （详见 `memory.rs::release_bytes` 的说明）。
+        #[allow(deprecated)]
         let _ = self
             .memory_used
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
