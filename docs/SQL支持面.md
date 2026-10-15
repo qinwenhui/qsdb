@@ -53,6 +53,7 @@
 | 语法 | 状态 | 说明 |
 |---|---|---|
 | 单表 / 派生表 `/ CTE` 引用 / 表函数（`read_parquet` / `read_csv`） | ✅ | |
+| `read_parquet` 的 **hive 目录语义**（F12） | ✅ | 路径里出现 `k=v` 段时，分区列**由目录名组装**（数据文件里没有它）——**自动启用，无需开关**。类型按首个值推断（`dt=2026-01-01` ⇒ `DATE`）。<br>⚠️ **自动是刻意的，所以要写明白**：目录名叫 `a=b` 就会被当成一个分区列。真不想这样，就把数据放到不含 `=` 的目录层。<br>⚠️ 布局**不一致**时**显式报错**（`partition value 'region' missing`），不静默给 NULL。<br>值级验收 `tests/external_parquet.rs::f12_hive_directory_semantics` |
 > 本节每条都由 `crates/qsdb/tests/join_surface.rs` **实测**钉住（✅ 的断言**值**、
 > ✋ 的断言**报错文案**）。正文里那些引号中的话就是引擎原话。
 
