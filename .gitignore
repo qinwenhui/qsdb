@@ -17,3 +17,7 @@ Thumbs.db
 *.tmp
 *.lock.tmp
 /data/
+
+# 往轮遗留的临时补丁脚本/日志（不进版本库）
+patch_*.py
+soak_*.log
