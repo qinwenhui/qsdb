@@ -6,6 +6,7 @@
 //!        CAST、IS [NOT] NULL、标量函数 v1 集、别名
 
 pub mod exec_builder;
+pub mod params;
 pub mod translate;
 
 use std::sync::Arc;
@@ -133,34 +134,80 @@ pub fn execute_sql_with_role(
     role: crate::users::Role,
     ctx: &Arc<crate::query::QueryContext>,
 ) -> Result<SqlResult> {
+    execute_sql_full(db, sql, Vec::new(), Some(role), ctx)
+}
+
+/// 带**参数**执行（`docs/参数化查询设计.md`）：`params` 是已类型化的字面量，
+/// 绑定在解析期完成（值→AST 字面量节点，**从不进入 SQL 文本**）。
+pub fn execute_sql_params_ctx(
+    db: &Qsdb,
+    sql: &str,
+    params: Vec<Literal>,
+    ctx: &Arc<crate::query::QueryContext>,
+) -> Result<SqlResult> {
+    execute_sql_full(db, sql, params, None, ctx)
+}
+
+/// 带**参数** + 角色闸门（server 侧同时需要两者时用）。
+pub fn execute_sql_with_role_and_params(
+    db: &Qsdb,
+    sql: &str,
+    params: Vec<Literal>,
+    role: crate::users::Role,
+    ctx: &Arc<crate::query::QueryContext>,
+) -> Result<SqlResult> {
+    execute_sql_full(db, sql, params, Some(role), ctx)
+}
+
+fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) -> Result<SqlResult> {
+    execute_sql_full(db, sql, Vec::new(), None, ctx)
+}
+
+/// **唯一的执行入口**（参数 / 角色 / 上下文三件事在这里汇合）。
+///
+/// 顺带修掉一处既有浪费：角色那条路此前**解析两遍**（先 `parse_statements` 查权限、
+/// 丢掉、再进 `execute_inner` 重新解析一遍）。现在解析一次、`ParsedStatement`
+/// 直接交给下面的 match。
+fn execute_sql_full(
+    db: &Qsdb,
+    sql: &str,
+    params: Vec<Literal>,
+    role: Option<crate::users::Role>,
+    ctx: &Arc<crate::query::QueryContext>,
+) -> Result<SqlResult> {
     crate::query::run_isolated(|| {
+        ctx.check()?;
+        // **参数个数先对账，再翻译**（见 `params::normalize_placeholders` 的说明）：
+        // 在**文本**上数出这条 SQL 用几个占位符，与传来的个数比 —— 对不上就地拒。
+        // 放在这里而不是绑定期，是为了**任何副作用之前**就报错（`INSERT` 尤其）。
+        let (_, expected) = params::normalize_placeholders(sql)?;
+        params::check_param_count(expected, params.len())?;
+        // 参数作用域**必须在解析/绑定之前装上**（绑定器从这里取值）
+        let _scope = params::ParamScope::new(params);
         let mut stmts = translate::parse_statements(sql)?;
-        if stmts.len() != 1 {
+        if stmts.is_empty() {
+            return Err(QsdbError::invalid("empty statement"));
+        }
+        if stmts.len() > 1 {
             return Err(QsdbError::invalid(
                 "multiple statements in one call are not supported; execute one by one",
             ));
         }
         let stmt = stmts.pop().unwrap();
-        check_role_permission(&stmt, role)?;
-        // 复用主执行器：重新序列化回单条再走 execute（避免复制整个 match）
-        drop(stmt);
-        execute_inner(db, sql, ctx)
+        if let Some(r) = role {
+            check_role_permission(&stmt, r)?;
+        }
+        ctx.check()?;
+        execute_stmt(db, stmt, ctx)
     })
 }
 
-fn execute_inner(db: &Qsdb, sql: &str, ctx: &Arc<crate::query::QueryContext>) -> Result<SqlResult> {
-    ctx.check()?;
-    let mut stmts = translate::parse_statements(sql)?;
-    if stmts.is_empty() {
-        return Err(QsdbError::invalid("empty statement"));
-    }
-    if stmts.len() > 1 {
-        return Err(QsdbError::invalid(
-            "multiple statements in one call are not supported; execute one by one",
-        ));
-    }
-    let stmt = stmts.pop().unwrap();
-    ctx.check()?;
+/// 单条已翻译语句的执行（参数/角色都已处理完）。
+fn execute_stmt(
+    db: &Qsdb,
+    stmt: translate::ParsedStatement,
+    ctx: &Arc<crate::query::QueryContext>,
+) -> Result<SqlResult> {
     match stmt {
         translate::ParsedStatement::CreateTable { def } => {
             db.create_table(def)?;

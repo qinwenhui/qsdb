@@ -674,6 +674,11 @@ struct QueryBody {
     sql: String,
     #[serde(default)]
     format: Option<String>,
+    /// 参数化查询（`docs/参数化查询设计.md`）：**位置数组**，`$n` 取第 n 个。
+    /// 元素可以是裸 JSON 值（推类型）或 `{"type": …, "value": …}`（显式）。
+    /// 缺省 = 没有参数（行为与从前一字不差）。
+    #[serde(default)]
+    params: Option<serde_json::Value>,
 }
 
 /// J11：客户端透传 query id 的合法性。放行 `[A-Za-z0-9._:-]`、长度 `1..=64`
@@ -749,10 +754,21 @@ async fn query(
     let t = Instant::now();
     let st = Arc::clone(&s);
     let sql = body.sql;
+    // 参数在**请求线程**上先转好（类型/格式错立刻 400，不进 spawn_blocking）
+    let params = match qsdb::sql::params::params_from_json(body.params.as_ref()) {
+        Ok(p) => p,
+        Err(e) => {
+            s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+            reg.unregister_query(&query_id);
+            return ErrorCode::InvalidArgument.response(e.to_string());
+        }
+    };
     let ctx_exec = Arc::clone(&ctx);
-    let result =
-        tokio::task::spawn_blocking(move || st.db.sql_with_role_and_context(&sql, role, &ctx_exec))
-            .await;
+    let result = tokio::task::spawn_blocking(move || {
+        st.db
+            .sql_with_role_and_params_context(&sql, params, role, &ctx_exec)
+    })
+    .await;
     reg.unregister_query(&query_id);
     let elapsed = t.elapsed().as_nanos() as u64;
     s.metrics.observe_query(elapsed);

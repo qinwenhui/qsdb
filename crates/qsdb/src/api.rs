@@ -1062,6 +1062,20 @@ impl Qsdb {
         crate::sql::execute_sql_with_role(self, sql, role, ctx)
     }
 
+    /// 带**参数** + 角色 + 上下文执行（server 的 `/query` 走这条）。
+    ///
+    /// 参数见 `docs/参数化查询设计.md`：值在绑定期变成 AST 字面量，**从不进入
+    /// SQL 文本**（注入无从谈起）。
+    pub fn sql_with_role_and_params_context(
+        &self,
+        sql: &str,
+        params: Vec<crate::types::Literal>,
+        role: crate::users::Role,
+        ctx: &Arc<crate::query::QueryContext>,
+    ) -> Result<crate::sql::SqlResult> {
+        crate::sql::execute_sql_with_role_and_params(self, sql, params, role, ctx)
+    }
+
     /// 带外部上下文执行（可取消/超时/记账）。
     pub fn sql_with_context(
         &self,

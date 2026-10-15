@@ -516,26 +516,49 @@ fn parse_frame_bounds(
 /// 帧偏移量：**非负整数字面量**（本仓不做表达式求值兜底；上限收到 `i64::MAX`
 /// 以内，执行器按 `i64` 算帧区间）。
 fn frame_offset(e: &sqlparser::ast::Expr) -> Result<u64> {
-    let sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan {
-        value: sqlparser::ast::Value::Number(s, _),
-        ..
-    }) = e
-    else {
-        return Err(QsdbError::unsupported(format!(
-            "window frame offset must be a non-negative integer literal, got `{e}`"
-        )));
-    };
-    let v: i64 = s.parse().map_err(|_| {
-        QsdbError::unsupported(format!(
-            "window frame offset '{s}' is not an integer (or exceeds i64)"
-        ))
-    })?;
+    let v = const_nonneg_int(e, "window frame offset")?;
     if v < 0 {
         return Err(QsdbError::unsupported(
             "window frame offset must be non-negative (write it as PRECEDING/FOLLOWING)",
         ));
     }
     Ok(v as u64)
+}
+
+/// 从 AST 里取一个**整数常量**：整数字面量，或**一个参数**（`$n` / `?`）。
+///
+/// 为什么参数要在这里单独认一次：有两处（**窗口帧偏移**、`lag/lead` 偏移）是在
+/// **绑定之前**直接从 AST 上读整数的 —— 不认参数的话，用户写
+/// `ROWS BETWEEN $1 PRECEDING` 或 `lag(v, ?)` 会收到"必须是整数字面量"，
+/// 而他明明给的就是个参数。
+///
+/// 安全：`params::lookup` **无副作用**（"用到的最大序号"在 tokenizer 那一步就数完了），
+/// 所以就算这两处被走两遍也不影响别处。
+fn const_nonneg_int(e: &sqlparser::ast::Expr, what: &str) -> Result<i64> {
+    use sqlparser::ast::Value as V;
+    let sqlparser::ast::Expr::Value(v) = e else {
+        return Err(QsdbError::unsupported(format!(
+            "{what} must be an integer literal or a parameter, got `{e}`"
+        )));
+    };
+    match &v.value {
+        V::Number(s, _) => s.parse::<i64>().map_err(|_| {
+            QsdbError::unsupported(format!("{what} '{s}' is not an integer (or exceeds i64)"))
+        }),
+        V::Placeholder(p) => {
+            let idx = crate::sql::params::placeholder_index(p)?;
+            match crate::sql::params::lookup(idx)? {
+                Literal::Int64(n) => Ok(n),
+                other => Err(QsdbError::type_err(format!(
+                    "{what} 的参数必须是整数，实得 {:?}",
+                    other.logical_type().map(|t| format!("{t:?}"))
+                ))),
+            }
+        }
+        _ => Err(QsdbError::unsupported(format!(
+            "{what} must be an integer literal or a parameter, got `{e}`"
+        ))),
+    }
 }
 
 /// 解析一条窗口函数的帧（`None` = 没写帧 ⇒ 默认帧）。
@@ -672,6 +695,11 @@ pub enum ParsedStatement {
 }
 
 pub fn parse_statements(sql: &str) -> Result<Vec<ParsedStatement>> {
+    // **`?` 必须先固化**（参数化查询设计 §三）：序号写死在文本里，之后所有
+    // "把同一个表达式再走一遍"的路径（HAVING/窗口重绑、`group_key_pos` 试探绑定）
+    // 都不会错位。没有 `?` 时是借用，零成本。
+    let (numbered, _n_params) = crate::sql::params::normalize_placeholders(sql)?;
+    let sql: &str = &numbered;
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let upper = trimmed.to_ascii_uppercase();
     // 轻量语句手解析（SHOW/DESCRIBE 不在通用方言稳定支持范围）
@@ -1224,7 +1252,7 @@ fn object_name_single(name: sqlparser::ast::ObjectName) -> Result<String> {
 }
 
 /// sqlparser DataType → LogicalType
-fn ast_type_to_logical(dt: &sqlparser::ast::DataType) -> Result<LogicalType> {
+pub(crate) fn ast_type_to_logical(dt: &sqlparser::ast::DataType) -> Result<LogicalType> {
     use sqlparser::ast::DataType as D;
     use sqlparser::ast::{ExactNumberInfo, TimezoneInfo};
     Ok(match dt {
@@ -1387,6 +1415,14 @@ pub(crate) fn value_to_literal(v: &sqlparser::ast::Value) -> Result<Literal> {
         V::HexStringLiteral(s) => Ok(Literal::Binary(hex_bytes(s)?)),
         V::Boolean(b) => Ok(Literal::Boolean(*b)),
         V::Null => Ok(Literal::Null),
+        // **参数化查询的落点**：`$n` 在这里变成**字面量节点**（不是 SQL 文本）。
+        // 放在 `value_to_literal` 而不是 `bind_expr` 里，是为了让**所有**绑定入口
+        // 都自动认（`bind_expr` 与 `rebind_over_agg` 那条重绑路径都走这里）。
+        // 值从不进入文本 ⇒ 注入无从谈起（见 `docs/参数化查询设计.md` §七）。
+        V::Placeholder(p) => {
+            let idx = crate::sql::params::placeholder_index(p)?;
+            crate::sql::params::lookup(idx)
+        }
         other => Err(QsdbError::unsupported(format!(
             "literal {other:?} not supported"
         ))),
@@ -1417,6 +1453,80 @@ fn hex_bytes(s: &str) -> Result<Vec<u8>> {
         }
     }
     Ok(out)
+}
+
+/// 文本 + 声明类型 → 字面量（**参数化查询专用**：值从协议来，不是从 SQL 文本来）。
+///
+/// 与 `number_literal` / `TypedString` 那两条路刻意分开：那两条是**解析 SQL 文本**
+/// 时用的（形状由语法保证），这里要对**任意用户输入**做严格转换 —— 转不过去就报错，
+/// 绝不猜。
+pub(crate) fn parse_literal_text(text: &str, ty: &crate::types::LogicalType) -> Result<Literal> {
+    use crate::types::LogicalType as T;
+    use crate::types::temporal;
+    let bad = |what: &str| QsdbError::invalid(format!("值 `{text}` 转不成 {what}"));
+    Ok(match ty {
+        T::Boolean => match text {
+            "true" | "TRUE" | "1" => Literal::Boolean(true),
+            "false" | "FALSE" | "0" => Literal::Boolean(false),
+            _ => return Err(bad("BOOLEAN")),
+        },
+        T::Int8 => Literal::Int8(text.parse().map_err(|_| bad("Int8"))?),
+        T::Int16 => Literal::Int16(text.parse().map_err(|_| bad("Int16"))?),
+        T::Int32 => Literal::Int32(text.parse().map_err(|_| bad("Int32"))?),
+        T::Int64 => Literal::Int64(text.parse().map_err(|_| bad("BIGINT"))?),
+        T::Float32 => Literal::Float32(text.parse().map_err(|_| bad("FLOAT"))?),
+        T::Float64 => Literal::Float64(text.parse().map_err(|_| bad("DOUBLE"))?),
+        T::Decimal(meta) => {
+            // 十进制文本 → unscaled（**按字符串算，别过 f64**：那会丢精度）
+            let (neg, body) = match text.strip_prefix('-') {
+                Some(r) => (true, r),
+                None => (false, text.strip_prefix('+').unwrap_or(text)),
+            };
+            let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
+            if !int_part.chars().all(|c| c.is_ascii_digit())
+                || !frac_part.chars().all(|c| c.is_ascii_digit())
+            {
+                return Err(bad("DECIMAL"));
+            }
+            let scale = meta.scale as usize;
+            // 小数位不足补零、超出**报错**（静默截断 = 改值）
+            if frac_part.len() > scale {
+                return Err(QsdbError::invalid(format!(
+                    "值 `{text}` 的小数位比 DECIMAL 声明的多（scale = {}）—— \
+                     静默截断会改值，请显式写更宽的 DECIMAL 或自行取整",
+                    meta.scale
+                )));
+            }
+            let digits = format!("{int_part}{frac_part:0<width$}", width = scale);
+            let unscaled: i128 = digits.parse().map_err(|_| bad("DECIMAL"))?;
+            Literal::Decimal {
+                unscaled: if neg { -unscaled } else { unscaled },
+                meta: *meta,
+            }
+        }
+        T::Date => Literal::Date(temporal::parse_date(text)?),
+        T::Time => Literal::Time(temporal::parse_time_ns(text)?),
+        T::Timestamp { .. } => Literal::Timestamp(temporal::parse_timestamp_ns(text)?),
+        T::Varchar { .. } => Literal::Utf8(text.to_string()),
+        T::Binary => {
+            let h = text.strip_prefix("0x").unwrap_or(text);
+            if h.len() % 2 != 0 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(QsdbError::invalid(format!(
+                    "BINARY 参数要写成十六进制串（可带 `0x` 前缀），实得 `{text}`"
+                )));
+            }
+            let bytes = (0..h.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&h[i..i + 2], 16).expect("checked hex"))
+                .collect();
+            Literal::Binary(bytes)
+        }
+        other => {
+            return Err(QsdbError::unsupported(format!(
+                "参数不支持的类型 {other:?}"
+            )));
+        }
+    })
 }
 
 fn number_literal(s: &str) -> Result<Literal> {
@@ -4248,18 +4358,15 @@ fn parse_window_fn(
             // offset：正整数常量（默认 1）
             let offset = match arg_exprs.get(1) {
                 None => 1i64,
-                Some(sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan {
-                    value: sqlparser::ast::Value::Number(s, _),
-                    ..
-                })) => {
-                    let v: i64 = s.parse().map_err(|_| {
-                        QsdbError::invalid(format!("lag/lead offset '{s}' not an integer"))
-                    })?;
+                // 字面量或**参数**（`lag(v, ?)` —— 见 `const_nonneg_int` 的说明）
+                Some(e) => {
+                    let v = const_nonneg_int(e, "lag/lead offset")?;
                     if v <= 0 {
                         return Err(QsdbError::invalid("lag/lead offset must be positive"));
                     }
                     v
                 }
+                #[allow(unreachable_patterns)]
                 Some(_) => {
                     return Err(QsdbError::invalid(
                         "lag/lead offset must be an integer literal",
