@@ -39,6 +39,9 @@ pub struct QueryEntry {
 
 /// 服务共享状态。
 pub struct AppState {
+    /// 提交事件环形缓冲（T2）。钩子在**开库时**就装好了（`main.rs`），
+    /// 这里只是持一份用来服务 `GET /api/v1/watch`。
+    pub commits: Arc<crate::commit_log::CommitLog>,
     /// 用户 token 表（token → role；登录签发，进程内存态）
     pub tokens: std::sync::Mutex<std::collections::HashMap<String, qsdb::users::Role>>,
     pub db: Arc<Qsdb>,
@@ -53,9 +56,15 @@ pub struct AppState {
 
 impl AppState {
     /// 组装共享状态（HTTP 与 Flight 两面共用同一份；Flight 的单测也走这里）。
-    pub(crate) fn new(db: Arc<Qsdb>, token: Option<String>, max_concurrent_queries: usize) -> Self {
+    pub(crate) fn new(
+        db: Arc<Qsdb>,
+        token: Option<String>,
+        commits: Arc<crate::commit_log::CommitLog>,
+        max_concurrent_queries: usize,
+    ) -> Self {
         let writer = db.writer(WriteBufferOptions::default());
         Self {
+            commits,
             tokens: std::sync::Mutex::new(HashMap::new()),
             db,
             writer,
@@ -206,6 +215,8 @@ pub async fn serve(
     db: Arc<Qsdb>,
     addr: &str,
     token: Option<String>,
+    // 提交事件缓冲（T2；`GET /api/v1/watch` 的后端）
+    commits: Arc<crate::commit_log::CommitLog>,
     auto_compact_secs: Option<u64>,
     max_concurrent_queries: Option<usize>,
     // 单查询执行内存闸门（字节；`Some(0)` = 显式不限，`None` = 未指定，交由
@@ -237,6 +248,7 @@ pub async fn serve(
     let state = Arc::new(AppState::new(
         db,
         token,
+        commits,
         max_concurrent_queries.unwrap_or(0),
     ));
 
@@ -256,6 +268,7 @@ pub async fn serve(
         .route("/api/v1/tables/{table}/partitions", get(partitions))
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/queries", get(list_queries))
+        .route("/api/v1/watch", get(watch))
         .route("/api/v1/queries/{id}/cancel", post(cancel_query))
         .route("/api/v1/config", get(get_config).put(put_config))
         .layer(write_layer)
@@ -666,6 +679,56 @@ async fn metrics(State(s): State<Arc<AppState>>) -> Response {
         s.metrics.render(tables, bytes),
     )
         .into_response()
+}
+
+/// `GET /api/v1/watch?since=<游标>&wait=<秒>` —— **提交事件订阅**（T2）。
+///
+/// 消费方是 qsdb-sync：他们今天靠**轮询** `partition_stats` 发现增量，接上这里
+/// 就能换成 push（RPO 秒级 → 毫秒级）。设计见
+/// `docs/提交事件订阅与湖导出设计.md` §1.3。
+///
+/// **长轮询**（不是 SSE 流）：有事件**立刻**回，没有就挂到 `wait` 再回空批次。
+/// 交付同样的延迟，但不用处理流式解析 / keep-alive / 半开连接；将来要加流式是
+/// **新端点**（契约允许只增不改），`since` 游标与事件 schema 不用动。
+///
+/// ⚠️ **这是加速器，不是真相来源**：内核钩子可能丢事件（回调 panic 被吞、
+/// 远端写路径暂不透出 generation），所以消费方**应当保留一个慢轮询兜底**；
+/// 游标接不上时这里**显式报 `CURSOR_TOO_OLD`**，绝不假装连续。
+#[derive(serde::Deserialize)]
+struct WatchParams {
+    /// 上次响应里的 `next`。**省略 = 从现在开始**（首次订阅不该收历史全量）。
+    #[serde(default)]
+    since: Option<u64>,
+    /// 最长挂起秒数（默认 25，上限 60）
+    #[serde(default)]
+    wait: Option<u64>,
+}
+
+async fn watch(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(p): Query<WatchParams>,
+) -> Response {
+    // 与 /query 同一套鉴权；**reader 角色即可**（订阅只是读事件）
+    let Some(_role) = auth_role(&s, &headers) else {
+        return ErrorCode::Unauthorized.response("unauthorized");
+    };
+    let wait = std::time::Duration::from_secs(
+        p.wait
+            .unwrap_or(crate::commit_log::DEFAULT_WAIT_SECS)
+            .min(crate::commit_log::MAX_WAIT_SECS),
+    );
+    match s.commits.wait(p.since, wait).await {
+        Ok(b) => Json(serde_json::json!({
+            "events": b.events,
+            "next": b.next,
+            "more": b.more,
+        }))
+        .into_response(),
+        Err(_) => ErrorCode::CursorTooOld.response(
+            "订阅游标太旧（事件缓冲已滚过 / 服务端重启过）——              请改用 /api/v1/tables 与 /partitions 做一次全量对账，再从新的 next 续订",
+        ),
+    }
 }
 
 #[derive(serde::Deserialize)]

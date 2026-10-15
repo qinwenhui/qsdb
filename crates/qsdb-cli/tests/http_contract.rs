@@ -298,6 +298,86 @@ fn params_bind_over_http() {
     assert_eq!(r.status, 200);
 }
 
+// ---------------------------------------------------------------------------
+// 提交事件订阅（T2）
+// ---------------------------------------------------------------------------
+
+/// `GET /api/v1/watch`：**增量同步的 push 源**。
+///
+/// 这里钉协议面 + **一条最容易做错的语义**：游标接不上时报 `CURSOR_TOO_OLD`，
+/// **绝不**假装连续 —— 消费方据此去对账，而不是永远等一个不会到来的序号。
+#[test]
+fn watch_pushes_commit_events() {
+    let srv = Server::start(&[]);
+    let p = srv.port;
+    assert_eq!(
+        query(
+            p,
+            "CREATE TABLE t (dt STRING, id BIGINT) PARTITIONED BY (dt)",
+            None
+        )
+        .status,
+        200
+    );
+
+    // ① 首次订阅（不带 since）：**从现在开始**，立刻回一个空批次 + 游标
+    let r = http(p, "GET", "/api/v1/watch?wait=1", &[], &[]);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["events"].as_array().unwrap().len(), 0);
+    let cursor = r.json()["next"].as_u64().unwrap();
+
+    // ② 写两个分区 ⇒ 用刚才的游标能拿到**两条**分区级事件
+    assert_eq!(
+        query(
+            p,
+            "INSERT INTO t VALUES ('2026-01-01', 1), ('2026-01-02', 2)",
+            None
+        )
+        .status,
+        200
+    );
+    let r = http(
+        p,
+        "GET",
+        &format!("/api/v1/watch?since={cursor}&wait=1"),
+        &[],
+        &[],
+    );
+    assert_eq!(r.status, 200);
+    let evs = r.json()["events"].as_array().unwrap().clone();
+    assert_eq!(evs.len(), 2, "两个分区 ⇒ 两条事件：{evs:?}");
+    for e in &evs {
+        assert_eq!(e["table"], "t");
+        assert_eq!(e["kind"], "Append");
+        assert!(e["generation"].as_u64().unwrap() > 0);
+        assert_eq!(e["partition"].as_array().unwrap().len(), 1);
+    }
+    // 分区值用**目录名那套编码**（消费方靠它定位分区）
+    let mut parts: Vec<String> = evs
+        .iter()
+        .map(|e| e["partition"][0].as_str().unwrap().to_string())
+        .collect();
+    parts.sort();
+    assert_eq!(parts, vec!["2026-01-01", "2026-01-02"]);
+    let next = r.json()["next"].as_u64().unwrap();
+    assert!(next > cursor);
+
+    // ③ 追平后再订阅：空批次（不重复吐）
+    let r = http(
+        p,
+        "GET",
+        &format!("/api/v1/watch?since={next}&wait=1"),
+        &[],
+        &[],
+    );
+    assert_eq!(r.json()["events"].as_array().unwrap().len(), 0);
+
+    // ④ ★ 游标太新（服务端重启过 / 换了实例）⇒ 409 CURSOR_TOO_OLD，**不是**静静等
+    let r = http(p, "GET", "/api/v1/watch?since=999999&wait=1", &[], &[]);
+    assert_eq!(r.status, 409);
+    assert_eq!(r.code(), "CURSOR_TOO_OLD");
+}
+
 /// **无依赖批量通道**（`format=bulk` / `format=csv`，读**与**写两个方向）。
 ///
 /// 动机：生态工具（尤其 Java）不想引 arrow-java（JDK 11+ + FlatBuffers/Jackson），
@@ -1198,7 +1278,9 @@ fn error_catalog_endpoint_and_no_off_catalog_codes() {
     assert_eq!(r.status, 200, "目录端点应免鉴权可读");
     let codes = r.json()["codes"].as_array().cloned().unwrap_or_default();
     // 条数与代码侧枚举一致（docs/error-codes.md ↔ enum 的逐字对账在单测里）
-    assert_eq!(codes.len(), 23, "目录应列出全部 23 个码");
+    // 条数（集成测试看不到 crate 内部枚举，故这里写死；**逐字对账在 `error_code.rs`
+    // 的单测里**，那条才是防漂移的权威）
+    assert_eq!(codes.len(), 24, "目录应列出全部码（数错说明漏挂在 ALL 上）");
     for c in &codes {
         for k in ["code", "http", "retry", "category", "sqlState"] {
             assert!(c.get(k).is_some(), "目录条目缺字段 {k}: {c}");

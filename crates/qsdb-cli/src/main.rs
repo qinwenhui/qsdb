@@ -10,6 +10,7 @@ use arrow::array::Array;
 use arrow::record_batch::RecordBatch;
 use clap::Parser;
 use qsdb::sql::SqlResult;
+mod commit_log;
 mod error_code;
 #[cfg(feature = "flight")]
 mod flight;
@@ -472,10 +473,17 @@ fn main() {
                     std::process::exit(1);
                 }
             };
+            // **提交事件缓冲 + 钩子（T2）**：缓冲要在开库**之前**建好，
+            // 因为钩子得在 `Qsdb::open` 时一起装上去。
+            let commits = crate::commit_log::CommitLog::new();
             let opts = QsdbOptions {
                 storage,
                 durability: dur,
                 read_only,
+                on_commit: read_only
+                    .then_some(None)
+                    .flatten()
+                    .or_else(|| Some(commits.hook())),
                 writer_epoch,
                 // MB → 字节；0 = 不限（嵌入方/部署方自控）
                 memory_budget_bytes: (memory_budget_mb > 0)
@@ -511,6 +519,7 @@ fn main() {
                 db,
                 &addr,
                 token,
+                commits,
                 auto_compact_secs,
                 Some(max_concurrent_queries),
                 // MB → 字节；未显式给则 None（让配置文件优先，再由 serve 兜 4GB）

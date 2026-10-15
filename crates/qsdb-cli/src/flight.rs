@@ -377,7 +377,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
-        let state = Arc::new(crate::server::AppState::new(Arc::clone(&db), None, 16));
+        let state = Arc::new(crate::server::AppState::new(
+            Arc::clone(&db),
+            None,
+            crate::commit_log::CommitLog::new(),
+            16,
+        ));
         let handle = tokio::spawn(async move { serve_flight(state, &addr.to_string()).await });
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 

@@ -35,6 +35,8 @@ pub enum ErrorCode {
     AlreadyExists,
     WriteConflict,
     StaleWriter,
+    /// 订阅游标太旧（缓冲区挤掉 / 服务端重启）—— **必须重新对账**，不能续着等
+    CursorTooOld,
     NotFound,
     // ---- request ----
     InvalidArgument,
@@ -55,7 +57,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// 全量清单（目录端点与漂移测试的唯一来源）。
-    pub const ALL: [ErrorCode; 23] = [
+    pub const ALL: [ErrorCode; 24] = [
         Self::QueryTimeout,
         Self::QueryCancelled,
         Self::QueryMemoryLimit,
@@ -68,6 +70,7 @@ impl ErrorCode {
         Self::AlreadyExists,
         Self::WriteConflict,
         Self::StaleWriter,
+        Self::CursorTooOld,
         Self::InvalidArgument,
         Self::InvalidIpc,
         Self::NotFound,
@@ -96,6 +99,7 @@ impl ErrorCode {
             Self::AlreadyExists => "ALREADY_EXISTS",
             Self::WriteConflict => "WRITE_CONFLICT",
             Self::StaleWriter => "STALE_WRITER",
+            Self::CursorTooOld => "CURSOR_TOO_OLD",
             Self::InvalidArgument => "INVALID_ARGUMENT",
             Self::InvalidIpc => "INVALID_IPC",
             Self::NotFound => "NOT_FOUND",
@@ -126,7 +130,9 @@ impl ErrorCode {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
             Self::Unsupported => StatusCode::NOT_IMPLEMENTED,
-            Self::AlreadyExists | Self::WriteConflict | Self::StaleWriter => StatusCode::CONFLICT,
+            Self::AlreadyExists | Self::WriteConflict | Self::StaleWriter | Self::CursorTooOld => {
+                StatusCode::CONFLICT
+            }
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
@@ -159,9 +165,11 @@ impl ErrorCode {
             | Self::ParseError
             | Self::TypeError
             | Self::Unsupported => "query",
-            Self::AlreadyExists | Self::WriteConflict | Self::StaleWriter | Self::NotFound => {
-                "resource"
-            }
+            Self::AlreadyExists
+            | Self::WriteConflict
+            | Self::StaleWriter
+            | Self::CursorTooOld
+            | Self::NotFound => "resource",
             Self::InvalidArgument | Self::InvalidIpc => "request",
             Self::Unauthorized | Self::Forbidden => "auth",
             Self::TooManyQueries | Self::MemoryPressure | Self::ReadOnly => "capacity",
@@ -190,6 +198,9 @@ impl ErrorCode {
             // "重读再决定"，不是"改名"）
             Self::WriteConflict => "40001",
             Self::StaleWriter => "40001",
+            // 游标过期**不是**任何 SQL 标准条件 —— HY000 是 JDBC 的"一般错误"，
+            // 比硬套 40001（并发冲突）诚实
+            Self::CursorTooOld => "HY000",
             Self::InvalidArgument => "42000",
             Self::InvalidIpc => "08P01",
             Self::NotFound => "42704",
@@ -285,7 +296,8 @@ impl ErrorCode {
             // 不用 AlreadyExists（那是"改名"语义，会误导调用方）
             // 与 WRITE_CONFLICT 同族（"分区已前进，你的写被拒"），gRPC 侧一并用
             // ABORTED（标准类 = 读最新状态后重新决定；盲目重试无用）
-            Self::WriteConflict | Self::StaleWriter => Code::Aborted,
+            // 同上：游标过期也是"你的状态陈旧了，重新对账再继续"
+            Self::WriteConflict | Self::StaleWriter | Self::CursorTooOld => Code::Aborted,
             Self::IoError => Code::Unavailable,
             Self::QueryMemoryLimit
             | Self::QueryPanic
