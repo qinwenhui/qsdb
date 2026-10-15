@@ -195,7 +195,7 @@ fn 常用_join_形态摸底() {
             sql: "SELECT count(*) FROM l RIGHT JOIN r ON l.k = r.k",
             expect: 3, // r 的 k=4 未匹配 → 补 NULL 保留
             want_hash: None,
-            pending: true,
+            pending: false,
         },
         Row {
             name: "FULL 单等值",
@@ -209,7 +209,7 @@ fn 常用_join_形态摸底() {
             sql: "SELECT count(*) FROM l CROSS JOIN r",
             expect: 9,
             want_hash: None,
-            pending: true,
+            pending: false,
         },
         Row {
             name: "USING(k)",
@@ -276,14 +276,9 @@ fn 未实现的形态登记() {
     let (db, root) = seeded("todo");
     for (name, sql) in [
         (
-            "RIGHT 单等值",
-            "SELECT count(*) FROM l RIGHT JOIN r ON l.k = r.k",
-        ),
-        (
             "FULL 单等值",
             "SELECT count(*) FROM l FULL OUTER JOIN r ON l.k = r.k",
         ),
-        ("CROSS JOIN", "SELECT count(*) FROM l CROSS JOIN r"),
         ("USING(k)", "SELECT count(*) FROM l JOIN r USING (k)"),
     ] {
         let e = match db.sql(sql) {

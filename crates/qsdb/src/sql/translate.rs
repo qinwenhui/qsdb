@@ -2506,16 +2506,28 @@ fn translate_select_inner(
         .map(|t| t.joins.as_slice())
         .unwrap_or_else(|| no_joins.as_slice());
     for join in joins {
-        let (jt, constraint) = match &join.join_operator {
+        // `swap` = 换边规划（RIGHT 用）：右侧当 probe、左侧当 build。
+        let (jt, constraint, swap) = match &join.join_operator {
             sqlparser::ast::JoinOperator::Inner(c) | sqlparser::ast::JoinOperator::Join(c) => {
-                (crate::exec::join::JoinType::Inner, c)
+                (crate::exec::join::JoinType::Inner, Some(c), false)
             }
             sqlparser::ast::JoinOperator::LeftOuter(c) | sqlparser::ast::JoinOperator::Left(c) => {
-                (crate::exec::join::JoinType::LeftOuter, c)
+                (crate::exec::join::JoinType::LeftOuter, Some(c), false)
+            }
+            // **RIGHT = 换边的 LEFT**：`l RIGHT JOIN r ON c` ≡ `r LEFT JOIN l ON c`
+            //（"保留哪侧的未匹配行"正是 LEFT/RIGHT 的唯一区别）。换边后输出列序是
+            // `r.* ++ l.*`，与用户写的相反 ⇒ 下面补一层投影换回来。
+            sqlparser::ast::JoinOperator::RightOuter(c)
+            | sqlparser::ast::JoinOperator::Right(c) => {
+                (crate::exec::join::JoinType::LeftOuter, Some(c), true)
+            }
+            // `CROSS JOIN`：约束是 `JoinConstraint::None`（没有 ON），谓词恒真
+            sqlparser::ast::JoinOperator::CrossJoin(_) => {
+                (crate::exec::join::JoinType::Inner, None, false)
             }
             other => {
                 return Err(QsdbError::unsupported(format!(
-                    "{} not supported (only INNER JOIN / LEFT [OUTER] JOIN with an equi `ON`)",
+                    "{} not supported (only INNER / LEFT [OUTER] / RIGHT [OUTER] / CROSS JOIN with an equi `ON`)",
                     join_op_name(other)
                 )));
             }
@@ -2595,8 +2607,29 @@ fn translate_select_inner(
             }
             other => return Err(QsdbError::unsupported(format!("JOIN target {other:?}"))),
         };
-        let sqlparser::ast::JoinConstraint::On(on_expr) = constraint else {
-            return Err(QsdbError::unsupported("JOIN ... ON <equi-cond> required"));
+        // `CROSS JOIN` 的约束是 `None`（它本来就没有 ON）；`USING`/`NATURAL`
+        // 仍是明确拒绝（当叉积会炸行数）——两者都在这条分派里。
+        let on_expr = match constraint {
+            Some(sqlparser::ast::JoinConstraint::On(e)) => Some(e),
+            Some(sqlparser::ast::JoinConstraint::Using(_)) => {
+                return Err(QsdbError::unsupported(
+                    "JOIN ... USING (cols) not supported — write `ON l.c = r.c` (USING also merges the output column; this engine's join does not)",
+                ));
+            }
+            Some(sqlparser::ast::JoinConstraint::Natural) => {
+                return Err(QsdbError::unsupported(
+                    "NATURAL JOIN not supported（隐式按同名列匹配，加一列就可能静默改语义）—                      write the `ON` explicitly",
+                ));
+            }
+            // ⚠️ **裸 `JOIN b`（无 ON/USING）仍然拒绝**：它只是"没写约束"，
+            // 不是"要笛卡尔积"——静默当叉积会**炸行数**（旧行为就是拒，别动它）。
+            Some(sqlparser::ast::JoinConstraint::None) => {
+                return Err(QsdbError::unsupported(
+                    "JOIN ... ON <equi-cond> required (use CROSS JOIN if you really want a                      cartesian product)",
+                ));
+            }
+            // 只有显式的 `CROSS JOIN` 会走到这里（它在算子匹配里就没有约束对象）
+            None => None,
         };
         // ctx 扩展：右表列仅以限定名注册（table.col），顺序 = join 输出右段。
         // 非限定右列引用不支持（SQL-2 约束，歧义保护）。
@@ -2613,8 +2646,57 @@ fn translate_select_inner(
         // `ON` 拆成「键 + 残留」：`ON l.k=r.k AND r.v>1` 从"整条退化成叉积"变成
         // **多键/单键哈希 join + 残留**（残留必须在 join 内对匹配对求值，
         // 不能提到 WHERE —— 见 `LogicalPlan::Join::residual`）。
+        let Some(on_expr) = on_expr else {
+            // **`CROSS JOIN`**：笛卡尔积 = 谓词恒真的非等值 INNER
+            plan = LogicalPlan::CrossJoinFilter {
+                left: Box::new(plan),
+                right: Box::new(right_plan),
+                predicate: PhysExpr::Lit(Literal::Boolean(true)),
+            };
+            continue;
+        };
         let split = split_on_condition(on_expr, n_left, &ctx)?;
-        if !split.keys.is_empty() {
+        if swap {
+            // **RIGHT 换边**：`l RIGHT JOIN r` ≡ `r LEFT JOIN l`（"保留哪侧的未匹配行"
+            // 正是 LEFT/RIGHT 的唯一区别）。三件事都要跟着换算，漏一件就是静默错值：
+            //   ① 两侧**角色互换**（右表当 probe、左表当 build）；
+            //   ② **键的索引空间**：`left_keys` 是 probe 局部序、`right_keys` 是
+            //      "从 probe 宽度起算"的全局序（见 `exec_builder::local_keys`），
+            //      换边后两者互换角色；
+            //   ③ **残留**绑在合并 schema（左 ++ 右）上，换边后合并序变成右 ++ 左；
+            // 最后补一层投影把**输出列序换回** `l.* ++ r.*`（用户写的顺序）。
+            if split.keys.is_empty() {
+                return Err(QsdbError::unsupported(format!(
+                    "non-equi {} not supported (only non-equi INNER is) — put the condition \
+                     in WHERE for an INNER, or join on an equi key",
+                    join_op_name(&join.join_operator)
+                )));
+            }
+            let (lk, rk): (Vec<PhysExpr>, Vec<PhysExpr>) = split.keys.into_iter().unzip();
+            let n_right = right_cols.len();
+            let probe_keys: Vec<PhysExpr> = rk
+                .iter()
+                .map(|k| shift_col_idx(k, -(n_left as isize)))
+                .collect();
+            let build_keys: Vec<PhysExpr> = lk
+                .iter()
+                .map(|k| shift_col_idx(k, n_right as isize))
+                .collect();
+            let residual = split
+                .residual
+                .as_ref()
+                .map(|r| swap_sides_expr(r, n_left, n_right));
+            let joined = LogicalPlan::Join {
+                left: Box::new(right_plan),
+                right: Box::new(plan),
+                left_keys: probe_keys,
+                right_keys: build_keys,
+                join_type: jt,
+                needed: None,
+                residual,
+            };
+            plan = reorder_after_swap(joined, &right_cols, &ctx, n_left, n_right);
+        } else if !split.keys.is_empty() {
             let (lk, rk): (Vec<PhysExpr>, Vec<PhysExpr>) = split.keys.into_iter().unzip();
             plan = LogicalPlan::Join {
                 left: Box::new(plan),
@@ -2638,10 +2720,11 @@ fn translate_select_inner(
         } else {
             // 纯非等值 INNER 之外的（LEFT/RIGHT/…）：**不能按 INNER 跑**——
             // 那会静默丢掉未匹配行。文案说清"改怎么写"（别留路线图口吻）。
-            return Err(QsdbError::unsupported(
-                "non-equi LEFT JOIN not supported (only non-equi INNER is) — \
-                 put the condition in WHERE for an INNER, or join on an equi key",
-            ));
+            return Err(QsdbError::unsupported(format!(
+                "non-equi {} not supported (only non-equi INNER is) — put the condition in \
+                 WHERE for an INNER, or join on an equi key",
+                join_op_name(&join.join_operator)
+            )));
         }
     }
 
@@ -3072,6 +3155,106 @@ fn replace_top_project(plan: LogicalPlan, exprs: Vec<PhysExpr>, names: Vec<Strin
 /// `n_left` = **左侧输入的输出宽度**（列序号 < n_left 即属左侧）。调用方必须传
 /// `ctx.cols` 在**追加右表列之前**的长度——见 `translate_select_inner` 里 JOIN 循环处
 /// 的注释（那里曾误用"非限定列数"，导致第二次 join 静默退化成叉积）。
+/// 列引用整体平移 `delta`（换边时换算索引空间；非列表达式原样）。
+fn shift_col_idx(e: &PhysExpr, delta: isize) -> PhysExpr {
+    match e {
+        PhysExpr::Column { idx, name, ty } => PhysExpr::Column {
+            idx: (*idx as isize + delta).max(0) as usize,
+            name: name.clone(),
+            ty: ty.clone(),
+        },
+        other => other.clone(),
+    }
+}
+
+/// 合并 schema 由 `[左 ++ 右]` 变成 `[右 ++ 左]`（换边后**残留谓词**的落点）。
+///
+/// 递归改写，因为残留通常是 `And` / `Cmp` 的组合而不是单个列。
+fn swap_sides_expr(e: &PhysExpr, n_left: usize, n_right: usize) -> PhysExpr {
+    match e {
+        PhysExpr::Column { idx, name, ty } => {
+            // 左列（旧 idx < n_left）整段后移到右侧段之后；右列前移 n_left。
+            let new_idx = if *idx < n_left {
+                n_right + *idx
+            } else {
+                *idx - n_left
+            };
+            PhysExpr::Column {
+                idx: new_idx,
+                name: name.clone(),
+                ty: ty.clone(),
+            }
+        }
+        PhysExpr::And(a, b) => PhysExpr::And(
+            Box::new(swap_sides_expr(a, n_left, n_right)),
+            Box::new(swap_sides_expr(b, n_left, n_right)),
+        ),
+        PhysExpr::Or(a, b) => PhysExpr::Or(
+            Box::new(swap_sides_expr(a, n_left, n_right)),
+            Box::new(swap_sides_expr(b, n_left, n_right)),
+        ),
+        PhysExpr::Not(a) => PhysExpr::Not(Box::new(swap_sides_expr(a, n_left, n_right))),
+        PhysExpr::Cmp { op, l, r } => PhysExpr::Cmp {
+            op: *op,
+            l: Box::new(swap_sides_expr(l, n_left, n_right)),
+            r: Box::new(swap_sides_expr(r, n_left, n_right)),
+        },
+        PhysExpr::IsNull(a, n) => {
+            PhysExpr::IsNull(Box::new(swap_sides_expr(a, n_left, n_right)), *n)
+        }
+        PhysExpr::Arith { op, l, r, ty } => PhysExpr::Arith {
+            op: *op,
+            l: Box::new(swap_sides_expr(l, n_left, n_right)),
+            r: Box::new(swap_sides_expr(r, n_left, n_right)),
+            ty: ty.clone(),
+        },
+        other => other.clone(),
+    }
+}
+
+/// 换边后补一层投影：把 join 的输出序 `[右 ++ 左]` 换回 `[左 ++ 右]`。
+///
+/// ⚠️ 这是"位置属于哪个空间"那个老坑的又一站：`LogicalPlan::Join` 的输出恒为
+/// `probe ++ build`，换边后与**用户看到的列序**不同。漏了这层投影，
+/// `SELECT l.k, r.k` 会取到**对调的列**（类型还常常兼容 ⇒ 静默错值）。
+///
+/// 列名取"该列在**未换边**时本该有的名字"：左段用 `ctx.cols` 的前 `n_left` 个
+/// （多表链时外层可能已带限定名），右段用右表自己的列名（与
+/// `plan_output_columns(Join)` 的口径一致——那里给的也是右表裸名）。
+fn reorder_after_swap(
+    joined: LogicalPlan,
+    right_cols: &[(String, LogicalType)],
+    ctx: &SchemaCtx,
+    n_left: usize,
+    n_right: usize,
+) -> LogicalPlan {
+    let mut exprs: Vec<PhysExpr> = Vec::with_capacity(n_left + n_right);
+    let mut names: Vec<String> = Vec::with_capacity(n_left + n_right);
+    // 源序 = [右..., 左...]：左列自 `n_right` 起，右列自 0 起
+    for j in 0..n_left {
+        let (name, ty) = ctx.cols[j].clone();
+        exprs.push(PhysExpr::Column {
+            idx: n_right + j,
+            name: name.clone(),
+            ty,
+        });
+        names.push(name);
+    }
+    for (i, (cn, ct)) in right_cols.iter().enumerate() {
+        exprs.push(PhysExpr::Column {
+            idx: i,
+            name: cn.clone(),
+            ty: ct.clone(),
+        });
+        names.push(cn.clone());
+    }
+    LogicalPlan::Project {
+        input: Box::new(joined),
+        exprs,
+        names,
+    }
+}
+
 /// `JoinOperator` → **用户写的那种写法**（用于拒绝文案）。
 ///
 /// **别用 `{op:?}`**：`JoinOperator` 的 Debug 会把整条 `ON` 表达式连同 `Ident`/

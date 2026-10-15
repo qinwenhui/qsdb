@@ -270,35 +270,55 @@ fn 三表链式等值_join() {
 fn cross_join() {
     let (db, root) = seeded("cross");
     // `CROSS JOIN` 是 sqlparser 的独立算子（`JoinOperator::CrossJoin`），
-    // **不经过** INNER 那条臂。文档曾把"非等值 ON 走叉积"写成了"CROSS JOIN ✅"
-    // （`docs/SQL支持面.md` 已于 2026-10-15 按本探针纠正；`error-codes.md` 里
-    //  `UNSUPPORTED` 一直拿它当例子——那边是对的）。
-    rejected(&db, "SELECT count(*) FROM a CROSS JOIN b");
-    // 想要笛卡尔积的替代写法：非等值 INNER 的恒真谓词 ⇒ 叉积 + 全通过
+    // **不经过** INNER 那条臂 —— 2026-10-15 前它被拒（而文档写着 ✅，已纠正），
+    // 现在按笛卡尔积实现，与 `ON TRUE` 那条非等值 INNER 路径同义。
+    assert_eq!(count1(&db, "SELECT count(*) FROM a CROSS JOIN b"), 9, "3×3");
     assert_eq!(
         count1(&db, "SELECT count(*) FROM a JOIN b ON TRUE"),
         9,
-        "`ON TRUE` 走非等值 INNER，等价于笛卡尔积"
+        "`ON TRUE` 走非等值 INNER，与 CROSS JOIN 同义"
+    );
+    // ⚠️ 但**裸 `JOIN b`（无 ON/USING）仍要拒**：那是"没写约束"，静默当叉积会炸行数
+    //（这条差点被 CROSS 的实现顺带改掉 —— `sql_e2e` 的既有断言当场抓到）
+    rejected(&db, "SELECT count(*) FROM a JOIN b");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn right_join_已支持_保留右表未匹配行() {
+    let (db, root) = seeded("right");
+    // `a RIGHT JOIN b` ≡ `b LEFT JOIN a`（换边实现）：b 的 k=4 未匹配 ⇒ 补 NULL 保留。
+    // 值级验收在 `join_right_cross.rs`（`count(*)` 测不出列序错）。
+    assert_eq!(
+        count1(&db, "SELECT count(*) FROM a RIGHT JOIN b ON a.k = b.k"),
+        3
+    );
+    assert_eq!(
+        count1(
+            &db,
+            "SELECT count(*) FROM a RIGHT JOIN b ON a.k = b.k WHERE a.k IS NULL"
+        ),
+        1,
+        "未匹配的**右**行要补 NULL 保留（这正是 RIGHT 与 INNER 的区别）"
+    );
+    assert_eq!(
+        count1(
+            &db,
+            "SELECT count(*) FROM a RIGHT OUTER JOIN b ON a.k = b.k"
+        ),
+        3
     );
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
-fn right_join_与_full_join_根本没有实现() {
-    let (db, root) = seeded("rightfull");
-    // 注意：`JoinType` 枚举里**没有** RightOuter/FullOuter 变体 ——
-    // 这不是"没接上"，是结构性缺失（要做就得连执行层一起加）。
+fn full_join_还没有实现() {
+    let (db, root) = seeded("fullonly");
+    // `JoinType` 枚举里**没有** FullOuter 变体 —— 这不是"没接上"，是结构性缺失
+    // （要做得连执行层一起加；设计见 `docs/join补全设计.md` P1-2）。
     //
-    // 文案要说**用户写的那种写法**（"RIGHT JOIN"），不是 sqlparser 的变体名、
-    // 更不是语法树 dump。修复前这里打的是：
-    // `JOIN type Right(On(BinaryOp { left: CompoundIdentifier([Ident { value: "a", …`
-    // （`m` 带 `unsupported: ` 类别前缀，判"第一句说的是不是这种写法"要先剥掉它）
-    let m = rejected(&db, "SELECT count(*) FROM a RIGHT JOIN b ON a.k = b.k");
-    let body = m.strip_prefix("unsupported: ").unwrap_or(&m);
-    assert!(
-        body.starts_with("RIGHT JOIN"),
-        "文案该直接说 RIGHT JOIN：{m}"
-    );
+    // 文案要说**用户写的那种写法**（"FULL [OUTER] JOIN"），不是 sqlparser 的变体名、
+    // 更不是语法树 dump（修复前这里打的是 `JOIN type FullOuter(On(BinaryOp { …`）。
     let m = rejected(&db, "SELECT count(*) FROM a FULL JOIN b ON a.k = b.k");
     let body = m.strip_prefix("unsupported: ").unwrap_or(&m);
     assert!(body.starts_with("FULL"), "{m}");
