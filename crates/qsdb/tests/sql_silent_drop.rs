@@ -92,18 +92,34 @@ fn aggregate_filter_and_null_treatment_are_rejected() {
 }
 
 /// ② 窗口帧：静默忽略会**换一个数字**（用默认累计帧）而不报错。
+///
+/// 2026-10-15 起 `ROWS` **已实现**（本闸门的正例从"没有帧"扩到"ROWS 帧"），
+/// `RANGE`/`GROUPS` 仍拒。**正例必须断言值**：只断言"不报错"的话，将来谁把
+/// ROWS 又退化成默认帧，这条闸门会静静地放过（正是它当初要防的事）。
 #[test]
 fn window_frame_is_rejected() {
     let (db, root) = setup("frame");
-    rejected(
-        &db,
-        "SELECT sum(b) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
-        "window frame",
-    );
+    // t 的 b：a=1→10, a=2→NULL, a=3→40, a=NULL→30（ORDER BY a 默认 NULLS LAST）
+    // ROWS 1 PRECEDING AND CURRENT ROW ⇒ 10 / 10+NULL=10 / NULL+40=40 / 40+30=70
+    let bs = db
+        .sql_collect(
+            "SELECT sum(b) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+        )
+        .unwrap();
+    let vals: Vec<String> = (0..bs[0].num_rows())
+        .map(|i| arrow::util::display::array_value_to_string(bs[0].column(0).as_ref(), i).unwrap())
+        .collect();
+    assert_eq!(vals, vec!["10", "10", "40", "70"], "ROWS 帧 = 滑动一行");
+    // RANGE / GROUPS 仍拒（按值分帧 / 按组计数是另一件事，当 ROWS 跑会换数字）
     rejected(
         &db,
         "SELECT sum(b) OVER (ORDER BY a RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t",
-        "window frame",
+        "RANGE",
+    );
+    rejected(
+        &db,
+        "SELECT sum(b) OVER (ORDER BY a GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+        "GROUPS",
     );
     // 对照组：默认帧（不写帧）是对的（累计）
     let bs = db

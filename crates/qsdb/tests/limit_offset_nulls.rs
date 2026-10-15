@@ -210,13 +210,15 @@ fn window_order_by_uses_same_nulls_rule() {
         col(&db, "SELECT sum(b) OVER (ORDER BY b ASC) FROM t"),
         ["10", "40", "80", "130", "130"]
     );
-    // 显式 NULLS FIRST：NULL 排最前 ⇒ 0,10,40,80,130
+    // 显式 NULLS FIRST：NULL 排最前 ⇒ 首行帧内**一个非 NULL 都没有** ⇒ **NULL**
+    // （2026-10-15 修：此前给 0 —— `sum` 跳过 NULL，没有非 NULL 就是 NULL，
+    //  0 是个会被下游当真数字的错值。PG/DuckDB 同样给 NULL。）
     assert_eq!(
         col(
             &db,
             "SELECT sum(b) OVER (ORDER BY b ASC NULLS FIRST) FROM t"
         ),
-        ["0", "10", "40", "80", "130"]
+        ["NULL", "10", "40", "80", "130"]
     );
     // 窗口 NULLS 不同的两个调用**不能被当成同一个窗口**（签名要含该维度）
     let bs = db

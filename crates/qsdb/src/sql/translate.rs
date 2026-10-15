@@ -417,17 +417,163 @@ fn audit_function(f: &sqlparser::ast::Function) -> Result<()> {
 /// 窗口说明上的子句：**帧边界**（`ROWS/RANGE BETWEEN …`）与窗口内 `ORDER BY` 选项。
 ///
 /// 帧静默忽略最阴：`ROWS BETWEEN 1 PRECEDING AND CURRENT ROW` 被当成默认帧
-/// （累计），结果**换个数字、不报错**。
+/// （累计），结果**换个数字、不报错**。现在 `ROWS` 已实现（走滑窗路径），
+/// `RANGE`/`GROUPS` 仍**显式拒**。
 fn audit_window_spec(spec: &sqlparser::ast::WindowSpec) -> Result<()> {
-    if spec.window_frame.is_some() {
-        return Err(QsdbError::unsupported(
-            "window frame (ROWS/RANGE BETWEEN …) is not supported — refusing rather than \
-             silently using the default frame (which returns different numbers, not an error)",
-        ));
+    if let Some(fr) = &spec.window_frame {
+        audit_window_frame(fr)?;
     }
     audit_order_by(&sqlparser::ast::OrderByKind::Expressions(
         spec.order_by.clone(),
     ))
+}
+
+/// 帧闸门（**单位**这一层）：`ROWS` 放行（`parse_window_fn_frame` 会把边界解析成
+/// [`crate::exec::window::RowFrame`] 交给执行器），其余单位**显式拒**。
+///
+/// `RANGE` / `GROUPS` 必须拒：按**值**分帧要 `ORDER BY` 恰好一列 + 值域语义，
+/// 与 ROWS 是两回事 —— 当 ROWS 跑会**换个数字**（本批只实现 ROWS）。
+fn audit_window_frame(fr: &sqlparser::ast::WindowFrame) -> Result<()> {
+    use sqlparser::ast::WindowFrameUnits as U;
+    match fr.units {
+        U::Rows => Ok(()),
+        U::Range => Err(QsdbError::unsupported(
+            "window frame RANGE BETWEEN … (only ROWS is implemented) — RANGE 按「值」\
+             分帧（要 ORDER BY 恰好一列 + 值域语义），按 ROWS 跑会给出不同数字",
+        )),
+        U::Groups => Err(QsdbError::unsupported(
+            "window frame GROUPS BETWEEN … (only ROWS is implemented)",
+        )),
+    }
+}
+
+/// 起点是否不在终点之后（帧非空）。
+///
+/// 起点侧的 `Unbounded` = −∞、终点侧的 = +∞，故**无界一律放行**；两侧都有界时
+/// 才比相对次序（`5 PRECEDING` 在 `3 PRECEDING` 之前 ✓，写反了 ✗）。
+fn frame_bounds_order_ok(
+    start: crate::exec::window::FrameBound,
+    end: crate::exec::window::FrameBound,
+) -> bool {
+    use crate::exec::window::FrameBound as B;
+    let ord = |b: B| -> i128 {
+        match b {
+            B::Unbounded => 0, // 两侧都在上面拦掉了，这里取不到
+            B::Preceding(n) => -(n as i128),
+            B::Current => 0,
+            B::Following(n) => n as i128,
+        }
+    };
+    if matches!(start, B::Unbounded) || matches!(end, B::Unbounded) {
+        return true;
+    }
+    ord(start) <= ord(end)
+}
+
+/// 解析 `ROWS BETWEEN … AND …` 的两个边界（非法组合在 [`parse_window_fn_frame`] 判，
+/// 单位在 [`audit_window_frame`] 判）。
+fn parse_frame_bounds(
+    fr: &sqlparser::ast::WindowFrame,
+) -> Result<(
+    crate::exec::window::FrameBound,
+    crate::exec::window::FrameBound,
+)> {
+    use crate::exec::window::FrameBound as B;
+    let start = match &fr.start_bound {
+        sqlparser::ast::WindowFrameBound::CurrentRow => B::Current,
+        sqlparser::ast::WindowFrameBound::Preceding(None) => B::Unbounded,
+        sqlparser::ast::WindowFrameBound::Preceding(Some(e)) => B::Preceding(frame_offset(e)?),
+        sqlparser::ast::WindowFrameBound::Following(None) => {
+            return Err(QsdbError::unsupported(
+                "window frame `UNBOUNDED FOLLOWING` as the start bound (standard forbids it)",
+            ));
+        }
+        sqlparser::ast::WindowFrameBound::Following(Some(e)) => B::Following(frame_offset(e)?),
+    };
+    let end = match fr.end_bound.as_ref() {
+        None => B::Current,
+        Some(sqlparser::ast::WindowFrameBound::CurrentRow) => B::Current,
+        Some(sqlparser::ast::WindowFrameBound::Preceding(None)) => {
+            return Err(QsdbError::unsupported(
+                "window frame `UNBOUNDED PRECEDING` as the end bound (standard forbids it)",
+            ));
+        }
+        Some(sqlparser::ast::WindowFrameBound::Preceding(Some(e))) => {
+            B::Preceding(frame_offset(e)?)
+        }
+        Some(sqlparser::ast::WindowFrameBound::Following(None)) => B::Unbounded,
+        Some(sqlparser::ast::WindowFrameBound::Following(Some(e))) => {
+            B::Following(frame_offset(e)?)
+        }
+    };
+    Ok((start, end))
+}
+
+/// 帧偏移量：**非负整数字面量**（本仓不做表达式求值兜底；上限收到 `i64::MAX`
+/// 以内，执行器按 `i64` 算帧区间）。
+fn frame_offset(e: &sqlparser::ast::Expr) -> Result<u64> {
+    let sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan {
+        value: sqlparser::ast::Value::Number(s, _),
+        ..
+    }) = e
+    else {
+        return Err(QsdbError::unsupported(format!(
+            "window frame offset must be a non-negative integer literal, got `{e}`"
+        )));
+    };
+    let v: i64 = s.parse().map_err(|_| {
+        QsdbError::unsupported(format!(
+            "window frame offset '{s}' is not an integer (or exceeds i64)"
+        ))
+    })?;
+    if v < 0 {
+        return Err(QsdbError::unsupported(
+            "window frame offset must be non-negative (write it as PRECEDING/FOLLOWING)",
+        ));
+    }
+    Ok(v as u64)
+}
+
+/// 解析一条窗口函数的帧（`None` = 没写帧 ⇒ 默认帧）。
+///
+/// **排名 / lag / lead 带帧 ⇒ 显式拒**：标准说它们忽略帧，而本仓纪律是
+/// "不静默忽略"（静默忽略正是这批要消灭的东西）。
+fn parse_window_fn_frame(
+    f: &sqlparser::ast::Function,
+    name: &str,
+) -> Result<Option<crate::exec::window::RowFrame>> {
+    let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = &f.over else {
+        return Ok(None);
+    };
+    let Some(fr) = &spec.window_frame else {
+        return Ok(None);
+    };
+    let (start, end) = parse_frame_bounds(fr)?;
+    if !frame_bounds_order_ok(start, end) {
+        return Err(QsdbError::unsupported(
+            "window frame start is after its end (e.g. `3 PRECEDING AND 5 PRECEDING`) — \
+             the frame would always be empty",
+        ));
+    }
+    let is_agg = matches!(name, "sum" | "count" | "min" | "max" | "avg");
+    if !is_agg {
+        return Err(QsdbError::unsupported(format!(
+            "window function '{name}' does not take a frame (`ROWS BETWEEN …`) — \
+             ranking/lag/lead 按定义只吃分区与排序，帧是给聚合函数用的"
+        )));
+    }
+    // 无 ORDER BY 时行序由扫描决定（可能随并行度变化）⇒ 按行号分帧会给出
+    // **不确定**的值。整分区那一种（前后都无界）与行序无关，放行。
+    let whole_partition = matches!(start, crate::exec::window::FrameBound::Unbounded)
+        && matches!(end, crate::exec::window::FrameBound::Unbounded);
+    if spec.order_by.is_empty() && !whole_partition {
+        return Err(QsdbError::unsupported(
+            "window frame `ROWS BETWEEN …` without ORDER BY — 没有 ORDER BY 就没有确定的\
+             行序（并行扫描下会变），按行号分帧算出来的值不可复现；请加 ORDER BY，\
+             或改用 `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`（整分区）",
+        ));
+    }
+    Ok(Some(crate::exec::window::RowFrame { start, end }))
 }
 
 /// INSERT 的源：字面量行集（VALUES）或一条完整 SELECT（含 CTE/集合操作）。
@@ -3757,6 +3903,11 @@ fn window_call_key(f: &sqlparser::ast::Function) -> String {
 }
 
 /// OVER spec 的 AST 签名（小写；named window 后置）。
+///
+/// **帧必须进签名**：两个窗口调用只差帧（`sum(x) OVER (ORDER BY i ROWS BETWEEN
+/// 1 PRECEDING AND 1 FOLLOWING)` vs `… 2 PRECEDING AND 2 FOLLOWING`）时，若签名
+/// 相同就会被 `collect_window_calls` 去重成**同一个调用** ⇒ 两列都拿第一个帧的
+/// 结果（静默错值，而且数字只差一点、极难发现）。
 fn window_spec_sig(f: &sqlparser::ast::Function) -> String {
     if let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = &f.over {
         let p: Vec<String> = spec
@@ -3772,7 +3923,20 @@ fn window_spec_sig(f: &sqlparser::ast::Function) -> String {
                 format!("{}:{desc}", ob.expr.to_string().to_ascii_lowercase())
             })
             .collect();
-        format!("p[{}]o[{}]", p.join(","), o.join(","))
+        // 帧（原样文本即可：同一段源码里的同一个写法必然得到同一个串）
+        let fr = match &spec.window_frame {
+            None => String::new(),
+            Some(fr) => format!(
+                "{}:{}:{}",
+                fr.units,
+                fr.start_bound,
+                fr.end_bound
+                    .as_ref()
+                    .map(|b| b.to_string())
+                    .unwrap_or_default()
+            ),
+        };
+        format!("p[{}]o[{}]f[{}]", p.join(","), o.join(","), fr)
     } else {
         "named-window".into()
     }
@@ -3898,6 +4062,16 @@ fn parse_window_spec(
     }
 }
 
+/// 参数里写了 `*`（`count(*)` 这种）。
+fn has_star_arg(f: &sqlparser::ast::Function) -> bool {
+    fn_args(f).iter().any(|a| {
+        matches!(
+            a,
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard)
+        )
+    })
+}
+
 /// 解析窗口函数本体（参数经 bind 绑定）。
 fn parse_window_fn(
     f: &sqlparser::ast::Function,
@@ -3905,6 +4079,8 @@ fn parse_window_fn(
 ) -> Result<crate::exec::window::WindowFn> {
     use crate::exec::window::WindowFn as W;
     let name = fn_name(f);
+    // 帧先解析（`None` = 没写帧 ⇒ 默认帧）：排名/偏移类带帧在这里就被拒。
+    let frame = parse_window_fn_frame(f, &name)?;
     let arg_exprs: Vec<sqlparser::ast::Expr> = fn_args(f)
         .iter()
         .filter_map(|a| match a {
@@ -3918,17 +4094,38 @@ fn parse_window_fn(
         "row_number" | "rownum" => Ok(W::RowNumber),
         "rank" => Ok(W::Rank),
         "dense_rank" => Ok(W::DenseRank),
-        "sum" | "count" | "min" | "max" | "avg" => {
+        // `count(*)`（数**行**）与 `count(x)`（数非 NULL 的 x）是两件事，
+        // 用 `Option<PhysExpr>` 区分（`None` = `*`）—— 与聚合那边同一套表示。
+        // 此前窗口这边**没有** `*` 的表示，于是 `count(*) OVER (…)` 报
+        // "needs an argument"（把"没实现"说成"你写错了"），而
+        // `docs/SQL支持面.md` 声称窗口 `count` 可用 —— F29 那一类。
+        "count" => {
+            let arg = match arg_exprs.first() {
+                Some(e) => Some(bind(e)?),
+                None if has_star_arg(f) => None,
+                None => {
+                    return Err(QsdbError::invalid(
+                        "window count needs an argument (write count(*) or count(x))",
+                    ));
+                }
+            };
+            Ok(W::Count(arg, frame))
+        }
+        "sum" | "min" | "max" | "avg" => {
+            if has_star_arg(f) {
+                return Err(QsdbError::unsupported(format!(
+                    "window {name}(*) —— `*` 只有 count 能用（{name} 要一列或一个表达式）"
+                )));
+            }
             let first = arg_exprs
                 .first()
-                .ok_or_else(|| QsdbError::invalid("window agg needs an argument"))?;
+                .ok_or_else(|| QsdbError::invalid(format!("window {name} needs an argument")))?;
             let arg = bind(first)?;
             Ok(match name.as_str() {
-                "sum" => W::Sum(arg),
-                "count" => W::Count(arg),
-                "min" => W::Min(arg),
-                "max" => W::Max(arg),
-                _ => W::Avg(arg),
+                "sum" => W::Sum(arg, frame),
+                "min" => W::Min(arg, frame),
+                "max" => W::Max(arg, frame),
+                _ => W::Avg(arg, frame),
             })
         }
         "lag" | "lead" => {

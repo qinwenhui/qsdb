@@ -5,6 +5,11 @@
 //! - 聚合类（默认帧 = SQL 标准 RANGE 语义）：SUM / COUNT / MIN / MAX / AVG
 //!   - 无 ORDER BY → 帧为整个分区，每行取分区总值
 //!   - 有 ORDER BY → 无界前驱到当前行（含并列 peer），并列行共享段尾值
+//! - **显式行帧** `ROWS BETWEEN a AND b`（[`RowFrame`]）：按**行数**分帧，
+//!   与默认帧是**两条路径**（默认帧 = `None` ⇒ 原快路径一字不改）。
+//!   语义按 SQL 标准 / PG / DuckDB：帧 = `{j | i-a ≤ j ≤ i+b}` ∩ 本分区，
+//!   **帧可能为空**（边界落在当前行之外时不回夹到分区边）⇒ 除 `count` 外
+//!   空帧一律 NULL（`count` 空帧 = 0）。
 //! - 偏移类：LAG / LEAD(arg, offset[, default])——offset 为正整数常量，越出分区取 NULL/default
 //!
 //! 输出列序：输入列 ++ 窗口列（按 SELECT 中出现顺序）。
@@ -26,8 +31,13 @@
 //! （`QUERY_MEMORY_LIMIT` / `MEMORY_PRESSURE`），不硬做。
 //! 这是设计边界，见 `docs/内存预算与溢出设计.md` §四 4.2。
 //!
-//! 已知后置：全 NULL 分区的 SUM/MIN/MAX 返回 0、AVG 返回 NaN（应为 NULL）；
-//! SUM/AVG 不支持 Decimal 参数（显式报错）。
+//! 已知后置：SUM/AVG 不支持 Decimal 参数（显式报错）。
+//!
+//! 取值口径（两条路径**同一套**）：帧内**一个非 NULL 都没有**（含空帧）⇒
+//! SUM/MIN/MAX/AVG 输出 **NULL**（此前输出 0 / NaN —— 那是错值，2026-10-15 修）；
+//! COUNT 输出 **0**（`count` 数的是行，空帧就是 0）。默认帧与显式帧因此
+//! **逐值一致**：`sum(x) OVER (ORDER BY i)` 与 `… ROWS BETWEEN UNBOUNDED
+//! PRECEDING AND CURRENT ROW` 在无并列时结果相同。
 
 use std::sync::Arc;
 
@@ -75,17 +85,52 @@ impl WindowSpec {
     }
 }
 
+/// 行帧的一段边界（`ROWS BETWEEN a AND b` 里的 a 或 b）。
+///
+/// `Unbounded` 的**方向由位置决定**：作起点是 `UNBOUNDED PRECEDING`、作终点是
+/// `UNBOUNDED FOLLOWING`。非法组合（起点 = `UNBOUNDED FOLLOWING`、终点 =
+/// `UNBOUNDED PRECEDING`、起点在终点之后）在**绑定期**就被拒，见
+/// `translate::parse_window_fn_frame` —— 这里不再重复校验。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameBound {
+    /// 起点 `UNBOUNDED PRECEDING` / 终点 `UNBOUNDED FOLLOWING`
+    Unbounded,
+    /// `n PRECEDING`（n ≥ 0）
+    Preceding(u64),
+    /// `CURRENT ROW`
+    Current,
+    /// `n FOLLOWING`（n ≥ 0）
+    Following(u64),
+}
+
+/// 显式行帧 `ROWS BETWEEN start AND end`：**按行数**分帧（不看值）。
+///
+/// 只表示"用户显式写了帧"。**默认帧不走这里**（`None` = 默认 ⇒ 原快路径），
+/// 因为默认帧是 RANGE 语义（按**值**分段、并列行共享段尾值），与行帧是两回事。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowFrame {
+    pub start: FrameBound,
+    pub end: FrameBound,
+}
+
 /// 窗口函数定义（binder 产出）。
+///
+/// 聚合变体带 `Option<RowFrame>`：`Some` = 用户显式写了 `ROWS BETWEEN`（走滑窗
+/// 路径），`None` = 默认帧（走原来的运行累加器）。排名/偏移类**不带帧**
+/// —— 按标准它们忽略帧，而本仓纪律是"不静默忽略"，故绑定期直接拒（见
+/// `translate::audit_window_spec`）。
 #[derive(Debug, Clone)]
 pub enum WindowFn {
     RowNumber,
     Rank,
     DenseRank,
-    Sum(PhysExpr),
-    Count(PhysExpr),
-    Min(PhysExpr),
-    Max(PhysExpr),
-    Avg(PhysExpr),
+    Sum(PhysExpr, Option<RowFrame>),
+    /// `count(x)`（`Some`）或 `count(*)`（`None`，数**行**）—— 与聚合那边同一套
+    /// 表示；两者在含 NULL 的列上结果不同，所以必须分开。
+    Count(Option<PhysExpr>, Option<RowFrame>),
+    Min(PhysExpr, Option<RowFrame>),
+    Max(PhysExpr, Option<RowFrame>),
+    Avg(PhysExpr, Option<RowFrame>),
     /// lag(arg, offset[, default])：分区内在排序序上取前 offset 行的值
     Lag(PhysExpr, i64, Option<Box<PhysExpr>>),
     /// lead(arg, offset[, default])：取后 offset 行的值
@@ -93,16 +138,26 @@ pub enum WindowFn {
 }
 
 impl WindowFn {
+    /// 显式行帧：`Some` ⇒ 走滑窗路径；`None` ⇒ 默认帧（原快路径）。
+    pub fn frame(&self) -> Option<RowFrame> {
+        match self {
+            Self::Sum(_, fr) | Self::Min(_, fr) | Self::Max(_, fr) | Self::Avg(_, fr) => *fr,
+            Self::Count(.., fr) => *fr,
+            _ => None,
+        }
+    }
+
     pub fn output_name(&self) -> String {
         match self {
             Self::RowNumber => "row_number()".into(),
             Self::Rank => "rank()".into(),
             Self::DenseRank => "dense_rank()".into(),
-            Self::Sum(e) => format!("sum({})", e.display()),
-            Self::Count(e) => format!("count({})", e.display()),
-            Self::Min(e) => format!("min({})", e.display()),
-            Self::Max(e) => format!("max({})", e.display()),
-            Self::Avg(e) => format!("avg({})", e.display()),
+            Self::Sum(e, _) => format!("sum({})", e.display()),
+            Self::Count(None, _) => "count(*)".into(),
+            Self::Count(Some(e), _) => format!("count({})", e.display()),
+            Self::Min(e, _) => format!("min({})", e.display()),
+            Self::Max(e, _) => format!("max({})", e.display()),
+            Self::Avg(e, _) => format!("avg({})", e.display()),
             Self::Lag(e, off, None) => format!("lag({}, {off})", e.display()),
             Self::Lag(e, off, Some(d)) => format!("lag({}, {off}, {})", e.display(), d.display()),
             Self::Lead(e, off, None) => format!("lead({}, {off})", e.display()),
@@ -115,8 +170,8 @@ impl WindowFn {
     pub fn output_type(&self) -> crate::types::LogicalType {
         use crate::types::LogicalType;
         match self {
-            Self::RowNumber | Self::Rank | Self::DenseRank | Self::Count(_) => LogicalType::Int64,
-            Self::Sum(e) => match e.data_type() {
+            Self::RowNumber | Self::Rank | Self::DenseRank | Self::Count(..) => LogicalType::Int64,
+            Self::Sum(e, _) => match e.data_type() {
                 LogicalType::Float32 | LogicalType::Float64 => LogicalType::Float64,
                 t if t.is_numeric() => LogicalType::Int64,
                 LogicalType::Decimal(m) => {
@@ -124,8 +179,8 @@ impl WindowFn {
                 }
                 _ => LogicalType::Int64,
             },
-            Self::Avg(_) => LogicalType::Float64,
-            Self::Min(e) | Self::Max(e) => e.data_type(),
+            Self::Avg(..) => LogicalType::Float64,
+            Self::Min(e, _) | Self::Max(e, _) => e.data_type(),
             Self::Lag(e, ..) | Self::Lead(e, ..) => e.data_type(),
         }
     }
@@ -517,18 +572,26 @@ fn compute_window_fn(
             }
             Ok(Arc::new(Int64Array::from(dr)))
         }
-        WindowFn::Sum(arg) | WindowFn::Avg(arg) | WindowFn::Min(arg) | WindowFn::Max(arg) => {
+        WindowFn::Sum(arg, fr)
+        | WindowFn::Avg(arg, fr)
+        | WindowFn::Min(arg, fr)
+        | WindowFn::Max(arg, fr) => {
             let arg_arr = eval::eval(arg, sorted_batch)?;
-            let is_avg = matches!(f, WindowFn::Avg(_));
-            let is_min = matches!(f, WindowFn::Min(_));
-            let is_max = matches!(f, WindowFn::Max(_));
+            let is_avg = matches!(f, WindowFn::Avg(..));
+            let is_min = matches!(f, WindowFn::Min(..));
+            let is_max = matches!(f, WindowFn::Max(..));
             let fname = match f {
-                WindowFn::Sum(_) => "sum",
-                WindowFn::Avg(_) => "avg",
-                WindowFn::Min(_) => "min",
+                WindowFn::Sum(..) => "sum",
+                WindowFn::Avg(..) => "avg",
+                WindowFn::Min(..) => "min",
                 _ => "max",
             };
-            match arg.data_type() {
+            // **显式帧走另一条路**（滑窗）；默认帧（None）**不进这里**，
+            // 下面原代码一字不改 —— 这是"零回归"的落点。
+            if let Some(frame) = *fr {
+                return framed_agg(f, &arg_arr, arg.data_type(), frame, &partition_start, n);
+            }
+            let out = match arg.data_type() {
                 t if t.is_integer() => {
                     // 整型路径：i64 运行值（sum/min/max → Int64，avg → Float64）
                     let mut acc = 0i64; // sum 累加
@@ -536,6 +599,9 @@ fn compute_window_fn(
                     let mut cnt = 0i64; // 非 null 计数（avg 除数）
                     let mut out_i = vec![0i64; n];
                     let mut out_f = vec![0f64; n];
+                    // 帧内一个非 NULL 都没有的行（只可能是分区开头的一段）⇒ 输出 NULL。
+                    // **无 NULL 数据时这个 Vec 一次都不 push**（零额外代价）。
+                    let mut empty_rows: Vec<u32> = Vec::new();
                     for i in 0..n {
                         if partition_start[i] {
                             acc = 0;
@@ -551,6 +617,8 @@ fn compute_window_fn(
                                 Some(e) if is_max => e.max(v),
                                 Some(e) => e,
                             });
+                        } else if cnt == 0 {
+                            empty_rows.push(i as u32);
                         }
                         if is_avg {
                             out_f[i] = acc as f64 / cnt as f64;
@@ -561,11 +629,9 @@ fn compute_window_fn(
                         }
                     }
                     if is_avg {
-                        backfill_segments(&mut out_f, &seg_start);
-                        Ok(Arc::new(Float64Array::from(out_f)))
+                        finish_float(out_f, &empty_rows, &seg_start)
                     } else {
-                        backfill_segments(&mut out_i, &seg_start);
-                        Ok(Arc::new(Int64Array::from(out_i)))
+                        finish_int(out_i, &empty_rows, &seg_start)
                     }
                 }
                 t if t.is_floating() => {
@@ -574,6 +640,7 @@ fn compute_window_fn(
                     let mut ext: Option<f64> = None;
                     let mut cnt = 0i64;
                     let mut out = vec![0f64; n];
+                    let mut empty_rows: Vec<u32> = Vec::new();
                     for i in 0..n {
                         if partition_start[i] {
                             acc = 0.0;
@@ -589,6 +656,8 @@ fn compute_window_fn(
                                 Some(e) if is_max => e.max(v),
                                 Some(e) => e,
                             });
+                        } else if cnt == 0 {
+                            empty_rows.push(i as u32);
                         }
                         out[i] = if is_min || is_max {
                             ext.unwrap_or(0.0)
@@ -598,23 +667,33 @@ fn compute_window_fn(
                             acc
                         };
                     }
-                    backfill_segments(&mut out, &seg_start);
-                    Ok(Arc::new(Float64Array::from(out)))
+                    finish_float(out, &empty_rows, &seg_start)
                 }
-                other => Err(QsdbError::unsupported(format!(
-                    "window {fname} over {other:?} (support: integer/float args)"
-                ))),
-            }
+                other => {
+                    return Err(QsdbError::unsupported(format!(
+                        "window {fname} over {other:?} (support: integer/float args)"
+                    )));
+                }
+            };
+            align_output(f, out)
         }
-        WindowFn::Count(arg) => {
-            let arg_arr = eval::eval(arg, sorted_batch)?;
+        WindowFn::Count(arg, fr) => {
+            // `count(*)`（arg = None）逐行都计 ⇒ 没有"非 NULL"这回事。
+            let arg_arr = match arg {
+                Some(e) => Some(eval::eval(e, sorted_batch)?),
+                None => None,
+            };
+            let counted = |i: usize| arg_arr.as_ref().is_none_or(|a| !a.is_null(i));
+            if let Some(frame) = *fr {
+                return Ok(framed_count(arg_arr.as_deref(), frame, &partition_start, n));
+            }
             let mut out = vec![0i64; n];
             let mut cnt = 0i64;
             for i in 0..n {
                 if partition_start[i] {
                     cnt = 0;
                 }
-                if !arg_arr.is_null(i) {
+                if counted(i) {
                     cnt += 1;
                 }
                 out[i] = cnt;
@@ -675,6 +754,298 @@ fn compute_window_fn(
             }
         }
     }
+}
+
+/// 聚合窗口函数名（报错文案用）。
+fn agg_name(f: &WindowFn) -> &'static str {
+    match f {
+        WindowFn::Sum(..) => "sum",
+        WindowFn::Count(..) => "count",
+        WindowFn::Min(..) => "min",
+        WindowFn::Max(..) => "max",
+        _ => "avg",
+    }
+}
+
+/// 默认帧的输出收尾（整型/浮点各一份：arrow 的 `From<Vec<_>>` 只对具体类型实现，
+/// 泛型函数写不出来）：`empty_rows`（帧内一个非 NULL 都没有）→ NULL，然后段内回填。
+///
+/// **`empty_rows` 为空时走原快路径**（`Vec<T>` 直出、零额外分配）—— 没有 NULL
+/// 的数据（含基准里的）一分钱都不多付；有 NULL 时才付一次 `Vec<Option<T>>`。
+fn finish_int(vals: Vec<i64>, empty_rows: &[u32], seg_start: &[bool]) -> ArrayRef {
+    if empty_rows.is_empty() {
+        let mut v = vals;
+        backfill_segments(&mut v, seg_start);
+        return Arc::new(Int64Array::from(v));
+    }
+    let mut opts: Vec<Option<i64>> = vals.into_iter().map(Some).collect();
+    for &i in empty_rows {
+        opts[i as usize] = None;
+    }
+    // 段内回填照做：段（并列组）的尾部无值 ⇒ 整段 NULL
+    backfill_segments(&mut opts, seg_start);
+    Arc::new(Int64Array::from(opts))
+}
+
+/// 见 [`finish_int`]（浮点的一份）。
+fn finish_float(vals: Vec<f64>, empty_rows: &[u32], seg_start: &[bool]) -> ArrayRef {
+    if empty_rows.is_empty() {
+        let mut v = vals;
+        backfill_segments(&mut v, seg_start);
+        return Arc::new(Float64Array::from(v));
+    }
+    let mut opts: Vec<Option<f64>> = vals.into_iter().map(Some).collect();
+    for &i in empty_rows {
+        opts[i as usize] = None;
+    }
+    backfill_segments(&mut opts, seg_start);
+    Arc::new(Float64Array::from(opts))
+}
+
+/// 显式行帧的滑窗求值（`ROWS BETWEEN …`）。
+///
+/// **取值口径与默认帧同一套**（见模块头）：帧内一个非 NULL 都没有 ⇒ SUM/MIN/
+/// MAX/AVG 为 NULL、COUNT 为 0。两条路径的差别**只在帧怎么划**：默认帧是 RANGE
+/// （按值分段、并列行共享段尾值），这里是 ROWS（按行号，帧可能为空）。
+fn framed_agg(
+    f: &WindowFn,
+    arg_arr: &ArrayRef,
+    arg_type: crate::types::LogicalType,
+    frame: RowFrame,
+    partition_start: &[bool],
+    n: usize,
+) -> Result<ArrayRef> {
+    let fname = agg_name(f);
+    let is_avg = matches!(f, WindowFn::Avg(..));
+    let is_extreme = matches!(f, WindowFn::Min(..) | WindowFn::Max(..));
+    let want_min = matches!(f, WindowFn::Min(..));
+
+    let arr: ArrayRef = match arg_type {
+        t if t.is_integer() => {
+            let vals: Vec<Option<i64>> = (0..n).map(|i| arr_i64(arg_arr, i)).collect();
+            if is_extreme {
+                Arc::new(Int64Array::from(framed_extreme(
+                    &vals,
+                    frame,
+                    partition_start,
+                    n,
+                    want_min,
+                )))
+            } else {
+                let (sums, cnts) = framed_prefix(n, partition_start, frame, &vals);
+                if is_avg {
+                    Arc::new(Float64Array::from(avg_of(&sums, &cnts, |v| v as f64)))
+                } else {
+                    Arc::new(Int64Array::from(sums))
+                }
+            }
+        }
+        t if t.is_floating() => {
+            let vals: Vec<Option<f64>> = (0..n).map(|i| arr_f64(arg_arr, i)).collect();
+            if is_extreme {
+                Arc::new(Float64Array::from(framed_extreme(
+                    &vals,
+                    frame,
+                    partition_start,
+                    n,
+                    want_min,
+                )))
+            } else {
+                let (sums, cnts) = framed_prefix(n, partition_start, frame, &vals);
+                if is_avg {
+                    Arc::new(Float64Array::from(avg_of(&sums, &cnts, |v| v)))
+                } else {
+                    Arc::new(Float64Array::from(sums))
+                }
+            }
+        }
+        other => {
+            return Err(QsdbError::unsupported(format!(
+                "window {fname} over {other:?} (support: integer/float args)"
+            )));
+        }
+    };
+    align_output(f, arr)
+}
+
+/// 把聚合窗口的输出**对齐到声明类型**。
+///
+/// 为什么需要：`min/max` 的输出类型 = **参数类型**（`INT` 列 ⇒ `Int32`），而两条
+/// 取值路径都按 `i64`/`f64` 算 ⇒ 类型对不上时 `RecordBatch::try_new` 直接抛
+/// `column types must match schema types, expected Int32 but found Int64`。
+/// **默认帧路径此前就是这样**：`min(x) OVER (ORDER BY i)` 在 `INT` 列上必炸
+/// （报的是内部错误、不是人话），`FLOAT` 列上其实也对不上（只是没人写过）。
+/// 类型相同 ⇒ 零拷贝直通，所以热路径不付代价。
+fn align_output(f: &WindowFn, arr: ArrayRef) -> Result<ArrayRef> {
+    let want = f.output_type().arrow_type();
+    if arr.data_type() == &want {
+        return Ok(arr);
+    }
+    arrow::compute::cast(&arr, &want)
+        .map_err(|e| QsdbError::unsupported(format!("window {} output type: {e}", agg_name(f))))
+}
+
+/// `count` 的帧求值：数**行**（`count(x)` 数的是非 NULL 的 x）。
+///
+/// `has_arg = None` 即 `count(*)` —— 逐行都计。与 sum/min/max/avg 的关键差别：
+/// **空帧给 0 而不是 NULL**（它数的是行的个数，0 是正确答案，不是"没有值"）。
+fn framed_count(
+    has_arg: Option<&dyn Array>,
+    frame: RowFrame,
+    partition_start: &[bool],
+    n: usize,
+) -> ArrayRef {
+    // 非 NULL 记 1、NULL 记 0，前缀和即区间计数（`count(*)` 全是 1）
+    let marks: Vec<Option<i64>> = (0..n)
+        .map(|i| match has_arg {
+            None => Some(1i64),
+            Some(a) if a.is_null(i) => None,
+            Some(_) => Some(1i64),
+        })
+        .collect();
+    let (_, cnts) = framed_prefix(n, partition_start, frame, &marks);
+    Arc::new(Int64Array::from(cnts))
+}
+
+/// `sum/count → avg`：`counts[i] == 0`（空帧或帧内全 NULL）⇒ NULL。
+fn avg_of<T: Copy>(
+    sums: &[Option<T>],
+    cnts: &[i64],
+    to_f64: impl Fn(T) -> f64,
+) -> Vec<Option<f64>> {
+    sums.iter()
+        .zip(cnts)
+        .map(|(s, &c)| s.map(|v| to_f64(v) / c as f64))
+        .collect()
+}
+
+/// 分区区间 `[ps, pe)`（输入已按 `PARTITION BY` 排好，`partition_start[0] == true`）。
+fn partition_ranges(n: usize, partition_start: &[bool]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut s = 0usize;
+    for (i, is_start) in partition_start.iter().enumerate().take(n).skip(1) {
+        if *is_start {
+            out.push((s, i));
+            s = i;
+        }
+    }
+    if n > 0 {
+        out.push((s, n)); // 末分区的右端（开区间）
+    }
+    out
+}
+
+/// 行 `i` 的帧区间 `[a, b]`（闭区间，行号在本分区内；`a > b` = 空帧）。
+///
+/// **只夹"该在分区内"的那一侧**：越出分区的那一侧**不**回夹到分区边 ——
+/// 回夹会把不该进帧的行算进来。`ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING` 在
+/// 分区首行是**空帧**（PG / DuckDB 都给 NULL），回夹成 `[ps, ps]` 就成"取首行"了。
+fn frame_bounds(frame: RowFrame, i: usize, ps: usize, pe: usize) -> (i64, i64) {
+    let i = i as i64;
+    let a = match frame.start {
+        FrameBound::Unbounded => ps as i64,
+        FrameBound::Current => i,
+        FrameBound::Preceding(k) => (i - k as i64).max(ps as i64),
+        FrameBound::Following(k) => i + k as i64,
+    };
+    let b = match frame.end {
+        FrameBound::Unbounded => pe as i64 - 1,
+        FrameBound::Current => i,
+        FrameBound::Preceding(k) => i - k as i64,
+        FrameBound::Following(k) => (i + k as i64).min(pe as i64 - 1),
+    };
+    (a, b)
+}
+
+/// 滑窗求和/计数：分区内一次前缀和 ⇒ 每行 O(1)。
+///
+/// 返回 `(sums, counts)`。`counts[i] == 0`（空帧 **或** 帧内全 NULL）时
+/// `sums[i] = None` —— 这就是"帧内无值 ⇒ NULL"的判据，与默认帧路径同一套口径。
+/// ⚠️ `counts` 的口径是**非 NULL 计数**（`count(x)`），不是行数。
+fn framed_prefix<T>(
+    n: usize,
+    partition_start: &[bool],
+    frame: RowFrame,
+    vals: &[Option<T>],
+) -> (Vec<Option<T>>, Vec<i64>)
+where
+    T: Copy + Default + std::ops::Add<Output = T> + std::ops::Sub<Output = T>,
+{
+    let mut sums: Vec<Option<T>> = vec![None; n];
+    let mut cnts = vec![0i64; n];
+    for (ps, pe) in partition_ranges(n, partition_start) {
+        let len = pe - ps;
+        let mut psum = vec![T::default(); len + 1];
+        let mut pcnt = vec![0i64; len + 1];
+        for k in 0..len {
+            let v = vals[ps + k];
+            psum[k + 1] = psum[k] + v.unwrap_or_default();
+            pcnt[k + 1] = pcnt[k] + i64::from(v.is_some());
+        }
+        for i in ps..pe {
+            let (a, b) = frame_bounds(frame, i, ps, pe);
+            if a > b {
+                continue; // 空帧 ⇒ sums 保持 None、cnts 保持 0
+            }
+            let lo = (a - ps as i64) as usize;
+            let hi = (b - ps as i64 + 1) as usize;
+            cnts[i] = pcnt[hi] - pcnt[lo];
+            sums[i] = if cnts[i] == 0 {
+                None
+            } else {
+                Some(psum[hi] - psum[lo])
+            };
+        }
+    }
+    (sums, cnts)
+}
+
+/// 滑窗 min/max：单调队列，摊还 O(1)/行。
+///
+/// 能用队列的前提是**帧两端都随 i 单调不减**（`Preceding` / `Current` /
+/// `Following` / `Unbounded` 四种边界都满足）⇒ 出队（滑出左界、或被更优值压掉）
+/// 的元素此后再不会被任何一帧需要。分区开头重置队列，否则会把上一分区的行推
+/// 进来。NULL **不入队**（不参与极值），帧内全 NULL ⇒ 空队 ⇒ NULL。
+fn framed_extreme<T: PartialOrd + Copy>(
+    vals: &[Option<T>],
+    frame: RowFrame,
+    partition_start: &[bool],
+    n: usize,
+    want_min: bool,
+) -> Vec<Option<T>> {
+    let mut out: Vec<Option<T>> = vec![None; n];
+    for (ps, pe) in partition_ranges(n, partition_start) {
+        let mut dq: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+        let mut last = ps as i64 - 1; // 已入过队的最大行号
+        for (i, slot) in out.iter_mut().enumerate().take(pe).skip(ps) {
+            let (a, b) = frame_bounds(frame, i, ps, pe);
+            while last < b {
+                last += 1;
+                let j = last as usize;
+                let Some(v) = vals[j] else { continue };
+                // 队尾不比新值更优 ⇒ 此后永远不可能是答案，直接丢弃
+                while let Some(&k) = dq.back() {
+                    match vals[k] {
+                        Some(kv) if (want_min && kv >= v) || (!want_min && kv <= v) => {
+                            dq.pop_back();
+                        }
+                        _ => break,
+                    }
+                }
+                dq.push_back(j);
+            }
+            // 队首滑出帧左界 ⇒ 出队（左界单调不减 ⇒ 出去就不会再回来）
+            while let Some(&k) = dq.front() {
+                if (k as i64) < a {
+                    dq.pop_front();
+                } else {
+                    break;
+                }
+            }
+            *slot = dq.front().and_then(|&k| vals[k]);
+        }
+    }
+    out
 }
 
 /// RANGE 默认帧段回填：同一取值段内所有行取段尾运行值。
