@@ -301,9 +301,106 @@ pub struct HashJoinExec {
     matched: Option<Vec<bool>>,
 }
 
+/// **build 侧物化数据：保留分批，不 concat**。
+///
+/// ## 为什么不做成一张大表（2026-10-15 改）
+///
+/// 原实现把所有批 `concat_batches` 成一张大表 —— 那一刻**源批与新表同时活着**，
+/// 瞬时 **2×**。后果实测过：右表 32MB 配 64MB 配额（**逻辑上绰绰有余**）也会因为
+/// 这 2× 而触发溢出（INNER/LEFT 落盘白跑一趟）或**直接报错**（FULL 没有溢出通道）。
+///
+/// 改成"保留分批 + 跨批全局行号"后，常驻 = **1×**，那笔峰值**根本不存在**。
+/// 取数走 `arrow::compute::interleave`（每种类型都有特化核，不是慢路径）；
+/// 单批时仍走原来的 `take` 快路径。
+///
+/// ⚠️ **行号口径**：整个 join 内部用的行号一律是**跨批全局行号**
+/// （索引、`join_batch`、`full_tail` 的匹配位图三处必须一致）。
+struct BuildSide {
+    batches: Vec<RecordBatch>,
+    /// `base[i]` = 第 i 批第一行的全局行号；末项 = 总行数（长度 = 批数 + 1）
+    base: Vec<usize>,
+    n_rows: usize,
+    /// **build 输入的 schema**（不是批的）：build 侧可能**一批都没有**，
+    /// 那时仍要能回答"这一列是什么类型"（`column` / `null_like` 用）。
+    schema: SchemaRef,
+}
+
+impl BuildSide {
+    fn new(batches: Vec<RecordBatch>, schema: SchemaRef) -> Self {
+        let mut base = Vec::with_capacity(batches.len() + 1);
+        let mut acc = 0usize;
+        base.push(0);
+        for b in &batches {
+            acc += b.num_rows();
+            base.push(acc);
+        }
+        Self {
+            batches,
+            base,
+            n_rows: acc,
+            schema,
+        }
+    }
+
+    fn num_rows(&self) -> usize {
+        self.n_rows
+    }
+
+    fn num_columns(&self) -> usize {
+        self.schema.fields().len()
+    }
+
+    /// 物化字节数（记账用；与 `crate::memory::batch_bytes` 同口径，逐批求和）。
+    fn bytes(&self) -> u64 {
+        self.batches.iter().map(crate::memory::batch_bytes).sum()
+    }
+
+    /// 该列的**一个代表数组**（只用来取类型造 NULL；空 build 侧也能回答）。
+    fn column(&self, c: usize) -> ArrayRef {
+        match self.batches.first() {
+            Some(b) => b.column(c).clone(),
+            None => arrow::array::new_null_array(self.schema.field(c).data_type(), 0),
+        }
+    }
+
+    /// 全局行号 → `(批号, 批内行号)`。`base` 单调 ⇒ 二分。
+    fn row_of(&self, global: usize) -> (usize, usize) {
+        let upto = &self.base[..self.base.len() - 1];
+        let b = match upto.binary_search(&global) {
+            Ok(i) => i,
+            Err(i) => i - 1, // 落在 base[i-1]..base[i] 之间
+        };
+        (b, global - self.base[b])
+    }
+
+    /// 按**全局行号**取列（`interleave` 一次成型，不 concat 中间结果）。
+    fn take(&self, c: usize, idx: &UInt32Array) -> Result<ArrayRef> {
+        if self.batches.is_empty() {
+            // **一批都没有**（右表为空）：这里只可能是"取 0 行"（行号来自空索引），
+            // 按该列的**类型**造等长 NULL 数组即可 —— 直接走 `interleave` 会报
+            // "requires input of at least one array"（FULL + 空右表那次实测踩到）。
+            return Ok(arrow::array::new_null_array(
+                self.schema.field(c).data_type(),
+                idx.len(),
+            ));
+        }
+        if self.batches.len() == 1 {
+            // 单批：走原来的 `take` 快路径（不构造 (批号,行号) 对）
+            return take(self.batches[0].column(c), idx, None)
+                .map_err(|e| QsdbError::invalid(format!("join take: {e}")));
+        }
+        let arrays: Vec<&dyn Array> = self.batches.iter().map(|b| b.column(c).as_ref()).collect();
+        let pairs: Vec<(usize, usize)> = (0..idx.len())
+            .map(|i| self.row_of(idx.value(i) as usize))
+            .collect();
+        arrow::compute::interleave(&arrays, &pairs)
+            .map_err(|e| QsdbError::invalid(format!("join interleave: {e}")))
+    }
+}
+
 struct BuildState {
-    /// 右表物化批（单批 concat 后）
-    table: RecordBatch,
+    /// build 侧数据（**分批**，见 [`BuildSide`]）
+    table: BuildSide,
     /// 键索引：单整数键走 i64 免编码（probe 每行省一次字节编码 + 字节哈希）
     index: HashIndex,
 }
@@ -490,40 +587,14 @@ impl HashJoinExec {
             }
             batches.push(x);
         }
-        let total = res.bytes();
-        // concat 期间瞬时双份（峰值真实存在，就该记账）；但**要不到这份峰值额度
-        // 不是终止理由**：本算子有溢出能力（P2 分区块 hash join），整批交溢出即可。
-        // 回归（本行原为 `res.grow(total)?`）：build 侧 ≤ 配额、只是 2x 峰值越过配额
-        // 时被直接上抛 QueryMemoryLimit——外面实测
-        // 「query ab at 64MB would exceed its 64MB limit」（build 侧 ~32MB 时翻倍命中）。
-        if res.grow(total).is_err() {
-            self.enter_spill(batches)?; // 全部批都在（含最后一批，见上）；res 随返回归还
-            return Ok(());
-        }
-        let table = concat_batches(&batches, &self.build.schema())?;
-        res.shrink(total); // 源批已随 Vec 释放
+        // **不 concat**：分批保留 + 跨批全局行号。原先这里 `concat_batches` 出
+        // 一张大表，那一刻源批与新表**同时活着**（瞬时 2×）—— 右表 32MB 配 64MB
+        // 配额（逻辑上绰绰有余）也会被这 2× 顶掉，白跑一趟溢出（INNER/LEFT）
+        // 或直接报错（FULL 无溢出通道）。见 [`BuildSide`]。
+        let table = BuildSide::new(batches, self.build.schema());
 
-        // 键哈希索引
-        let mut key_cols: Vec<ArrayRef> = Vec::with_capacity(self.build_keys.len());
-        for k in &self.build_keys {
-            key_cols.push(eval::eval(k, &table)?);
-        }
-        let index: HashIndex = if HashIndex::int_ok(&self.build_keys) {
-            let mut m: I64Map<Vec<u32>> = I64Map::default();
-            if let Some(vals) = int_key_column(&key_cols[0]) {
-                let nrows = table.num_rows();
-                for row in 0..nrows {
-                    if let Some(v) = vals(row) {
-                        m.entry(v).or_default().push(row as u32);
-                    }
-                }
-                HashIndex::I64(m)
-            } else {
-                HashIndex::Bytes(build_bytes_index(&key_cols, table.num_rows()))
-            }
-        } else {
-            HashIndex::Bytes(build_bytes_index(&key_cols, table.num_rows()))
-        };
+        // 键哈希索引（**逐批构建，行号加全局偏移** —— 与 `BuildSide` 同一口径）
+        let index = build_index(&table, &self.build_keys)?;
         // 键索引（键值 + 行号列表）同样常驻，一并记账：粗估每行 16B
         // （键拷贝 + 行号），量级正确即可——目的是让预算覆盖它，不追求逐字节。
         //
@@ -532,7 +603,7 @@ impl HashJoinExec {
         // `enter_spill` 让每个分区各自物化（分区小了，行与索引一起变小）。
         // 回归：本行原为 `res.grow(...)?`，小全局预算下 join 被直接打死。
         if res.grow(table.num_rows() as u64 * 16).is_err() {
-            self.enter_spill(vec![table])?; // `res` 是局部量，随本次返回归还
+            self.enter_spill(table.batches)?; // `res` 是局部量，随本次返回归还
             return Ok(());
         }
         if std::env::var("QSDB_JOIN_PROF").is_ok() {
@@ -838,10 +909,9 @@ impl HashJoinExec {
                 if rows.is_empty() {
                     continue; // 该分区 build 侧为空 → 无匹配（LEFT 也无需发射）
                 }
-                let table = match concat_batches(&rows, &self.build.schema()) {
-                    Ok(t) => t,
-                    Err(e) => return Some(Err(e)),
-                };
+                // 同样**不 concat**（见 `BuildSide`）：分区的 build 侧也保留分批，
+                // 否则每个分区再各吃一次 2× 峰值。
+                let table = BuildSide::new(rows, self.build.schema());
                 // 分区表也记账：正常情况 ≈ build 总量 / P，但**键倾斜**时可能
                 // 仍很大——那时要不到额度就如实报错（不再往下切分），
                 // 而不是让它无界涨上去。
@@ -853,33 +923,13 @@ impl HashJoinExec {
                     Ok(r) => r,
                     Err(e) => return Some(Err(e)),
                 };
-                let est = crate::memory::batch_bytes(&table) + table.num_rows() as u64 * 16;
+                let est = table.bytes() + table.num_rows() as u64 * 16;
                 if let Err(e) = r.grow(est) {
                     return Some(Err(e));
                 }
-                let key_cols: Vec<ArrayRef> = match self
-                    .build_keys
-                    .iter()
-                    .map(|k| eval::eval(k, &table))
-                    .collect::<Result<_>>()
-                {
-                    Ok(c) => c,
+                let index = match build_index(&table, &self.build_keys) {
+                    Ok(i) => i,
                     Err(e) => return Some(Err(e)),
-                };
-                let index: HashIndex = if HashIndex::int_ok(&self.build_keys) {
-                    let mut m: I64Map<Vec<u32>> = I64Map::default();
-                    if let Some(vals) = int_key_column(&key_cols[0]) {
-                        for row in 0..table.num_rows() {
-                            if let Some(v) = vals(row) {
-                                m.entry(v).or_default().push(row as u32);
-                            }
-                        }
-                        HashIndex::I64(m)
-                    } else {
-                        HashIndex::Bytes(build_bytes_index(&key_cols, table.num_rows()))
-                    }
-                } else {
-                    HashIndex::Bytes(build_bytes_index(&key_cols, table.num_rows()))
                 };
                 self.build_res = Some(r);
                 self.cur_build = Some(BuildState { table, index });
@@ -1071,7 +1121,7 @@ impl HashJoinExec {
 /// 左段列一律 `new_null_array`（这些行在左表里没有对应物）；右段列照 `needed`
 /// 掩码决定是 `take` 还是填 NULL（与 `join_batch` 同一口径，别让它俩分叉）。
 fn unmatched_build_batch(
-    build: &RecordBatch,
+    build: &BuildSide,
     mask: &[bool],
     probe_schema: &SchemaRef,
     out_schema: &SchemaRef,
@@ -1094,15 +1144,12 @@ fn unmatched_build_batch(
         cols.push(arrow::array::new_null_array(f.data_type(), n));
     }
     let take_idx = UInt32Array::from(idx);
-    for (c, f) in build.schema().fields().iter().enumerate() {
+    for (c, f) in build.schema.fields().iter().enumerate() {
         if !want(n_left + c) {
             cols.push(arrow::array::new_null_array(f.data_type(), n));
             continue;
         }
-        cols.push(
-            take(build.column(c), &take_idx, None)
-                .map_err(|e| QsdbError::invalid(format!("full join take: {e}")))?,
-        );
+        cols.push(build.take(c, &take_idx)?);
     }
     RecordBatch::try_new_with_options(
         Arc::clone(out_schema),
@@ -1111,6 +1158,55 @@ fn unmatched_build_batch(
     )
     .map(Some)
     .map_err(|e| QsdbError::invalid(format!("full join output: {e}")))
+}
+
+/// build 侧键索引（**逐批**构建，行号是**跨批全局行号**）。
+///
+/// 逐批复用 `build_bytes_index` / i64 快路径，再把每批的结果按 `base` 偏移
+/// 并进总表 —— 不重写编码与"NULL 键不入索引"的规则，那两处一旦分叉就是静默错值。
+fn build_index(side: &BuildSide, build_keys: &[PhysExpr]) -> Result<HashIndex> {
+    let int_ok = HashIndex::int_ok(build_keys);
+    if int_ok {
+        let mut m: I64Map<Vec<u32>> = I64Map::default();
+        let mut ok = true;
+        for (bi, b) in side.batches.iter().enumerate() {
+            let mut key_cols: Vec<ArrayRef> = Vec::with_capacity(build_keys.len());
+            for k in build_keys {
+                key_cols.push(eval::eval(k, b)?);
+            }
+            match int_key_column(&key_cols[0]) {
+                Some(vals) => {
+                    let off = side.base[bi];
+                    for row in 0..b.num_rows() {
+                        if let Some(v) = vals(row) {
+                            m.entry(v).or_default().push((off + row) as u32);
+                        }
+                    }
+                }
+                None => {
+                    ok = false; // 类型不符 ⇒ 整体退字节路径（已经建的部分丢弃）
+                    break;
+                }
+            }
+        }
+        if ok {
+            return Ok(HashIndex::I64(m));
+        }
+    }
+    let mut m: BytesMap<Vec<u32>> = BytesMap::default();
+    for (bi, b) in side.batches.iter().enumerate() {
+        let mut key_cols: Vec<ArrayRef> = Vec::with_capacity(build_keys.len());
+        for k in build_keys {
+            key_cols.push(eval::eval(k, b)?);
+        }
+        let sub = build_bytes_index(&key_cols, b.num_rows());
+        let off = side.base[bi] as u32;
+        for (k, rows) in sub {
+            let e = m.entry(k).or_default();
+            e.extend(rows.into_iter().map(|r| r + off));
+        }
+    }
+    Ok(HashIndex::Bytes(m))
 }
 
 /// 字节键索引构建（多键/字符串/浮点路径）。
@@ -1138,7 +1234,7 @@ fn build_bytes_index(key_cols: &[ArrayRef], nrows: usize) -> BytesMap<Vec<u32>> 
 /// 成本；为它把求值器做进 take 里，省下的没有"语义只有一处"值钱。
 fn residual_keep_mask(
     probe_batch: &RecordBatch,
-    build_table: &RecordBatch,
+    build_table: &BuildSide,
     probe_idx: &[u32],
     build_idx: &[u32],
     residual: &PhysExpr,
@@ -1147,7 +1243,7 @@ fn residual_keep_mask(
     let bi = UInt32Array::from(build_idx.to_vec());
     let mut fields: Vec<arrow::datatypes::FieldRef> =
         probe_batch.schema().fields().iter().cloned().collect();
-    fields.extend(build_table.schema().fields().iter().cloned());
+    fields.extend(build_table.schema.fields().iter().cloned());
     let mut cols: Vec<ArrayRef> = Vec::with_capacity(fields.len());
     for c in 0..probe_batch.num_columns() {
         cols.push(
@@ -1156,10 +1252,7 @@ fn residual_keep_mask(
         );
     }
     for c in 0..build_table.num_columns() {
-        cols.push(
-            take(build_table.column(c), &bi, None)
-                .map_err(|e| QsdbError::invalid(format!("join residual take: {e}")))?,
-        );
+        cols.push(build_table.take(c, &bi)?);
     }
     let combined = RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), cols)
         .map_err(|e| QsdbError::invalid(format!("join residual batch: {e}")))?;
@@ -1328,8 +1421,7 @@ fn join_batch(
                 cols.push(new_null_like(state.table.column(c).as_ref(), total_rows));
                 continue;
             }
-            let taken = take(state.table.column(c), &build_indices, None)
-                .map_err(|e| QsdbError::invalid(format!("join take: {e}")))?;
+            let taken = state.table.take(c, &build_indices)?;
             if emit_unmatched {
                 // 未匹配段补 NULL：先取 build 段，再拼接 NULL 段
                 let nulls = new_null_like(taken.as_ref(), unmatched.len());
@@ -1434,28 +1526,6 @@ fn join_batch_semi(
     )
     .map(Some)
     .map_err(|e| QsdbError::invalid(format!("semi output: {e}")))
-}
-
-fn concat_batches(batches: &[RecordBatch], schema: &SchemaRef) -> Result<RecordBatch> {
-    if batches.is_empty() {
-        return Ok(RecordBatch::new_empty(Arc::clone(schema)));
-    }
-    if batches.len() == 1 {
-        return Ok(batches[0].clone());
-    }
-    let n_cols = schema.fields().len();
-    let mut cols = Vec::with_capacity(n_cols);
-    for c in 0..n_cols {
-        let parts: Vec<&dyn Array> = batches.iter().map(|b| b.column(c).as_ref()).collect();
-        cols.push(concat(&parts).map_err(|e| QsdbError::invalid(format!("concat: {e}")))?);
-    }
-    let n: usize = batches.iter().map(|b| b.num_rows()).sum();
-    RecordBatch::try_new_with_options(
-        Arc::clone(schema),
-        cols,
-        &RecordBatchOptions::new().with_row_count(Some(n)),
-    )
-    .map_err(|e| QsdbError::invalid(format!("concat batch: {e}")))
 }
 
 fn new_null_like(arr: &dyn Array, n: usize) -> ArrayRef {
