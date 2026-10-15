@@ -199,6 +199,13 @@ fn query(port: u16, sql: &str, qid: Option<&str>) -> Resp {
     http(port, "POST", "/api/v1/query", &h, body.as_bytes())
 }
 
+/// 带 params 的查询（协议面：`{"sql": …, "params": [...]}`）。
+fn query_params(port: u16, sql: &str, params: serde_json::Value) -> Resp {
+    let h = vec![("Content-Type", "application/json")];
+    let body = serde_json::json!({ "sql": sql, "params": params }).to_string();
+    http(port, "POST", "/api/v1/query", &h, body.as_bytes())
+}
+
 /// Arrow IPC 流：两列 Int64（nullable，与 DDL 默认一致）。
 fn ipc_two_int_cols(n: usize) -> Vec<u8> {
     let schema = Arc::new(Schema::new(vec![
@@ -222,6 +229,73 @@ fn ipc_two_int_cols(n: usize) -> Vec<u8> {
         w.finish().expect("finish ipc");
     }
     buf
+}
+
+// ---------------------------------------------------------------------------
+// 参数化查询（协议面）
+// ---------------------------------------------------------------------------
+
+/// `params` 是**新加的可选字段**：缺省行为与从前一字不差；给了就按位置绑定。
+///
+/// 这里只钉**协议面**（字段名、错误码、值语义）；绑定语义的逐值验收在
+/// `qsdb/tests/params.rs`。注入那条也在这里再走一遍 HTTP 全程 —— 值的模样
+/// 经过 JSON 编解码之后**仍然只是数据**。
+#[test]
+fn params_bind_over_http() {
+    let srv = Server::start(&[]);
+    let p = srv.port;
+    assert_eq!(
+        query(p, "CREATE TABLE t (g BIGINT, s STRING)", None).status,
+        200
+    );
+    assert_eq!(
+        query(p, "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')", None).status,
+        200
+    );
+
+    // ① 不给 params 的老请求：**一字不差**（回归护栏）
+    let r = query(p, "SELECT count(*) FROM t", None);
+    assert_eq!(r.status, 200);
+    assert_eq!(r.json()["rows"][0][0], 3);
+
+    // ② `$n` 与 `?` 都认
+    let r = query_params(p, "SELECT s FROM t WHERE g = $1", serde_json::json!([2]));
+    assert_eq!(r.status, 200);
+    assert_eq!(r.json()["rows"][0][0], "b");
+    let r = query_params(p, "SELECT s FROM t WHERE g = ?", serde_json::json!([3]));
+    assert_eq!(r.status, 200);
+    assert_eq!(r.json()["rows"][0][0], "c");
+
+    // ③ **注入**：值经过 JSON 往返仍只是数据 —— 整串原样进表、原样回来
+    let evil = "'; DROP TABLE t; --";
+    let r = query_params(p, "INSERT INTO t VALUES (9, $1)", serde_json::json!([evil]));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let r = query_params(p, "SELECT s FROM t WHERE g = $1", serde_json::json!([9]));
+    assert_eq!(r.json()["rows"][0][0], evil);
+    // 表还在（`DROP TABLE t` 没有被执行）
+    let r = query(p, "SELECT count(*) FROM t", None);
+    assert_eq!(r.json()["rows"][0][0], 4);
+
+    // ④ 个数对不上 ⇒ 400（不是 200 + 错值，也不是 500）
+    let r = query_params(
+        p,
+        "SELECT * FROM t WHERE g = $1 AND g = $2",
+        serde_json::json!([1]),
+    );
+    assert_eq!(r.status, 400);
+    assert!(r.json()["error"].as_str().unwrap().contains("参数不够"));
+    let r = query_params(p, "SELECT * FROM t WHERE g = $1", serde_json::json!([1, 2]));
+    assert_eq!(r.status, 400);
+    assert!(r.json()["error"].as_str().unwrap().contains("参数多了"));
+
+    // ⑤ `params` 不是数组 ⇒ 400（**类型不对就报错**，不静默忽略）
+    let r = query_params(p, "SELECT 1", serde_json::json!({"a": 1}));
+    assert_eq!(r.status, 400);
+    assert!(r.json()["error"].as_str().unwrap().contains("必须是数组"));
+
+    // ⑥ `params` 现在是被**认识**的字段 —— 不能再落到 deny_unknown_fields 上
+    let r = query_params(p, "SELECT 1", serde_json::json!([]));
+    assert_eq!(r.status, 200);
 }
 
 /// **无依赖批量通道**（`format=bulk` / `format=csv`，读**与**写两个方向）。

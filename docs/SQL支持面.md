@@ -111,7 +111,8 @@
 | `INTERVAL` / `AT TIME ZONE` / `COLLATE` / `SIMILAR TO` | ✋ | |
 | 行元组 `(a,b) IN (…)` | ✋ | `row-value comparison `(a, b) IN (subquery)` not supported — write it as EXISTS (SELECT 1 FROM … WHERE … AND …)`（**归类 `UNSUPPORTED`**，改写法即可） |
 | `= ANY(...)` / `= ALL(...)` | ✋ | `` `= ANY/ALL (subquery)` not supported — use IN / EXISTS, or an explicit OR/AND chain `` |
-| 位置参数 `?` / `PREPARE` / `$1` | ✋ | `unsupported: literal Placeholder("?") not supported`。⚠️ **2026-10-15 修正措辞**：本表此前写"本仓走 **HTTP/API 层参数化**" —— **那是假的**（协议面是 `{"sql": …}` 纯文本，**没有绑定参数**）。真实情况：客户端要么自己拼 SQL（**我们不提供转义助手**），要么走批通道/文件（见 `docs/客户端与嵌入方指南.md`）。参数化在待办里 |
+| 参数化查询：占位符 `$1…` / `?` | ✅ | 2026-10-15 实现（设计见 `docs/参数化查询设计.md`）。`$n` 显式位置、**可重复引用**；`?` 按出现顺序；**同一句不许混用**。值经协议 `params` 数组传入，在**绑定期变成 AST 字面量**（**从不进入 SQL 文本** ⇒ 注入无从谈起）。真值级验收 `tests/params.rs`。<br>⚠️ 生效范围：`WHERE`/`HAVING`/投影/`CASE`/`IN`/`LIKE`/`LIMIT`/`OFFSET`/窗口帧偏移/`lag-lead` 偏移都认；**表名位置不认**（那不是表达式位置） |
+| `PREPARE` / `EXECUTE`（SQL 级预编译） | ✋ | 不做：**会话态语句句柄**在无状态 HTTP + 重连下是地雷（设计 §二）。要"解析复用"走服务端计划缓存，协议不变 |
 | 标量函数集 | ✅ | `SELECT abs(1)` 之类报错会**列出支持清单**，以之为准 |
 | `GREATEST` / `LEAST` / `array_agg` 等 | ✋ | 未实现（报错列清单） |
 
