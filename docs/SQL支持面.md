@@ -115,10 +115,16 @@
 | 语法 | 状态 | 说明 |
 |---|---|---|
 | `row_number` / `rank` / `dense_rank` / `lag` / `lead` / `sum`/`avg`/`count`/`min`/`max` `OVER (…)` | ✅ | 支持清单以报错文案为准（`support: …`） |
+| `count(*) OVER (…)` | ✅ | 2026-10-15 修：此前报 `needs an argument`（把"没实现"说成"你写错了"）。`count(*)` 数**行**、`count(x)` 数**非 NULL** —— 含 NULL 的列上结果不同 |
 | `PARTITION BY` / `ORDER BY`（多列、混合方向） | ✅ | |
-| **帧边界** `ROWS/RANGE BETWEEN …` | ✋ | 此前**静默用默认帧** ⇒ 换一个数字（累计）而不报错 |
+| **行帧** `ROWS BETWEEN a AND b` | ✅ | 2026-10-15 实现。边界 `UNBOUNDED PRECEDING/FOLLOWING`、`n PRECEDING/FOLLOWING`、`CURRENT ROW`；简写 `ROWS n PRECEDING` ≡ `… AND CURRENT ROW`。**帧不会跨分区**。<br>⚠️ **帧可能为空**（边界全落在当前行之外，如 `3 PRECEDING AND 1 PRECEDING` 在分区首行）⇒ `sum/avg/min/max` 给 **NULL**、`count` 给 **0**（与 PG/DuckDB 一致；**不是**夹到分区边）。<br>⚠️ 帧内一个非 NULL 都没有时 `sum/avg/min/max` 也是 **NULL**（此前是 0 / NaN，2026-10-15 一并修）。<br>值级验收 `tests/window_frame.rs` |
+| 帧 + **无 `ORDER BY`** | ✋ | 显式拒：没有 `ORDER BY` 就没有确定行序（并行扫描下会变），按行分帧的值不可复现。**例外**：`ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`（整分区，与行序无关）放行 |
+| **`RANGE` / `GROUPS BETWEEN …`** | ✋ | 按**值**分帧 / 按组计数，是另一件事；当 `ROWS` 跑会换个数字，故显式拒 |
+| 起点在终点之后（`3 PRECEDING AND 5 PRECEDING`）、起点 `UNBOUNDED FOLLOWING`、终点 `UNBOUNDED PRECEDING` | ✋ | 帧恒空 / 标准不允许 —— 必是笔误，报错比回一列 NULL 好 |
+| **排名 / lag / lead 带帧** | ✋ | 按标准它们**忽略**帧；本仓不静默忽略 ⇒ 显式拒并指路 |
 | 窗口内 `ORDER BY … NULLS FIRST/LAST` | ✅ | 与外部 `ORDER BY` **同一套**规则（共用 `SortKey`）|
 | `ntile` / `first_value` / `last_value` / `percent_rank` / `cume_dist` | ✋ | 未实现（报错列支持清单） |
+| 窗口聚合 **NULL 口径** | ⚠️ | 帧内一个非 NULL 都没有 ⇒ `sum/avg/min/max` = **NULL**、`count` = **0**。**2026-10-15 改**：此前 `sum/min/max` 给 `0`、`avg` 给 `NaN` —— 那是**错值**（0 会被下游当真数字），已在 `tests/limit_offset_nulls.rs` 一并改正 |
 | 命名窗口 | ✋ | 见 §一 |
 
 ## 五、DML / DDL
