@@ -61,7 +61,8 @@
 | `RIGHT [OUTER] JOIN` | ✅ | 换边实现（`a RIGHT JOIN b` ≡ `b LEFT JOIN a`，输出列序换回 `a.* ++ b.*`）。仅支持等值 `ON`。值级验收 `tests/join_right_cross.rs` |
 | `FULL [OUTER] JOIN` | ✅ | 值级验收 `tests/join_full.rs`。⚠️ 两条限制：**不参与并行分片**、**不支持落盘溢出**（内存不足时明确报 `MEMORY_PRESSURE`，不假装能跑） |
 | ↑ 这两种的**替代写法**（实测通过，见 `join_surface.rs`） | ✅ | `A RIGHT JOIN B` ≡ `B LEFT JOIN A`（列序自己重排）。`FULL OUTER` 拼出来是：<br>`SELECT a.k FROM a LEFT JOIN b ON a.k = b.k`<br>`UNION ALL`<br>`SELECT b.k FROM b WHERE NOT EXISTS (SELECT 1 FROM a WHERE a.k = b.k)`<br>（左全 + 右未匹配；**列数/类型要对齐**，右侧补的列写 `CAST(NULL AS <类型>)`） |
-| `JOIN … USING (…)` / `NATURAL JOIN` | ✋ | `JOIN ... ON <equi-cond> required`（静默当叉积会**炸行数**，故必须拒） |
+| `JOIN … USING (cols)` | ✅ | 键 = 两侧同名列**且输出把那一列合并成一份**（`SELECT *` 只出一份；取值 `COALESCE(l.c, r.c)`，四种 join 一套覆盖）。值级验收 `tests/join_using.rs`。<br>⚠️ **偏差**：合并之后 `l.c` / `r.c` 这类**限定名会回退到裸名**、指到合并列上（PostgreSQL 是两者并存）；这是本仓限定名解析的既有行为，已记队列 |
+| `NATURAL JOIN` | ✋ | **明确不做**：按"同名同类型列"隐式匹配，两侧加一列就可能**静默改语义** —— 与"拼错就报错"的纪律相反。写 `ON`/`USING` |
 | 非等值 `ON` + `INNER` | ✅ | 走 `CrossJoinFilter`（叉积 + 过滤）。代价 = **左行数 × 右行数**，只适合小表 |
 | 非等值 `ON` + `LEFT` | ✋ | `non-equi LEFT JOIN not supported (only non-equi INNER is)`（**绝不能按 INNER 跑**——那会静默丢掉未匹配行） |
 | `CROSS JOIN` | ✅ | 笛卡尔积（谓词恒真）。⚠️ **裸 `JOIN b`（无 `ON`/`USING`）仍然拒绝** —— 那是"没写约束"，静默当叉积会炸行数 |
