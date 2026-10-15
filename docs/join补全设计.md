@@ -166,7 +166,7 @@ build 侧匹配位图**。落码时先确认：**分片路径 + 非分片路径�
 |---|---|---|
 | **第 1 批** | P0-1 + P0-2（复合键、残留谓词；残留统一在 join 内对匹配对求值） | ✅ **已落地**（`3fdce5d`/`335bd63`）：两条静默退化 → 真哈希 join（`0/1` → `1/0`）、LEFT 两条 ERR → 可用。⚠️ **连带发现**：`count(*)` 下推（`JoinCountExec`）只按键计数、看不见残留 —— 实测期望 1 回 2（**静默错值**），已让该分支在残留存在时"交给常规路径"；`annotate_join_needs` 的列掩码同样要留住残留引用的列（否则谓词恒 UNKNOWN ⇒ 少行） |
 | **第 2 批** | P1-1 + P1-3（RIGHT 换边、CROSS JOIN） | ✅ **已落地**：RIGHT 换边成 LEFT + 补一层列序重排投影（**键/残留/投影三处索引空间都要换算**，漏一处就是静默错值）；CROSS 走"谓词恒真的叉积"。⚠️ **差点顺带改坏**：`JoinConstraint::None`（裸 `JOIN b`，无 ON）原本是明确拒绝，我一度把它当成了 CROSS —— 被 `sql_e2e` 的既有断言当场抓到，已分开处理（**只有显式 `CROSS JOIN`** 才是笛卡尔积）。值级验收 `tests/join_right_cross.rs`（6 条，含"列序不能对调"与 RIGHT+残留） |
-| **第 3 批** | P1-2（FULL OUTER，含分片一致性） | 待做 |
+| **第 3 批** | P1-2（FULL OUTER） | ✅ **已落地**（`e973166`）：`JoinType::FullOuter` + `HashJoinExec::matched` 标记 + `full_tail()` 收尾轮。**顺手挖出两个既有 bug**：① `try_project_join`（join 两侧列裁剪）**重建 HashJoinExec 时丢掉 residual** —— 残留完全不生效，是第 1/2 批留下的洞（当时的用例恰好没走这条裁剪路径）；② 残留块只对 `LeftOuter` 做"左行对全被否 ⇒ 并入未匹配"，FULL 漏了。**两条明确限制**：FULL **不参与分片**（右孤儿要看全量标记，每片各发会重复发射）+ **不支持落盘溢出**（`enter_spill` 明确报错）—— 都写在代码注释里，不假装能跑 |
 | **第 4 批** | P2-1 USING、P2-2 非等值 LEFT | 待做 |
 
 **进度口径**：`tests/join_common_probe.rs` 里每条形态都有 `pending` 开关 ——
