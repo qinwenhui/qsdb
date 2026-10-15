@@ -500,6 +500,12 @@ fn execute_stmt(
                 views: crate::views::ViewStore::read_all(db.store())?,
             };
             let (plan, cte_defs) = translate::translate_select_full_with_ctes(*q, &resolver)?;
+            // 计划打印（**诊断用**）：没有 EXPLAIN，计划形状只能靠猜 —— 而本仓
+            // 已经栽过好几次"形状静默走错路"（`complex_three_way 113×` 就是
+            // 多表 join 退化成叉积）。给一个最朴素的 dump，够用就行。
+            if std::env::var_os("QSDB_PLAN_DUMP").is_some() {
+                eprintln!("[plan] {plan:#?}");
+            }
             let _cte_scope = exec_builder::CteScope::new();
             materialize_ctes(db, &cte_defs, ctx)?;
             ctx.check()?;

@@ -219,8 +219,16 @@ fn spawn_producer(
 /// 构造扫描节点：可分片走并行，否则串行。
 pub fn make_scan(scan: Scan, ctx: &Arc<crate::query::QueryContext>) -> Box<dyn ExecNode> {
     let threads = rayon::current_num_threads().clamp(1, 16);
-    if let Some(p) = ParScanExec::new(&scan, threads, Arc::clone(ctx)) {
-        return Box::new(p);
+    // ★ 诊断开关在这条路上**此前是死的**（2026-10-15 实测）：`QSDB_SCAN_SERIAL=1`
+    //   只在**公开 `scan()` API** 那条路被认（`Scan::next` 里），而 SQL 路径走的是
+    //   这里 ⇒ 设了它照样起 16 个扫描线程。文档两处都把它写成"诊断/对照开关"，
+    //   于是**任何人做这个 A/B 都会得到"并行没有影响"的假结论**（我就先踩了一次）。
+    //   收口在 `make_scan`：SQL 的两个扫描叶（`Scan` / `ExternalScan`）都走它。
+    #[allow(clippy::collapsible_if)] // MSRV 1.85：还不能用 let-chains
+    if !scan_parallel_disabled() {
+        if let Some(p) = ParScanExec::new(&scan, threads, Arc::clone(ctx)) {
+            return Box::new(p);
+        }
     }
     Box::new(ScanExec::new(scan))
 }
