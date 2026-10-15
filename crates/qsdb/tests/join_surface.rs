@@ -312,19 +312,35 @@ fn right_join_已支持_保留右表未匹配行() {
 }
 
 #[test]
-fn full_join_还没有实现() {
-    let (db, root) = seeded("fullonly");
-    // `JoinType` 枚举里**没有** FullOuter 变体 —— 这不是"没接上"，是结构性缺失
-    // （要做得连执行层一起加；设计见 `docs/join补全设计.md` P1-2）。
-    //
-    // 文案要说**用户写的那种写法**（"FULL [OUTER] JOIN"），不是 sqlparser 的变体名、
-    // 更不是语法树 dump（修复前这里打的是 `JOIN type FullOuter(On(BinaryOp { …`）。
-    let m = rejected(&db, "SELECT count(*) FROM a FULL JOIN b ON a.k = b.k");
-    let body = m.strip_prefix("unsupported: ").unwrap_or(&m);
-    assert!(body.starts_with("FULL"), "{m}");
-    let m = rejected(&db, "SELECT count(*) FROM a FULL OUTER JOIN b ON a.k = b.k");
-    let body = m.strip_prefix("unsupported: ").unwrap_or(&m);
-    assert!(body.starts_with("FULL"), "{m}");
+fn full_join_已支持_两侧孤儿都保留() {
+    let (db, root) = seeded("full");
+    // a(1,2,3) × b(2,3,4)：匹配 2 对 + a 的 k=1 左孤儿 + b 的 k=4 右孤儿 = 4 行。
+    // 值级验收在 `join_full.rs`（`count(*)` 分辨不出"补哪一侧"）。
+    assert_eq!(
+        count1(&db, "SELECT count(*) FROM a FULL JOIN b ON a.k = b.k"),
+        4
+    );
+    assert_eq!(
+        count1(
+            &db,
+            "SELECT count(*) FROM a FULL JOIN b ON a.k = b.k WHERE a.k IS NULL"
+        ),
+        1,
+        "右孤儿"
+    );
+    assert_eq!(
+        count1(
+            &db,
+            "SELECT count(*) FROM a FULL JOIN b ON a.k = b.k WHERE b.k IS NULL"
+        ),
+        1,
+        "左孤儿（**唯一多出来的那一行** —— 收尾轮漏了就是 0）"
+    );
+    assert_eq!(
+        count1(&db, "SELECT count(*) FROM a FULL OUTER JOIN b ON a.k = b.k"),
+        4,
+        "`FULL OUTER` 与 `FULL` 同义"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -365,7 +381,7 @@ fn 逗号连接() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// `FULL [OUTER] JOIN` 没有实现，**但有等价配方**吗？
+/// `FULL [OUTER] JOIN`：**原生的**与"手工拼出来的"必须给同一个答案。
 ///
 /// `RIGHT JOIN` 可以改写成 `LEFT JOIN`（交换两侧），FULL 不行——它要
 /// "左未匹配 ∪ 右未匹配"，得自己拼。这条用例就是来**验**这个说法的：
@@ -394,8 +410,13 @@ fn full_outer_join_的等价拼法() {
             panic!("FULL OUTER 没有实现、又没有可用配方 —— 这是真实的表达力缺口，应当进文档/队列");
         }
     }
-    // 反向：真写 FULL 仍然必须是**明确拒绝**（不是静默给个错结果）
-    rejected(&db, "SELECT count(*) FROM a FULL OUTER JOIN b ON a.k = b.k");
+    // 2026-10-15：FULL 已原生实现 ⇒ 这条配方从"替代写法"升级成**交叉校验**：
+    // 两种写法必须给同一个数（一个走 UNION ALL 手工拼、一个走执行层收尾轮）。
+    assert_eq!(
+        count1(&db, "SELECT count(*) FROM a FULL OUTER JOIN b ON a.k = b.k"),
+        4,
+        "原生 FULL 与外层拼法必须一致"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 

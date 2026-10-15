@@ -2521,13 +2521,19 @@ fn translate_select_inner(
             | sqlparser::ast::JoinOperator::Right(c) => {
                 (crate::exec::join::JoinType::LeftOuter, Some(c), true)
             }
+            // **FULL OUTER**：两侧的孤儿都要保留 —— 不能换边（换边只是把
+            // "保留哪一侧"对调），执行层要记 build 侧匹配标记并补发一轮（见
+            // `HashJoinExec::full_tail`）。
+            sqlparser::ast::JoinOperator::FullOuter(c) => {
+                (crate::exec::join::JoinType::FullOuter, Some(c), false)
+            }
             // `CROSS JOIN`：约束是 `JoinConstraint::None`（没有 ON），谓词恒真
             sqlparser::ast::JoinOperator::CrossJoin(_) => {
                 (crate::exec::join::JoinType::Inner, None, false)
             }
             other => {
                 return Err(QsdbError::unsupported(format!(
-                    "{} not supported (only INNER / LEFT [OUTER] / RIGHT [OUTER] / CROSS JOIN with an equi `ON`)",
+                    "{} not supported (INNER / LEFT [OUTER] / RIGHT [OUTER] / FULL [OUTER] /                      CROSS JOIN are)",
                     join_op_name(other)
                 )));
             }

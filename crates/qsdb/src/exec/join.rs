@@ -28,6 +28,12 @@ use super::ExecNode;
 pub enum JoinType {
     Inner,
     LeftOuter,
+    /// **FULL OUTER**：匹配的对 + 左未匹配（左段有值、右段补 NULL）
+    /// + **右未匹配**（右段有值、左段补 NULL）。
+    ///
+    /// 与前两者的关键差别：probe 阶段要**记录哪些 build 行匹配过**
+    /// （`HashJoinExec::matched`），probe 跑完后补一轮"没匹配上的 build 行"。
+    FullOuter,
     /// Semi（IN / EXISTS）：左行命中 build 键集 ≥1 次则发射（至多一次，
     /// 不重复）；NULL 键不命中（SQL：NULL IN set = UNKNOWN）
     Semi,
@@ -288,6 +294,11 @@ pub struct HashJoinExec {
     needed: Option<Arc<Vec<u32>>>,
     /// 键之外的 ON 条件（对**匹配对**求值）。见 [`HashJoinExec::with_residual`]。
     residual: Option<PhysExpr>,
+    /// **FULL OUTER 专用**：build 侧每行是否匹配过（长度 = build 行数）。
+    ///
+    /// `None` = 非 FULL（不必记）。probe 阶段由 `join_batch` 置位，
+    /// probe 跑完后据此补发"没匹配上的 build 行"（见 [`HashJoinExec::full_tail`]）。
+    matched: Option<Vec<bool>>,
 }
 
 struct BuildState {
@@ -434,6 +445,7 @@ impl HashJoinExec {
             cur_probe: None,
             needed: None,
             residual: None,
+            matched: None,
         }
     }
 
@@ -764,6 +776,17 @@ impl HashJoinExec {
     /// `build_phase_exists`，要不到额度仍报 `MEMORY_PRESSURE`）；非等值 join
     /// （`CrossJoinExec` 无键可分区）。
     fn enter_spill(&mut self, collected: Vec<RecordBatch>) -> Result<()> {
+        // **FULL OUTER 不支持溢出**（本版限制，明确报错而不是假装能跑）：
+        // 分区块 hash join 按**键**分区两侧，逐分区连接；但 FULL 的"右孤儿"要
+        // 看**全量** build 侧的匹配标记，分区各发各的会**重复发射**同一个右孤儿
+        // （每片都认为它没配上）。要支持得把标记做成跨分区的全局位图 +
+        // 收尾阶段单独扫一遍所有分区 —— 那是另一件事，别在这里半吊子地做。
+        if self.join_type == JoinType::FullOuter {
+            return Err(QsdbError::MemoryPressure(
+                "FULL OUTER JOIN 在内存不足时不支持落盘溢出（本版限制）——                  请抬高内存配额、或先减少 join 两侧的行数"
+                    .to_string(),
+            ));
+        }
         let build_schema = self.build.schema();
         let probe_schema = self.probe.schema();
         let ctx = Arc::clone(&self.ctx);
@@ -893,6 +916,9 @@ impl HashJoinExec {
                 join_type,
                 needed.as_ref().map(|v| v.as_slice()),
                 residual.as_ref(),
+                // 溢出分区路径不传掩码：FULL 在这里被 `enter_spill` 挡下（见那里的说明），
+                // 所以走到这一步的 `matched` 必然是 None —— 传 None 是**如实**的
+                None,
             ) {
                 Ok(Some(b)) => return Some(Ok(b)),
                 Ok(None) => continue,
@@ -947,35 +973,144 @@ impl ExecNode for HashJoinExec {
                 }
             }
         }
-        let build = self.build_state.as_ref().unwrap();
+        // FULL OUTER：建 build 侧匹配标记（probe 阶段置位、跑完据此补发未匹配行）
+        if join_type == JoinType::FullOuter && self.matched.is_none() {
+            let n = self
+                .build_state
+                .as_ref()
+                .map(|b| b.table.num_rows())
+                .unwrap_or(0);
+            self.matched = Some(vec![false; n]);
+        }
         loop {
             if let Err(e) = self.ctx.check() {
                 return Some(Err(e));
             }
-            let batch = self.probe.next()?;
-            let batch = match batch {
-                Ok(b) => b,
-                Err(e) => return Some(Err(e)),
+            let batch = match self.probe.next() {
+                // probe 跑完 → FULL 还要补一轮"没匹配上的 build 行"（其余类型就此结束）
+                None => return self.full_tail(),
+                Some(Ok(b)) => b,
+                Some(Err(e)) => return Some(Err(e)),
             };
             if batch.num_rows() == 0 {
                 continue;
             }
-            let out = match join_batch(
-                &batch,
-                build,
-                &probe_keys,
-                &out_schema,
-                join_type,
-                needed.as_ref().map(|v| v.as_slice()),
-                self.residual.as_ref(),
-            ) {
-                Ok(Some(b)) => b,
-                Ok(None) => continue, // 无匹配且非 LEFT
-                Err(e) => return Some(Err(e)),
+            // 分字段借用：`build_state` 只读、`matched` 只写（二者不重叠）
+            let out = {
+                let Self {
+                    build_state,
+                    matched,
+                    residual,
+                    ..
+                } = self;
+                let build = build_state.as_ref().expect("build 阶段已过");
+                join_batch(
+                    &batch,
+                    build,
+                    &probe_keys,
+                    &out_schema,
+                    join_type,
+                    needed.as_ref().map(|v| v.as_slice()),
+                    residual.as_ref(),
+                    matched.as_mut().map(|m| m.as_mut_slice()),
+                )
             };
-            return Some(Ok(out));
+            match out {
+                Ok(Some(b)) => return Some(Ok(b)),
+                Ok(None) => continue, // 无匹配且非 LEFT/FULL
+                Err(e) => return Some(Err(e)),
+            }
         }
     }
+}
+
+impl HashJoinExec {
+    /// FULL OUTER 的**收尾轮**：把 build 侧"一个 probe 行都没配上"的行发射一次，
+    /// 左段整片补 NULL。（其余 join 类型直接结束。）
+    ///
+    /// 为什么必须有这一轮：FULL = 匹配对 ∪ 左孤儿 ∪ **右孤儿**。前两者 probe
+    /// 阶段就发完了，右孤儿只有等 probe 跑完、看过 `matched` 标记才知道是谁。
+    /// 漏了它 = 静默**少行**（实测口径：4 行变 3 行）。
+    ///
+    /// 发完把标记全置真，保证只发一次（`next()` 之后还可能被再调）。
+    fn full_tail(&mut self) -> Option<Result<RecordBatch>> {
+        if self.join_type != JoinType::FullOuter {
+            return None;
+        }
+        let Self {
+            matched,
+            build_state,
+            probe,
+            schema,
+            needed,
+            ..
+        } = self;
+        let (Some(mask), Some(build)) = (matched.as_mut(), build_state.as_ref()) else {
+            return None;
+        };
+        let out = unmatched_build_batch(
+            &build.table,
+            mask,
+            &probe.schema(),
+            schema,
+            needed.as_ref().map(|v| v.as_slice()),
+        );
+        if mask.iter().any(|m| !*m) {
+            mask.iter_mut().for_each(|m| *m = true);
+        }
+        match out {
+            Ok(Some(b)) => Some(Ok(b)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+/// 把 `mask` 里**没匹配上**的 build 行挑出来，左段补 NULL 发射。
+///
+/// 左段列一律 `new_null_array`（这些行在左表里没有对应物）；右段列照 `needed`
+/// 掩码决定是 `take` 还是填 NULL（与 `join_batch` 同一口径，别让它俩分叉）。
+fn unmatched_build_batch(
+    build: &RecordBatch,
+    mask: &[bool],
+    probe_schema: &SchemaRef,
+    out_schema: &SchemaRef,
+    needed: Option<&[u32]>,
+) -> Result<Option<RecordBatch>> {
+    let n_left = probe_schema.fields().len();
+    let idx: Vec<u32> = mask
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| !**m)
+        .map(|(i, _)| i as u32)
+        .collect();
+    if idx.is_empty() {
+        return Ok(None);
+    }
+    let n = idx.len();
+    let want = |pos: usize| needed.is_none_or(|nn| nn.contains(&(pos as u32)));
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(out_schema.fields().len());
+    for f in probe_schema.fields() {
+        cols.push(arrow::array::new_null_array(f.data_type(), n));
+    }
+    let take_idx = UInt32Array::from(idx);
+    for (c, f) in build.schema().fields().iter().enumerate() {
+        if !want(n_left + c) {
+            cols.push(arrow::array::new_null_array(f.data_type(), n));
+            continue;
+        }
+        cols.push(
+            take(build.column(c), &take_idx, None)
+                .map_err(|e| QsdbError::invalid(format!("full join take: {e}")))?,
+        );
+    }
+    RecordBatch::try_new_with_options(
+        Arc::clone(out_schema),
+        cols,
+        &RecordBatchOptions::new().with_row_count(Some(n)),
+    )
+    .map(Some)
+    .map_err(|e| QsdbError::invalid(format!("full join output: {e}")))
 }
 
 /// 字节键索引构建（多键/字符串/浮点路径）。
@@ -1040,7 +1175,10 @@ fn residual_keep_mask(
 /// `residual` = 键之外的 ON 条件（**对匹配对**求值；判否只丢弃那个"对"）。
 /// LEFT 下"全部对都被否掉"的左行**仍要补 NULL 保留** —— 这正是它不能被提到
 /// `WHERE` 的原因（提上去就整体丢行）。见 `LogicalPlan::Join::residual`。
-#[allow(clippy::too_many_arguments)] // 多一个语义参数，比把 8 个参数包成结构体更好读
+/// `matched` = FULL OUTER 的 build 侧匹配标记（长度 = build 行数）；
+/// 发射**存活**的匹配对时置位，probe 跑完后据此补发没匹配上的 build 行。
+/// 其它 join 类型传 `None`。
+#[allow(clippy::too_many_arguments)] // 多两个语义参数，比把 9 个参数包成结构体更好读
 fn join_batch(
     probe_batch: &RecordBatch,
     state: &BuildState,
@@ -1049,6 +1187,7 @@ fn join_batch(
     join_type: JoinType,
     needed: Option<&[u32]>,
     residual: Option<&PhysExpr>,
+    matched: Option<&mut [bool]>,
 ) -> Result<Option<RecordBatch>> {
     let n = probe_batch.num_rows();
     // probe 键求值
@@ -1115,8 +1254,9 @@ fn join_batch(
                     nb.push(build_idx[i]);
                 }
             }
-            if join_type == JoinType::LeftOuter {
+            if matches!(join_type, JoinType::LeftOuter | JoinType::FullOuter) {
                 // 匹配过、但**一对都没活下来**的左行 → 并入未匹配（补 NULL 保留）。
+                // FULL 同样要（它的左孤儿定义与 LEFT 一致）。
                 // 三个集合都是 O(1) 查：残留路径上 probe_idx 可能有几十万项，
                 // 用 `Vec::contains` 就是 O(n²)（一次误判够毁掉整条查询）。
                 let survived: std::collections::HashSet<u32> = np.iter().copied().collect();
@@ -1135,8 +1275,16 @@ fn join_batch(
         }
     }
 
-    // LEFT：未匹配行补 NULL build 侧
-    let emit_unmatched = join_type == JoinType::LeftOuter && !unmatched.is_empty();
+    // FULL：记录**存活**的匹配对用到了哪些 build 行（判否的对不算匹配）
+    if let Some(mask) = matched {
+        for &b in &build_idx {
+            mask[b as usize] = true;
+        }
+    }
+
+    // LEFT / FULL：未匹配行补 NULL build 侧
+    let emit_unmatched =
+        matches!(join_type, JoinType::LeftOuter | JoinType::FullOuter) && !unmatched.is_empty();
     if probe_idx.is_empty() && !emit_unmatched {
         return Ok(None);
     }

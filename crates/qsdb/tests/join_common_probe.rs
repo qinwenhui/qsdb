@@ -202,7 +202,7 @@ fn 常用_join_形态摸底() {
             sql: "SELECT count(*) FROM l FULL OUTER JOIN r ON l.k = r.k",
             expect: 4, // 两侧孤儿各一行
             want_hash: None,
-            pending: true,
+            pending: false,
         },
         Row {
             name: "CROSS JOIN",
@@ -274,13 +274,7 @@ fn 常用_join_形态摸底() {
 #[test]
 fn 未实现的形态登记() {
     let (db, root) = seeded("todo");
-    for (name, sql) in [
-        (
-            "FULL 单等值",
-            "SELECT count(*) FROM l FULL OUTER JOIN r ON l.k = r.k",
-        ),
-        ("USING(k)", "SELECT count(*) FROM l JOIN r USING (k)"),
-    ] {
+    for (name, sql) in [("USING(k)", "SELECT count(*) FROM l JOIN r USING (k)")] {
         let e = match db.sql(sql) {
             Ok(_) => {
                 eprintln!("[已实现?] {name} —— 上表里的 pending 该改成 false 了");

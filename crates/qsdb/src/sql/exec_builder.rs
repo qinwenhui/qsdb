@@ -709,11 +709,21 @@ fn build_inner(
                 left_keys,
                 right_keys,
                 join_type,
+                residual,
                 ..
             } = input.as_ref()
             {
                 if let Some(node) = try_project_join(
-                    db, left, right, left_keys, right_keys, *join_type, exprs, names, ctx,
+                    db,
+                    left,
+                    right,
+                    left_keys,
+                    right_keys,
+                    *join_type,
+                    exprs,
+                    names,
+                    residual.as_ref(),
+                    ctx,
                 )? {
                     return Ok(node);
                 }
@@ -1046,6 +1056,7 @@ fn try_project_join(
     join_type: crate::exec::join::JoinType,
     exprs: &[PhysExpr],
     names: &[String],
+    residual: Option<&PhysExpr>,
     ctx: &Arc<crate::query::QueryContext>,
 ) -> Result<Option<Box<dyn ExecNode>>> {
     let (
@@ -1073,6 +1084,11 @@ fn try_project_join(
     }
     for k in left_keys.iter().chain(right_keys.iter()) {
         k.collect_columns(&mut used);
+    }
+    // ⚠️ **残留谓词引用的列也要留下**：它是对匹配对求值的，被裁掉就会读到 NULL
+    // ⇒ 谓词恒 UNKNOWN ⇒ 静默少行。（同 `annotate_join_needs` 的那条说明。）
+    if let Some(r) = residual {
+        r.collect_columns(&mut used);
     }
     let mut lproj: Vec<String> = Vec::new();
     let mut rproj: Vec<String> = Vec::new();
@@ -1133,8 +1149,12 @@ fn try_project_join(
             other => other.clone(),
         })
         .collect();
+    // 残留与 `exprs` 同在"join 输出（左全列 ++ 右全列）"这个索引空间里，
+    // 故用同一个重映射器换算到裁剪后的空间。
+    let new_residual = residual.map(|r| remap_join_expr(r, lw, nl, &lmap, &rmap));
     let join =
-        crate::exec::join::HashJoinExec::new(probe, build, lk, rk, join_type, Arc::clone(ctx));
+        crate::exec::join::HashJoinExec::new(probe, build, lk, rk, join_type, Arc::clone(ctx))
+            .with_residual(new_residual);
     // exprs 在 Join 之上 → 带 nl 偏移（输出 = 左投影 ++ 右投影）
     let new_exprs: Vec<PhysExpr> = exprs
         .iter()
@@ -2128,6 +2148,15 @@ fn try_shard_source(
                 });
                 cur = left;
             }
+            // ⚠️ **FULL OUTER 不许分片**（正确性，不是保守）：分片按**行**切左输入，
+            // 而 FULL 的"右孤儿"要等 probe 跑完、看过**全量** build 匹配标记才知道
+            // 是谁。每片各发各的 ⇒ 同一个右孤儿会被**发射 N 次**（静默多行）。
+            // 要支持得把标记做成跨分片全局位图 + 单独一轮收尾 —— 那是另一件事，
+            // 别在这里半吊子地做。所以到此为止：不分片，让整条管线走单线程。
+            LogicalPlan::Join {
+                join_type: crate::exec::join::JoinType::FullOuter,
+                ..
+            } => break None,
             // ★ INNER/LEFT：左链继续分片，这一层**随分片一起重建**。
             //
             // 正确性：分片是左输入的不相交划分 ⇒ 每一行左数据只出现在一片里，
