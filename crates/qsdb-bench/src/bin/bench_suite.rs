@@ -389,23 +389,34 @@ fn peak_rss_kb() -> u64 {
 // 造数 / 落盘
 // ---------------------------------------------------------------------------
 
-/// 打开库。`--budget-mb` / `--cache-mb` 可给内存预算与扫描缓存（默认：无预算 + 缓存 0）。
+/// 打开库。`--budget-mb` / `--cache-mb` 可给内存预算与扫描缓存。
 ///
-/// 为什么分开两个旋钮：**本文具默认无内存预算**（`memory_budget_bytes` 不设 = 池不限），
-/// 所以"给更多内存"对*单条*查询没有影响——真正影响重复查询/多查询的是**扫描缓存**
-/// （解码后的批，第二次同名扫描直接命中）。要比"给到 2G 能不能追平 DuckDB"，
-/// 得同时给上这两个。
+/// # ★ 默认 **缓存 0**（2026-10-15 改，此前默认是 `QsdbOptions::default()` 的 256MB）
+///
+/// 为什么改：本工具**每轮都重新 `open`**（`run_once` 里）⇒ 段缓存**每轮都是冷的**，
+/// 一次命中都不会有，但**每一轮都要把它灌满**。于是"峰值 RSS"那一列量到的其实是
+/// 「工作集 + 一次完整灌缓存」，**既不是用户会遇到的口径**（真 server 缓存是热的），
+/// 也把每一格都抬高了——实测 `complex_window` 987MB vs 工作集 **151MB**、
+/// `simple_filter` 254MB vs **13.5MB**。
+///
+/// 这个畸形口径已经造成过实际后果：我们曾据它判定"`complex_window` 内存 43×、
+/// 是最该先修的一格"，而真实工作集是 **6.7×**。
+/// ⇒ **内存那一列必须是工作集；要看"给缓存会怎样"请显式 `--cache-mb` 单跑一轮。**
+///
+/// 要复现/对账用 `cache_probe`（同样在本 crate），它把**缓存自己的记账**
+/// （`cache_stats().used`）与 `VmHWM` 并排打出来。
 fn open(dir: &Path) -> Qsdb {
     let budget = arg("--budget-mb").and_then(|v| v.parse::<u64>().ok());
     let cache = arg("--cache-mb")
         .and_then(|v| v.parse::<usize>().ok())
-        .map(|mb| mb * 1024 * 1024);
-    let mut opts = QsdbOptions::default();
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(0);
+    let mut opts = QsdbOptions {
+        scan_cache_bytes: cache,
+        ..QsdbOptions::default()
+    };
     if let Some(mb) = budget {
         opts.memory_budget_bytes = Some(mb * 1024 * 1024);
-    }
-    if let Some(c) = cache {
-        opts.scan_cache_bytes = c;
     }
     Qsdb::open(dir, opts).expect("open db")
 }
