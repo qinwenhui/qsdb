@@ -26,7 +26,7 @@
 | `SELECT t.*`（限定通配） | ✋ | |
 | `SELECT * EXCLUDE/EXCEPT/REPLACE/RENAME/ILIKE` | ✋ | |
 | `WHERE` / `HAVING` / `GROUP BY` / `ORDER BY` | ✅ | |
-| `GROUP BY` 位置序号（`GROUP BY 1`） | ✋ | 报错文案已明确（此前是"列不在 GROUP BY 里"，误导） |
+| `GROUP BY` 位置序号（`GROUP BY 1`） | ✋ | **明确拒绝**：`GROUP BY 位置序号（GROUP BY 1）暂不支持 —— 请写列名`（2026-10-15 修，F29②：此前误报"列 "g" 必须出现在 GROUP BY 里"，把"没实现"说成"你写错了"）。`ORDER BY 1` 是 ✅ —— 这个不对称**已知**，实现在生态功能批次 |
 | `GROUP BY ROLLUP/CUBE/GROUPING SETS` | ✋ | |
 | `GROUP BY ALL` | ✋ | |
 | `ORDER BY` 位置序号 / 输出别名 | ✅ | |
@@ -129,7 +129,7 @@
 | `INSERT INTO t SELECT …` / `INSERT OVERWRITE t SELECT …` | ✅ | |
 | `INSERT … ON CONFLICT` | ✋ | 此前**静默忽略** ⇒ 直接插重复行 |
 | `INSERT … RETURNING` / `IGNORE` / `REPLACE INTO` / `PARTITION (…)` | ✋ | |
-| `DELETE FROM t [WHERE …]` | ✅ | |
+| `DELETE FROM t [WHERE …]` | ⚠️ | **只支持分区键谓词**（分区粒度）：`DELETE FROM t WHERE dt = '…'` ✅；`WHERE <非分区列>` → `unsupported: DELETE WHERE references non-partition column …`。**非分区表上带任何 `WHERE` 一律拒**（没有分区列可裁剪）。整表清空（无 `WHERE`）✅。<br>⚠️ F29①（2026-10-15，qsdb-sync 实测）：此前本表写的是无条件 ✅，**方括号没限定**，读起来像"任意 WHERE 都行" —— 对 BI 的"删这一行"尤其误导。**行级 DELETE 未实现**（是独立特性） |
 | `UPDATE` | ✋ | |
 | `TRUNCATE TABLE` | ✅ | |
 | `CREATE TABLE`（含 `PARTITIONED BY`、`NOT NULL`、`CHECK`、`COMMENT`） | ✅ | **分区表至少要有一个非分区列**（否则数据文件零列，见 `docs/进度与待办.md` §三之四） |

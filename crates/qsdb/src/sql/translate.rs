@@ -5386,10 +5386,26 @@ fn rebind_over_agg(
                     name: group[gi].display(),
                     ty: group[gi].data_type(),
                 }),
-                None => Err(QsdbError::invalid(format!(
-                    "column '{}' must appear in GROUP BY or inside an aggregate",
-                    id.value
-                ))),
+                None => {
+                    // **F29②（qsdb-sync 实测）**：`GROUP BY 1` 走到这里会报"列不在
+                    // GROUP BY 里" —— **误导**（用户写的不是列名）。GROUP BY 里的
+                    // 裸整数按标准 SQL 是**位置序号**，我们没实现 ⇒ 必须**指名道姓**
+                    // 地拒（与 `ORDER BY 1` 是 ✅ 形成的不对称正是不满的来源）。
+                    if group.iter().any(|g| {
+                        matches!(
+                            g,
+                            PhysExpr::Lit(Literal::Int64(_)) | PhysExpr::Lit(Literal::Int32(_))
+                        )
+                    }) {
+                        return Err(QsdbError::unsupported(
+                            "GROUP BY 位置序号（`GROUP BY 1`）暂不支持 —— 请写列名（`ORDER BY 1` 是支持的，见 docs/SQL支持面.md）",
+                        ));
+                    }
+                    Err(QsdbError::invalid(format!(
+                        "column '{}' must appear in GROUP BY or inside an aggregate",
+                        id.value
+                    )))
+                }
             }
         }
         // 复合表达式：与 group 表达式 display 匹配
