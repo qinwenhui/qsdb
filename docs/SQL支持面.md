@@ -26,10 +26,12 @@
 | `SELECT t.*`（限定通配） | ✋ | |
 | `SELECT * EXCLUDE/EXCEPT/REPLACE/RENAME/ILIKE` | ✋ | |
 | `WHERE` / `HAVING` / `GROUP BY` / `ORDER BY` | ✅ | |
-| `GROUP BY` 位置序号（`GROUP BY 1`） | ✋ | **明确拒绝**：`GROUP BY 位置序号（GROUP BY 1）暂不支持 —— 请写列名`（2026-10-15 修，F29②：此前误报"列 "g" 必须出现在 GROUP BY 里"，把"没实现"说成"你写错了"）。`ORDER BY 1` 是 ✅ —— 这个不对称**已知**，实现在生态功能批次 |
+| `GROUP BY` 位置序号（`GROUP BY 1`） | ✅ | 2026-10-15 实现（生态功能批次 #2）。裸整数 = **投射第 n 个表达式**（1 起，与 `ORDER BY 1` 同一套标准），不是常量。**显式拒**：越界（`GROUP BY 0` / 超出列数）、非整数（`GROUP BY 1.5`）、指向聚合（不能当分组键）、指向 `SELECT *`（通配展不成"第 n 个表达式"）。值级验收 `tests/group_by_ordinal.rs` |
+| `GROUP BY <表达式>`（`upper(s)` / `v % 2` / `CAST(…)` / `CASE WHEN …` / `a ‖ b` …） | ✅ | 2026-10-15 **修**：此前**全都不工作**（报"列 's' 必须出现在 GROUP BY 里"，把"没实现"说成"你写错了"）。根因是判据拿 AST 的 `to_string()` 去比 `PhysExpr::display()`（后者带括号，`(g + 1)` vs `g + 1`）**永远比不中**。本表此前把 `GROUP BY` 整行标 ✅，**是虚的** |
 | `GROUP BY ROLLUP/CUBE/GROUPING SETS` | ✋ | |
 | `GROUP BY ALL` | ✋ | |
-| `ORDER BY` 位置序号 / 输出别名 | ✅ | |
+| `ORDER BY` 位置序号 / 输出别名 | ✅ | 序号越界 / 非整数**显式拒**（`ORDER BY 5` / `0` / `1.5`）。⚠️ 2026-10-15 修：此前越界**静默变成不排序**（退回"当常量排序键"）—— 它一直是靠"常量排序键让批内列长对不齐而报错"**借 bug 通过**的，`sql_gaps::order_by_ordinal` 那条断言实为"借 bug 通过" |
+| `ORDER BY <常量>`（`ORDER BY 'k'`） | ✅ | 合法但无意义（不排序）；与"越界序号"是两回事，别混 |
 | `ORDER BY … NULLS FIRST/LAST` | ✅ | **默认放置**：`ASC ⇒ NULLS LAST`、`DESC ⇒ NULLS FIRST`（与 PG 一致）；显式值覆盖默认。此前被**静默忽略** ⇒ 顺序错 |
 | `ORDER BY ALL` / `ORDER BY … USING` | ✋ / ⛔ | |
 | `TOP n`（SQL Server 形） | ✋ | 用 `LIMIT` |
@@ -160,3 +162,14 @@
 4. **顺手挖到的真实踩坑**：`SELECT * FROM t EXCLUDE (b)` 会被解析成「表别名
    `exclude` + 列清单 `(b)`」⇒ **静默拿到全列**（Snowflake 用户会中招）。同类
    写法 `FROM t AS x(a,b)` 一并拦。
+5. **"本表说 ✅，实测不 ✅"是这份清单最大的风险**（F29 家族，已经栽过三次：
+   `count(DISTINCT)` 的推荐改写、`GROUP BY 1` 的报错文案、CTAS 的报错文案）。
+   2026-10-15 又栽一次：`GROUP BY` 整行标 ✅，实际**表达式分组键全都不工作**。
+   ⇒ 凡本表写"已实现/已修/文案已明确"，**都要有一条实测用例兜着**
+   （`tests/support_claims.rs` 就是干这个的）。
+6. **常量不是普通表达式**：`eval` 对常量返回**长度 1** 的数组，而下游按批内行号
+   索引 ⇒ 不广播就有两个下场：`RecordBatch::try_new` 报**内部话术**
+   （`all columns in a record batch must have the same length`）或**直接 panic**。
+   2026-10-15 一次性清掉**四个**落点（投影 / 聚合分组键 / 聚合参数 / JOIN 残留），
+   其中 `SELECT 1, g FROM t` 这种最普通的写法**此前必炸**。回归
+   `tests/const_broadcast.rs`。**新写"按行索引数组"的代码时先问一句：它会不会是常量？**
