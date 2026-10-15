@@ -13,6 +13,7 @@ pub mod api;
 pub mod bulk;
 pub mod cache;
 pub mod catalog;
+pub mod commit;
 pub mod compact;
 pub mod csv;
 pub mod error;

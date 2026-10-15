@@ -34,6 +34,11 @@ pub struct WriteResult {
     pub rows: u64,
     pub bytes: u64,
     pub segments: u32,
+    /// 提交**之后**的分区 generation（提交钩子的事件要用；无分区的动作 = 0）。
+    ///
+    /// 放在 `WriteResult` 里而不是让钩子自己回读 manifest：**回读会读到别人的提交**，
+    /// 而钩子要报的是"**我这次**提交后的 generation"。
+    pub generation: u64,
 }
 
 /// 表**全列**（含分区列）的 arrow schema。
@@ -589,6 +594,7 @@ pub(crate) fn append_partition(
         rows,
         bytes,
         segments: nseg,
+        generation: manifest.generation,
     })
 }
 
@@ -723,6 +729,9 @@ pub(crate) fn overwrite_partition(
                     rows: e.row_count,
                     bytes: e.byte_size,
                     segments: 1,
+                    // overwrite 的 generation **继承旧值**（见下面提交点注释），
+                    // 真正的值在 manifest 提交后回填
+                    generation: 0,
                 };
                 new_segments.push(e);
             }
@@ -745,6 +754,7 @@ pub(crate) fn overwrite_partition(
     if store.is_local() {
         sync_index(store, table_dir, &dir, &manifest);
     }
+    result.generation = manifest.generation;
     drop(_guard);
 
     // 旧数据文件不立即回收（本地/远端同语义）：留在原地由 GC 按安全期清理
@@ -847,6 +857,12 @@ fn append_partition_remote(
         rows: entry.row_count,
         bytes: entry.byte_size,
         segments: 1,
+        // ⚠️ **远端路径暂不透出 generation**：它是在 `occ_commit` 的闭包里建好
+        // manifest 后提交的，那个值当下没有回传（要改 `occ_commit` 的返回类型）。
+        // 填 0 是**明确约定**：`api::emit_commit` 见到 0 **不发事件** ——
+        // 宁可不发，也不发一个假的 generation 让订阅方误判进度。
+        // 补法见 `docs/提交事件订阅与湖导出设计.md` §三 的 follow-up。
+        generation: 0,
     })
 }
 
@@ -1004,6 +1020,8 @@ fn overwrite_partition_remote(
             rows: entry.row_count,
             bytes: entry.byte_size,
             segments: 1,
+            // 同 `append_partition`（远端形态）：generation 在提交后才回填
+            generation: 0,
         };
         new_segments.push(entry);
     }

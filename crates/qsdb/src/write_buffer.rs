@@ -195,6 +195,7 @@ fn merge_write(a: WriteResult, b: WriteResult) -> WriteResult {
         rows: a.rows + b.rows,
         bytes: a.bytes + b.bytes,
         segments: a.segments + b.segments,
+        generation: a.generation.max(b.generation),
     }
 }
 

@@ -145,6 +145,11 @@ pub struct QsdbOptions {
     /// refresh-index；server /write 返回 503）。standby/只读副本用——
     /// 与「多写者协议」正交：只读句柄永不做写者，杜绝误连双主。
     pub read_only: bool,
+    /// **提交事件钩子**（T2）：写入提交之后、**锁外**通知订阅方。
+    ///
+    /// 默认 `None`（一次 `Option` 判断，零开销）。语义与三条纪律见
+    /// [`crate::commit::CommitHook`] —— 一句话：**它是加速器，不是真相来源**。
+    pub on_commit: Option<crate::commit::CommitHook>,
     /// **写者身份代**（qsdb-sync F25；默认 0 = 不启用）。
     ///
     /// 每次分区提交原样盖进 manifest（`PartitionManifest::epoch`）。
@@ -175,6 +180,7 @@ impl Default for QsdbOptions {
             durability: Durability::ProcessCrash,
             read_only: false,
             writer_epoch: 0,
+            on_commit: None,
         }
     }
 }
@@ -592,18 +598,23 @@ impl Qsdb {
                     return Ok(());
                 }
                 let merged = crate::exec::spill::concat_batches(cur, &schema)?;
-                total = merge_write(
-                    total,
-                    write::append_partition(
-                        &self.store,
-                        self.staging(),
-                        &tdir,
-                        &def,
-                        &values,
-                        &[merged],
-                        self.writer_epoch(),
-                    )?,
+                let r = write::append_partition(
+                    &self.store,
+                    self.staging(),
+                    &tdir,
+                    &def,
+                    &values,
+                    &[merged],
+                    self.writer_epoch(),
+                )?;
+                // 提交已成 ⇒ 通知（**锁已在 append_partition 内 drop** ⇒ 天然锁外）
+                self.emit_commit(
+                    table,
+                    &values,
+                    r.generation,
+                    crate::commit::CommitKind::Append,
                 );
+                total = merge_write(total, r);
                 cur.clear();
                 *cur_bytes = 0;
                 Ok(())
@@ -702,7 +713,7 @@ impl Qsdb {
                 data_batches.push(data);
             }
         }
-        write::overwrite_partition(
+        let r = write::overwrite_partition(
             &self.store,
             self.staging(),
             &tdir,
@@ -711,7 +722,14 @@ impl Qsdb {
             &data_batches,
             expected_generation,
             self.writer_epoch(),
-        )
+        )?;
+        self.emit_commit(
+            table,
+            &ordered,
+            r.generation,
+            crate::commit::CommitKind::Overwrite,
+        );
+        Ok(r)
     }
 
     // -- 读 ------------------------------------------------------------------
@@ -747,6 +765,35 @@ impl Qsdb {
             Some(Arc::clone(&self.cache)),
             ctx,
         )
+    }
+
+    /// 触发提交钩子（T2）。语义与三条纪律见 [`crate::commit::CommitHook`]
+    /// —— 一句话：**它是加速器，不是真相来源**。
+    ///
+    /// `None` ⇒ 一次 `Option` 判断返回（零开销）；回调 panic 由 `fire` 捕获
+    /// （**不能**让已提交的写变成"返回错误"）。
+    fn emit_commit(
+        &self,
+        table: &str,
+        values: &[Literal],
+        generation: u64,
+        kind: crate::commit::CommitKind,
+    ) {
+        // `generation == 0` = **远端写路径还没把它透出来**（见 `write.rs` 的说明）。
+        // 这里**不发**：宁可少一个通知（订阅方本来就有游标/兜底轮询），
+        // 也不发一个假的 0 让它误判"我还落后"或"我追平了"。
+        if generation == 0 {
+            return;
+        }
+        let Some(h) = &self.opts.on_commit else {
+            return;
+        };
+        h.fire(&crate::commit::CommitEvent {
+            table: table.to_string(),
+            partition_values: values.to_vec(),
+            generation,
+            kind,
+        });
     }
 
     /// 外表扫描（read_parquet；exec_builder 调用）。
@@ -883,7 +930,16 @@ impl Qsdb {
             .zip(ordered.iter().cloned())
             .collect();
         empty.segments = Vec::new();
+        let generation = empty.generation;
         empty.commit(&self.store, &dir, self.writer_epoch())?;
+        // 清空也是"提交"（generation 继承、单调不减）⇒ 同样要通知订阅方，
+        // 否则它们会一直以为这个分区还有数据
+        self.emit_commit(
+            &def.name,
+            &ordered,
+            generation,
+            crate::commit::CommitKind::Clear,
+        );
         let rel = dir
             .strip_prefix(tdir)
             .unwrap_or(&dir)
@@ -1603,6 +1659,9 @@ fn merge_write(a: WriteResult, b: WriteResult) -> WriteResult {
         rows: a.rows + b.rows,
         bytes: a.bytes + b.bytes,
         segments: a.segments + b.segments,
+        // 合并时取**较大**的那个：一次调用跨多分区时，generation 是"最后一个分区
+        // 提交后的值"，取大者才是"我至少追到这儿了"（钩子是逐分区发的，不靠它）
+        generation: a.generation.max(b.generation),
     }
 }
 
