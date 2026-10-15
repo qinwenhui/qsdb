@@ -308,6 +308,37 @@ pub fn drop_table(store: &Store, db: &str, table: &str) -> Result<()> {
     write_table_names(store, db, names)
 }
 
+/// 把**已经在盘上**的表重新登记进清单 —— **回收站恢复用**。
+///
+/// ⚠️ 为什么恢复不能只"把目录挪回去"：`drop_table` 做的是**两件事** ——
+/// 目录进 `_trash` **+** 从清单（`{db}/_catalog`）里去掉名。只补前一件的话，
+/// 盘上目录回来了、库**仍然不认识它**（`not found: table default.t`）。
+/// 这条是写恢复时实测撞出来的。
+pub fn register_existing_table(store: &Store, db: &str, table: &str) -> Result<()> {
+    if !store.is_local() {
+        #[cfg(feature = "remote")]
+        return Err(QsdbError::unsupported(
+            "register_existing_table is local-only (trash 是本地概念)",
+        ));
+        #[cfg(not(feature = "remote"))]
+        return Err(QsdbError::unsupported("remote store requires feature 's3'"));
+    }
+    let root = store.root();
+    let _guard = PartitionLock::acquire_local(&catalog_lock(root))?;
+    // 必须真的是张表：`table.json` 在，才算（否则不动清单 —— 别把 `_spill` 之类塞进去）
+    if !store.exists(&table_json_path(root, db, table)) {
+        return Err(QsdbError::invalid(format!(
+            "`{db}/{table}` 里没有 table.json —— 它看起来不是一张表，不登记"
+        )));
+    }
+    let mut names = read_table_names(store, db)?;
+    if names.iter().any(|n| n == table) {
+        return Ok(()); // 已经在清单里（幂等）
+    }
+    names.push(table.to_string());
+    write_table_names(store, db, names)
+}
+
 /// ALTER TABLE ADD COLUMN（只加不删）：catalog 锁内重读 table.json → 追加列 →
 /// 原子替换。约束：列必须 nullable（NOT NULL 需 DEFAULT，后置）、不能与现有列/
 /// 分区键重名。旧 segment 读取时缺列补 NULL（scan::pad_missing_columns）。

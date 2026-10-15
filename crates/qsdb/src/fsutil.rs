@@ -218,6 +218,13 @@ pub fn move_to_trash(root: &Path, src: &Path) -> Result<bool> {
     } else {
         dest
     };
+    // **记下"原来在哪"**：`_trash/{ts}/` 里躺着的东西从路径看不出身份
+    // （`default/t` 与 `_spill/xxx` 长得没区别），而"捞回来"必须知道往哪放。
+    // 写在 `{ts}` 根上，且**先写标记再 rename** —— 反过来的话中途崩会留下
+    // 一个"有货但认不出来"的条目。
+    let ts_dir = root.join("_trash").join(ts.to_string());
+    fs::write(ts_dir.join(TRASH_MARKER), rel.as_bytes())
+        .map_err(|e| QsdbError::meta(format!("write trash marker failed: {e}")))?;
     match fs::rename(src, &dest) {
         Ok(()) => Ok(true),
         // Windows 上可能被读句柄占用：跳过，留待下轮 GC
@@ -227,6 +234,110 @@ pub fn move_to_trash(root: &Path, src: &Path) -> Result<bool> {
             src.display()
         ))),
     }
+}
+
+/// 回收站条目的**来源标记**文件名（内容 = 原始相对路径，`/` 分隔）。
+pub const TRASH_MARKER: &str = ".qsdb_src";
+
+/// 回收站里的一条。
+pub struct TrashEntry {
+    /// 目录名（毫秒时间戳）—— 恢复时的句柄
+    pub ts: u64,
+    /// 原始相对路径（相对库根）。`None` = **旧版遗留**（加标记之前删的），
+    /// 认不出原来是什么 ⇒ 只能看、不能恢复（**不猜**）。
+    pub src: Option<String>,
+    /// 占用字节
+    pub bytes: u64,
+}
+
+/// 列回收站。按时间倒序（最近的在前 —— 误删通常刚发生）。
+pub fn list_trash(root: &Path) -> Result<Vec<TrashEntry>> {
+    let trash = root.join("_trash");
+    let mut out = Vec::new();
+    let Ok(rd) = fs::read_dir(&trash) else {
+        return Ok(out); // 没有 _trash 目录 = 空的
+    };
+    for entry in rd.flatten() {
+        let Some(ts) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let src = fs::read_to_string(entry.path().join(TRASH_MARKER))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        out.push(TrashEntry {
+            ts,
+            src,
+            bytes: dir_size(&entry.path()),
+        });
+    }
+    out.sort_by_key(|e| std::cmp::Reverse(e.ts));
+    Ok(out)
+}
+
+/// 把 `ts` 这条捞回它原来的位置。
+///
+/// ⚠️ **目标已存在 ⇒ 拒绝**（不做静默覆盖）：恢复是"撤销一次删除"，
+/// 而那个位置现在有东西，说明**删除之后又建了同名的** —— 覆盖它等于用一次
+/// 撤销毁掉另一份数据。让调用方自己决定先删哪个。
+pub fn restore_trash(root: &Path, ts: u64) -> Result<PathBuf> {
+    let ts_dir = root.join("_trash").join(ts.to_string());
+    if !ts_dir.is_dir() {
+        return Err(QsdbError::not_found(format!("回收站里没有条目 {ts}")));
+    }
+    let raw = fs::read_to_string(ts_dir.join(TRASH_MARKER)).map_err(|_| {
+        QsdbError::invalid(format!(
+            "条目 {ts} 没有来源标记（`{TRASH_MARKER}`）—— 多半是加标记之前的旧遗留，             认不出原来在哪，**不猜**"
+        ))
+    })?;
+    let src = raw.trim();
+    if src.is_empty() {
+        return Err(QsdbError::meta(format!("条目 {ts} 的来源标记是空的")));
+    }
+    let dest = root.join(src.replace('/', std::path::MAIN_SEPARATOR_STR));
+    if dest.exists() {
+        return Err(QsdbError::invalid(format!(
+            "恢复目标 `{}` 已经存在 —— 拒绝覆盖（那多半是你删掉之后又建了同名的）。             请先处理掉它，或直接去 `{}` 里手动取",
+            dest.display(),
+            ts_dir.display()
+        )));
+    }
+    // 条目的**实际数据**未必正好在 `{ts}/{src}`：同毫秒撞名时会加后缀。
+    // 两种都认：先试原路径，再找 `{src}.*`（后缀形态）。
+    let direct = ts_dir.join(src.replace('/', std::path::MAIN_SEPARATOR_STR));
+    let actual = if direct.exists() {
+        direct
+    } else {
+        let (parent, base): (Option<&str>, &str) = match src.rsplit_once('/') {
+            Some((p, b)) => (Some(p), b),
+            None => (None, src),
+        };
+        let dir = match parent {
+            Some(p) => ts_dir.join(p.replace('/', std::path::MAIN_SEPARATOR_STR)),
+            None => ts_dir.clone(),
+        };
+        let mut hit: Option<PathBuf> = None;
+        for e in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n == base || n.starts_with(&format!("{base}.")) {
+                hit = Some(e.path());
+                break;
+            }
+        }
+        hit.ok_or_else(|| QsdbError::meta(format!("条目 {ts} 里找不到 `{src}` 对应的数据")))?
+    };
+    if let Some(p) = dest.parent() {
+        fs::create_dir_all(p).map_err(|e| QsdbError::meta(format!("mkdir failed: {e}")))?;
+    }
+    fs::rename(&actual, &dest)
+        .map_err(|e| QsdbError::meta(format!("restore {} failed: {e}", dest.display())))?;
+    // 数据挪走了，条目壳（含标记）留着没意义 → 清掉
+    let _ = fs::remove_dir_all(&ts_dir);
+    Ok(dest)
 }
 
 fn locked_on_windows(e: &io::Error) -> bool {

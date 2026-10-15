@@ -653,6 +653,13 @@ pub enum ParsedStatement {
     ShowPartitions {
         table: String,
     },
+    /// `SHOW CREATE TABLE t` —— 把表结构**反渲染**成可重放的 DDL（备份/迁移用）。
+    ///
+    /// 放在 SQL 面而不是只放 CLI：这样 HTTP / JDBC 的调用方也能拿到它
+    /// （`qsdb dump` 只是它的一个薄壳）。
+    ShowCreateTable {
+        table: String,
+    },
     Insert {
         table: String,
         source: InsertSource,
@@ -745,6 +752,14 @@ pub fn parse_statements(sql: &str) -> Result<Vec<ParsedStatement>> {
         // ALTER USER name SET PASSWORD 'pw' | SET ROLE r
         if let Some((name, action)) = parse_alter_user(rest, trimmed) {
             return Ok(vec![ParsedStatement::AlterUser { name, action }]);
+        }
+    }
+    if upper.starts_with("SHOW CREATE TABLE ") {
+        let rest = &trimmed["SHOW CREATE TABLE".len()..].trim_start();
+        if !rest.is_empty() && !rest.contains(' ') {
+            return Ok(vec![ParsedStatement::ShowCreateTable {
+                table: rest.to_ascii_lowercase(),
+            }]);
         }
     }
     if upper.starts_with("SHOW PARTITIONS ") {

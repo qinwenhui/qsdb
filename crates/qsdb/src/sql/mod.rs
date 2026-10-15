@@ -16,6 +16,7 @@ use arrow::record_batch::RecordBatch;
 
 use crate::api::{Qsdb, ScanRequest};
 use crate::catalog::ColumnDef;
+use crate::catalog::TableDef;
 use crate::error::{QsdbError, Result};
 use crate::types::cast::cast_literal;
 use crate::types::{Literal, LogicalType};
@@ -97,6 +98,7 @@ pub fn check_role_permission(
         | PS::Describe { .. }
         | PS::ShowTables
         | PS::ShowPartitions { .. }
+        | PS::ShowCreateTable { .. }
         | PS::ShowUsers => Ok(()),
         // 写：Writer 及以上
         PS::Insert { .. } | PS::Delete { .. } => {
@@ -389,6 +391,30 @@ fn execute_stmt(
                     })
                 }
             }
+        }
+        translate::ParsedStatement::ShowCreateTable { table } => {
+            let def = db.table_def(&table)?;
+            let ddl = create_table_ddl(&def);
+            let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("table", arrow::datatypes::DataType::Utf8, false),
+                arrow::datatypes::Field::new(
+                    "create_table",
+                    arrow::datatypes::DataType::Utf8,
+                    false,
+                ),
+            ]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(vec![def.name.clone()])),
+                    Arc::new(arrow::array::StringArray::from(vec![ddl])),
+                ],
+            )
+            .map_err(|e| QsdbError::invalid(format!("show create batch: {e}")))?;
+            Ok(SqlResult::Query {
+                schema,
+                batches: vec![batch],
+            })
         }
         translate::ParsedStatement::ShowPartitions { table } => {
             let def = db.table_def(&table)?;
@@ -1202,6 +1228,86 @@ fn insert_values(
 /// ① 列名/类型由 SELECT 的**输出**推导（没写列清单时）；
 /// ② 失败时把刚建的表**删掉** —— PG 的 CTAS 是全有全无的，留一张空表让人以为
 ///    "建好了、只是没数据"比报错更坏。
+/// 把 `TableDef` **反渲染**成可重放的 `CREATE TABLE`（备份/迁移/交付用）。
+///
+/// # ★ 唯一的硬要求：**必须往返**
+///
+/// `CREATE TABLE <产出的 DDL>` 必须得到**与原来相等**的 `TableDef`
+/// （验收 `tests/dump_schema.rs` 逐字段比对）。所以：
+///
+/// - 只渲染 `CREATE TABLE` **真的收**的子句（列 / 类型 / `NOT NULL` / `CHECK` /
+///   `COMMENT` / `PARTITIONED BY` / `WITH (...)`）—— 多渲染一个就会被解析器拒，
+///   往返当场断。**别"顺手"加 `DEFAULT`**：本仓解析器明确拒它（见
+///   `parse_col_options`），`ColumnDef.default` 因此恒为 `None`。
+/// - 属性按**键排序**输出。`TableDef.properties` 是 `HashMap`，迭代序**每次进程都不同**
+///   ⇒ 不排的话同一张表两次 dump 结果不一样（备份脚本会天天"变"）。
+/// - 标识符不加引号：表名/列名受 `validate_ident` 约束（`[A-Za-z_][A-Za-z0-9_]*`），
+///   本来就无需转义。**字符串值要转义单引号**（`'` ⇒ `''`）。
+pub fn create_table_ddl(def: &TableDef) -> String {
+    let mut out = String::new();
+    out.push_str("CREATE TABLE ");
+    out.push_str(&def.name);
+    out.push_str(
+        " (
+",
+    );
+    for (i, c) in def.columns.iter().enumerate() {
+        if i > 0 {
+            out.push_str(
+                ",
+",
+            );
+        }
+        out.push_str("  ");
+        out.push_str(&c.name);
+        out.push(' ');
+        out.push_str(&c.logical_type.to_string());
+        if !c.nullable {
+            out.push_str(" NOT NULL");
+        }
+        if let Some(chk) = &c.check {
+            // 原样回填（写入端会重新解析绑定；加不加括号都能过解析器）
+            out.push_str(" CHECK (");
+            out.push_str(chk);
+            out.push(')');
+        }
+        if let Some(cm) = &c.comment {
+            out.push_str(" COMMENT '");
+            out.push_str(&sql_escape(cm));
+            out.push('\'');
+        }
+        // `default` 不渲染 —— 解析器拒 `DEFAULT`，渲染了往返就断（见函数文档）
+    }
+    out.push_str(
+        "
+)",
+    );
+    if !def.partition_keys.is_empty() {
+        out.push_str(" PARTITIONED BY (");
+        out.push_str(&def.partition_keys.join(", "));
+        out.push(')');
+    }
+    if !def.properties.is_empty() {
+        // **按键排序**：HashMap 的迭代序每次进程都不同（见函数文档）
+        let mut kv: Vec<(&String, &String)> = def.properties.iter().collect();
+        kv.sort();
+        let body: Vec<String> = kv
+            .iter()
+            .map(|(k, v)| format!("{k} = '{}'", sql_escape(v)))
+            .collect();
+        out.push_str(" WITH (");
+        out.push_str(&body.join(", "));
+        out.push(')');
+    }
+    out.push(';');
+    out
+}
+
+/// SQL 单引号字符串转义（`'` ⇒ `''`）。
+fn sql_escape(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
 /// `COPY (SELECT …) TO '<目录>' (FORMAT PARQUET [, PARTITION_BY (…)])`（F9 / A3）。
 ///
 /// 与 `create_table_as` 同构：绑计划 → 建 exec → 拉批。区别只在批的去处 ——

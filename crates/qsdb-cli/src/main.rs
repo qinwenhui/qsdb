@@ -55,6 +55,14 @@ enum Cmd {
     Admin {
         #[arg(long)]
         path: PathBuf,
+        /// **回收站静默期（秒；默认 600 = 10 分钟）**。
+        ///
+        /// 它就是"**删了还能捞回来**"的窗口长度：`admin gc` 只清**早于**它的条目。
+        /// ⇒ 想让回收站当误删保险（比如"昨天手滑删的表今天还能救"），
+        /// 这里给大值（如 `86400` = 一天），**并且别把 `gc` 跑得比它勤**。
+        /// 代价是删掉的数据在盘上多留那么久。
+        #[arg(long, default_value_t = 600)]
+        trash_grace_secs: u64,
         #[command(subcommand)]
         cmd: AdminCmd,
     },
@@ -158,6 +166,35 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         read_only: bool,
     },
+    /// **导出库结构**（DDL；打印到 stdout）—— 备份/迁移/交付。
+    ///
+    /// 数据不在这一步：用 `--data <目录>` 连数据一起导，或自己走
+    /// `COPY (SELECT …) TO '<目录>' (FORMAT PARQUET)`（A3 的导出原语）。
+    Dump {
+        #[arg(long)]
+        path: PathBuf,
+        /// 写者身份代（F25；默认 0）
+        #[arg(long, default_value_t = 0)]
+        writer_epoch: u64,
+        /// 只导这一张表（默认全部表 + 视图）
+        #[arg(long)]
+        table: Option<String>,
+        /// 连**数据**一起导到该目录（产出 `tables/` + `views/` + `data/`）
+        #[arg(long)]
+        data: Option<PathBuf>,
+    },
+    /// 从 `dump --data` 产出的目录**恢复**（结构 + 数据）。
+    ///
+    /// ⚠️ **目标库必须是空的**（一张表都没有）—— 不做静默覆盖：往半个库里灌备份，
+    /// 出来的东西既不是备份也不是原库，而没人看得出。
+    Restore {
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        writer_epoch: u64,
+        #[arg(long)]
+        from: PathBuf,
+    },
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -168,8 +205,12 @@ enum AdminCmd {
     Partitions { table: String },
     /// 重建表级分区索引
     RefreshIndex { table: String },
-    /// trash/孤儿清理
+    /// trash/孤儿清理（**注意：这会真的删掉回收站里的东西**）
     Gc,
+    /// 列出回收站（误删的东西在这儿；最近的在前）
+    TrashList,
+    /// 从回收站捞回一条（`ts` 见 trash-list 的第一列）
+    TrashRestore { ts: u64 },
     /// 小文件合并
     Compact { table: String },
     /// 添加用户（角色 admin|writer|reader；密码可经 --password 或交互输入）
@@ -219,8 +260,23 @@ fn main() {
                 }
             }
         }
-        Cmd::Admin { path, cmd } => {
-            let db = open(&path);
+        Cmd::Dump {
+            path,
+            writer_epoch,
+            table,
+            data,
+        } => dump(path, writer_epoch, table, data),
+        Cmd::Restore {
+            path,
+            writer_epoch,
+            from,
+        } => restore(path, writer_epoch, &from),
+        Cmd::Admin {
+            path,
+            trash_grace_secs,
+            cmd,
+        } => {
+            let db = open_with_grace(&path, 0, trash_grace_secs);
             let r = match cmd {
                 AdminCmd::Tables => db.sql("SHOW TABLES"),
                 AdminCmd::Partitions { table } => db.sql(&format!("SHOW PARTITIONS {table}")),
@@ -356,6 +412,60 @@ fn main() {
                             for (n, r) in users {
                                 println!("{n:<20} {}", r.name());
                             }
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                },
+                AdminCmd::TrashList => {
+                    let list = match qsdb::fsutil::list_trash(db.root()) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    if list.is_empty() {
+                        println!("（回收站是空的）");
+                    } else {
+                        println!("{:<16} {:>10}  原来在哪", "ts（恢复用）", "大小");
+                        for e in &list {
+                            println!(
+                                "{:<16} {:>9.1}MB  {}",
+                                e.ts,
+                                e.bytes as f64 / 1048576.0,
+                                e.src.as_deref().unwrap_or("(旧遗留，认不出来)")
+                            );
+                        }
+                    }
+                    println!(
+                        "\n捞回来：qsdb admin --path <库> trash-restore <ts>\n\
+                         ⚠️ **真删是 `admin gc`** —— 它会把回收站清空。要当误删保险，\
+                         别让它跑太勤，或用 `admin --trash-grace-secs <秒>` 把窗口调大。"
+                    );
+                    return;
+                }
+                AdminCmd::TrashRestore { ts } => match qsdb::fsutil::restore_trash(db.root(), ts) {
+                    Ok(p) => {
+                        // ★ **光把目录挪回来不够**：`drop_table` 是两件事 ——
+                        //   目录进 trash **+** 从清单去掉名。少了后半件，库仍然
+                        //   不认识它（`not found: table default.t`）——
+                        //   这条是写这个功能时实测撞出来的。
+                        if let Some((d, t)) = table_rel(db.root(), &p) {
+                            if let Err(e) =
+                                qsdb::catalog::register_existing_table(db.store(), &d, &t)
+                            {
+                                eprintln!(
+                                    "error: 目录已挪回，但**没能登记进清单**（表仍不可见）：{e}"
+                                );
+                                std::process::exit(1);
+                            }
+                            println!("已恢复 → {}（表 {d}.{t} 已重新登记）", p.display());
+                        } else {
+                            println!("已恢复 → {}", p.display());
                         }
                         return;
                     }
@@ -535,8 +645,17 @@ fn main() {
     }
 }
 
-fn open(path: &std::path::Path) -> Qsdb {
-    open_with_epoch(path, 0)
+/// 带**回收站静默期**打开（`admin gc` 只清早于它的条目）。
+fn open_with_grace(path: &std::path::Path, writer_epoch: u64, trash_grace_secs: u64) -> Qsdb {
+    let opts = QsdbOptions {
+        writer_epoch,
+        trash_grace_ms: trash_grace_secs.saturating_mul(1000),
+        ..Default::default()
+    };
+    Qsdb::open(path, opts).unwrap_or_else(|e| {
+        eprintln!("error: open {} failed: {e}", path.display());
+        std::process::exit(1);
+    })
 }
 
 /// 带写者身份代打开（F25）。
@@ -552,6 +671,254 @@ fn open_with_epoch(path: &std::path::Path, writer_epoch: u64) -> Qsdb {
             std::process::exit(1);
         }
     }
+}
+
+/// `qsdb dump`：导出库结构（可选连数据）。
+///
+/// **为什么数据不在这一步**：导出数据的原语是 SQL 的 `COPY (SELECT …) TO …`
+/// （A3），有 HTTP / 驱动 / 嵌入方四条路在用；再在 CLI 里做一套是重复。
+/// 这里 `--data` 只是**薄壳**：逐表调那条原语。
+fn dump(path: PathBuf, writer_epoch: u64, only: Option<String>, data: Option<PathBuf>) {
+    let db = open_with_epoch(&path, writer_epoch);
+    let tables: Vec<String> = match &only {
+        Some(t) => vec![t.to_ascii_lowercase()],
+        None => match db.tables() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        },
+    };
+    // 视图：`SqlResult` 直接给 DDL 文本？不 —— 视图存的是 SELECT 原文，这里拼。
+    let views: Vec<(String, String)> = if only.is_none() {
+        match qsdb::views::ViewStore::read_all(db.store()) {
+            Ok(m) => {
+                let mut v: Vec<(String, String)> = m.into_iter().collect();
+                v.sort(); // 确定序（HashMap 迭代序每次进程都不同）
+                v
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let ddl_of = |t: &str| -> String {
+        match db.sql(&format!("SHOW CREATE TABLE {t}")) {
+            Ok(r) => {
+                if let qsdb::sql::SqlResult::Query { batches, .. } = r {
+                    batches
+                        .first()
+                        .map(|b| {
+                            arrow::util::display::array_value_to_string(b.column(1).as_ref(), 0)
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                }
+            }
+            Err(e) => {
+                eprintln!("error: SHOW CREATE TABLE {t}: {e}");
+                std::process::exit(1);
+            }
+        }
+    };
+
+    match data {
+        // 只导结构 → 打到 stdout（人读 / 重定向进 .sql）
+        None => {
+            for t in &tables {
+                println!("{}", ddl_of(t));
+            }
+            for (n, sql) in &views {
+                println!("CREATE VIEW {n} AS {sql};");
+            }
+        }
+        // 连数据 → 落目录。**一表一个 .sql 文件**：正好一条语句，
+        // 恢复时不需要"切分 SQL 文本"（切分要处理字符串里的分号，是个静默出错面）
+        Some(dir) => {
+            let sub = |d: &str| -> PathBuf {
+                let p = dir.join(d);
+                if let Err(e) = std::fs::create_dir_all(&p) {
+                    eprintln!("error: mkdir {}: {e}", p.display());
+                    std::process::exit(1);
+                }
+                p
+            };
+            let tdir = sub("tables");
+            let vdir = sub("views");
+            let ddir = sub("data");
+            for t in &tables {
+                if let Err(e) = std::fs::write(tdir.join(format!("{t}.sql")), ddl_of(t)) {
+                    eprintln!("error: write {t}.sql: {e}");
+                    std::process::exit(1);
+                }
+                // 数据：走 A3 的原语，但**刻意不传 `PARTITION_BY`** ——
+                // 「备份」与「湖导出」要的不是一回事：
+                //   · 湖导出要**互操作**（Spark/pyarrow 读）⇒ 分区列进目录名；
+                //   · 备份要**保真** ⇒ 值就留在数据文件里、类型原样，不经过
+                //     "目录名文本 → 类型推断"那一跳（那跳还带类型白名单限制）。
+                // 恢复侧按列名映射，两种布局都成立；平铺更稳。
+                let target = ddir.join(t).to_string_lossy().replace('\\', "/");
+                if let Err(e) = db.sql(&format!(
+                    "COPY (SELECT * FROM {t}) TO '{target}' (FORMAT PARQUET)"
+                )) {
+                    eprintln!("error: 导出表 {t} 的数据：{e}");
+                    std::process::exit(1);
+                }
+            }
+            for (n, sql) in &views {
+                let _ = std::fs::write(
+                    vdir.join(format!("{n}.sql")),
+                    format!("CREATE VIEW {n} AS {sql};"),
+                );
+            }
+            eprintln!(
+                "已导出 {} 张表 + {} 个视图 → {}",
+                tables.len(),
+                views.len(),
+                dir.display()
+            );
+        }
+    }
+}
+
+/// 恢复出来的路径若是 `<库>/<表>` 形态，返回 `(库, 表)`。
+///
+/// 判据收紧成"**正好两层、且都不以 `_` 开头**"——`_trash`/`_spill`/`_catalog`
+/// 这类内部目录不在此列（它们不是表，别去登记）。是否**真是**表由
+/// `catalog::register_existing_table` 用 `table.json` 的存在性最终判定。
+fn table_rel(root: &std::path::Path, restored: &std::path::Path) -> Option<(String, String)> {
+    let rel = restored.strip_prefix(root).ok()?;
+    let parts: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    if parts.iter().any(|s| s.starts_with('_')) {
+        return None;
+    }
+    Some((parts[0].clone(), parts[1].clone()))
+}
+
+/// 目录下（含子目录）有没有 parquet 文件 —— 用来区分"空表"与"导出了但读不到"。
+fn has_parquet(dir: &std::path::Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if has_parquet(&p) {
+                return true;
+            }
+        } else if p.extension().and_then(|s| s.to_str()) == Some("parquet") {
+            return true;
+        }
+    }
+    false
+}
+
+/// `qsdb restore`：从 `dump --data` 的目录恢复（结构 + 数据）。
+fn restore(path: PathBuf, writer_epoch: u64, from: &std::path::Path) {
+    let db = open_with_epoch(&path, writer_epoch);
+    // **目标库必须空**（不做静默覆盖 —— 见子命令的文档）
+    let existing = match db.tables() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+    if !existing.is_empty() {
+        eprintln!(
+            "error: 目标库不是空的（已有 {} 张表：{}）—— 本命令**不做静默覆盖**。\
+             请换一个空目录，或先自己清掉",
+            existing.len(),
+            existing.join(", ")
+        );
+        std::process::exit(1);
+    }
+
+    let run = |sql: &str, what: &str| {
+        if let Err(e) = db.sql(sql) {
+            eprintln!("error: {what}: {e}\n--- SQL ---\n{sql}");
+            std::process::exit(1);
+        }
+    };
+
+    // ① 结构：一表一个文件 = 一条语句（不需要切分文本）
+    let mut n_tab = 0usize;
+    for (dir, sub) in [(from.join("tables"), "表"), (from.join("views"), "视图")] {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue; // 没有视图目录很正常
+        };
+        let mut files: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        files.sort(); // 确定序
+        for f in files {
+            if f.extension().and_then(|s| s.to_str()) != Some("sql") {
+                continue;
+            }
+            let Ok(sql) = std::fs::read_to_string(&f) else {
+                eprintln!("error: 读不了 {}", f.display());
+                std::process::exit(1);
+            };
+            run(sql.trim(), &format!("建{sub} {}", f.display()));
+            if sub == "表" {
+                n_tab += 1;
+            }
+        }
+    }
+
+    // ② 数据：从 hive 目录读回来（A4 的 hive 语义正好接上）
+    //
+    // ⚠️ **必须显式列名，不能用 `SELECT *`**：`read_parquet` 读 hive 目录时给出的
+    // 列序是「**数据文件列 ++ 分区列**」，而表的列序是**建表时写的那个序**
+    // （分区列可能夹在中间）。按位置灌 = **静默错值的经典形状**（值全在、全串位）。
+    // 按名则与顺序无关，列对不上时会**报错**而不是错位。
+    let mut n_data = 0usize;
+    for t in db.tables().unwrap_or_default() {
+        let d = from.join("data").join(&t);
+        if !d.is_dir() {
+            continue;
+        }
+        let def = match db.table_def(&t) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("error: 读表定义 {t}: {e}");
+                std::process::exit(1);
+            }
+        };
+        let list = def
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        // **空表没有 parquet 文件**（导出时不写零行段）⇒ 没有文件就跳过。
+        // 不跳的话 `read_parquet` 会报 "no file matches" —— 而"空表恢复成空表"
+        // 本来就是对的，那不是错误。
+        if !has_parquet(&d) {
+            continue;
+        }
+        let glob = format!("{}/**/*.parquet", d.to_string_lossy().replace('\\', "/"));
+        run(
+            &format!("INSERT INTO {t} ({list}) SELECT {list} FROM read_parquet('{glob}')"),
+            &format!("灌表 {t} 的数据"),
+        );
+        n_data += 1;
+    }
+    eprintln!(
+        "已恢复 {n_tab} 张表（{n_data} 张带数据）→ {}",
+        path.display()
+    );
 }
 
 fn shell(path: PathBuf, writer_epoch: u64) {
