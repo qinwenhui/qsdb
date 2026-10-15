@@ -54,12 +54,27 @@
 > 本节每条都由 `crates/qsdb/tests/join_surface.rs` **实测**钉住（✅ 的断言**值**、
 > ✋ 的断言**报错文案**）。正文里那些引号中的话就是引擎原话。
 
+> ### ⚠️ 写 join 前先知道两件事（省一次"内存爆了"）
+>
+> **① 哈希 join 只把「右表」整张放进内存**，左表**逐批流式**。
+> 所以 `A JOIN B` 的常驻内存 ≈ **B 的大小**，与 A 多大**无关**；
+> 而我们**没有自动换边** ⇒ **书写顺序有实际代价**。
+> **大表放左边**：`big JOIN small`（✔ 流式）而不是 `small JOIN big`（✘ 整张 big 进内存）。
+>
+> **② 没有"溢出阈值"旋钮**：溢出**不是**"超过某个 MB 就落盘"，
+> 而是**内存额度要不到时才触发**（配额见 `memory_limit` / 全局池）。
+> 要多少 = 右表 + **concat 瞬时 2×** + 键索引（`行数 × 16B`）—— 中间那笔 2×
+> 最容易"看起来够、实际不够"。额度不够时：
+> **INNER / LEFT / RIGHT 转分区块 hash join（落盘，跑完）**，
+> **FULL 没有这条退路**（右孤儿会被分区重复发射）⇒ 明确报 `MEMORY_PRESSURE`。
+> 完整口径见 `docs/内存预算与溢出设计.md` §4.4。
+
 | 语法 | 状态 | 说明 |
 |---|---|---|
 | 多表逗号连接（`FROM a, b`） | ✋ | `unsupported: multi-FROM (comma join) not supported` |
 | `INNER JOIN`（`JOIN` 同义）/ `LEFT [OUTER] JOIN` + `ON <等值>` | ✅ | 哈希 join；三表以上链式等值同样走它 |
 | `RIGHT [OUTER] JOIN` | ✅ | 换边实现（`a RIGHT JOIN b` ≡ `b LEFT JOIN a`，输出列序换回 `a.* ++ b.*`）。仅支持等值 `ON`。值级验收 `tests/join_right_cross.rs` |
-| `FULL [OUTER] JOIN` | ✅ | 值级验收 `tests/join_full.rs`。⚠️ 两条限制：**不参与并行分片**、**不支持落盘溢出**（内存不足时明确报 `MEMORY_PRESSURE`，不假装能跑） |
+| `FULL [OUTER] JOIN` | ✅ | 值级验收 `tests/join_full.rs`。⚠️ 两条限制：**不参与并行分片**、**不支持落盘溢出**（内存不足时明确报 `MEMORY_PRESSURE`，不假装能跑）。实用判据：`2 × 右表大小 + 索引` 装得进内存配额 —— 细节见 `docs/内存预算与溢出设计.md` §4.4 |
 | ↑ 这两种的**替代写法**（实测通过，见 `join_surface.rs`） | ✅ | `A RIGHT JOIN B` ≡ `B LEFT JOIN A`（列序自己重排）。`FULL OUTER` 拼出来是：<br>`SELECT a.k FROM a LEFT JOIN b ON a.k = b.k`<br>`UNION ALL`<br>`SELECT b.k FROM b WHERE NOT EXISTS (SELECT 1 FROM a WHERE a.k = b.k)`<br>（左全 + 右未匹配；**列数/类型要对齐**，右侧补的列写 `CAST(NULL AS <类型>)`） |
 | `JOIN … USING (cols)` | ✅ | 键 = 两侧同名列**且输出把那一列合并成一份**（`SELECT *` 只出一份；取值 `COALESCE(l.c, r.c)`，四种 join 一套覆盖）。值级验收 `tests/join_using.rs`。<br>⚠️ **偏差**：合并之后 `l.c` / `r.c` 这类**限定名会回退到裸名**、指到合并列上（PostgreSQL 是两者并存）；这是本仓限定名解析的既有行为，已记队列 |
 | `NATURAL JOIN` | ✋ | **明确不做**：按"同名同类型列"隐式匹配，两侧加一列就可能**静默改语义** —— 与"拼错就报错"的纪律相反。写 `ON`/`USING` |
