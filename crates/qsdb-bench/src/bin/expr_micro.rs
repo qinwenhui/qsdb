@@ -6,7 +6,7 @@ use arrow::array::{Decimal128Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use qsdb::expr::eval::eval;
-use qsdb::expr::{ArithOp, CmpOp, PhysExpr};
+use qsdb::expr::{ArithOp, CmpOp, FoldKind, PhysExpr};
 use qsdb::types::{DecimalMeta, Literal, LogicalType};
 use std::sync::Arc;
 use std::time::Instant;
@@ -110,7 +110,11 @@ fn main() {
         ),
         (
             "coalesce(a,b)",
-            PhysExpr::Coalesce(vec![a64.clone(), b64.clone()], LogicalType::Int64),
+            PhysExpr::Fold {
+                kind: FoldKind::Coalesce,
+                args: vec![a64.clone(), b64.clone()],
+                ty: LogicalType::Int64,
+            },
         ),
         (
             "s1||s2",

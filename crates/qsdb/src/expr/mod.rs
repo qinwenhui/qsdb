@@ -102,8 +102,14 @@ pub enum PhysExpr {
         else_expr: Box<PhysExpr>,
         ty: LogicalType,
     },
-    /// COALESCE（M7-B）：按序取首个非 NULL。
-    Coalesce(Vec<PhysExpr>, LogicalType),
+    /// 多参折叠（COALESCE / LEAST / GREATEST）：**跳过 NULL**，按 `kind` 的选择器
+    /// 在其余值里取一个；**全 NULL ⇒ NULL**。三者是同一个形状，故共用一个变体。
+    /// 参数已 cast 到 `ty`（公共超类型），求值时无需再转换。
+    Fold {
+        kind: FoldKind,
+        args: Vec<PhysExpr>,
+        ty: LogicalType,
+    },
     /// 字符串拼接 `||`（M7-B）：两侧已 cast 为 Utf8
     Concat(Box<PhysExpr>, Box<PhysExpr>),
     /// LIKE/ILIKE（M7-B4）：模式绑定期预编译；ci=大小写不敏感。
@@ -113,6 +119,27 @@ pub enum PhysExpr {
         negated: bool,
         ci: bool,
     },
+}
+
+/// `Fold` 的选择器：跳过 NULL 之后，在剩下的值里选谁。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldKind {
+    /// COALESCE：取**首个**（按参数顺序）。
+    Coalesce,
+    /// LEAST：取**最小**（Spark 语义：忽略 NULL，全 NULL ⇒ NULL）。
+    Least,
+    /// GREATEST：取**最大**（同上）。
+    Greatest,
+}
+
+impl FoldKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Coalesce => "coalesce",
+            Self::Least => "least",
+            Self::Greatest => "greatest",
+        }
+    }
 }
 
 /// LIKE 模式词元（`%` 任意序列 / `_` 单字符；字面字符按 char）。
@@ -282,7 +309,7 @@ impl PhysExpr {
             Self::Column { ty, .. } => ty.clone(),
             Self::Lit(l) => l.logical_type().unwrap_or(LogicalType::Boolean),
             Self::Arith { ty, .. } | Self::Cast { ty, .. } | Self::Fn { ty, .. } => ty.clone(),
-            Self::Case { ty, .. } | Self::Coalesce(_, ty) => ty.clone(),
+            Self::Case { ty, .. } | Self::Fold { ty, .. } => ty.clone(),
             Self::Concat(..) => LogicalType::Varchar { max_chars: None },
             Self::Cmp { .. }
             | Self::And(..)
@@ -327,7 +354,7 @@ impl PhysExpr {
                 }
                 else_expr.collect_columns(out);
             }
-            Self::Coalesce(exprs, _) => exprs.iter().for_each(|e| e.collect_columns(out)),
+            Self::Fold { args, .. } => args.iter().for_each(|e| e.collect_columns(out)),
             Self::Concat(l, r) => {
                 l.collect_columns(out);
                 r.collect_columns(out);
@@ -368,9 +395,9 @@ impl PhysExpr {
                 s.push_str(" END");
                 s
             }
-            Self::Coalesce(exprs, _) => {
-                let inner: Vec<String> = exprs.iter().map(|e| e.display()).collect();
-                format!("coalesce({})", inner.join(", "))
+            Self::Fold { kind, args, .. } => {
+                let inner: Vec<String> = args.iter().map(|e| e.display()).collect();
+                format!("{}({})", kind.name(), inner.join(", "))
             }
             Self::Concat(l, r) => format!("({} || {})", l.display(), r.display()),
             Self::Like {

@@ -397,7 +397,7 @@ fn collect_expr_columns(e: &PhysExpr, out: &mut Vec<String>) {
             }
             collect_expr_columns(else_expr, out);
         }
-        PhysExpr::Coalesce(exprs, _) => exprs.iter().for_each(|e| collect_expr_columns(e, out)),
+        PhysExpr::Fold { args, .. } => args.iter().for_each(|e| collect_expr_columns(e, out)),
         PhysExpr::Concat(l, r) => {
             collect_expr_columns(l, out);
             collect_expr_columns(r, out);
@@ -892,10 +892,11 @@ fn map_expr_idx(e: &PhysExpr, f: &dyn Fn(usize, &str) -> usize) -> PhysExpr {
             else_expr: Box::new(map_expr_idx(else_expr, f)),
             ty: ty.clone(),
         },
-        PhysExpr::Coalesce(exprs, ty) => PhysExpr::Coalesce(
-            exprs.iter().map(|e| map_expr_idx(e, f)).collect(),
-            ty.clone(),
-        ),
+        PhysExpr::Fold { kind, args, ty } => PhysExpr::Fold {
+            kind: *kind,
+            args: args.iter().map(|e| map_expr_idx(e, f)).collect(),
+            ty: ty.clone(),
+        },
         PhysExpr::Concat(l, r) => {
             PhysExpr::Concat(Box::new(map_expr_idx(l, f)), Box::new(map_expr_idx(r, f)))
         }
@@ -1303,12 +1304,14 @@ fn remap_join_expr(
             else_expr: Box::new(remap_join_expr(else_expr, lw, nl, lmap, rmap)),
             ty: ty.clone(),
         },
-        PhysExpr::Coalesce(es, ty) => PhysExpr::Coalesce(
-            es.iter()
+        PhysExpr::Fold { kind, args, ty } => PhysExpr::Fold {
+            kind: *kind,
+            args: args
+                .iter()
                 .map(|e| remap_join_expr(e, lw, nl, lmap, rmap))
                 .collect(),
-            ty.clone(),
-        ),
+            ty: ty.clone(),
+        },
         PhysExpr::Concat(l, r) => PhysExpr::Concat(
             Box::new(remap_join_expr(l, lw, nl, lmap, rmap)),
             Box::new(remap_join_expr(r, lw, nl, lmap, rmap)),

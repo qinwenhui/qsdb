@@ -581,18 +581,29 @@ fn build() -> HashMap<&'static str, Arc<ScalarFnDef>> {
         Arc::new(ScalarFnDef {
             ret_ty: Arc::new(|args| match args {
                 [
-                    LogicalType::Date | LogicalType::Timestamp { .. },
+                    // 字符串入参按 Spark 收（可转时间戳的字符串），见 `date_format_eval`
+                    LogicalType::Date
+                    | LogicalType::Timestamp { .. }
+                    | LogicalType::Varchar { .. },
                     LogicalType::Varchar { .. } | LogicalType::Int64,
                 ] => Ok(LogicalType::Varchar { max_chars: None }),
                 _ => Err(QsdbError::type_err(
-                    "date_format(DATE/TIMESTAMP, '<java pattern>') expected",
+                    "date_format(DATE/TIMESTAMP/STRING, '<java pattern>') expected",
                 )),
             }),
             eval: Arc::new(|args| {
                 let f = string_arg(args, 1, "date_format")?;
-                if f.len() != 1 || f.is_null(0) {
+                // 常量性判据是「**所有行同值且非 NULL**」，不能只认 `len() == 1`：
+                // 常量在批里**可能已经被广播到 n 行**（日清分那批 SQL 两个参数都是
+                // 常量 —— `DATE_FORMAT(CAST(CAST('2026-07-14 14:40:41' AS STRING) AS STRING),
+                // 'yyyy-MM-dd HH:mm:ss')` —— 于是 `len()` 是批长而不是 1，
+                // 只认 1 会让 **38 个块**在这条上全挂）。
+                if f.is_empty()
+                    || f.is_null(0)
+                    || (0..f.len()).any(|i| f.is_null(i) || f.value(i) != f.value(0))
+                {
                     return Err(QsdbError::invalid(
-                        "date_format: 格式串必须是**单个常量字符串**",
+                        "date_format: 格式串必须是**常量字符串**（每行同值）",
                     ));
                 }
                 let parts = parse_java_date_fmt(f.value(0))?;
@@ -848,6 +859,31 @@ fn date_format_eval(col: &ArrayRef, parts: &[FmtPart]) -> Result<ArrayRef> {
         }
     };
     match col.data_type() {
+        // 字符串入参：Spark 的 `date_format` 收**可转成时间戳的字符串**
+        // （实测真 Spark 3.5.2：`date_format('2026-07-14 14:40:41','yyyy-MM-dd')`
+        // ⇒ `2026-07-14`，`typeof` 仍是 `string`）。
+        //
+        // ★ 日清分那批 SQL 全是这个形状：`DATE_FORMAT(CAST(CAST('...' AS STRING) AS STRING),
+        // 'yyyy-MM-dd HH:mm:ss')` —— 一串 cast 之后参数就是**字符串**。
+        // 一个形状卡住 38 个块 ⇒ 这里先转时间戳再走同一条渲染路。
+        arrow::datatypes::DataType::Utf8 | arrow::datatypes::DataType::LargeUtf8 => {
+            let ts = arrow::datatypes::DataType::Timestamp(TimeUnit::Nanosecond, None);
+            let casted = arrow::compute::cast_with_options(
+                col.as_ref(),
+                &ts,
+                &arrow::compute::CastOptions {
+                    safe: false,
+                    format_options: Default::default(),
+                },
+            )
+            .map_err(|e| {
+                QsdbError::type_err(format!(
+                    "date_format: 字符串参数转 TIMESTAMP 失败（{e}）—— \
+                     预期形如 'yyyy-MM-dd HH:mm:ss'"
+                ))
+            })?;
+            return date_format_eval(&casted, parts);
+        }
         arrow::datatypes::DataType::Date32 => {
             let a = col
                 .as_any()

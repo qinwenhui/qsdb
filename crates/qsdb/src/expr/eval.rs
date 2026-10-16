@@ -17,7 +17,7 @@ use arrow::datatypes::DataType;
 use arrow::datatypes::i256 as I256;
 use arrow::record_batch::RecordBatch;
 
-use super::{ArithOp, CmpOp, PhysExpr};
+use super::{ArithOp, CmpOp, FoldKind, PhysExpr};
 use crate::error::{QsdbError, Result};
 use crate::types::{Literal, LogicalType, decimal};
 
@@ -114,17 +114,43 @@ fn select_arrays(mask: &BooleanArray, a: &ArrayRef, b: &ArrayRef) -> Result<Arra
         .map_err(|e| QsdbError::invalid(format!("select failed: {e}")))
 }
 
-/// COALESCE 向量化：按序从后往前覆盖非 NULL 位置。
-fn eval_coalesce(exprs: &[PhysExpr], batch: &RecordBatch) -> Result<ArrayRef> {
+/// COALESCE / LEAST / GREATEST 向量化 —— **跳过 NULL 的折叠**。
+///
+/// 参数在绑定期已 cast 到公共类型，此处逐参数扫一遍：
+/// - `acc` 为 NULL 而本参非 NULL ⇒ 本参接上（这一步 = 「忽略 NULL」，全 NULL 的位置
+///   自然保持 NULL）；
+/// - 两者都非 NULL ⇒ 按 `ord` 取舍（`None` = 取**首个**，即 COALESCE；`Some(max)`
+///   = 取最小/最大，即 LEAST/GREATEST）。
+fn eval_fold(args: &[PhysExpr], batch: &RecordBatch, ord: Option<bool>) -> Result<ArrayRef> {
     let n = batch.num_rows();
-    let mut current = arrow::array::new_null_array(&exprs[0].data_type().arrow_type(), n);
-    for e in exprs.iter().rev() {
+    let mut acc = arrow::array::new_null_array(&args[0].data_type().arrow_type(), n);
+    for e in args {
         let arr = eval_to_n(e, batch, n)?;
-        let non_null = arrow::compute::is_not_null(&arr)
+        let acc_nn = is_not_null(&acc)
             .map_err(|er| QsdbError::invalid(format!("is_not_null failed: {er}")))?;
-        current = select_arrays(&non_null, &arr, &current)?;
+        let arr_nn = is_not_null(&arr)
+            .map_err(|er| QsdbError::invalid(format!("is_not_null failed: {er}")))?;
+        // acc 尚空、本参有值 ⇒ 接上
+        let fill = and_kleene(&not(&acc_nn)?, &arr_nn)?;
+        let take = match ord {
+            None => fill,
+            Some(max) => {
+                let both = and_kleene(&acc_nn, &arr_nn)?;
+                // `take` 的语义是「用本参替换 acc」，所以判据写成 acc 站在**输**的一侧：
+                // 取最大 —— 本参更大（acc < arr）时让位；取最小 —— 本参更小（acc > arr）。
+                let better = if max {
+                    cmp::lt(&acc, &arr)
+                } else {
+                    cmp::gt(&acc, &arr)
+                }
+                .map_err(|er| QsdbError::invalid(format!("compare failed: {er}")))?;
+                // 两者都非 NULL 时才谈得上取舍；`both`/`fill` 均无 NULL 位
+                or_kleene(&and_kleene(&both, &better)?, &fill)?
+            }
+        };
+        acc = select_arrays(&take, &arr, &acc)?;
     }
-    Ok(current)
+    Ok(acc)
 }
 
 /// 字符串拼接 ||：NULL || x = NULL（SQL 语义）。
@@ -260,7 +286,14 @@ fn eval_val(expr: &PhysExpr, batch: &RecordBatch) -> Result<EvalVal> {
         PhysExpr::Case {
             conds, else_expr, ..
         } => Ok(EvalVal::Arr(eval_case(conds, else_expr, batch)?)),
-        PhysExpr::Coalesce(exprs, _) => Ok(EvalVal::Arr(eval_coalesce(exprs, batch)?)),
+        PhysExpr::Fold { kind, args, .. } => {
+            let ord = match kind {
+                FoldKind::Coalesce => None,
+                FoldKind::Least => Some(false),
+                FoldKind::Greatest => Some(true),
+            };
+            Ok(EvalVal::Arr(eval_fold(args, batch, ord)?))
+        }
         PhysExpr::Concat(l, r) => Ok(EvalVal::Arr(eval_concat(l, r, batch)?)),
         PhysExpr::Like {
             e,

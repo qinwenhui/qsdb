@@ -9,7 +9,7 @@ use sqlparser::parser::Parser;
 use crate::catalog::TableDef;
 use crate::error::{QsdbError, Result};
 use crate::exec::SortKey;
-use crate::expr::{AggExpr, AggFunc, ArithOp, CmpOp, PhysExpr, scalar};
+use crate::expr::{AggExpr, AggFunc, ArithOp, CmpOp, FoldKind, PhysExpr, scalar};
 use crate::scan::Predicate;
 use crate::types::cast::cast_literal;
 use crate::types::{Literal, LogicalType, decimal::DecimalMeta, temporal};
@@ -2641,10 +2641,128 @@ fn filter_reachable_ctes(defs: Vec<CteDef>, main: &LogicalPlan) -> Vec<CteDef> {
         .collect()
 }
 
+/// 从一段 SQL **文本**里扫出标识符 token（`[A-Za-z_][A-Za-z0-9_]*`）。
+///
+/// 刻意**不做**完整词法分析：字符串字面量 / 带引号标识符里的同名 token 也会被收进来。
+/// 那是**保守方向**（只会多留几个 CTE，不会少留），理由见 [`live_cte_names`]。
+fn ident_tokens(s: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_alphabetic() || c == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            if let Some(tok) = s.get(start..i) {
+                out.insert(tok.to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 本层 `WITH` 里**哪些 CTE 真的会被用到**（从主查询出发的传递闭包）。
+///
+/// ## 为什么要判、为什么必须在**绑定之前**判
+///
+/// 绑定是**全量**的：`bind_with_ctes` 会对每个 CTE 都跑一遍 `translate_select_inner`，
+/// 而 `filter_reachable_ctes` 只在事后把不可达的从**物化列表**里删掉 —— 死 CTE 该报的错
+/// 那时早报完了。这在"机器生成的臃肿 SQL"上很致命：日清分那 154 个 SQL 块里
+/// **2890 个 CTE 有 562 个是死的**（最臃肿的一块 46 个定义里 38 个是死的 ——
+/// 同一个任务的别的输出的分支被复制进了每一块），而死 CTE 里藏着 **46 处
+/// `PIVOT`/`stack`**，全是**我们还没实现**的东西。
+///
+/// ## 判定口径（保守，两个方向都安全）
+///
+/// 按 AST **分段**取文本（主查询 / 每个 CTE 体各自 `Display`），再扫标识符 token：
+///
+/// - **不会漏**：`Display` 保真渲染标识符 ⇒ 真被引用的名字一定出现在文本里；
+///   万一漏了 ⇒ CTE 被判死 ⇒ 引用处报 `table not found` —— **响亮的错误**，不是错值。
+/// - **只会多留**：字符串字面量、嵌套 `WITH` 的局部同名 CTE 都会被算成引用 ⇒
+///   那个 CTE 照常绑定 ⇒ **退回今天的行为**，不会更差。
+///
+/// ## 与 Spark 的差异（刻意，且只有一处）
+///
+/// 实测真 Spark 3.5.2：**死 CTE 里写错表/列/函数照样报错**（它的 analysis 覆盖全文，
+/// 只是不执行；`'CTERelationDef 0, false` 照样在 plan 里）。我们提前砍 ⇒
+/// **在非法 SQL 上比 Spark 宽松**：死 CTE 里写错我们不再报。
+/// 方向是安全的 —— 永远不产错值，只是少报一个"你那段死代码写错了"。
+/// 主查询文本：`body` + `order_by` + `limit` + `fetch`。
+/// **不含 `q.with`** —— 那正是要判的对象，含进去会把所有 CTE 都算成活的。
+///
+/// ⚠️ 必须在 `q.body` 被移出去**之前**调（`translate_select_inner` 里是
+/// `match *q.body`，那一下会部分移动 `q`）。
+fn cte_main_text(q: &sqlparser::ast::Query) -> String {
+    let mut main = q.body.to_string();
+    if let Some(ob) = &q.order_by {
+        main.push(' ');
+        main.push_str(&ob.to_string());
+    }
+    if let Some(l) = &q.limit_clause {
+        main.push(' ');
+        main.push_str(&l.to_string());
+    }
+    if let Some(f) = &q.fetch {
+        main.push(' ');
+        main.push_str(&f.to_string());
+    }
+    main
+}
+
+fn live_cte_names(
+    main: &str,
+    ctes: &[sqlparser::ast::Cte],
+) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+    let names: HashSet<&str> = ctes.iter().map(|c| c.alias.name.value.as_str()).collect();
+    let pick = |s: &str| -> HashSet<String> {
+        ident_tokens(s)
+            .into_iter()
+            .filter(|t| names.contains(t.as_str()))
+            .collect()
+    };
+
+    let idx: std::collections::HashMap<&str, usize> = ctes
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.alias.name.value.as_str(), i))
+        .collect();
+
+    let mut live: HashSet<usize> = HashSet::new();
+    let mut queue: Vec<usize> = Vec::new();
+    for t in pick(&main) {
+        if let Some(&i) = idx.get(t.as_str()) {
+            queue.push(i);
+        }
+    }
+    while let Some(i) = queue.pop() {
+        if !live.insert(i) {
+            continue;
+        }
+        for t in pick(&ctes[i].query.to_string()) {
+            if let Some(&j) = idx.get(t.as_str()) {
+                queue.push(j);
+            }
+        }
+    }
+    live.into_iter()
+        .map(|i| ctes[i].alias.name.value.clone())
+        .collect()
+}
+
 /// WITH 子句绑定（普通 SELECT 与集合操作两路共用）：
 /// CTE 内联展开为子计划，祖先可见（后定义可引用先定义，链式）。
+///
+/// ⚠️ **死 CTE 不绑定**（判定见 [`live_cte_names`]）—— 这是能让日清分那批
+/// "臃肿 SQL"跑起来的关键：死代码里那些 `PIVOT`/`stack` 不该拦路。
 fn bind_with_ctes(
     with: Option<&sqlparser::ast::With>,
+    main_text: &str,
     resolver: &TableResolver,
     ancestors: &VisibleCtes,
 ) -> Result<(VisibleCtes, Vec<CteDef>)> {
@@ -2654,10 +2772,23 @@ fn bind_with_ctes(
         if with.recursive {
             return Err(QsdbError::unsupported("recursive CTE"));
         }
+        let live = live_cte_names(main_text, &with.cte_tables);
+        // 名字唯一性对**全部** CTE 查（名字空间与"用不用得上"是两件事），
+        // 于是死 CTE 之间重名照样报错 —— 不比今天宽松。
+        let mut seen = std::collections::HashSet::new();
         for cte in &with.cte_tables {
             let name = cte.alias.name.value.clone();
-            if visible.contains_key(&name) || (resolver.resolve)(&name).is_ok() {
+            if !seen.insert(name.clone())
+                || visible.contains_key(&name)
+                || (resolver.resolve)(&name).is_ok()
+            {
                 return Err(QsdbError::unsupported("recursive or duplicate CTE"));
+            }
+        }
+        for cte in &with.cte_tables {
+            let name = cte.alias.name.value.clone();
+            if !live.contains(&name) {
+                continue;
             }
             let (sub, mut child_defs) =
                 translate_select_inner(*cte.query.clone(), resolver, &visible)?;
@@ -2689,7 +2820,9 @@ fn translate_set_operation(
     ancestors: &VisibleCtes,
 ) -> Result<(LogicalPlan, Vec<CteDef>)> {
     use crate::exec::SetOpKind;
-    let (visible, mut cte_defs) = bind_with_ctes(q.with.as_ref(), resolver, ancestors)?;
+    let main_text = cte_main_text(q);
+    let (visible, mut cte_defs) =
+        bind_with_ctes(q.with.as_ref(), &main_text, resolver, ancestors)?;
     let body_query = |body: Box<sqlparser::ast::SetExpr>| sqlparser::ast::Query {
         with: None,
         body,
@@ -2968,6 +3101,8 @@ fn translate_select_inner(
     ancestors: &VisibleCtes,
 ) -> Result<(LogicalPlan, Vec<CteDef>)> {
     use sqlparser::ast::*;
+    // ⚠️ 必须在下面 `match *q.body`（会把 `q` 部分移动）**之前**取。
+    let cte_main = cte_main_text(&q);
 
     // **静默丢弃闸门**（见 `audit_query`）：每个 Query 的必经点，嵌套子查询自动被审。
     audit_query(&q)?;
@@ -3011,7 +3146,8 @@ fn translate_select_inner(
     }
     // CTE（非递归）：WITH name AS (...) 内联展开为子计划。
     // 定义期即分配 cte_id；祖先 CTE 可见（后定义可引用先定义，链式）。
-    let (visible, mut cte_defs) = bind_with_ctes(q.with.as_ref(), resolver, ancestors)?;
+    let (visible, mut cte_defs) =
+        bind_with_ctes(q.with.as_ref(), &cte_main, resolver, ancestors)?;
 
     // FROM 主表：实表 / 表函数（read_parquet）/ CTE（本级 → 祖先）/ 派生表；
     // 无 FROM → 单行零列源（SELECT 1+1 / SELECT CURRENT_DATE）
@@ -4004,8 +4140,9 @@ fn using_merge_project(
     for (li, ri, ty) in pairs {
         let (ln, _) = ctx.cols[*li].clone();
         let rn = ctx.cols[n_left + *ri].0.clone();
-        exprs.push(PhysExpr::Coalesce(
-            vec![
+        exprs.push(PhysExpr::Fold {
+            kind: FoldKind::Coalesce,
+            args: vec![
                 PhysExpr::Column {
                     idx: left_base + *li,
                     name: ln.clone(),
@@ -4017,8 +4154,8 @@ fn using_merge_project(
                     ty: ty.clone(),
                 },
             ],
-            ty.clone(),
-        ));
+            ty: ty.clone(),
+        });
         cols.push((ln, ty.clone()));
     }
     // ② 左侧其余列（名字沿用左输入的 —— 多表链时可能已带限定名）
@@ -4720,6 +4857,51 @@ fn not_found_with_hint(ctx: &SchemaCtx, name: &str) -> QsdbError {
 }
 
 // ---------------------------------------------------------------------------
+// 多参折叠（COALESCE / NVL / LEAST / GREATEST）
+// ---------------------------------------------------------------------------
+
+/// 已经 cast 好、类型已知的 `Fold` —— 供 `IS TRUE` 族这类内部改写直接构造。
+fn fold_coalesce(args: Vec<PhysExpr>, ty: LogicalType) -> PhysExpr {
+    PhysExpr::Fold {
+        kind: FoldKind::Coalesce,
+        args,
+        ty,
+    }
+}
+
+/// COALESCE / LEAST / GREATEST 的共同绑定：参数逐个绑定，cast 到**公共超类型**。
+///
+/// 类型规则（实测真 Spark 3.5.2 对齐）：字面量 `NULL` 参数**不参与**超类型计算
+/// （`least(1, null)` ⇒ `int`）；若全是 NULL 则落到 Int64（与 coalesce 同）。
+fn bind_fold(
+    kind: FoldKind,
+    args: &[&sqlparser::ast::Expr],
+    ctx: &SchemaCtx,
+) -> Result<PhysExpr> {
+    let bound: Vec<PhysExpr> = args
+        .iter()
+        .map(|a| bind_expr(a, ctx))
+        .collect::<Result<_>>()?;
+    let mut ty: Option<LogicalType> = None;
+    for b in &bound {
+        if matches!(b, PhysExpr::Lit(Literal::Null)) {
+            continue;
+        }
+        ty = Some(match ty {
+            None => b.data_type(),
+            Some(acc) => common_supertype(&acc, &b.data_type()),
+        });
+    }
+    let ty = ty.unwrap_or(LogicalType::Int64);
+    let casted: Vec<PhysExpr> = bound.into_iter().map(|b| b.cast_to(ty.clone())).collect();
+    Ok(PhysExpr::Fold {
+        kind,
+        args: casted,
+        ty,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // 表达式绑定（无聚合上下文）
 // ---------------------------------------------------------------------------
 
@@ -4813,40 +4995,42 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
             };
             finish_case(conds, else_expr)
         }
-        // `NVL(a, b)` 是 **Spark SQL 的内置函数**（= 两参的 coalesce，
-        // 实测真 Spark 3.5.2：`SELECT nvl(0.2, 1)` ⇒ `0.2`）。日清那批结算 SQL 在用。
-        // 与 `coalesce` 走同一条绑定路，只是**参数个数固定 2**。
+        // COALESCE / NVL / LEAST / GREATEST —— 四者**同一个形状**（跳过 NULL 折叠，
+        // 见 `PhysExpr::Fold`），共用一条绑定路，只有选择器与参数个数规则不同。
+        //
+        // - `NVL(a, b)` 是 **Spark SQL 的内置函数**（= 两参的 coalesce，
+        //   实测真 Spark 3.5.2：`SELECT nvl(0.2, 1)` ⇒ `0.2`）。日清那批结算 SQL 在用。
+        // - `LEAST` / `GREATEST` 实测真 Spark 3.5.2（2026-10-16）：
+        //   `least(1,null,3)` ⇒ `1`、`greatest(1,null,3)` ⇒ `3`（**忽略 NULL**）、
+        //   `least(null,null)` ⇒ `NULL`；类型取公共超类型
+        //   （`least(1,2)`⇒int、`least(1.5,2)`⇒decimal(11,1)、`least(1,2.0E0)`⇒double）。
         E::Function(f)
-            if (f.name.to_string().eq_ignore_ascii_case("coalesce")
-                || f.name.to_string().eq_ignore_ascii_case("nvl"))
-                && f.over.is_none() =>
+            if f.over.is_none() && {
+                let n = f.name.to_string();
+                ["coalesce", "nvl", "least", "greatest"]
+                    .iter()
+                    .any(|k| n.eq_ignore_ascii_case(k))
+            } =>
         {
-            let is_nvl = f.name.to_string().eq_ignore_ascii_case("nvl");
+            let fname = f.name.to_string();
+            let kind = if fname.eq_ignore_ascii_case("least") {
+                FoldKind::Least
+            } else if fname.eq_ignore_ascii_case("greatest") {
+                FoldKind::Greatest
+            } else {
+                FoldKind::Coalesce
+            };
             let args = arg_exprs(f)?;
-            if is_nvl && args.len() != 2 {
+            if fname.eq_ignore_ascii_case("nvl") && args.len() != 2 {
                 return Err(QsdbError::invalid("nvl(a, b) requires exactly 2 arguments"));
             }
             if args.len() < 2 {
-                return Err(QsdbError::invalid("coalesce requires >= 2 arguments"));
+                return Err(QsdbError::invalid(format!(
+                    "{}(...) requires >= 2 arguments",
+                    kind.name()
+                )));
             }
-            let bound: Vec<PhysExpr> = args
-                .iter()
-                .map(|a| bind_expr(a, ctx))
-                .collect::<Result<_>>()?;
-            // 类型：非 NULL 参数的公共超类型
-            let mut ty: Option<LogicalType> = None;
-            for b in &bound {
-                if matches!(b, PhysExpr::Lit(Literal::Null)) {
-                    continue;
-                }
-                ty = Some(match ty {
-                    None => b.data_type(),
-                    Some(acc) => common_supertype(&acc, &b.data_type()),
-                });
-            }
-            let ty = ty.unwrap_or(LogicalType::Int64);
-            let casted: Vec<PhysExpr> = bound.into_iter().map(|b| b.cast_to(ty.clone())).collect();
-            Ok(PhysExpr::Coalesce(casted, ty))
+            bind_fold(kind, &args, ctx)
         }
         E::Function(f) if f.name.to_string().eq_ignore_ascii_case("nullif") && f.over.is_none() => {
             let args = arg_exprs(f)?;
@@ -5109,7 +5293,7 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
         E::IsTrue(inner) => {
             let x = bind_expr(inner, ctx)?;
             require_boolean(&x, "IS TRUE")?;
-            Ok(PhysExpr::Coalesce(
+            Ok(fold_coalesce(
                 vec![x, PhysExpr::Lit(Literal::Boolean(false))],
                 LogicalType::Boolean,
             ))
@@ -5117,7 +5301,7 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
         E::IsNotTrue(inner) => {
             let x = bind_expr(inner, ctx)?;
             require_boolean(&x, "IS NOT TRUE")?;
-            Ok(PhysExpr::Coalesce(
+            Ok(fold_coalesce(
                 vec![
                     PhysExpr::Not(Box::new(x)),
                     PhysExpr::Lit(Literal::Boolean(true)),
@@ -5128,7 +5312,7 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
         E::IsFalse(inner) => {
             let x = bind_expr(inner, ctx)?;
             require_boolean(&x, "IS FALSE")?;
-            Ok(PhysExpr::Coalesce(
+            Ok(fold_coalesce(
                 vec![
                     PhysExpr::Not(Box::new(x)),
                     PhysExpr::Lit(Literal::Boolean(false)),
@@ -5139,7 +5323,7 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
         E::IsNotFalse(inner) => {
             let x = bind_expr(inner, ctx)?;
             require_boolean(&x, "IS NOT FALSE")?;
-            Ok(PhysExpr::Coalesce(
+            Ok(fold_coalesce(
                 vec![x, PhysExpr::Lit(Literal::Boolean(true))],
                 LogicalType::Boolean,
             ))
@@ -5207,8 +5391,17 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
         } => {
             let inner = bind_expr(expr, ctx)?;
             let ty = cast_target_to_logical(data_type)?;
-            if crate::types::cast::cast_rule(&inner.data_type(), &ty)
-                == crate::types::cast::CastRule::Impossible
+            // `CAST(NULL AS <类型>)` —— 字面量 NULL 的**兜底类型是 Boolean**（它没有自己的
+            // 类型），于是 `cast_rule(Boolean, Int32)` 会被判 Impossible。但值的语义是
+            // **恒 NULL**，转成什么类型都合法 ⇒ 这里放行。
+            //
+            // ⚠️ 求值侧早就是这样处理的（`eval.rs` 的 `PhysExpr::Cast`：全 NULL 短路，
+            // 注释就写着这个理由），**只有绑定期这道闸门没跟上** —— 于是
+            // `SELECT CAST(NULL AS INT)` 一直是被拒的。2026-10-16 补上，两侧对齐。
+            let is_null_lit = matches!(inner, PhysExpr::Lit(Literal::Null));
+            if !is_null_lit
+                && crate::types::cast::cast_rule(&inner.data_type(), &ty)
+                    == crate::types::cast::CastRule::Impossible
             {
                 return Err(QsdbError::type_err(format!(
                     "cannot cast {} to {ty}",
@@ -5438,6 +5631,7 @@ fn bind_cmp_phys(op: CmpOp, lb: PhysExpr, rb: PhysExpr) -> Result<PhysExpr> {
         return Ok(PhysExpr::Lit(Literal::Null));
     }
     let (lb, rb) = promote_temporal_lit(lb, rb)?;
+    let (lb, rb) = promote_string_lit(lb, rb);
     let lt = lb.data_type();
     let rt = rb.data_type();
     let common = cmp_common_type(&lt, &rt)?;
@@ -5703,6 +5897,7 @@ fn bind_cmp(
     // F16：temporal 列 × 字符串字面量 → 绑定期字面量提升（白名单隐式转换）。
     // 谓词保持 typed → min/max 裁剪与谓词下推不受影响；解析失败给出字面量指引。
     let (lb, rb) = promote_temporal_lit(lb, rb)?;
+    let (lb, rb) = promote_string_lit(lb, rb);
     let lt = lb.data_type();
     let rt = rb.data_type();
     let common = cmp_common_type(&lt, &rt)?;
@@ -5751,6 +5946,56 @@ fn promote_temporal_lit(lb: PhysExpr, rb: PhysExpr) -> Result<(PhysExpr, PhysExp
             Ok((PhysExpr::Lit(lit), rb))
         }
         _ => Ok((lb, rb)),
+    }
+}
+
+/// **字符串字面量 vs 数值** 的比较：Spark 把字符串**隐式转成对方的数值类型**。
+///
+/// 实测真 Spark 3.5.2（2026-10-16）：
+///
+/// | 表达式 | Spark |
+/// |---|---|
+/// | `CAST(2 AS TINYINT) = '2'` | `true` |
+/// | `'2' = CAST(2 AS TINYINT)` | `true`（对称） |
+/// | `CAST(1.5 AS DECIMAL(10,2)) = '1.50'` | `true` |
+/// | `1 = 'z'` | **`NULL`** —— **不是报错**（`ansi.enabled=false` 下的语义） |
+///
+/// ★ 日清分那批 SQL 里这是**最大的一类拦路虎**：`SETTLE_TYPE = '2'`
+/// （`TINYINT` 列 vs 字符串字面量）**一个形状就卡住 77 个块**。
+///
+/// 转不动的（`'z'` vs 数值）**整条比较给 NULL**，与 Spark 一致 ——
+/// 报错会比 Spark 严，而 `NULL` 才是它真正的答案。
+fn promote_string_lit(lb: PhysExpr, rb: PhysExpr) -> (PhysExpr, PhysExpr) {
+    // 刻意**只收数值**：`Boolean` 没实测过，宁可不收（保持现状报错，而不是猜一个语义）。
+    let numeric = |t: &LogicalType| {
+        use LogicalType as Lt;
+        matches!(
+            t,
+            Lt::Int8
+                | Lt::Int16
+                | Lt::Int32
+                | Lt::Int64
+                | Lt::Float32
+                | Lt::Float64
+                | Lt::Decimal { .. }
+        )
+    };
+    let coerce = |s: &str, ty: &LogicalType| -> PhysExpr {
+        match cast_literal(&Literal::Utf8(s.to_string()), ty) {
+            Ok(v) => PhysExpr::Lit(v),
+            Err(_) => PhysExpr::Lit(Literal::Null),
+        }
+    };
+    match (&lb, &rb) {
+        (a, PhysExpr::Lit(Literal::Utf8(s))) if numeric(&a.data_type()) => {
+            let ty = a.data_type();
+            (lb, coerce(s, &ty))
+        }
+        (PhysExpr::Lit(Literal::Utf8(s)), b) if numeric(&b.data_type()) => {
+            let ty = b.data_type();
+            (coerce(s, &ty), rb)
+        }
+        _ => (lb, rb),
     }
 }
 
