@@ -105,6 +105,12 @@ def main():
         spark.sparkContext.setLogLevel("ERROR")
         # 表在 `js_bench` 库（刻意灌进新库，见 load_tables.py 的说明）
         rewrite = lambda s: s.replace("js_produce.", "js_bench.").replace("js_data.", "js_bench.")
+    else:
+        # ⚠️ qsdb 是**单库模型**，`库.表` 限定名不支持 —— 语料里全是
+        # `js_produce.` / `js_data.` 前缀（266 处），全部剥掉（L0-06_01 当初
+        # 就是漏网的 js_data. 前缀）。口径与交接文档一致：**数据侧改写，
+        # 引擎不收限定名**（收了就得定义"前缀不匹配算什么错"，没有需求不加）。
+        rewrite = lambda s: s.replace("js_produce.", "").replace("js_data.", "")
 
     # 分区副本表名（`_p` 结尾）—— 只在开了开关时用
     ptabs = []

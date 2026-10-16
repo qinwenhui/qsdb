@@ -107,21 +107,20 @@ fn 死_cte_引用的_cte_也是死的() {
     assert_eq!(got, vec!["1", "2", "3"]);
 }
 
-/// **活的** CTE 里的 `PIVOT` 仍然**显式拒** —— 裁剪不能把真拦路虎也放过去。
+/// **活的** CTE 里的 `PIVOT` 必须照常执行 —— 裁剪只能砍死的，不能砍活的。
 #[test]
-fn 活的_cte_里的_pivot_仍然拒() {
+fn 活的_cte_里的_pivot_照常执行() {
     let (db, _r) = setup("livepivot");
-    let e = db
-        .sql_collect(
-            "WITH live AS (SELECT * FROM (SELECT a, b FROM t) x PIVOT (SUM(b) FOR a IN (1))) \
-             SELECT * FROM live",
-        )
-        .unwrap_err();
-    let s = e.to_string().to_lowercase();
-    assert!(
-        s.contains("pivot") || s.contains("unsupported") || s.contains("not supported"),
-        "unexpected: {s}"
+    // 历史注：本条在 `PIVOT` 未实现时断言"仍拒"（提交 `0a279cd` 落地 PIVOT 后
+    // 翻成"算对"）。`live` 被外层引用 ⇒ **活的**，必须真执行：
+    // `FOR a IN (1)` 无别名 ⇒ 列名按 Spark 规则取字面量文本 `1`，值为 a=1 组的
+    // `SUM(b)` = 10。
+    let got = rows(
+        &db,
+        "WITH live AS (SELECT * FROM (SELECT a, b FROM t) x PIVOT (SUM(b) FOR a IN (1))) \
+         SELECT * FROM live",
     );
+    assert_eq!(got, vec!["10"], "PIVOT 结果列 `1` 应为 a=1 组的 SUM(b)");
 }
 
 /// ★ **保守性**：CTE 只在**表达式里的子查询**被引用（不在 FROM / JOIN 里）。

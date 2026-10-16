@@ -1193,14 +1193,7 @@ fn build_inner(
                 let left_width = probe.schema().fields().len();
                 right_keys
                     .iter()
-                    .map(|k| match k {
-                        PhysExpr::Column { idx, name, ty } => PhysExpr::Column {
-                            idx: idx.saturating_sub(left_width),
-                            name: name.clone(),
-                            ty: ty.clone(),
-                        },
-                        other => other.clone(),
-                    })
+                    .map(|k| key_to_build_local(k, left_width))
                     .collect()
             };
             if needed.is_some() && std::env::var("QSDB_JOIN_PROF").is_ok() {
@@ -1330,6 +1323,26 @@ fn remap_join_expr(
     }
 }
 
+/// Join **右键**换到 build 侧局部序（Column idx 减左宽）。
+///
+/// ⚠️ 必须**钻进包装**：跨类型键归一后键可以是 `CAST(右列 AS DOUBLE)`
+/// （`translate::as_equi_key` 的类型归一，L7-02_01）——只认裸列会把**全局 idx**
+/// 原样带进 build 批 ⇒ 越界 panic，或更糟：没越界时**静默读错列**。
+fn key_to_build_local(k: &PhysExpr, left_width: usize) -> PhysExpr {
+    match k {
+        PhysExpr::Column { idx, name, ty } => PhysExpr::Column {
+            idx: idx.saturating_sub(left_width),
+            name: name.clone(),
+            ty: ty.clone(),
+        },
+        PhysExpr::Cast { e, ty } => PhysExpr::Cast {
+            e: Box::new(key_to_build_local(e, left_width)),
+            ty: ty.clone(),
+        },
+        other => other.clone(),
+    }
+}
+
 /// Join 两侧列裁剪下推。**两个已知坑**（首次尝试均踩中）：
 /// ① 投影列必须按**表定义序**排列——`Scan` 的 read_columns 会按 def.columns
 ///    重排，而 build_mapping 按给定序索引，序不一致则 idx 错位（越界/结果空）。
@@ -1424,21 +1437,11 @@ fn try_project_join(
         .iter()
         .map(|k| rewrite_expr(k, &lmap, &lall))
         .collect();
-    // ★ 坑 ②：右键 → 右表局部序（减 lw）再映射到右投影序，**不带 nl**
+    // ★ 坑 ②：右键 → 右表局部序（减 lw，**钻进 Cast**，见 `key_to_build_local`）
+    //    再映射到右投影序，**不带 nl**
     let rk: Vec<PhysExpr> = right_keys
         .iter()
-        .map(|k| match k {
-            PhysExpr::Column { idx, name, ty } => rewrite_expr(
-                &PhysExpr::Column {
-                    idx: idx.saturating_sub(lw),
-                    name: name.clone(),
-                    ty: ty.clone(),
-                },
-                &rmap,
-                &rall,
-            ),
-            other => other.clone(),
-        })
+        .map(|k| rewrite_expr(&key_to_build_local(k, lw), &rmap, &rall))
         .collect();
     // 残留与 `exprs` 同在"join 输出（左全列 ++ 右全列）"这个索引空间里，
     // 故用同一个重映射器换算到裁剪后的空间。

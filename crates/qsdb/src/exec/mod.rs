@@ -164,8 +164,40 @@ impl ExecNode for ProjectExec {
             }
         }
         Some(
-            RecordBatch::try_new(self.schema(), cols)
-                .map_err(|e| QsdbError::invalid(format!("project failed: {e}"))),
+            // `cols.clone()`：`Vec<Arc>` 的克隆只是引用计数 +1（每列一次原子加），
+            // 为的是**报错路径**还能拿到实际产出类型 —— 热路径上这点开销
+            // 相对每个 batch 的表达式求值可以忽略。
+            RecordBatch::try_new(self.schema(), cols.clone()).map_err(|e| {
+                // **schema 声明的类型 ≠ 实际产出的类型** —— 这种错不给"是哪一列"
+                // 就没法定位：表达式类型是绑定期推的，37 层 CTE 的语料里
+                // 每一层的类型都是推导出来的（L4-01 三块卡了半天，就是因为
+                // 报错里没有表达式，只能一层层数）。
+                let bad: Vec<String> = self
+                    .exprs
+                    .iter()
+                    .zip(cols.iter())
+                    .enumerate()
+                    .filter(|(_, (e, a))| e.data_type().arrow_type() != *a.data_type())
+                    .map(|(i, (e, a))| {
+                        format!(
+                            "col[{}] {:?}: schema={} actual={} expr={}",
+                            i,
+                            self.schema().fields()[i].name(),
+                            e.data_type(),
+                            a.data_type(),
+                            e.display()
+                        )
+                    })
+                    .collect();
+                if bad.is_empty() {
+                    QsdbError::invalid(format!("project failed: {e}"))
+                } else {
+                    QsdbError::invalid(format!(
+                        "project failed: {e}; mismatched columns: {}",
+                        bad.join("; ")
+                    ))
+                }
+            }),
         )
     }
 }

@@ -1888,6 +1888,27 @@ pub fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<(String, LogicalTyp
     })
 }
 
+/// 计划的第 `i` 个输出列是不是**裸 NULL 字面量**（`SELECT NULL AS x`）。
+///
+/// `Literal::Null` 没有类型，`PhysExpr::data_type()` 只能兜底成 Boolean ——
+/// 这个"假 Boolean"在集合操作归一里**必须当成 NullType 处理**（采纳对侧类型），
+/// 否则下游类型判断全歪（见 `translate_set_operation` 里的说明）。
+///
+/// **穿透 `Project`**：分支常常是 `SELECT v FROM (SELECT NULL AS v) x` ——
+/// 顶层投影里是 `Column` 引用，要顺着它的下标钻进内层才能看到那个 NULL。
+/// 其余节点（聚合/连接…）拿不到裸投影，视为不是。
+fn plan_col_is_null_lit(plan: &LogicalPlan, i: usize) -> bool {
+    match plan {
+        LogicalPlan::Project { input, exprs, .. } => match exprs.get(i) {
+            Some(PhysExpr::Lit(Literal::Null)) => true,
+            Some(PhysExpr::Column { idx, .. }) => plan_col_is_null_lit(input, *idx),
+            _ => false,
+        },
+        LogicalPlan::Distinct { input } => plan_col_is_null_lit(input, i),
+        _ => false,
+    }
+}
+
 pub struct TableResolver<'a> {
     pub resolve: TableResolverFn<'a>,
     /// 视图（name → SQL；SELECT 期重解析展开）
@@ -2860,8 +2881,21 @@ fn translate_set_operation(
     let common: Vec<LogicalType> = lc
         .iter()
         .zip(&rc)
-        .map(|((_, a), (_, b))| {
+        .enumerate()
+        .map(|(i, ((_, a), (_, b)))| {
             if a == b {
+                a.clone()
+            } else if plan_col_is_null_lit(&lp, i) {
+                // **裸 NULL 分支采纳对侧的类型**（Spark 语义）。
+                //
+                // `SELECT NULL AS v1 … UNION ALL SELECT decimal_col AS v1 …`：
+                // NULL 字面量没有类型，`data_type()` 兜底成 **Boolean** ——
+                // 不认这一下，公共类型就按 Boolean 归，下游整个类型世界全歪：
+                // 语料里两个块（L7-02_01/L8-02_02）就是这么被毒化的 ——
+                // 前者 `V1 = ''` 报 "BOOLEAN vs STRING"，后者 BIGINT 侧被
+                // 字符串化之后报 "STRING vs BIGINT"。
+                b.clone()
+            } else if plan_col_is_null_lit(&rp, i) {
                 a.clone()
             } else {
                 common_supertype(a, b)
@@ -2871,7 +2905,14 @@ fn translate_set_operation(
     let needs_cast =
         |cols: &[(String, LogicalType)]| cols.iter().zip(&common).any(|((_, t), c)| t != c);
     if needs_cast(&rc) {
-        rp = cast_setop_side(rp, &common, &lc);
+        // ⚠️ 第三参必须是**这一侧自己的**列（类型尤其）——此前右侧也传 `lc`，
+        // `cast_to_impl` 拿"左边的类型"当右列的现状类型：`common` 恰好等于左侧
+        // 类型时（左侧在归一里"赢"），它看到类型相等**不包 Cast**，
+        // 右侧的真实类型裸穿到声明的 schema 下 ⇒
+        // `project failed: expected Decimal128(38,8) found Decimal128(30,8)`
+        // —— 语料 L4-01 三块卡了一整天的真凶（CASE 折叠整数 0 每层 +10 位
+        // 精度，30 就是这么攒出来的）。
+        rp = cast_setop_side(rp, &common, &rc);
     }
     if needs_cast(&lc) {
         lp = cast_setop_side(lp, &common, &lc);
@@ -3329,7 +3370,7 @@ fn proj_item_expr(it: &sqlparser::ast::SelectItem) -> Option<&sqlparser::ast::Ex
 
 /// `stack(n, k₁,v₁, …, kₙ,vₙ) AS (c1, c2)` —— **列转行**，绑定期重写成 `UNION ALL`。
 ///
-/// ```
+/// ```text
 /// SELECT a, stack(2, 'x', v1, 'y', v2) AS (k, v) FROM t
 /// -- ≡
 /// SELECT a, 'x' AS k, v1 AS v FROM t UNION ALL
@@ -4736,6 +4777,12 @@ fn shift_col_idx(e: &PhysExpr, delta: isize) -> PhysExpr {
             name: name.clone(),
             ty: ty.clone(),
         },
+        // 键可以是 `CAST(列 AS …)`（跨类型键归一，见 `as_equi_key`）——
+        // delta 必须作用到**里面的列**，否则全局 idx 原样进 build 批 ⇒ 越界/错列。
+        PhysExpr::Cast { e, ty } => PhysExpr::Cast {
+            e: Box::new(shift_col_idx(e, delta)),
+            ty: ty.clone(),
+        },
         other => other.clone(),
     }
 }
@@ -4779,6 +4826,12 @@ fn swap_sides_expr(e: &PhysExpr, n_left: usize, n_right: usize) -> PhysExpr {
             op: *op,
             l: Box::new(swap_sides_expr(l, n_left, n_right)),
             r: Box::new(swap_sides_expr(r, n_left, n_right)),
+            ty: ty.clone(),
+        },
+        // 跨类型键归一会把键包成 `CAST(列 AS …)` —— 里面的列同样活在合并 schema
+        // 里，必须跟着换段（漏了 = idx 不换段 ⇒ 越界/错列，2026-10-17 实测）。
+        PhysExpr::Cast { e, ty } => PhysExpr::Cast {
+            e: Box::new(swap_sides_expr(e, n_left, n_right)),
             ty: ty.clone(),
         },
         other => other.clone(),
@@ -5060,7 +5113,38 @@ fn as_equi_key(
             _ => None,
         }
     };
-    match (side(&lb), side(&rb)) {
+    // ⚠️ **键两侧必须先做类型归一**：`t5 INNER JOIN t8 ON t5.SETTLE_TYPE = t8.JS_OBJECT`
+    //    （数值列 = 字符串列，语料 L7-02_01）—— 此前各绑各的、类型原样进哈希，
+    //    编码不同 ⇒ **0 匹配、无报错**（Spark 8136 行，我们 0 行；静默错值）。
+    //    走与比较路径**同一套**提升（temporal/字符串字面量/字符串表达式），
+    //    再归到公共比较类型；归一不了 ⇒ 返回 None 落到残留，由 `bind_expr`
+    //    给出确切的错（不是静默）。
+    //
+    // ⚠️ **先判侧、后 cast**：cast 会把裸列包成 `Cast{Column}`，
+    //    `side()` 只认裸列 —— 顺序反了 LEFT/RIGHT 会掉进"非等值"分支被拒。
+    let (s_l, s_r) = (side(&lb), side(&rb));
+    let (lb, rb) = promote_temporal_lit(lb, rb).ok()?;
+    let (lb, rb) = promote_string_lit(lb, rb);
+    let (lb, rb) = {
+        let lt = lb.data_type();
+        let rt = rb.data_type();
+        if lt == rt {
+            (lb, rb)
+        } else {
+            let common = cmp_common_type(&lt, &rt).ok()?;
+            let cast = |x: PhysExpr, from: &LogicalType| -> Option<PhysExpr> {
+                if *from == common {
+                    Some(x)
+                } else if is_lit(&x) {
+                    cast_lit_expr(x, &common).ok()
+                } else {
+                    Some(x.cast_to(common.clone()))
+                }
+            };
+            (cast(lb, &lt)?, cast(rb, &rt)?)
+        }
+    };
+    match (s_l, s_r) {
         (Some(true), Some(false)) => Some((lb, rb)),
         (Some(false), Some(true)) => Some((rb, lb)),
         _ => None,
@@ -6510,6 +6594,25 @@ fn bind_binary_arith(op: ArithOp, l: PhysExpr, r: PhysExpr) -> Result<PhysExpr> 
         }
     }
     if !lt.is_numeric() || !rt.is_numeric() {
+        // ── **字符串参与算术**（Spark 语义，3.5.2 实测）：字符串被转成 **double** 再算
+        //    —— `decimal_col * CAST(numeric_col AS STRING)` 照样算出数来。
+        //    L11-01 那批 SQL 就是这个形状：`COALESCE(fee,0.0)*CAST(energy AS STRING)/…`。
+        //    两侧一起转 double（结果也是 double，随后由外层 CAST 归位）。
+        //    ⚠️ 字符串×非数值（日期/布尔）不在此列，照旧往下报错。
+        //    ⚠️ 字符串列里装着非数字（'abc'）时，eval 的 cast 会**显式报错** ——
+        //    与比较路径的字符串**字面量**（`promote_string_lit` 转不动给 NULL）不同：
+        //    那边绑定期就见得到值，NULL 是 Spark 的真答案；这边值在数据里，
+        //    宁可炸也不猜。
+        if (lt.is_string() && (rt.is_numeric() || rt.is_string()))
+            || (rt.is_string() && lt.is_numeric())
+        {
+            return Ok(PhysExpr::Arith {
+                op,
+                l: Box::new(l.cast_to(Lt::Float64)),
+                r: Box::new(r.cast_to(Lt::Float64)),
+                ty: Lt::Float64,
+            });
+        }
         return Err(QsdbError::type_err(format!(
             "arithmetic on {} and {} not supported",
             lt, rt
@@ -6786,6 +6889,7 @@ fn promote_string_lit(lb: PhysExpr, rb: PhysExpr) -> (PhysExpr, PhysExpr) {
         }
     };
     match (&lb, &rb) {
+        // —— 字符串**字面量**侧：绑定期就转（转不动给 NULL，Spark 非 ANSI 语义）——
         (a, PhysExpr::Lit(Literal::Utf8(s))) if numeric(&a.data_type()) => {
             let ty = a.data_type();
             (lb, coerce(s, &ty))
@@ -6794,6 +6898,20 @@ fn promote_string_lit(lb: PhysExpr, rb: PhysExpr) -> (PhysExpr, PhysExpr) {
             let ty = b.data_type();
             (coerce(s, &ty), rb)
         }
+        // —— 字符串**表达式**侧（列/CAST 结果，L8-02_02 的
+        //     `CAST(VALUE AS STRING) = 1`）：运行期 cast。**两侧一起转 double** ——
+        //     Spark 对 string-vs-double 就是这么做的；string-vs-int 它走精确
+        //     bigint，这里 double 在 |v| < 2^53 时与其逐值一致（结算数值都在
+        //     此范围内），换来 cast 内核统一走 arrow，不另造"字符串经 decimal
+        //     再截断"的一套。转不动的值（'abc'）在 cast 处**显式报错**，不猜。
+        (a, b) if a.data_type().is_string() && numeric(&b.data_type()) => (
+            a.clone().cast_to(LogicalType::Float64),
+            b.clone().cast_to(LogicalType::Float64),
+        ),
+        (a, b) if b.data_type().is_string() && numeric(&a.data_type()) => (
+            a.clone().cast_to(LogicalType::Float64),
+            b.clone().cast_to(LogicalType::Float64),
+        ),
         _ => (lb, rb),
     }
 }
