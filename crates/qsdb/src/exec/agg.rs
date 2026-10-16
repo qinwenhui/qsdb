@@ -1566,6 +1566,23 @@ impl GroupTable {
         // 原始键是**绕过索引**直接进 `key_arena` 的 ⇒ 内联槽会过期
         // （同一个键可能已有槽、也可能没有）。清掉即可：下次 `ingest` 会按
         // arena 的规范编码重建（见 `rebuild_int_slots`）。
+        //
+        // ⚠️ 但**清槽之前**得先确认 `by_hash` 认得全部已有的组 —— 否则上面那句
+        // "清掉即可"是**假的**：`int_slots` 这条路**从不写 `by_hash`**
+        // （新建组只走 `push_group`），而下面那次查找用的正是它 ⇒ 一个**已经存在**
+        // 的键会被**再建一次组**（静默多数）。
+        //
+        // 判据取"有组但 `by_hash` 空"：通用路（`group_id`）新建组必 `bucket_push`，
+        // 所以这只可能是"整表由内联槽喂出来的"。今天所有调用点灌的都是**空白表**
+        // （溢出重分区，见 `DistinctCountExec::drain_partitions`）⇒ 这是给"以后有人
+        // 在非空表上用它"留的守卫，代价在空表上是一次 no-op。
+        // 回归：`exec::agg::tests::insert_raw_key_does_not_duplicate_existing_groups`。
+        if !self.is_empty() && self.by_hash.is_empty() {
+            for gid in 0..self.len() {
+                let h = fxhash_bytes(self.key_of(gid));
+                self.bucket_push(h, gid as u32);
+            }
+        }
         self.int_slots.clear();
         self.count_only_null_gid = None;
         let h = fxhash_bytes(key);
@@ -2399,6 +2416,40 @@ mod tests {
         let mut c = GroupTable::default();
         c.merge(b, 0);
         assert_eq!(c.payload_bytes, c.payload_bytes_full(), "整体接管后");
+    }
+
+    /// ★ `insert_raw_key` **不许把已有的键再建一次组**。
+    ///
+    /// 靶子：内联槽这条路（`int_slots`）**从不写 `by_hash`**，而 `insert_raw_key`
+    /// 的查找用的正是 `by_hash` ⇒ 少了上面那个守卫就会重复建组（**静默多数**）。
+    /// 今天所有调用点灌的都是空白表（溢出重分区），所以它是**防御性**的 ——
+    /// 这条测试让 `insert_raw_key` 文档里那句"清掉即可"从"目前碰巧成立"变成真的。
+    #[test]
+    fn insert_raw_key_does_not_duplicate_existing_groups() {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("k", arrow::datatypes::DataType::Int64, true),
+        ]));
+        let arr = Int64Array::from((0..100i64).collect::<Vec<_>>());
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)]).unwrap();
+        let g = vec![PhysExpr::Column {
+            idx: 0,
+            name: "k".into(),
+            ty: LogicalType::Int64,
+        }];
+        let mut t = GroupTable::new_count_only();
+        t.ingest(&g, &[], &batch).unwrap();
+        assert_eq!(t.len(), 100);
+        assert!(!t.int_slots.is_empty(), "单 Int64 列应走内联槽");
+        assert_eq!(t.by_hash.len(), 0, "内联槽这条路不写 by_hash");
+        for gid in 0..t.len() {
+            let kb = t.key_of(gid).to_vec();
+            assert_eq!(
+                t.insert_raw_key(&kb) as usize,
+                gid,
+                "同一个键必须回到同一个 gid"
+            );
+        }
+        assert_eq!(t.len(), 100, "raw 键不该建出新组");
     }
 
     #[test]

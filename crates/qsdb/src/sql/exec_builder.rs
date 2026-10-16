@@ -1705,16 +1705,38 @@ fn build_aggregate(
             // 要不到就走原来的单线程路径 —— 预算紧的查询行为与今天完全一致，
             // **不引入新的失败模式**。
             let node = build_inner(db, input, scan_proj.clone(), ctx)?;
-            // ⚠️ **单 Int64 键不走分区**：那条路单线程下已有一条专用快路
-            // （`GroupTable::int_slots`，键存在槽里 ⇒ 命中不碰 arena，实测 6–10×），
-            // 而分区路径只能走 `insert_raw_key`（通用编码）⇒ 反而慢。
-            // 实测教训（2026-10-15）：没这个闸门时 `simple_distinct_int`
-            // 从 0.132s 退到 **0.444s**（3.4×）。
+            // ⚠️ **单定长键（整数 / 日期）不走分区**。
+            //
+            // 两条独立的依据，都实测过：
+            // 1. **Int64** 单线程下已有一条专用快路（`GroupTable::int_slots`，
+            //    键存在槽里 ⇒ 命中不碰 arena，实测 6–10×），而分区路径只能走
+            //    `insert_raw_key`（通用编码）⇒ 反而慢。2026-10-15 实测：没这道闸门时
+            //    `simple_distinct_int` 从 0.132s 退到 **0.444s**（3.4×）。
+            // 2. **整数 / 日期**这类定长键**整体**不该分区（2026-10-16 补的）
+            //    —— `.14` 真表 5 轮中位：`tpoint`(INT32) 49→**97**ms、
+            //    `pdate`(DATE32，15 组) 44→**92**ms、`month`(DATE32，3 组) 43→**92**ms
+            //    ⇒ 分区**一律亏 ~2×**。基准表上单线程也一路赢到 **250 万组**
+            //    （`docs/去重计数性能设计.md` §4.1）。
+            //    原因就是分区路径的**相 1 是顺序的、且它自己就是一次完整的逐行编码+哈希**
+            //    （≈ 单线程路径的全部成本），相 2 只是再做一遍 ⇒ 只有"相 2 的插入成本"
+            //    远大于"相 1 的一次顺序遍"时才划算，而**定长键的插入本来就便宜**。
+            //
+            // ⚠️ **变长键（VARCHAR）不在此列**：它在高基数下分区确实赢 2–3×
+            //    （同上 §4.1），判据要按基数走 —— **还没做**（设计稿 §6.1 的 W1b）。
+            // ⚠️ 这里只放**实测过**的类型：浮点 / 小数 / 时间戳**没有数据**，
+            //    保持原样继续分区（宁可少改一列）。
             let sc = node.schema();
             let fs = sc.fields();
-            let single_int_key =
-                fs.len() == 1 && matches!(fs[0].data_type(), arrow::datatypes::DataType::Int64);
-            if !single_int_key {
+            let fixed_width_key = fs.len() == 1
+                && matches!(
+                    fs[0].data_type(),
+                    arrow::datatypes::DataType::Int8
+                        | arrow::datatypes::DataType::Int16
+                        | arrow::datatypes::DataType::Int32
+                        | arrow::datatypes::DataType::Int64
+                        | arrow::datatypes::DataType::Date32
+                );
+            if !fixed_width_key {
                 if let Some(rows) = distinct_row_upper_bound(db, input) {
                     let nparts = distinct_parts();
                     let reserve = rows.saturating_mul(DISTINCT_SHUFFLE_BYTES_PER_ROW);
