@@ -15,6 +15,30 @@
 
 ---
 
+## 〇、命名空间：**没有** database / schema —— 一个实例 = 一个库
+
+**实测**（2026-10-16，`qsdb query` + `qsdb shell`）：
+
+| 写法 | 结果 |
+|---|---|
+| `SELECT … FROM t` | ✅（表名一律**裸名**） |
+| `SHOW TABLES`（shell 里还有 `.tables` / `.schema <t>`） | ✅ |
+| `SELECT … FROM default.t` / `FROM mydb.t` | ✋ `qualified names (db.table) not supported yet; single database in use` |
+| `CREATE TABLE s1.x (…)` | ✋ 同上 |
+| `SHOW DATABASES` / `SHOW SCHEMAS` | ✋ `statement \`ShowDatabases\` not supported in this version (SQL-1)` |
+| `information_schema.*` | ✋ 同上（限定名一律拒） |
+
+⇒ **一个 QSDB 实例 = 一个库目录 = 一个命名空间**。要"分库"就开两个目录（两个实例）。
+磁盘上表落在 `<库根>/default/<表名>/` —— 那个 `default` 是**内部目录名**，
+不是可寻址的 schema（`default.t` 会被拒；早期报错里出现过 `not found: table default.t`，
+那是在念内部名字，别当成可用的限定名）。
+
+> 为什么记这一条：此前**没有任何对外文档写过它** —— 用户是撞到报错才知道的
+> （与"文档说 ✅、实测不 ✅"是同一类问题，只是方向反过来：**能用的没写、不能用的没拦**）。
+> 限定名这条是**显式拒**（不是静默忽略）✅ 符合本文的声明；缺的只是**声明本身**。
+
+---
+
 ## 一、`SELECT` 子句
 
 | 语法 | 状态 | 说明 |
