@@ -557,6 +557,29 @@ impl HashJoinExec {
 
     /// 只物化这些输出位置（不在表里的填 NULL）。见 `LogicalPlan::Join::needed`。
     pub fn with_needed(mut self, needed: Option<Arc<Vec<u32>>>) -> Self {
+        // ⚠️ **被掩码的列会按 NULL 产出 ⇒ 那几列在 schema 里必须标成可空**，
+        // 否则组装输出批时 `try_new` 当场拒（`Column 'k' is declared as non-nullable
+        // but contains null values`）。与 `Scan::restrict_read` 是同一处病、同一个修法。
+        // 我们自己的测试表列全可空 ⇒ 一直没暴露；2026-10-16 拿真表（MySQL 迁来的列
+        // 全是 `NOT NULL`）跑多表 SQL 一测就报出来。
+        //
+        // 标可空是**如实描述**（这些位置确实会出现 NULL），不是放宽约束。
+        if let Some(n) = &needed {
+            let fields: Vec<arrow::datatypes::FieldRef> = self
+                .schema
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    if n.contains(&(i as u32)) {
+                        Arc::clone(f)
+                    } else {
+                        Arc::new(f.as_ref().clone().with_nullable(true))
+                    }
+                })
+                .collect();
+            self.schema = Arc::new(arrow::datatypes::Schema::new(fields));
+        }
         self.needed = needed;
         self
     }

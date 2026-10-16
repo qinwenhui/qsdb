@@ -658,8 +658,21 @@ fn metadata_shortcut_count(
         return Ok(None);
     }
     let agg = &aggs[0];
-    if agg.func != crate::expr::AggFunc::Count || agg.arg.is_some() {
+    if agg.func != crate::expr::AggFunc::Count {
         return Ok(None);
+    }
+    // `count(<非 NULL 常量>)` 与 `count(*)` **逐行等价**（每行都非空 ⇒ 每行计一次）
+    // ⇒ 同样可以走 footer 行数。`count(1)` 是极常见写法，此前它带着一个常量参数
+    // 就掉进全表扫描（实测 2.4M 行：`count(*)` 0.07ms vs `count(1)` **35.7ms**，
+    // 差 ~500×；DuckDB 两个都是 1ms）。
+    //
+    // ⚠️ **`count(NULL)` 绝不能走这条** —— 它是 **0**（每行都空），不是行数。
+    // 所以判据是"常量**且非 NULL**"，不是"常量"。新加别的常量形态时，
+    // 先问一句"这个常量会不会是 NULL"。
+    match &agg.arg {
+        None => {}
+        Some(crate::expr::PhysExpr::Lit(l)) if !matches!(l, crate::Literal::Null) => {}
+        Some(_) => return Ok(None),
     }
     // ⚠️ **写了 `FILTER` 就不能走元数据短路**（2026-10-15）：这条短路直接回
     // parquet footer 的行数，压根不看行 —— `count(*) FILTER (WHERE v>15)` 会被

@@ -1765,12 +1765,34 @@ impl Scan {
             .cloned()
             .collect();
         let proj_src = compute_proj_src(&self.plan.def, &self.plan.projection, &read);
+        // ⚠️ **被"不解码"的列会按 NULL 产出 ⇒ schema 里那几列必须标成可空**，
+        // 否则 `RecordBatch::try_new` 当场拒（`Column 'x' is declared as non-nullable
+        // but contains null values`）。此前这里是照抄原 schema，于是**只在非空列上炸**：
+        // 我们自己的测试表列全可空（`CREATE TABLE` 默认），所以从没暴露；
+        // 2026-10-16 拿 MySQL 迁来的真表（列全是 `NOT NULL`）一测就报出来。
+        //
+        // 标可空是**如实描述**（这些位置确实会出现 NULL），不是放宽约束：
+        // 上层只用类型与列序，不看 nullability；真读那些列的场景根本不会走到这条。
+        let fields: Vec<arrow::datatypes::FieldRef> = self
+            .plan
+            .output_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                if matches!(proj_src.get(i), Some(ProjSrc::Null)) {
+                    Arc::new(f.as_ref().clone().with_nullable(true))
+                } else {
+                    Arc::clone(f)
+                }
+            })
+            .collect();
         let plan = ScanPlan {
             def: Arc::clone(&self.plan.def),
             projection: self.plan.projection.clone(),
             read_columns: read,
             predicate: self.plan.predicate.clone(),
-            output_schema: Arc::clone(&self.plan.output_schema),
+            output_schema: Arc::new(arrow::datatypes::Schema::new(fields)),
             proj_src,
         };
         Self {

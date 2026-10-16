@@ -178,7 +178,13 @@ pub fn prune_decision(plan: &LogicalPlan) -> Option<(Vec<String>, Vec<String>)> 
     let all: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
     let mut proj: Vec<String> = all
         .iter()
-        .filter(|n| used.iter().any(|u| u.eq_ignore_ascii_case(n.as_str())))
+        .filter(|n| {
+            // ⚠️ `used` 里可能是**限定名**（`b.k`）、`all` 里是**裸名** ⇒ 比之前先剥
+            // （同 `bare_col_name`；不剥的话带表限定的键列会被当成"没人读"**裁掉**，
+            // 而它在 JOIN 里恰恰是必须留下的那一列）。
+            used.iter()
+                .any(|u| bare_col_name(u).eq_ignore_ascii_case(n))
+        })
         .cloned()
         .collect();
     if proj.is_empty() {
@@ -739,12 +745,33 @@ fn rewrite_plan(
 fn rewrite_expr(e: &PhysExpr, mapping: &[Option<usize>], all: &[String]) -> PhysExpr {
     map_expr_idx(e, &|idx, name| {
         // 非表列（聚合输出列等）：idx 语义属上层算子，保持不变
-        if all.iter().any(|a| a.eq_ignore_ascii_case(name)) {
+        if all
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(bare_col_name(name)))
+        {
             mapping[idx].unwrap_or(idx)
         } else {
             idx
         }
     })
+}
+
+/// 列名的**裸名**（去掉表限定：`b.k` ⇒ `k`）。
+///
+/// ⚠️ **按列名判"这一列是不是表列"之前必须先剥限定符** —— JOIN 右表的列在计划里
+/// 是**限定名**（`translate` 绑 `CompoundIdentifier` 时把 `b.k` 原样存进 `Column.name`），
+/// 而 `def.columns` / `mapping` 用的都是**裸名**。不剥就永远判"不是表列"，于是
+/// `unwrap_or(idx)` **把旧索引原样留下**，静默指到隔壁列。
+///
+/// 实测（2026-10-16，两张同构真表 —— 电力日清的"日前 vs 实际"）：
+/// `SELECT a.k, b.v FROM a JOIN b ON a.k=b.k` **静默回 0 行**、
+/// `SELECT a.k, b.k FROM …` 直接 `index out of bounds: len 1 index 1`（panic）。
+///
+/// 剥是安全的：本仓列名**不许带 `.`**（见 `ident_ok`），所以"带点"必然是限定引用。
+/// （`build_aggregate` 的键投影里早就在剥了 —— 见那句 `n.rsplit('.').next()` ——
+/// 只是 `rewrite_expr` 这条路上漏了。))
+fn bare_col_name(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
 }
 
 /// "窗口**之上**的表达式"的 idx 改写：它们活在**窗口输出空间**里
