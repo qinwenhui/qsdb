@@ -1,0 +1,15 @@
+# 生成物与语料副本：不进版本库（语料本体是用户的 untracked 文档，由 extract_daily.py 现抽）
+__pycache__/
+*.tsv
+*.tgz
+*.log
+daily/
+daily_plain/
+report.txt
+cte_graph.txt
+err_hist.txt
+mem.txt
+timing.txt
+groups.txt
+dag.json
+tables.json

@@ -8,6 +8,7 @@
 单值 ⇒ 退化成 `Eq` ⇒ 能下推到分区裁剪），而热表有 15~119 个日期
 ⇒ 扫描量理论上降到 1/15~1/119。
 """
+import os
 import subprocess
 import sys
 
@@ -25,12 +26,19 @@ def run(sql):
 
 
 def tables():
-    _, out = run("SHOW TABLES")
+    """表名从**库目录**取，**不用 `SHOW TABLES`**。
+
+    ⚠️ CLI 的 `SHOW TABLES` 显示**会截断长表名**（`t_cal_day_ahead_unit_…`）——
+    照着截断后的名字去 `DESCRIBE` 必然失败，于是表被**静默跳过**
+    （2026-10-16 实测：39 张被这么漏掉，还以为是"没有 pdate 列"）。
+    文件系统才是真值。
+    """
+    d = os.path.join(DB, "default")
     ts = []
-    for line in out.splitlines():
-        s = line.strip()
-        if s.startswith("t_") and not s.endswith("_p"):
-            ts.append(s.split()[0])
+    for name in sorted(os.listdir(d)):
+        if name.startswith("t_") and not name.endswith("_p"):
+            if os.path.isdir(os.path.join(d, name)):
+                ts.append(name)
     return ts
 
 

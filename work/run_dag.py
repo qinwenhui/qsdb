@@ -109,10 +109,13 @@ def main():
     # 分区副本表名（`_p` 结尾）—— 只在开了开关时用
     ptabs = []
     if args.pdate_partitioned:
-        import re as _re
-        _ok, _ms, _rss, _out = run_qsdb("SHOW TABLES", "/tmp/qsdbrun_showtables.txt")
-        ptabs = [l.strip().split()[0] for l in _out.splitlines()
-                 if l.strip().startswith("t_") and l.strip().endswith("_p")]
+        # ⚠️ **从库目录取表名，不用 `SHOW TABLES`**：CLI 的输出列**会截断长名字**
+        # （加 `…`），照着数只能数到短名的那些 —— 实测 68 张只数出 23 张，
+        # 于是 A/B 只改写了三分之一，数字看着"没什么变化"纯属假象。
+        _d = os.path.join(DB, "default")
+        ptabs = [n for n in sorted(os.listdir(_d))
+                 if n.startswith("t_") and n.endswith("_p")
+                 and os.path.isdir(os.path.join(_d, n))]
         # 长的先替，避免前缀重叠（`\b` 已经挡住 `unit` vs `unit_report`，双保险）
         ptabs.sort(key=len, reverse=True)
         print("分区副本 %d 张" % len(ptabs), flush=True)
