@@ -569,6 +569,38 @@ fn build() -> HashMap<&'static str, Arc<ScalarFnDef>> {
         }),
     );
 
+    // ── date_format(x, fmt) → STRING ──────────────────────────────
+    //
+    // ⚠️ **按 Spark 的语义**（用户那批 SQL 是 Spark SQL）：格式串是 Java
+    // `SimpleDateFormat` 的风格（`yyyy-MM-dd`）。**MySQL 的同名函数用
+    // `%Y-%m-%d`** —— 同名不同语法。我们把 `%` 开头的模式**显式拒**
+    // （`parse_java_date_fmt`），**绝不**把 `%Y` 当普通字符原样输出
+    // —— 那正是本仓一路在消灭的静默错值。
+    m.insert(
+        "date_format",
+        Arc::new(ScalarFnDef {
+            ret_ty: Arc::new(|args| match args {
+                [
+                    LogicalType::Date | LogicalType::Timestamp { .. },
+                    LogicalType::Varchar { .. } | LogicalType::Int64,
+                ] => Ok(LogicalType::Varchar { max_chars: None }),
+                _ => Err(QsdbError::type_err(
+                    "date_format(DATE/TIMESTAMP, '<java pattern>') expected",
+                )),
+            }),
+            eval: Arc::new(|args| {
+                let f = string_arg(args, 1, "date_format")?;
+                if f.len() != 1 || f.is_null(0) {
+                    return Err(QsdbError::invalid(
+                        "date_format: 格式串必须是**单个常量字符串**",
+                    ));
+                }
+                let parts = parse_java_date_fmt(f.value(0))?;
+                date_format_eval(&args[0], &parts)
+            }),
+        }),
+    );
+
     // ── `uuid()`（别名 `sys_guid()`）───────────────────────────────
     // 这里只登记**类型**（binder 要查得到才能过）；真正的求值在 `expr::eval` 里
     // **特判**——因为要**逐行**给不同的值，而注册表的约定是"1 个元素 ⇒ 常量广播"。
@@ -698,6 +730,164 @@ fn write_uuid(buf: &mut [u8], hi: u64, lo: u64) {
         buf[j] = HEX[*v as usize];
         j += 1;
     }
+}
+
+/// `date_format` 的格式片段（解析一次、逐行套用）。
+enum FmtPart {
+    Lit(u8),
+    Field(FmtField, u8),
+}
+
+#[derive(Clone, Copy)]
+enum FmtField {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+    Millis,
+}
+
+/// 解析 Java `SimpleDateFormat` 风格的格式串（Spark 的 `date_format` 用它）。
+///
+/// 支持：`y`(1/2/4) `M`(1/2) `d`(1/2) `H`(1/2) `m`(1/2) `s`(1/2) `S`(3)
+/// 与 `'…'` 引起来的字面量；**其余字母逐个显式拒**（不静默当字面量）。
+fn parse_java_date_fmt(fmt: &str) -> Result<Vec<FmtPart>> {
+    let b = fmt.as_bytes();
+    let mut out: Vec<FmtPart> = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'%' {
+            return Err(QsdbError::unsupported(
+                "date_format: 这是 **Spark/Java 风格**的格式串（`yyyy-MM-dd`）—— \
+                 `%Y-%m-%d` 是 **MySQL** 的语法，本仓按 Spark 实现；请改成 Java 模式",
+            ));
+        }
+        if c == b'\'' {
+            // `'…'` 里的原样输出
+            i += 1;
+            while i < b.len() && b[i] != b'\'' {
+                out.push(FmtPart::Lit(b[i]));
+                i += 1;
+            }
+            if i >= b.len() {
+                return Err(QsdbError::invalid("date_format: 格式串里的 `'` 没有闭合"));
+            }
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_alphabetic() {
+            let mut n = 0usize;
+            while i < b.len() && b[i] == c {
+                n += 1;
+                i += 1;
+            }
+            let field = match (c, n) {
+                (b'y', 1 | 4) => (FmtField::Year, n as u8),
+                (b'y', 2) => (FmtField::Year, 2),
+                (b'M', 1 | 2) => (FmtField::Month, n as u8),
+                (b'd', 1 | 2) => (FmtField::Day, n as u8),
+                (b'H', 1 | 2) => (FmtField::Hour, n as u8),
+                (b'm', 1 | 2) => (FmtField::Minute, n as u8),
+                (b's', 1 | 2) => (FmtField::Second, n as u8),
+                (b'S', 3) => (FmtField::Millis, 3),
+                _ => {
+                    let pat: String = std::iter::repeat_n(c as char, n).collect();
+                    return Err(QsdbError::unsupported(format!(
+                        "date_format: 格式符 `{pat}` 未实现（支持 y/yy/yyyy、M/MM、d/dd、                         H/HH、m/mm、s/ss、SSS，以及 `'…'` 字面量）"
+                    )));
+                }
+            };
+            out.push(FmtPart::Field(field.0, field.1));
+            continue;
+        }
+        out.push(FmtPart::Lit(c));
+        i += 1;
+    }
+    Ok(out)
+}
+
+/// 逐行套用格式片段。`Date32` 与 `Timestamp(ns)` 统一成 `(epoch 天, 日内纳秒)`。
+fn date_format_eval(col: &ArrayRef, parts: &[FmtPart]) -> Result<ArrayRef> {
+    use arrow::datatypes::TimeUnit;
+    let n = col.len();
+    let mut out = arrow::array::StringBuilder::new();
+    let mut buf: Vec<u8> = Vec::with_capacity(32);
+    let render = |days: i32, ns_in_day: i64, buf: &mut Vec<u8>| {
+        let (y, mo, d) = crate::types::temporal::civil_from_days(days);
+        buf.clear();
+        for p in parts {
+            match p {
+                FmtPart::Lit(c) => buf.push(*c),
+                FmtPart::Field(f, w) => {
+                    let v: i64 = match f {
+                        FmtField::Year => {
+                            if *w == 2 {
+                                i64::from(y).rem_euclid(100)
+                            } else {
+                                i64::from(y)
+                            }
+                        }
+                        FmtField::Month => i64::from(mo),
+                        FmtField::Day => i64::from(d),
+                        FmtField::Hour => ns_in_day / NANOS_PER_HOUR,
+                        FmtField::Minute => (ns_in_day % NANOS_PER_HOUR) / NANOS_PER_MIN,
+                        FmtField::Second => (ns_in_day % NANOS_PER_MIN) / NANOS_PER_SEC,
+                        FmtField::Millis => (ns_in_day % NANOS_PER_SEC) / 1_000_000,
+                    };
+                    if *w == 1 {
+                        buf.extend_from_slice(v.to_string().as_bytes());
+                    } else {
+                        let s = format!("{:0w$}", v, w = *w as usize);
+                        buf.extend_from_slice(s.as_bytes());
+                    }
+                }
+            }
+        }
+    };
+    match col.data_type() {
+        arrow::datatypes::DataType::Date32 => {
+            let a = col
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| QsdbError::type_err("date_format: bad date arg"))?;
+            for i in 0..n {
+                if a.is_null(i) {
+                    out.append_null();
+                    continue;
+                }
+                render(a.value(i), 0, &mut buf);
+                out.append_value(std::str::from_utf8(&buf).unwrap_or_default());
+            }
+        }
+        arrow::datatypes::DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let a = col
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .ok_or_else(|| QsdbError::type_err("date_format: bad timestamp arg"))?;
+            for i in 0..n {
+                if a.is_null(i) {
+                    out.append_null();
+                    continue;
+                }
+                let v = a.value(i);
+                render(
+                    v.div_euclid(NANOS_PER_DAY) as i32,
+                    v.rem_euclid(NANOS_PER_DAY),
+                    &mut buf,
+                );
+                out.append_value(std::str::from_utf8(&buf).unwrap_or_default());
+            }
+        }
+        other => {
+            return Err(QsdbError::type_err(format!(
+                "date_format: {other} 不支持（DATE / TIMESTAMP）"
+            )));
+        }
+    }
+    Ok(Arc::new(out.finish()))
 }
 
 /// epoch 秒（current_date 用）。
