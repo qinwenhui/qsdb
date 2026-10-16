@@ -483,3 +483,44 @@ fn f18_truncate_unpartitioned() {
     db.sql("TRUNCATE TABLE nop").unwrap();
     assert!(q(&db, "SELECT count(*) FROM nop") == vec!["0"]);
 }
+
+/// ★ `TRIM(x)` 此前**在 SQL 里根本够不到**：sqlparser 把 `trim` 解析成专用节点
+/// （`Expr::Trim`），而绑定器没有那条臂 ⇒ 掉进兜底报一句泛化的 unsupported。
+/// 注册表里有它、`scalar.rs` 的模块头也写着它是内置的 —— **"文档说 ✅、实测不 ✅"**。
+///
+/// 这条同时钉住**边界**：带修饰的形态必须**显式拒**，不许落到"只去空白"
+/// 那条路上假装支持。
+#[test]
+fn trim_is_reachable_and_only_the_plain_form() {
+    let (db, root) = db("trim");
+    db.sql("CREATE TABLE tt (s VARCHAR)").unwrap();
+    db.sql("INSERT INTO tt VALUES ('  QS  '), (''), (NULL)")
+        .unwrap();
+    // 无修饰形态：能用，且与无 FROM 常量写法一致
+    assert_eq!(
+        q(&db, "SELECT trim(s) FROM tt"),
+        vec!["", "NULL", "QS"],
+        "`q()` 会对结果排序：空串 < NULL < QS"
+    );
+    assert_eq!(q(&db, "SELECT trim('  x  ')"), vec!["x"]);
+    // 去掉两端**全部** ASCII 空白（不只是空格）
+    assert_eq!(q(&db, "SELECT trim('\t\n x \r ')"), vec!["x"]);
+    // 带修饰的形态：显式拒，文案要指出是**没实现**，不是"你写错了"
+    for sql in [
+        // ⚠️ 只用**真能到达绑定器**的写法：`trim(LEADING FROM '  x  ')` 这种
+        // 死在 sqlparser 自己的文法上（还没到我们这儿），拿它测我们的文案是测不到的
+        // —— 实测过的四种见下。
+        "SELECT trim(LEADING '  x  ')",
+        "SELECT trim(BOTH 'x' FROM 'xax')",
+        "SELECT trim('x' FROM 'xax')",
+        "SELECT trim('xax', 'x')",
+    ] {
+        let e = db.sql_collect(sql).unwrap_err().to_string();
+        assert!(
+            e.contains("only TRIM(<string>) is supported"),
+            "`{sql}` 该给出「只支持无修饰形态」的明确报错，实得：{e}"
+        );
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}

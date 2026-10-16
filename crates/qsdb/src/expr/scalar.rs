@@ -84,17 +84,51 @@ fn build() -> HashMap<&'static str, Arc<ScalarFnDef>> {
                 }),
                 eval: Arc::new(move |args| {
                     let s = string_arg(args, 0, mode)?;
-                    let out: GenericStringArray<i32> = s
-                        .iter()
-                        .map(|v| {
-                            v.map(|x| match mode {
+                    // ⚠️ **ASCII 快路**：`to_uppercase()` / `to_lowercase()` /
+                    // `trim().to_string()` **每个都是一次堆分配**。实测（`.14`，
+                    // 500 万行）`upper` 比同列的 `count(gs)` 贵 **+20ns/行**、
+                    // `lower` **+14ns/行**。
+                    //
+                    // 在 **ASCII 域**上这三个与标准库**逐字等价**（判据见
+                    // `ascii_trim_bounds`；ASCII 的大小写映射全是 1:1，没有
+                    // "一个字符展开成多个"的情形）⇒ 可以在一段**复用缓冲**上
+                    // 就地做，一次分配都不要。非 ASCII 才回退标准库那条。
+                    let mut out = arrow::array::StringBuilder::new();
+                    let mut buf: Vec<u8> = Vec::new();
+                    for i in 0..s.len() {
+                        if s.is_null(i) {
+                            out.append_null();
+                            continue;
+                        }
+                        let x = s.value(i);
+                        if x.is_ascii() {
+                            buf.clear();
+                            buf.extend_from_slice(x.as_bytes());
+                            let r: &str = match mode {
+                                "upper" => {
+                                    buf.make_ascii_uppercase();
+                                    std::str::from_utf8(&buf).unwrap_or_default()
+                                }
+                                "lower" => {
+                                    buf.make_ascii_lowercase();
+                                    std::str::from_utf8(&buf).unwrap_or_default()
+                                }
+                                _ => {
+                                    let (a, b) = ascii_trim_bounds(&buf);
+                                    std::str::from_utf8(&buf[a..b]).unwrap_or_default()
+                                }
+                            };
+                            out.append_value(r);
+                        } else {
+                            let owned = match mode {
                                 "upper" => x.to_uppercase(),
                                 "lower" => x.to_lowercase(),
                                 _ => x.trim().to_string(),
-                            })
-                        })
-                        .collect();
-                    Ok(Arc::new(out))
+                            };
+                            out.append_value(&owned);
+                        }
+                    }
+                    Ok(Arc::new(out.finish()))
                 }),
             }),
         );
@@ -120,6 +154,12 @@ fn build() -> HashMap<&'static str, Arc<ScalarFnDef>> {
                 } else {
                     None
                 };
+                // ⚠️ **一行一次分配都不要**。原实现每行两发：`Vec<char>`（为了按
+                // **字符**数取下标）+ `collect::<String>()`（为了喂 `append_value`）。
+                // 实测（`.14`，500 万行）`substr` 比同列的 `count(gs)` 贵 **+43ns/行**，
+                // 而剖针里 **≈56% 在分配器**（`_int_malloc`/`realloc`/`_free` +
+                // `Vec::from_iter<Chars>`）。改成**算字节区间、直接切片**之后
+                // 两发分配全消失 —— 切片本身就是合法 UTF-8（边界按整字符推进）。
                 let mut out = arrow::array::StringBuilder::new();
                 for i in 0..s.len() {
                     if s.is_null(i) || start.is_null(i) {
@@ -133,24 +173,10 @@ fn build() -> HashMap<&'static str, Arc<ScalarFnDef>> {
                         }
                     }
                     let sv = s.value(i);
-                    let chars: Vec<char> = sv.chars().collect();
                     let start0 = (start.value(i) - 1).max(0) as usize;
-                    if start0 >= chars.len() {
-                        out.append_value("");
-                        continue;
-                    }
-                    let take = match len_arr {
-                        None => chars.len() - start0,
-                        Some(l) => {
-                            let lv = l.value(i);
-                            if lv <= 0 {
-                                0
-                            } else {
-                                (lv as usize).min(chars.len() - start0)
-                            }
-                        }
-                    };
-                    out.append_value(chars[start0..start0 + take].iter().collect::<String>());
+                    let lv = len_arr.map(|l| l.value(i));
+                    let (b0, b1) = substr_byte_range(sv, start0, lv);
+                    out.append_value(&sv[b0..b1]);
                 }
                 Ok(Arc::new(out.finish()))
             }),
@@ -779,6 +805,79 @@ pub fn known_functions() -> Vec<&'static str> {
     v
 }
 
+/// `trim` 在 **ASCII 域**上的有效区间（去掉两端的空白）。
+///
+/// **为什么可以用它替掉标准库的 `str::trim()`**：`char::is_whitespace` 在 ASCII
+/// 上认的正好是 `u8::is_ascii_whitespace` 那一组（U+0009–U+000D + U+0020），
+/// 于是对**纯 ASCII** 输入两者逐字等价；非 ASCII 的输入走标准库那条（见调用点）。
+fn ascii_trim_bounds(b: &[u8]) -> (usize, usize) {
+    let mut a = 0usize;
+    while a < b.len() && b[a].is_ascii_whitespace() {
+        a += 1;
+    }
+    let mut e = b.len();
+    while e > a && b[e - 1].is_ascii_whitespace() {
+        e -= 1;
+    }
+    (a, e)
+}
+
+/// `substr(s, start0, len)` 结果的**字节区间**（`start0` 已转 0-based，按**字符**数计）。
+///
+/// **为什么算字节而不是收 `Vec<char>`**：语义确实是"按字符数取"，但**不需要**
+/// 把整串摊成 `Vec<char>` 才能做到 —— 字符边界只要扫一遍前导字节就能定出来。
+/// 原实现每行为此付两发堆分配（见 `substr` 的注释）。
+///
+/// - **ASCII 快路**：字符下标 == 字节下标，直接算，**一次扫描都不用**（`is_ascii`
+///   是 SIMD 友好的）。
+/// - 非 ASCII：按 UTF-8 前导字节推进。区间两端都落在**字符边界**上 ⇒
+///   调用方拿到的切片一定是合法 UTF-8。
+fn substr_byte_range(s: &str, start0: usize, len: Option<i64>) -> (usize, usize) {
+    let b = s.as_bytes();
+    let take = |avail: usize| -> usize {
+        match len {
+            None => avail,
+            Some(l) if l <= 0 => 0,
+            Some(l) => (l as usize).min(avail),
+        }
+    };
+    if s.is_ascii() {
+        if start0 >= b.len() {
+            return (b.len(), b.len());
+        }
+        return (start0, start0 + take(b.len() - start0));
+    }
+    let mut idx = 0usize; // 字节位置
+    let mut c = 0usize; // 已越过的字符数
+    while c < start0 && idx < b.len() {
+        idx += utf8_seq_len(b[idx]);
+        c += 1;
+    }
+    if idx >= b.len() {
+        return (b.len(), b.len());
+    }
+    let start_b = idx;
+    let n = take(usize::MAX);
+    let mut end_b = idx;
+    let mut k = 0usize;
+    while k < n && end_b < b.len() {
+        end_b += utf8_seq_len(b[end_b]);
+        k += 1;
+    }
+    (start_b, end_b)
+}
+
+/// 一个 UTF-8 序列从 `lead` 开始的字节数。非法/续字节按 1 走（不 panic、不越界）。
+fn utf8_seq_len(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1,
+    }
+}
+
 fn string_arg<'a>(
     args: &'a [ArrayRef],
     i: usize,
@@ -824,6 +923,147 @@ mod tests {
         let out = (lookup("length").unwrap().eval)(&[Arc::clone(&inp)]).unwrap();
         let a = out.as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(a.value(0), 5);
+    }
+
+    /// ★★ `substr` 现在**算字节区间**再切片，必须与**朴素实现**（摊成 `Vec<char>`
+    /// 再按字符切片 —— 也就是原实现的语义）**逐字相等**。
+    ///
+    /// ⚠️ **只测 ASCII 是测不到它的**：`is_ascii` 快路在那个域里把字符下标和字节
+    /// 下标**当同一件事**，字符边界那一支压根不执行。所以这里的用例**绝大多数是
+    /// 多字节**（`é` 是 2 字节、`世` 是 3、`🙂` 是 4），并且逐例断言两端都落在
+    /// `is_char_boundary` 上 —— 越界/切半个字符都会当场炸。
+    #[test]
+    fn substr_byte_range_matches_naive_impl() {
+        let cases = [
+            "hello world",
+            "",
+            "a",
+            "héllo",
+            "世界和平",
+            "aé世界b",
+            "🙂🙂🙂",
+            "naïve café",
+            "日本語テキスト",
+        ];
+        let mut n = 0;
+        for s in cases {
+            for start in [-3i64, 0, 1, 2, 3, 5, 99] {
+                for len in [
+                    None,
+                    Some(-1i64),
+                    Some(0),
+                    Some(1),
+                    Some(2),
+                    Some(4),
+                    Some(99),
+                ] {
+                    // 期望值 = **朴素实现**（原 `substr` 的做法）现算
+                    let chars: Vec<char> = s.chars().collect();
+                    let start0 = (start - 1).max(0) as usize;
+                    let want: String = if start0 >= chars.len() {
+                        String::new()
+                    } else {
+                        let take = match len {
+                            None => chars.len() - start0,
+                            Some(l) if l <= 0 => 0,
+                            Some(l) => (l as usize).min(chars.len() - start0),
+                        };
+                        chars[start0..start0 + take].iter().collect()
+                    };
+                    let (b0, b1) = substr_byte_range(s, start0, len);
+                    assert_eq!(&s[b0..b1], want, "s={s:?} start={start} len={len:?}");
+                    assert!(
+                        s.is_char_boundary(b0) && s.is_char_boundary(b1),
+                        "切在了半个字符上：s={s:?} start={start} len={len:?} → {b0}..{b1}"
+                    );
+                    n += 1;
+                }
+            }
+        }
+        assert_eq!(n, 9 * 7 * 7, "用例数不对说明有循环被改没了");
+    }
+
+    /// ★ `upper`/`lower`/`trim` 的 **ASCII 快路**（就地折返 + 复用缓冲）必须与
+    /// **标准库**（也就是非 ASCII 那条回退路）**逐字相等**。
+    ///
+    /// 用例里**必须混非 ASCII**：纯 ASCII 的输入压根走不到回退那条，
+    /// 两边就没有对照物了（"快路对不对"是在跟"标准库同不同"比）。
+    #[test]
+    fn case_and_trim_fast_path_matches_stdlib() {
+        let cases = [
+            "",
+            "a",
+            "Hello World",
+            "  QS  ",
+            "\t\nMiXeD\r ",
+            "abc123",
+            "   ",
+            "ÉÀÜ",
+            "世 界",
+            "ß",
+        ];
+        let inp = utf8(cases.to_vec());
+        for name in ["upper", "lower", "trim"] {
+            let out = (lookup(name).unwrap().eval)(&[Arc::clone(&inp)]).unwrap();
+            let a = out
+                .as_any()
+                .downcast_ref::<GenericStringArray<i32>>()
+                .unwrap();
+            for (i, c) in cases.iter().enumerate() {
+                let want = match name {
+                    "upper" => c.to_uppercase(),
+                    "lower" => c.to_lowercase(),
+                    _ => c.trim().to_string(),
+                };
+                assert_eq!(a.value(i), want, "{name}({c:?})");
+            }
+        }
+    }
+
+    /// 数组级：三参形态的 NULL 传播 + **按字符而不是按字节**取下标。
+    ///
+    /// ⚠️ 断 NULL 必须用 `is_null`，**不能用 `value() == ""`** —— 空槽上
+    /// `value()` 读回 `""`，两者会被混成一件（我第一次就把期望写错了）。
+    #[test]
+    fn substr_array_null_and_multibyte() {
+        let inp = utf8(vec!["hello", "世界和平", "aé", "", "x"]);
+        let start = Arc::new(Int64Array::from(vec![
+            Some(1i64),
+            Some(2),
+            None,
+            Some(1),
+            Some(1),
+        ]));
+        let len = Arc::new(Int64Array::from(vec![
+            Some(3i64),
+            Some(2),
+            Some(1),
+            None,
+            Some(0),
+        ]));
+        let out = (lookup("substr").unwrap().eval)(&[inp, start, len]).unwrap();
+        let a = out
+            .as_any()
+            .downcast_ref::<GenericStringArray<i32>>()
+            .unwrap();
+        assert_eq!(a.value(0), "hel");
+        assert_eq!(
+            a.value(1),
+            "界和",
+            "从第 2 个**字符**起（不是第 2 个字节 —— 第 2 字节是「界」的中间）"
+        );
+        assert!(a.is_null(2), "起点 NULL ⇒ 结果 NULL");
+        assert!(a.is_null(3), "长度 NULL ⇒ 结果 NULL");
+        assert_eq!(a.value(4), "", "长度 0 ⇒ 空串（不是 NULL）");
+
+        // 两参形态（没有长度参数 ⇒ 取到末尾）：非 ASCII 同样按字符数
+        let start = Arc::new(Int64Array::from(vec![3i64]));
+        let out = (lookup("substr").unwrap().eval)(&[utf8(vec!["世界和平"]), start]).unwrap();
+        let a = out
+            .as_any()
+            .downcast_ref::<GenericStringArray<i32>>()
+            .unwrap();
+        assert_eq!(a.value(0), "和平");
     }
 
     #[test]

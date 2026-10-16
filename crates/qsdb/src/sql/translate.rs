@@ -5036,6 +5036,37 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
                 ty,
             })
         }
+        // TRIM(x) → 标量函数 `trim`。**只认无修饰的那一种。**
+        //
+        // ⚠️ 此前**根本没有这条臂**：sqlparser 把 `trim` 解析成**专用节点**
+        // （`Expr::Trim`，不是 `Function`）⇒ `trim(x)` 掉进兜底、报一句泛化的
+        // unsupported。而 `expr::scalar` 的注册表里**有** `trim`、模块头也写着它是内置的
+        // ⇒ **"文档说 ✅、实测不 ✅"**（本仓第四次栽在同一个形态上；前三次见
+        // `SQL支持面.md` 的 `GROUP BY` 行、F29 两处）。
+        //
+        // ⚠️ 其余形态（`LEADING`/`TRAILING`、`TRIM(chars FROM x)`、`TRIM(x, chars)`）
+        // **显式拒**——绝不许落到"只去空白"的那条路上**假装支持**（那正是本仓
+        // 一路在消灭的静默）。
+        E::Trim {
+            trim_where,
+            trim_what,
+            expr,
+            trim_characters,
+        } => {
+            if trim_where.is_some() || trim_what.is_some() || trim_characters.is_some() {
+                return Err(QsdbError::unsupported(
+                    "only TRIM(<string>) is supported; LEADING/TRAILING and custom \
+                     character sets are not implemented yet",
+                ));
+            }
+            let inner = bind_expr(expr, ctx)?;
+            let ty = (scalar::lookup("trim")?.ret_ty)(&[inner.data_type()])?;
+            Ok(PhysExpr::Fn {
+                name: "trim".into(),
+                args: vec![inner],
+                ty,
+            })
+        }
         E::Floor { expr, .. } => bind_floor_ceil(expr, ctx, "floor"),
         E::Ceil { expr, .. } => bind_floor_ceil(expr, ctx, "ceil"),
         // EXTRACT(field FROM x) / EXTRACT(field, x) → extract('<field>', x)
