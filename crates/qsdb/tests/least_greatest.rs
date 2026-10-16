@@ -152,3 +152,31 @@ fn cast_null_到任意类型都合法() {
         assert_eq!(cell(&db, sql), want, "sql={sql}");
     }
 }
+
+/// **除零 ⇒ NULL**（Spark 语义）：实测真 Spark 3.5.2 三格全是 `NULL`
+/// （`1/0` / 小数除零 / `1%0`）。数据相关的运行期状况不该让整批挂掉，
+/// 与"小数**溢出**报错"是两条不同口径（后者见 `eval.rs` 里那段注释）。
+#[test]
+fn 除零给_null_而不是报错() {
+    let (db, _r) = setup("divzero");
+    assert_eq!(cell(&db, "SELECT 1/0"), "");
+    assert_eq!(cell(&db, "SELECT 1%0"), "");
+    assert_eq!(
+        cell(
+            &db,
+            "SELECT CAST(1.0 AS DECIMAL(10,2)) / CAST(0 AS DECIMAL(10,2))"
+        ),
+        ""
+    );
+    // 非零仍然正常。⚠️ 小数除法的结果 scale 按 Spark 规则是
+    // `max(6, s1 + p2 + 1)` = max(6, 2+10+1) = **13**（不是 2）——
+    // 所以是 `1.5000000000000`。这里**不改数字去迁就直觉**：
+    // 结算场景下这个 scale 是规格的一部分。
+    assert_eq!(
+        cell(
+            &db,
+            "SELECT CAST(6 AS DECIMAL(10,2)) / CAST(4 AS DECIMAL(10,2))"
+        ),
+        "1.5000000000000"
+    );
+}

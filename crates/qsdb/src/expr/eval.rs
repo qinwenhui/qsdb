@@ -394,8 +394,60 @@ fn arith_arrow(op: ArithOp, l: &EvalVal, r: &EvalVal) -> Result<ArrayRef> {
         ArithOp::Add => with_datum(l, r, numeric::add),
         ArithOp::Sub => with_datum(l, r, numeric::sub),
         ArithOp::Mul => with_datum(l, r, numeric::mul),
-        ArithOp::Div => with_datum(l, r, numeric::div),
-        ArithOp::Mod => with_datum(l, r, numeric::rem),
+        // **整数除零 ⇒ NULL**（Spark 语义）。arrow 的整数内核**直接报错**
+        // （`Divide by zero error`），与 Spark 的 `NULL` 不同。
+        //
+        // 走**冷路径**：先照常调内核（热路径**零开销** —— 绝大多数批里没有 0），
+        // 只有当它确实因除零失败时，才重算一遍并把那些位置改成 NULL。
+        // （DECIMAL 不走这里，见 `decimal_arith`，那边同样是 NULL。）
+        ArithOp::Div => div_mod_null_on_zero(true, l, r),
+        ArithOp::Mod => div_mod_null_on_zero(false, l, r),
+    }
+}
+
+/// 整数除/模的**除零 ⇒ NULL**：内核报除零时，把分母的 0 换成 1 重算，
+/// 再把那些位置盖成 NULL。只为**错误路径**付代价。
+fn div_mod_null_on_zero(is_div: bool, l: &EvalVal, r: &EvalVal) -> Result<ArrayRef> {
+    let first = if is_div {
+        with_datum(l, r, numeric::div)
+    } else {
+        with_datum(l, r, numeric::rem)
+    };
+    match first {
+        Ok(v) => Ok(v),
+        Err(e) if e.to_string().to_lowercase().contains("divide by zero") => {
+            let n = l.len_hint().max(r.len_hint());
+            let op_name = if is_div { "div" } else { "rem" };
+            let ra = match r {
+                EvalVal::Arr(a) => Arc::clone(a),
+                EvalVal::Const(one) => materialize_const(one, n)?,
+            };
+            let rdt = ra.data_type().clone();
+            let scalar = |v: i64| -> Result<ArrayRef> {
+                cast_with_options(
+                    &Int64Array::from(vec![v]),
+                    &rdt,
+                    &CastOptions::default(),
+                )
+                .map_err(|er| {
+                    QsdbError::invalid(format!("{op_name}: 构造常量失败: {er}"))
+                })
+            };
+            let zero = scalar(0)?;
+            let one = scalar(1)?;
+            // 分母非零 → 真；0 或 NULL → 假
+            let nz: BooleanArray = cmp::neq(&ra, &WrapConst(zero.as_ref()))
+                .map_err(|er| QsdbError::invalid(format!("{op_name}: 比较失败: {er}")))?;
+            let safe_r = select_arrays(&nz, &ra, &one)?;
+            let out: ArrayRef = if is_div {
+                with_datum(l, &EvalVal::Arr(safe_r), numeric::div)?
+            } else {
+                with_datum(l, &EvalVal::Arr(safe_r), numeric::rem)?
+            };
+            let nulls = arrow::array::new_null_array(&out.data_type().clone(), n);
+            select_arrays(&nz, &out, &nulls)
+        }
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -446,8 +498,16 @@ fn decimal_arith(op: ArithOp, l: &EvalVal, r: &EvalVal, ty: &LogicalType) -> Res
             out.push(None);
             continue;
         }
+        // **除零 ⇒ NULL**（Spark 语义，实测真 Spark 3.5.2：`1/0`、小数除零、`1%0`
+        // 全是 `NULL`）。
+        //
+        // 与下面 `Mul` 的**溢出**报错口径不同，是**刻意**的：
+        // - 溢出是"这个值装不下"，报错能逼出模型/精度问题（本仓一贯口径）；
+        // - 除零是**数据相关**的运行期状况（某一行分母恰好是 0），
+        //   报错会让整批结算因为一个坏行全挂，而 Spark 的答案本来就是 NULL。
         if b_is_zero(rd, i) && matches!(op, ArithOp::Div | ArithOp::Mod) {
-            return Err(QsdbError::type_err("divide by zero"));
+            out.push(None);
+            continue;
         }
         let a = I256::from_i128(ld.value(i));
         let b = I256::from_i128(rd.value(i));

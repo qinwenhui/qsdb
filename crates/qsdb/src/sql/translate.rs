@@ -3128,6 +3128,35 @@ fn translate_select_inner(
             ancestors,
         );
     }
+    // **整个查询体被括号包起来**：`(SELECT …) UNION ALL (SELECT …)` —— Spark 那批 SQL
+    // 的 `UNION` **两侧各套一层括号**，sqlparser 于是把每一侧解析成 `SetExpr::Query`
+    // 而不是 `Select`（14 个块卡在这条上）。括号在语义上是**透明**的 ⇒
+    // 把外层 WITH 内联进内层再走同一条路（`WITH c AS (…) (SELECT …)` ≡ `WITH c AS (…) SELECT …`）。
+    //
+    // ⚠️ 两处**不许静默丢**，都显式拒：外层挂着的 ORDER BY / LIMIT / FETCH；
+    // 内层自己又带一个 WITH（两个 WITH 合并是另一件事，没实现就不装作实现了）。
+    if let SetExpr::Query(inner) = q.body.as_ref() {
+        if q.order_by.is_some() || q.limit_clause.is_some() || q.fetch.is_some() {
+            return Err(QsdbError::unsupported(
+                "ORDER BY / LIMIT / FETCH on a parenthesized query body ((SELECT …) …) \
+                 — 拒绝而不是静默丢掉它",
+            ));
+        }
+        if inner.with.is_some() {
+            return Err(QsdbError::unsupported(
+                "parenthesized query body that itself carries a WITH — \
+                 merging two WITH clauses is not implemented",
+            ));
+        }
+        return translate_select_inner(
+            sqlparser::ast::Query {
+                with: q.with.clone(),
+                ..(**inner).clone()
+            },
+            resolver,
+            ancestors,
+        );
+    }
     let select = match *q.body {
         SetExpr::Select(s) => {
             audit_select(&s)?;

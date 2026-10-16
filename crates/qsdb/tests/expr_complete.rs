@@ -274,12 +274,19 @@ fn decimal_mod() {
     assert!(q(&db, "SELECT amount % 7 FROM t WHERE cnt = 1") == vec!["3.5000"]);
     // 20.25 % 3 = 2.25
     assert!(q(&db, "SELECT amount % 3 FROM t WHERE cnt = 2") == vec!["2.2500"]);
-    // NULL 传播 + 除零报错
+    // NULL 传播
     assert!(q(&db, "SELECT amount % 7 FROM t WHERE cnt IS NULL") == vec!["NULL"]);
-    assert!(
-        db.sql_collect("SELECT amount % 0 FROM t WHERE cnt = 1")
-            .is_err()
-    );
+    // **除零 ⇒ NULL**（2026-10-16 行为**有变**，见下）。
+    //
+    // 这里原先是 `assert!(… .is_err())` —— 断言"除零必须报错"。
+    // 按**真 Spark 3.5.2 实测**改成 NULL：`1/0`、小数除零、`1%0` **三格全是 NULL**，
+    // 这是它 non-ANSI 模式的既定语义（用户的日清分 SQL 就是 Spark SQL，9 个块
+    // 因为这条整批挂掉）。除零是**数据相关**的运行期状况（某行分母恰好 0），
+    // 报错会让整批结算因为一个坏行全挂。
+    //
+    // ⚠️ **只改除零，不动溢出**：小数**溢出**仍然报错（`eval.rs::decimal_arith` 里
+    // 的 `Mul` 那条），那是本仓"宁可报错也不静默回绕"的既有口径，与这条不是一件事。
+    assert!(q(&db, "SELECT amount % 0 FROM t WHERE cnt = 1") == vec!["NULL"]);
 }
 
 // ── 数学函数 ──────────────────────────────────────────────────────────────
