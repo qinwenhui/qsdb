@@ -36,7 +36,7 @@
 | simple_distinct | **要干活**：逐行编码/哈希的常数差 |
 | simple_filter / group | 都用向量化；我们靠**并行聚合** |
 | complex_cte | 接近 |
-| complex_window | **整分区物化 + 单线程** |
+| complex_window | ✅ **列裁剪原先被窗口一刀切挡住 ⇒ 读全部列**（2026-10-16 闭环：`tests/window_prune.rs`、`docs/列裁剪穿透窗口设计.md`）。"整分区物化 + 单线程"那条**已被实测排除**（物化后跑窗口只要 0.16ms）—— 细节见 `真机基准对账.md` |
 | complex_join_group / three_way | **每行成本**（probe 逐行）+ 建侧 |
 | import_parquet | 写段 |
 | import_csv | **CSV 解析** |

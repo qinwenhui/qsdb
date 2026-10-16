@@ -8,6 +8,7 @@ use arrow::record_batch::RecordBatch;
 use crate::api::{Qsdb, ScanRequest};
 use crate::error::Result;
 use crate::exec::agg::GroupTable;
+use crate::exec::window::WindowFn;
 use crate::exec::{ExecNode, FilterExec, HashAggExec, LimitExec, ProjectExec, ScanExec, SortExec};
 use crate::expr::{AggExpr, PhysExpr};
 
@@ -146,11 +147,14 @@ pub fn build(
     ctx: &Arc<crate::query::QueryContext>,
 ) -> Result<Box<dyn ExecNode>> {
     // M4-3 列裁剪下推：收集全计划引用列，Scan 只读所需列（含谓词列）。
-    // Window 计划的窗口列 idx 假设全列序——下推重排会破坏索引映射，跳过。
+    // 含窗计划**默认**仍然跳过（窗口列 idx 假设全列序）——只放行
+    // `phase1_window` 那一种形状，见 `prune_decision`。
     if let Some((all, proj)) = prune_decision(plan) {
         if proj.len() < all.len() {
             let mapping = build_mapping(&all, &proj);
-            let rewritten = rewrite_plan(plan, &mapping, &all);
+            // 裁掉的列数 = 各派生空间相对原计划的**左移量**（见 `output_shift`）
+            let k = all.len() - proj.len();
+            let rewritten = rewrite_plan(plan, &mapping, &all, k);
             return build_inner(db, &rewritten, Some(proj), ctx);
         }
     }
@@ -164,7 +168,8 @@ pub fn build(
 /// 而"结果对不对"根本看不出它有没有白跑（少裁一列只是变慢，不是变错）。
 /// 回归：`tests/projection_space.rs`。
 pub fn prune_decision(plan: &LogicalPlan) -> Option<(Vec<String>, Vec<String>)> {
-    if has_window_node(plan) {
+    // 含窗计划：**只放行**第一阶段那一种形状，其余照旧一刀切关掉（见 `phase1_window`）。
+    if has_window_node(plan) && !phase1_window(plan) {
         return None;
     }
     let mut used: Vec<String> = Vec::new();
@@ -180,6 +185,80 @@ pub fn prune_decision(plan: &LogicalPlan) -> Option<(Vec<String>, Vec<String>)> 
         proj = all.first().cloned().into_iter().collect();
     }
     Some((all, proj))
+}
+
+/// 第一阶段放行的窗口形状。**其余含窗计划一律不裁。**
+///
+/// ```text
+/// ( Limit | Project | Sort(Project(…)) )*  Window( Aggregate?( Filter?( Scan ) ) )
+/// ```
+///
+/// ## 为什么只放行一种形状
+///
+/// `Window` 的输出 = **输入 ++ 窗口列**（它**追加**列）。裁剪落在窗口**之下**时，
+/// 窗口**之上**的表达式会整体左移，而它们的 `Column.idx` 是按原宽度绑定的 ——
+/// `rewrite_plan` 必须知道"左移了多少"才能把它们一起平移，而那个量**只能从下往上算**
+/// （要到扫描处才定得下来）。本仓在这个"表达式活在哪个索引空间"的坑上已栽过三次
+/// （回归就是 `tests/projection_space.rs`），故第一阶段只收这一种：
+///
+/// - **之上**只有 `Project`/`Limit`/`Sort(Project(…))` ⇒ 左移量由**结构**决定
+///   （见 [`output_shift`]），不必按列名判 —— 按名判会撞车：窗口输出里的 `pdate`
+///   与表列 `pdate` 同名却活在两个空间里（2026-10-16 那次"删掉 guard"的尝试就是
+///   死在这里：`decimal window arg downcast failed`）；
+/// - **之下**是 `Scan`/`Filter`/`Aggregate` ⇒ 三者的表达式都能精确定位；
+/// - 全计划**恰好一个** `Window`（下面的链与 [`under_window_ok`] 已排除嵌套情形）。
+///
+/// ### `Sort` 那条为什么要写成 `Sort(Project(…))` 而不是裸 `Sort`
+///
+/// `rewrite_plan` 的 `Sort` 臂把排序键**原样保留**（键是"输入的输出序"，不是表列序，
+/// 见那条注释与 `tests/order_by_prune.rs`）—— 而那条约定成立的前提是
+/// "`Sort` 输入的空间**没被挪动过**"。`Project` 恰好满足：它的投影式被重写了，
+/// 但**产出列的位置与含义一个都没变** ⇒ 键仍然指得对。
+///
+/// ⚠️ 反过来说 `Sort(Window(…))`（键直接活在窗口输出空间里）就**不安全**：
+/// 那时键要按 [`rewrite_above_window_expr`] 改，而 `Sort` 臂是不改的。
+/// 于是这里只认"`Sort` 紧贴在一个 `Project` 之上"这一种。
+///
+/// （`ORDER BY` 落在窗口查询外面是最常见的写法 —— `.14` 真表上正是它：
+/// 裸 `Sort` 时 223 ms 一动不动，放行后 41 ms。）
+///
+/// 其余形状（之上还有 `Aggregate`/join、多个 `Window`、窗口接 join）
+/// **继续关着**：每一个都得单独论证它的列空间。少裁一列只是变慢，
+/// **裁错一列是静默错值**。
+///
+/// 回归：`tests/window_prune.rs`（反例必须仍然回 `None`）。
+fn phase1_window(plan: &LogicalPlan) -> bool {
+    let mut cur = plan;
+    loop {
+        match cur {
+            LogicalPlan::Window { input, .. } => return under_window_ok(input),
+            LogicalPlan::Project { input, .. } | LogicalPlan::Limit { input, .. } => cur = input,
+            // 见上面"`Sort` 那条"：只收紧贴 `Project` 的 `Sort`
+            LogicalPlan::Sort { input, .. } if matches!(**input, LogicalPlan::Project { .. }) => {
+                cur = input
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// 窗口**之下**允许的链。见 [`phase1_window`]。
+///
+/// **`Sort` 刻意不在内**：`rewrite_plan` 的 `Sort` 臂把排序键**原样保留**
+/// （键是"输入的输出序"而非表列序，见那条注释）—— 那条约定成立的前提是
+/// "`Sort` 的输入空间没被裁剪过"，窗口夹在中间会让它失效。
+fn under_window_ok(p: &LogicalPlan) -> bool {
+    match p {
+        LogicalPlan::Scan { .. }
+        | LogicalPlan::ExternalScan { .. }
+        | LogicalPlan::CsvScan { .. } => true,
+        // `Filter` 恒等 schema：它的谓词与 Scan 同处一个列空间
+        LogicalPlan::Filter { input, .. } => under_window_ok(input),
+        // 聚合**另起**一个列空间（输出宽度 = group ++ aggs，与裁剪无关）
+        // ⇒ 它之上的窗口表达式一个字都不用改
+        LogicalPlan::Aggregate { input, .. } => under_window_ok(input),
+        _ => false,
+    }
 }
 
 /// 全计划引用列名（Column 节点）。
@@ -249,7 +328,32 @@ fn collect_plan_columns(plan: &LogicalPlan, out: &mut Vec<String>) {
         LogicalPlan::Join { .. } | LogicalPlan::CrossJoinFilter { .. } => {
             // INNER/LEFT 多表计划不走列裁剪下推（build 的 count_scans guard 兜底）
         }
-        LogicalPlan::Values { .. } | LogicalPlan::Window { .. } | LogicalPlan::OneRow => {} // 内存/窗口源无需裁剪
+        LogicalPlan::Values { .. } | LogicalPlan::OneRow => {} // 内存源无需裁剪
+        // ⚠️ `Window` **有 input**（此前和上面那两兄弟混在同一条"无输入"臂里，
+        // 因为含窗计划一律不裁 ⇒ 那条臂是**死代码**）。现在要裁了，两处必须收全：
+        // 1. 它输入里的列；
+        // 2. 它自己的 `partition_by`/`order_by`/窗口函数参数 —— `Project(Window(Scan))`
+        //    上层的投影只引用 `sum(x)` 这个**输出名**（不是表列 ⇒ 会被下面的过滤丢掉），
+        //    窗口参数是**唯一**提到 `x` 的地方；漏了它 ⇒ 扫描裁剪过头 ⇒ 窗口读到 NULL。
+        LogicalPlan::Window {
+            input,
+            partition_by,
+            order_by,
+            window_fns,
+        } => {
+            for p in partition_by {
+                collect_expr_columns(p, out);
+            }
+            for k in order_by {
+                collect_expr_columns(&k.expr, out);
+            }
+            for w in window_fns {
+                for a in window_fn_args(w) {
+                    collect_expr_columns(a, out);
+                }
+            }
+            collect_plan_columns(input, out);
+        }
         // CSV 外表：叶节点且无谓词字段（谓词不下推进扫描，见 CsvScan 注释）
         LogicalPlan::CsvScan { .. } => {}
         LogicalPlan::SetOp { left, right, .. } => {
@@ -368,6 +472,60 @@ fn out_schema_is_table(p: &LogicalPlan) -> bool {
     }
 }
 
+/// 本节点的**直接输入**（叶返回 `None`）。
+///
+/// 与 [`exprs_are_in_table_space`] 同一条前提：表达式是按**自己输入的输出序**编号的，
+/// 所以"表达式活在哪个空间"这个问题问的就是它的输入是谁。
+fn direct_input(p: &LogicalPlan) -> Option<&LogicalPlan> {
+    match p {
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Distinct { input }
+        | LogicalPlan::Window { input, .. } => Some(input),
+        LogicalPlan::Join {
+            left, join_type, ..
+        } if join_type.is_semi_family() => Some(left),
+        _ => None,
+    }
+}
+
+/// 本节点**输出**的列序相对原计划左移了几列（列裁剪的产物）。
+///
+/// 只有"原样透传输入的列"的节点会把左移量传下去：
+///
+/// | 节点 | 输出左移量 |
+/// |---|---|
+/// | 扫描叶 | `k`（= 被裁掉的列数） |
+/// | `Filter`/`Sort`/`Limit`/`Distinct` | 继承输入 |
+/// | `Window` | 继承输入（窗口列是**追加在尾部**的，不挪动已有列） |
+/// | semi/anti `Join` | 继承左子（输出 = 左 schema） |
+/// | `Aggregate`/`Project`/其它 `Join` | **0** —— 它们**另起**列空间，宽度与列序都与裁剪无关 |
+///
+/// 这个量就是 `rewrite_plan` 判断"表达式的 idx 该怎么改"的依据：表达式活在自己
+/// 输入的输出空间里 ⇒ 问左移量就是问 [`direct_input`]。注意它与
+/// [`out_schema_is_table`] 差在 `Window` 上：`Window(Scan)` 的左移量是 `k`，
+/// 但它的输出**不是**表空间 —— 那个差值正是要走 [`rewrite_above_window_expr`]
+/// 那条"分两段"的路（而不是一个统一平移，见那里）。
+fn output_shift(p: &LogicalPlan, k: usize) -> usize {
+    match p {
+        LogicalPlan::Scan { .. }
+        | LogicalPlan::ExternalScan { .. }
+        | LogicalPlan::CsvScan { .. } => k,
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Distinct { input }
+        | LogicalPlan::Window { input, .. } => output_shift(input, k),
+        LogicalPlan::Join {
+            left, join_type, ..
+        } if join_type.is_semi_family() => output_shift(left, k),
+        _ => 0,
+    }
+}
+
 /// 该节点**自身的表达式**（谓词 / 投影式 / 分组键 / 聚合参数）是否按**表列序**编号。
 ///
 /// 表达式永远是对**自己输入的输出**求值 ⇒ 当且仅当那个输出就是表空间。
@@ -397,22 +555,42 @@ fn exprs_are_in_table_space(plan: &LogicalPlan) -> bool {
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Distinct { input } => out_schema_is_table(input),
+        // 窗口**自己不读**窗口列：`partition_by`/`order_by`/函数参数都是对它**输入的列**
+        // 求值（窗口列是它**追加**到输出尾部的）⇒ 与 `Filter` 同判。
+        // ⚠️ 这条只对"输入就是表空间"成立：`Window(Aggregate(Scan))` 里窗口的
+        // `ORDER BY pdate` 引用的是**聚合输出**的 `pdate`，而 `pdate` 碰巧也是表列名
+        // ⇒ 必须靠这条结构性判据挡住按名映射（那就是 H1）。
+        LogicalPlan::Window { input, .. } => out_schema_is_table(input),
         _ => false,
     }
 }
 
 /// 重写计划中所有 Column.idx（全表列序 → 投影序）。
 /// `all`：表全列名——非表列（聚合输出列如 sum(x)）保持原 idx。
-fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -> LogicalPlan {
-    // `mapping` 只在「表达式按表列序编号」时才有意义——见 `exprs_are_in_table_space`。
-    // 用**位置**说不清的节点（外层 Project/Filter/Aggregate 坐在别的 Project 之上）
-    // 一律**原样保留**：宁可少裁一列，也不能把表达式指到隔壁列上去。
-    let tbl = exprs_are_in_table_space(plan);
+fn rewrite_plan(
+    plan: &LogicalPlan,
+    mapping: &[Option<usize>],
+    all: &[String],
+    k: usize,
+) -> LogicalPlan {
+    // 表达式的 idx 活在**自己输入的输出空间**里（同 `exprs_are_in_table_space` 的前提），
+    // 所以"该怎么改"由那个空间的左移量三选一：
+    //   · 没动（0）⇒ 一个字都不用改；
+    //   · 仍是**表空间** ⇒ 按 `mapping` 换算（含重排）；
+    //   · 是**窗口输出空间** ⇒ 分两段，见 `rewrite_above_window_expr`。
+    //
+    // 第三种是本文件最容易错的一处（见 `output_shift` 的表格）：它**不是**一个统一平移。
+    // 旧 `Window` 臂在这里无条件按名重写，2026-10-16 实测炸出
+    // `decimal window arg downcast failed`。宁可少裁一列，也不能把表达式指到隔壁列上去。
+    let space = direct_input(plan).map_or(0, |i| output_shift(i, k));
+    let tbl = space > 0 && exprs_are_in_table_space(plan);
     let re = |e: &PhysExpr| -> PhysExpr {
-        if tbl {
+        if space == 0 {
+            e.clone()
+        } else if tbl {
             rewrite_expr(e, mapping, all)
         } else {
-            e.clone()
+            rewrite_above_window_expr(e, mapping, all, space)
         }
     };
     match plan {
@@ -434,7 +612,7 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
             needed,
             residual,
         } if join_type.is_semi_family() => LogicalPlan::Join {
-            left: Box::new(rewrite_plan(left, mapping, all)),
+            left: Box::new(rewrite_plan(left, mapping, all, k)),
             // 右键为右子计划局部 idx（绑定期约定），裁剪不触碰
             right: Box::new((**right).clone()),
             // ⚠️ 左键**无条件**按表列序重写（不要按 `out_schema_is_table(left)` 加闸门：
@@ -467,7 +645,7 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
             files: Arc::clone(files),
         },
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
-            input: Box::new(rewrite_plan(input, mapping, all)),
+            input: Box::new(rewrite_plan(input, mapping, all, k)),
             predicate: re(predicate),
         },
         LogicalPlan::Project {
@@ -475,12 +653,12 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
             exprs,
             names,
         } => LogicalPlan::Project {
-            input: Box::new(rewrite_plan(input, mapping, all)),
+            input: Box::new(rewrite_plan(input, mapping, all, k)),
             exprs: exprs.iter().map(&re).collect(),
             names: names.clone(),
         },
         LogicalPlan::Aggregate { input, group, aggs } => LogicalPlan::Aggregate {
-            input: Box::new(rewrite_plan(input, mapping, all)),
+            input: Box::new(rewrite_plan(input, mapping, all, k)),
             group: group.iter().map(&re).collect(),
             aggs: aggs
                 .iter()
@@ -497,7 +675,7 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
                 .collect(),
         },
         LogicalPlan::Sort { input, keys } => LogicalPlan::Sort {
-            input: Box::new(rewrite_plan(input, mapping, all)),
+            input: Box::new(rewrite_plan(input, mapping, all, k)),
             // **排序键不重写**——它们是**输入自身的输出序**，不是表列序。
             //
             // 两个索引空间不能混：`mapping` 是「表列序 → 扫描投影序」（列裁剪用），
@@ -511,12 +689,12 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
             keys: keys.clone(),
         },
         LogicalPlan::Limit { input, n, offset } => LogicalPlan::Limit {
-            input: Box::new(rewrite_plan(input, mapping, all)),
+            input: Box::new(rewrite_plan(input, mapping, all, k)),
             n: *n,
             offset: *offset,
         },
         LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
-            input: Box::new(rewrite_plan(input, mapping, all)),
+            input: Box::new(rewrite_plan(input, mapping, all, k)),
         },
         LogicalPlan::Join { .. }
         | LogicalPlan::CrossJoinFilter { .. }
@@ -528,8 +706,8 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
             op,
             all: all_flag,
         } => LogicalPlan::SetOp {
-            left: Box::new(rewrite_plan(left, mapping, all)),
-            right: Box::new(rewrite_plan(right, mapping, all)),
+            left: Box::new(rewrite_plan(left, mapping, all, k)),
+            right: Box::new(rewrite_plan(right, mapping, all, k)),
             op: *op,
             all: *all_flag,
         },
@@ -539,68 +717,140 @@ fn rewrite_plan(plan: &LogicalPlan, mapping: &[Option<usize>], all: &[String]) -
             order_by,
             window_fns,
         } => LogicalPlan::Window {
-            input: Box::new(rewrite_plan(input, mapping, all)),
-            partition_by: partition_by
-                .iter()
-                .map(|p| rewrite_expr(p, mapping, all))
-                .collect(),
+            input: Box::new(rewrite_plan(input, mapping, all, k)),
+            // 窗口的表达式活在**它输入**的空间里 ⇒ 与上面同一套判据（`re`）。
+            // 此前这里无条件按名重写（H1：`Window(Aggregate(…))` 的 `ORDER BY pdate`
+            // 会拿聚合空间的位置去查表映射），而 `window_fns` 更是直接 `clone()`
+            // （`Window(Scan)` 的参数列会悬空）。
+            partition_by: partition_by.iter().map(&re).collect(),
             order_by: order_by
                 .iter()
-                .map(|k| crate::exec::SortKey {
-                    expr: rewrite_expr(&k.expr, mapping, all),
-                    descending: k.descending,
-                    nulls_first: k.nulls_first,
+                .map(|sk| crate::exec::SortKey {
+                    expr: re(&sk.expr),
+                    descending: sk.descending,
+                    nulls_first: sk.nulls_first,
                 })
                 .collect(),
-            window_fns: window_fns.clone(),
+            window_fns: window_fns.iter().map(|w| map_window_fn(w, &re)).collect(),
         },
     }
 }
 
 fn rewrite_expr(e: &PhysExpr, mapping: &[Option<usize>], all: &[String]) -> PhysExpr {
-    match e {
-        PhysExpr::Column { idx, name, ty } => {
-            // 非表列（聚合输出列等）：idx 语义属上层算子，保持不变
-            let is_table_col = all.iter().any(|a| a.eq_ignore_ascii_case(name.as_str()));
-            PhysExpr::Column {
-                idx: if is_table_col {
-                    mapping[*idx].unwrap_or(*idx)
-                } else {
-                    *idx
-                },
-                name: name.clone(),
-                ty: ty.clone(),
-            }
+    map_expr_idx(e, &|idx, name| {
+        // 非表列（聚合输出列等）：idx 语义属上层算子，保持不变
+        if all.iter().any(|a| a.eq_ignore_ascii_case(name)) {
+            mapping[idx].unwrap_or(idx)
+        } else {
+            idx
         }
+    })
+}
+
+/// "窗口**之上**的表达式"的 idx 改写：它们活在**窗口输出空间**里
+/// （`Window` 输出 = 输入 ++ 窗口列），而那个空间分两段，**两段的下场不同**：
+///
+/// | 位置 | 是什么 | 怎么改 |
+/// |---|---|---|
+/// | `[0, all.len())` | **透传列**：窗口原样带下来的输入列 | 位置仍是表列序 ⇒ 按 `mapping` |
+/// | `[all.len(), …)` | **追加的窗口列**（`sum(x)` 这类输出名） | 在**尾部**，扫描裁掉几列就整体左移几列 |
+///
+/// ## 两处容易想错的地方
+///
+/// 1. **不能一律平移**。第一版按"整段 −k"写，结果透传列 `i` 也被减了 —— 读成隔壁
+///    `g` 列（`window_frame` 的 `count_星号数行而_count_列数非空` 当场变红：
+///    首列变成恒定的 1）。分界线是**位置**，不是"整个空间挪了多少"。
+/// 2. **分界线用 `all.len()` 是精确的，不是近似**：能走到这一支 ⟺ 窗口的输入是一条
+///    **表空间链**（`output_shift` > 0 且 `out_schema_is_table` 为假，只可能是
+///    `Window(表空间链)`）⇒ 窗口输入的宽度**就是**表宽，前一段正是表列序。
+///    （输入是聚合时左移量为 0，整条走 `clone`，压根到不了这里。）
+///
+/// 也因此这里**不需要**按列名判"这一列是不是表列"（那正是 H1 撞车的地方）——
+/// 位置本身就是判据。
+fn rewrite_above_window_expr(
+    e: &PhysExpr,
+    mapping: &[Option<usize>],
+    all: &[String],
+    shift: usize,
+) -> PhysExpr {
+    map_expr_idx(e, &|idx, _| {
+        if idx < all.len() {
+            mapping[idx].unwrap_or(idx)
+        } else {
+            idx.saturating_sub(shift)
+        }
+    })
+}
+
+/// `WindowFn` 的**表达式参数**（`row_number()`/`count(*)` 这类没有参数）。
+fn window_fn_args(w: &WindowFn) -> Vec<&PhysExpr> {
+    match w {
+        WindowFn::RowNumber | WindowFn::Rank | WindowFn::DenseRank | WindowFn::Count(None, _) => {
+            Vec::new()
+        }
+        WindowFn::Sum(e, _) | WindowFn::Min(e, _) | WindowFn::Max(e, _) | WindowFn::Avg(e, _) => {
+            vec![e]
+        }
+        WindowFn::Count(Some(e), _) => vec![e],
+        WindowFn::Lag(e, _, d) | WindowFn::Lead(e, _, d) => match d {
+            Some(d) => vec![e, d.as_ref()],
+            None => vec![e],
+        },
+    }
+}
+
+/// 按 `f` 改写 `WindowFn` 的表达式参数（函数本身、帧一概不动）。
+fn map_window_fn(w: &WindowFn, f: &dyn Fn(&PhysExpr) -> PhysExpr) -> WindowFn {
+    match w {
+        WindowFn::RowNumber | WindowFn::Rank | WindowFn::DenseRank => w.clone(),
+        WindowFn::Sum(e, fr) => WindowFn::Sum(f(e), *fr),
+        WindowFn::Count(a, fr) => WindowFn::Count(a.as_ref().map(f), *fr),
+        WindowFn::Min(e, fr) => WindowFn::Min(f(e), *fr),
+        WindowFn::Max(e, fr) => WindowFn::Max(f(e), *fr),
+        WindowFn::Avg(e, fr) => WindowFn::Avg(f(e), *fr),
+        WindowFn::Lag(e, o, d) => WindowFn::Lag(f(e), *o, d.as_ref().map(|d| Box::new(f(d)))),
+        WindowFn::Lead(e, o, d) => WindowFn::Lead(f(e), *o, d.as_ref().map(|d| Box::new(f(d)))),
+    }
+}
+
+/// 把表达式里所有 `Column.idx` 按 `f(idx, name)` 改写（结构 / 列名 / 类型一概不动）。
+///
+/// 抽出来是因为"改 idx"在本文件里有**两套判据**（[`rewrite_expr`] / [`shift_expr`]），
+/// 而它们对表达式的遍历必须一字不差 —— 漏掉一个变体就是**静默漏改一列**。
+fn map_expr_idx(e: &PhysExpr, f: &dyn Fn(usize, &str) -> usize) -> PhysExpr {
+    match e {
+        PhysExpr::Column { idx, name, ty } => PhysExpr::Column {
+            idx: f(*idx, name),
+            name: name.clone(),
+            ty: ty.clone(),
+        },
         PhysExpr::Lit(l) => PhysExpr::Lit(l.clone()),
         PhysExpr::Arith { op, l, r, ty } => PhysExpr::Arith {
             op: *op,
-            l: Box::new(rewrite_expr(l, mapping, all)),
-            r: Box::new(rewrite_expr(r, mapping, all)),
+            l: Box::new(map_expr_idx(l, f)),
+            r: Box::new(map_expr_idx(r, f)),
             ty: ty.clone(),
         },
         PhysExpr::Cmp { op, l, r } => PhysExpr::Cmp {
             op: *op,
-            l: Box::new(rewrite_expr(l, mapping, all)),
-            r: Box::new(rewrite_expr(r, mapping, all)),
+            l: Box::new(map_expr_idx(l, f)),
+            r: Box::new(map_expr_idx(r, f)),
         },
-        PhysExpr::And(a, b) => PhysExpr::And(
-            Box::new(rewrite_expr(a, mapping, all)),
-            Box::new(rewrite_expr(b, mapping, all)),
-        ),
-        PhysExpr::Or(a, b) => PhysExpr::Or(
-            Box::new(rewrite_expr(a, mapping, all)),
-            Box::new(rewrite_expr(b, mapping, all)),
-        ),
-        PhysExpr::Not(a) => PhysExpr::Not(Box::new(rewrite_expr(a, mapping, all))),
-        PhysExpr::IsNull(a, neg) => PhysExpr::IsNull(Box::new(rewrite_expr(a, mapping, all)), *neg),
+        PhysExpr::And(a, b) => {
+            PhysExpr::And(Box::new(map_expr_idx(a, f)), Box::new(map_expr_idx(b, f)))
+        }
+        PhysExpr::Or(a, b) => {
+            PhysExpr::Or(Box::new(map_expr_idx(a, f)), Box::new(map_expr_idx(b, f)))
+        }
+        PhysExpr::Not(a) => PhysExpr::Not(Box::new(map_expr_idx(a, f))),
+        PhysExpr::IsNull(a, neg) => PhysExpr::IsNull(Box::new(map_expr_idx(a, f)), *neg),
         PhysExpr::Cast { e, ty } => PhysExpr::Cast {
-            e: Box::new(rewrite_expr(e, mapping, all)),
+            e: Box::new(map_expr_idx(e, f)),
             ty: ty.clone(),
         },
         PhysExpr::Fn { name, args, ty } => PhysExpr::Fn {
             name: name.clone(),
-            args: args.iter().map(|a| rewrite_expr(a, mapping, all)).collect(),
+            args: args.iter().map(|a| map_expr_idx(a, f)).collect(),
             ty: ty.clone(),
         },
         PhysExpr::Case {
@@ -610,29 +860,25 @@ fn rewrite_expr(e: &PhysExpr, mapping: &[Option<usize>], all: &[String]) -> Phys
         } => PhysExpr::Case {
             conds: conds
                 .iter()
-                .map(|(c, r)| (rewrite_expr(c, mapping, all), rewrite_expr(r, mapping, all)))
+                .map(|(c, r)| (map_expr_idx(c, f), map_expr_idx(r, f)))
                 .collect(),
-            else_expr: Box::new(rewrite_expr(else_expr, mapping, all)),
+            else_expr: Box::new(map_expr_idx(else_expr, f)),
             ty: ty.clone(),
         },
         PhysExpr::Coalesce(exprs, ty) => PhysExpr::Coalesce(
-            exprs
-                .iter()
-                .map(|e| rewrite_expr(e, mapping, all))
-                .collect(),
+            exprs.iter().map(|e| map_expr_idx(e, f)).collect(),
             ty.clone(),
         ),
-        PhysExpr::Concat(l, r) => PhysExpr::Concat(
-            Box::new(rewrite_expr(l, mapping, all)),
-            Box::new(rewrite_expr(r, mapping, all)),
-        ),
+        PhysExpr::Concat(l, r) => {
+            PhysExpr::Concat(Box::new(map_expr_idx(l, f)), Box::new(map_expr_idx(r, f)))
+        }
         PhysExpr::Like {
             e,
             pattern,
             negated,
             ci,
         } => PhysExpr::Like {
-            e: Box::new(rewrite_expr(e, mapping, all)),
+            e: Box::new(map_expr_idx(e, f)),
             pattern: pattern.clone(),
             negated: *negated,
             ci: *ci,
@@ -828,7 +1074,12 @@ fn build_inner(
             order_by,
             window_fns,
         } => {
-            let input_exec = build_inner(db, input, None, ctx)?;
+            // ⚠️ **必须把裁剪投影传下去**（此前硬编码 `None`）。窗口自己在窗口列之上
+            // 的表达式已经按裁剪后的空间重写好了（`rewrite_plan` 的 `Window` 臂），
+            // 这里若传 `None`，扫描会读回全宽批 ⇒ 重写过的 idx（如 `pdate` → 0）
+            // 会指到**另一个列**上 —— 而且不报错。窗口输出 = 输入 ++ 窗口列，
+            // 输入窄了，上面那层 Project 也已经在同一个窄空间里，两边自洽。
+            let input_exec = build_inner(db, input, scan_proj.clone(), ctx)?;
             Ok(Box::new(crate::exec::window::WindowExec::new(
                 input_exec,
                 partition_by.clone(),
@@ -1131,8 +1382,10 @@ fn try_project_join(
     rproj.sort_by_key(|n| rall.iter().position(|c| c == n).unwrap_or(usize::MAX));
     let lmap = build_mapping(&lall, &lproj);
     let rmap = build_mapping(&rall, &rproj);
-    let lp = rewrite_plan(left, &lmap, &lall);
-    let rp = rewrite_plan(right, &rmap, &rall);
+    // 这两条子树是**裸 Scan**（本函数的入口就断言了）⇒ 不含窗口，`k` 只喂给
+    // `output_shift` 的"扫描叶"那条臂，怎么算都对。
+    let lp = rewrite_plan(left, &lmap, &lall, lall.len() - lproj.len());
+    let rp = rewrite_plan(right, &rmap, &rall, rall.len() - rproj.len());
     let probe = build_inner(db, &lp, Some(lproj), ctx)?;
     let build = build_inner(db, &rp, Some(rproj), ctx)?;
     let nl = probe.schema().fields().len();
@@ -1593,7 +1846,8 @@ fn build_aggregate(
                             return (pl.clone(), keys.to_vec(), None);
                         }
                         let mapping = build_mapping(&all, &cols);
-                        let lp = rewrite_plan(pl, &mapping, &all);
+                        // 同上：这条子树是裸 Scan，不含窗口
+                        let lp = rewrite_plan(pl, &mapping, &all, all.len() - cols.len());
                         let k2: Vec<PhysExpr> = keys
                             .iter()
                             .map(|k| rewrite_expr(k, &mapping, &all))

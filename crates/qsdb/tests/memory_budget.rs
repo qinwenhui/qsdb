@@ -141,12 +141,15 @@ fn budget_error_is_distinguishable_from_quota_error() {
     let (db, root) = seeded_db("c1b", 64);
     let pool = Arc::new(qsdb::memory::MemoryPool::new(1024 * 1024));
 
+    // ⚠️ 这条查询**故意多读一列**（`k` 不参与任何运算）：列裁剪会裁掉没人读的列，
+    //    而"只读 `v`"时这条查询的最小配额正好是 1KB —— 恰好卡在下面那个配额上、
+    //    不再报错，这条测试就测不到配额机制了（2026-10-16 列裁剪穿透窗口后当场撞上）。
+    //    多要一列 ⇒ 最小配额 2KB，与配额 1KB 之间留出 2× 余量，且与裁剪行为解耦。
+    let q = "SELECT k, v, row_number() OVER (ORDER BY v) AS rn FROM t";
+
     // ① 自己的配额太小 → QueryMemoryLimit（400，改查询才有用）
     let small = QueryContext::new_with_pool("q-small", None, Some(1024), Some(Arc::clone(&pool)));
-    let err = err_of(db.sql_with_context(
-        "SELECT v, row_number() OVER (ORDER BY v) AS rn FROM t",
-        &small,
-    ));
+    let err = err_of(db.sql_with_context(q, &small));
     assert!(
         matches!(err, QsdbError::QueryMemoryLimit(_)),
         "配额超限应报 QueryMemoryLimit，实际: {err}"
@@ -155,10 +158,7 @@ fn budget_error_is_distinguishable_from_quota_error() {
     // ② 全库预算被占满（配额不限）→ MemoryPressure（503，可退避重试）
     let any = QueryContext::new_with_pool("q-any", None, None, Some(Arc::clone(&pool)));
     let _hog = any.try_reserve(1024 * 1024).unwrap();
-    let err = err_of(db.sql_with_context(
-        "SELECT v, row_number() OVER (ORDER BY v) AS rn FROM t",
-        &any,
-    ));
+    let err = err_of(db.sql_with_context(q, &any));
     assert!(
         matches!(err, QsdbError::MemoryPressure(_)),
         "全局吃紧应报 MemoryPressure，实际: {err}"
