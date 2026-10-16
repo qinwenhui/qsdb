@@ -1682,11 +1682,14 @@ fn number_literal(s: &str) -> Result<Literal> {
         ));
     }
     if let Some((int_part, frac_part)) = t.split_once('.') {
+        // ⚠️ **小数位按用户写的算，不剪末尾的 0**：`4.0` 是 `DECIMAL(2,1)` 而不是
+        // `(1,0)`。这不是美观问题 —— **它决定算术结果的类型**：真 Spark 实测
+        // `d/4.0`（d 是 DECIMAL(18,4)）⇒ `decimal(22,7)`，而剪掉末尾 0 之后我们给
+        // `(20,6)`，**除法的 scale 少一位 = 结算金额的精度少一位**。
+        // （整数部分的**前导** 0 仍然剪：它不进精度，`0.5` ⇒ `(1,1)` ✓ Spark 同。）
         let int_digits = int_part.trim_start_matches(['-', '+', '0']);
-        let frac_digits = frac_part.trim_end_matches('0');
-        let significant = int_digits.len() + frac_digits.len();
-        let scale = frac_digits.len() as i8;
-        let precision = significant.max(1) as u8;
+        let scale = frac_part.len() as i8;
+        let precision = (int_digits.len() + frac_part.len()).max(1) as u8;
         if precision > 38 {
             return Ok(Literal::Float64(
                 t.parse()
@@ -5567,18 +5570,40 @@ fn bind_binary_arith(op: ArithOp, l: PhysExpr, r: PhysExpr) -> Result<PhysExpr> 
                 ArithOp::Div => DecimalMeta::div_result(*a, *b),
                 ArithOp::Mod => DecimalMeta::mod_result(*a, *b),
             }?;
-            (Lt::Decimal(m), l, r) // decimal 路径 eval 内部对齐 scale
+            // ⚠️ **两侧各自转成"保住自己的整数位 + 结果 scale"**，而**不是**转成结果类型。
+            // 转成结果类型会在 `%` 上当场炸：余数比被除数小得多，Spark 的 `%` 结果
+            // 整数位取 **min** ⇒ 被除数 `10.5000` 被塞进 `DECIMAL(5,4)`（上限 9.9999）
+            // **溢出 ⇒ 静默变 NULL**（2026-10-16 实测 `10.5000 % 7` 回 NULL）。
+            // 每侧保住自己的整数位之后，`eval` 那边本来就会 `align_scale` 到 `rs`。
+            let lc = l.cast_to(Lt::Decimal(operand_meta(*a, m.scale)?));
+            let rc = r.cast_to(Lt::Decimal(operand_meta(*b, m.scale)?));
+            (Lt::Decimal(m), lc, rc)
         }
         (Lt::Decimal(a), x) | (x, Lt::Decimal(a)) if x.is_integer() => {
-            let b = DecimalMeta::try_new(19, 0)?;
+            // ⚠️ 整数侧占几位，**按 Spark 的规则**（见 `int_operand_precision`）：
+            // 字面量按**它自己的位数**、列按类型宽度。此前**一律写死 19**。
+            // 写死的后果不是"位数难看"，而是**精度虚高 ⇒ 提前撞上 38 的封顶 ⇒
+            // scale 被截掉 ⇒ 真丢小数**（真 Spark 实测 `(18,4)/4` ⇒ `decimal(20,6)`，
+            // 写死 19 我们给 `(38,24)`）。
+            let int_side: &PhysExpr = if matches!(lt, Lt::Decimal(_)) { &r } else { &l };
+            let b = DecimalMeta::try_new(int_operand_precision(int_side), 0)?;
             let m = match op {
                 ArithOp::Add | ArithOp::Sub => DecimalMeta::add_result(*a, b),
                 ArithOp::Mul => DecimalMeta::mul_result(*a, b),
                 ArithOp::Div => DecimalMeta::div_result(*a, b),
                 ArithOp::Mod => DecimalMeta::mod_result(*a, b),
             }?;
-            let lc = l.cast_to(Lt::Decimal(m));
-            let rc = r.cast_to(Lt::Decimal(m));
+            // ⚠️ **每侧用它自己的 meta**：十进制侧 `a`、整数侧 `b`。
+            // 用错侧是**静默 NULL**：`sum(cnt) * 1.4`（sum=15）若把 15 按字面量
+            // `1.4` 的 `DECIMAL(2,1)` 转（上限 9.9）⇒ 溢出 ⇒ 回 NULL。
+            // 这条是既有测试 `expr_complete::scalar_over_aggregate` 当场抓到的。
+            let dm = operand_meta(*a, m.scale)?;
+            let im = operand_meta(b, m.scale)?;
+            let (lc, rc) = if matches!(lt, Lt::Decimal(_)) {
+                (l.cast_to(Lt::Decimal(dm)), r.cast_to(Lt::Decimal(im)))
+            } else {
+                (l.cast_to(Lt::Decimal(im)), r.cast_to(Lt::Decimal(dm)))
+            };
             (Lt::Decimal(m), lc, rc)
         }
         (Lt::Decimal(_), Lt::Float32) | (Lt::Float32, Lt::Decimal(_)) => {
@@ -5595,6 +5620,54 @@ fn bind_binary_arith(op: ArithOp, l: PhysExpr, r: PhysExpr) -> Result<PhysExpr> 
         l: Box::new(lc),
         r: Box::new(rc),
         ty: result,
+    })
+}
+
+/// 整数操作数在 **decimal 算术**里占多少位（对齐 Spark）。
+///
+/// - **字面量**：按**值本身的位数**（`4` ⇒ 1 位、`1000` ⇒ 4 位）——
+///   "常量最小精度"，Spark / DuckDB 都这么做。真 Spark 实测：
+///   `(18,4)*4` ⇒ `decimal(20,4)`、`(18,4)/4` ⇒ `decimal(20,6)`、
+///   `(18,4)+4` ⇒ `decimal(19,4)`（= `DECIMAL(1,0)` 参与的算法）。
+/// - **列 / 其它表达式**：按**类型宽度**（Int8/16/32/64 ⇒ 3/5/10/19 位）——
+///   列里可能装着该类型能表示的最大值，**不能按"当前值"缩**（那会让类型依赖数据）。
+///
+/// ⚠️ 定得**过大**的代价不是"位数难看"：精度虚高会提前撞上 38 的封顶，
+/// 把 scale 截掉 ⇒ **真丢小数**。结算场景下这是金额错。
+/// 操作数在 decimal 算术里转成的类型：**保住它自己的整数位** + 指定的结果 scale。
+///
+/// 为什么不能直接转成"结果类型"：结果类型的整数位对 `%` 是取 **min** 的
+/// （余数 < 两侧较小者），拿它去装**被除数**必然溢出 ⇒ 静默 NULL。
+fn operand_meta(a: DecimalMeta, result_scale: i8) -> Result<DecimalMeta> {
+    let ip = i32::from(a.precision) - i32::from(a.scale);
+    DecimalMeta::try_new(
+        (ip + i32::from(result_scale)).clamp(1, 38) as u8,
+        result_scale,
+    )
+}
+
+fn int_operand_precision(e: &PhysExpr) -> u8 {
+    use crate::types::Literal as L;
+    fn digits(mut v: u128) -> u8 {
+        let mut d = 1u8;
+        while v >= 10 {
+            v /= 10;
+            d += 1;
+        }
+        d
+    }
+    let lit = match e {
+        PhysExpr::Lit(L::Int8(v)) => Some(digits(v.unsigned_abs() as u128)),
+        PhysExpr::Lit(L::Int16(v)) => Some(digits(v.unsigned_abs() as u128)),
+        PhysExpr::Lit(L::Int32(v)) => Some(digits(v.unsigned_abs() as u128)),
+        PhysExpr::Lit(L::Int64(v)) => Some(digits(v.unsigned_abs() as u128)),
+        _ => None,
+    };
+    lit.unwrap_or(match e.data_type() {
+        LogicalType::Int8 => 3,
+        LogicalType::Int16 => 5,
+        LogicalType::Int32 => 10,
+        _ => 19,
     })
 }
 
