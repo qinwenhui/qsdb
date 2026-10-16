@@ -1430,6 +1430,13 @@ pub(crate) fn ast_type_to_logical(dt: &sqlparser::ast::DataType) -> Result<Logic
             },
         },
         D::Binary(_) | D::Blob(_) | D::Bytea => LogicalType::Binary,
+        // **Spark 的 `BYTE` = `TINYINT`**（Spark SQL 文档里 `BYTE` 就是 TINYINT 的别名），
+        // 而 sqlparser 不认这个词、落到 `Custom` ⇒ 语料里 24 处 `CAST(x AS byte)` 全炸
+        // （8 个块，**全在 `stack` 里**，是被 `stack` 的前置拒绝挡住之后才露出来的）。
+        //
+        // ⚠️ **只认这一个词**：`Custom` 是"任何不认识的类型名"的收容所，
+        // 顺手放行等于把拼错的类型名也当成 TINYINT —— 其余照旧显式拒。
+        D::Custom(name, _) if name.to_string().eq_ignore_ascii_case("byte") => LogicalType::Int8,
         other => {
             return Err(QsdbError::unsupported(format!(
                 "type {other:?} not supported"
@@ -3095,6 +3102,681 @@ fn group_key_expr<'a>(
     Ok(target)
 }
 
+// ---------------------------------------------------------------------------
+// `stack`（列转行）：绑定期重写成 `UNION ALL`
+// ---------------------------------------------------------------------------
+
+/// 剥掉包着表达式的括号 —— `(e)` 在语义上透明，与"括号查询体"同一口径
+/// （见 `translate_select_inner` 里 `SetExpr::Query` 那段的说明）。
+fn unnest_expr(e: &sqlparser::ast::Expr) -> &sqlparser::ast::Expr {
+    let mut cur = e;
+    while let sqlparser::ast::Expr::Nested(inner) = cur {
+        cur = inner;
+    }
+    cur
+}
+
+/// 把 `Expr` 的**直系子表达式**塞进 `out`（[`any_subexpr`] 用）。
+///
+/// ⚠️ 覆盖面**不追求穷尽** `Expr` 的所有变体，但漏掉的形态不会造成"静默错值"：
+/// 本函数比 `collect_aggs` 只多不少，而 `collect_aggs` 漏掉的变体在**别处也一视同仁**
+/// 地漏掉 ⇒ 重写前后口径一致。`stack` 若落在漏掉的变体里，会走 `bind_expr` 的
+/// `unknown function 'stack'`（仍是显式报错）。
+fn expr_children<'a>(e: &'a sqlparser::ast::Expr, out: &mut Vec<&'a sqlparser::ast::Expr>) {
+    use sqlparser::ast::{Expr as E, FunctionArg, FunctionArgExpr, WindowType};
+    match e {
+        E::BinaryOp { left, right, .. }
+        | E::AnyOp { left, right, .. }
+        | E::AllOp { left, right, .. } => {
+            out.push(left);
+            out.push(right);
+        }
+        E::IsDistinctFrom(a, b) | E::IsNotDistinctFrom(a, b) => {
+            out.push(a);
+            out.push(b);
+        }
+        E::IsNull(x)
+        | E::IsNotNull(x)
+        | E::IsTrue(x)
+        | E::IsNotTrue(x)
+        | E::IsFalse(x)
+        | E::IsNotFalse(x)
+        | E::IsUnknown(x)
+        | E::IsNotUnknown(x)
+        | E::Nested(x)
+        | E::UnaryOp { expr: x, .. }
+        | E::Cast { expr: x, .. }
+        | E::Floor { expr: x, .. }
+        | E::Ceil { expr: x, .. }
+        | E::Extract { expr: x, .. }
+        | E::Collate { expr: x, .. } => out.push(x),
+        E::AtTimeZone {
+            timestamp,
+            time_zone,
+        } => {
+            out.push(timestamp);
+            out.push(time_zone);
+        }
+        E::Between {
+            expr, low, high, ..
+        } => {
+            out.push(expr);
+            out.push(low);
+            out.push(high);
+        }
+        E::InList { expr, list, .. } => {
+            out.push(expr);
+            out.extend(list.iter());
+        }
+        E::InSubquery { expr, .. } => out.push(expr),
+        E::Like {
+            expr,
+            pattern,
+            escape_char,
+            ..
+        }
+        | E::ILike {
+            expr,
+            pattern,
+            escape_char,
+            ..
+        }
+        | E::SimilarTo {
+            expr,
+            pattern,
+            escape_char,
+            ..
+        } => {
+            out.push(expr);
+            out.push(pattern);
+            if let Some(c) = escape_char {
+                out.push(c);
+            }
+        }
+        // `RLIKE` / `REGEXP` 没有 `escape_char`（见 sqlparser 的 `Expr::RLike`）
+        E::RLike { expr, pattern, .. } => {
+            out.push(expr);
+            out.push(pattern);
+        }
+        E::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            out.push(expr);
+            if let Some(a) = substring_from {
+                out.push(a);
+            }
+            if let Some(b) = substring_for {
+                out.push(b);
+            }
+        }
+        E::Trim {
+            expr,
+            trim_what,
+            trim_characters,
+            ..
+        } => {
+            out.push(expr);
+            if let Some(w) = trim_what {
+                out.push(w);
+            }
+            if let Some(cs) = trim_characters {
+                out.extend(cs.iter());
+            }
+        }
+        E::Overlay {
+            expr,
+            overlay_what,
+            overlay_from,
+            overlay_for,
+        } => {
+            out.push(expr);
+            out.push(overlay_what);
+            out.push(overlay_from);
+            if let Some(f) = overlay_for {
+                out.push(f);
+            }
+        }
+        E::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(o) = operand {
+                out.push(o);
+            }
+            for cw in conditions {
+                out.push(&cw.condition);
+                out.push(&cw.result);
+            }
+            if let Some(e) = else_result {
+                out.push(e);
+            }
+        }
+        E::Function(f) => {
+            for a in fn_args(f) {
+                if let FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) = a {
+                    out.push(x);
+                }
+            }
+            if let Some(WindowType::WindowSpec(spec)) = &f.over {
+                out.extend(spec.partition_by.iter());
+                for ob in &spec.order_by {
+                    out.push(&ob.expr);
+                }
+            }
+        }
+        E::Tuple(xs) => out.extend(xs.iter()),
+        _ => {}
+    }
+}
+
+/// `PIVOT … IN (<字面量>)` **没写 `AS`** 时的输出列名 —— **与 Spark 同一规则**：
+/// 取字面量的**文本形式**（`'1'` ⇒ `1`，`1` ⇒ `1`，`-1` ⇒ `-1`）。
+///
+/// ⚠️ 这不是"替用户编名"：语料里**下游 SQL 就是按这个名字引用的**
+/// （`work/daily/L1-01_01.sql` 的 t14 写着 ``SELECT `1` AS rqcqprice, `2` AS sscqprice …``）
+/// —— 名字是**下游的契约**，不是我们的发明。
+///
+/// 取不出确定名字的形态（列引用、`CAST`、表达式…）返回 `None` ⇒ 调用方**显式拒**。
+/// 猜名字万一猜错，后果是下游引用不到列（那是显式报错），但**宁可不猜**。
+fn literal_column_name(e: &sqlparser::ast::Expr) -> Option<String> {
+    use sqlparser::ast::{Expr as E, UnaryOperator, Value};
+    match unnest_expr(e) {
+        E::Value(v) => match &v.value {
+            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => Some(s.clone()),
+            Value::Number(n, _) => Some(n.clone()),
+            _ => None,
+        },
+        // 负数会被解析成 `UnaryOp(-, Number)`（`IN (-1 AS a)`）
+        E::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => match unnest_expr(expr) {
+            E::Value(v) => match &v.value {
+                Value::Number(n, _) => Some(format!("-{n}")),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// 这棵表达式树里**有没有**满足 `pred` 的节点（含自身）。
+fn any_subexpr(e: &sqlparser::ast::Expr, pred: &dyn Fn(&sqlparser::ast::Expr) -> bool) -> bool {
+    if pred(e) {
+        return true;
+    }
+    let mut kids = Vec::new();
+    expr_children(e, &mut kids);
+    kids.into_iter().any(|k| any_subexpr(k, pred))
+}
+
+/// 投影项里的表达式（`*` / `t.*` 返回 `None`）。
+fn proj_item_expr(it: &sqlparser::ast::SelectItem) -> Option<&sqlparser::ast::Expr> {
+    use sqlparser::ast::SelectItem as I;
+    match it {
+        I::UnnamedExpr(e)
+        | I::ExprWithAlias { expr: e, .. }
+        | I::ExprWithAliases { expr: e, .. } => Some(e),
+        _ => None,
+    }
+}
+
+/// `stack(n, k₁,v₁, …, kₙ,vₙ) AS (c1, c2)` —— **列转行**，绑定期重写成 `UNION ALL`。
+///
+/// ```
+/// SELECT a, stack(2, 'x', v1, 'y', v2) AS (k, v) FROM t
+/// -- ≡
+/// SELECT a, 'x' AS k, v1 AS v FROM t UNION ALL
+/// SELECT a, 'y' AS k, v2 AS v FROM t
+/// ```
+/// 兄弟投影项**原样复制**到每个分支，`stack` 那两项落在**原位**（列序与 Spark 一致）。
+///
+/// **为什么是重写、不加算子**：`UNION ALL` 的执行路径已经有了，"一行进多行出"却要
+/// 新算子 + 新的内存模型。重写后走的是同一条**已经验证过**的路。
+///
+/// **成本**（不藏着）：兄弟投影项被复制 n 份。但 `FROM` 是 **CTE 引用**时几乎免费 ——
+/// CTE 由 `CteDef` 物化一次，引用点只是 `LogicalPlan::Values { cte_id }` 读同一份批数据
+/// （见 `resolve_table_source` / `exec_builder` 的 `add_cte_batches`）。日清分那 28 个块
+/// 的 `stack` **全部**挂在 CTE 上。`FROM` 是实表/派生表时才会真的算 n 遍。
+///
+/// 边界一律**显式拒**（见 `docs/列转行与行转列设计.md`）：无两列别名、`stack` 被别的
+/// 表达式包住、与聚合/窗口/GROUP BY 混用、`n` 不是正整数字面量、参数个数对不上。
+fn try_rewrite_stack(q: &sqlparser::ast::Query) -> Result<Option<sqlparser::ast::Query>> {
+    use sqlparser::ast::*;
+    let SetExpr::Select(sel) = q.body.as_ref() else {
+        return Ok(None);
+    };
+    let mentions_stack =
+        |e: &Expr| any_subexpr(e, &|x: &Expr| matches!(x, Expr::Function(f) if fn_name(f) == "stack"));
+    let Some(si) = sel
+        .projection
+        .iter()
+        .position(|it| proj_item_expr(it).map_or(false, &mentions_stack))
+    else {
+        return Ok(None);
+    };
+
+    // —— 形状校验 ——
+    // 输出列名**只能来自用户写的别名**：本仓不替用户编名（Spark 会给 `stack` 的
+    // 两列编 `col1`/`col2`，那是别家的口径）。
+    let (call, aliases) = match &sel.projection[si] {
+        SelectItem::ExprWithAliases { expr, aliases } => (expr, aliases.as_slice()),
+        _ => {
+            return Err(QsdbError::unsupported(
+                "stack() needs a two-column alias list, as in \
+                 `stack(2, 'a', v1, 'b', v2) AS (name, value)` — QSDB does not invent \
+                 output column names for it",
+            ));
+        }
+    };
+    if aliases.len() != 2 {
+        return Err(QsdbError::invalid(format!(
+            "stack() needs exactly 2 output column aliases, got {}",
+            aliases.len()
+        )));
+    }
+    let Expr::Function(f) = unnest_expr(call) else {
+        return Err(QsdbError::unsupported(
+            "stack() must be a top-level SELECT item — wrapping it in an expression \
+             (`stack(…) + 1`) is not supported",
+        ));
+    };
+    // ⚠️ **必须再核一次函数名**：`abs(stack(…)) AS (x, y)` 的外层也是 `Expr::Function`，
+    // 不核名就会拿 `abs` 的参数列表当 `stack` 的读下去（实测报出的是
+    // "first argument must be a positive integer literal" —— **把人指向完全错误的方向**）。
+    if fn_name(f) != "stack" {
+        return Err(QsdbError::unsupported(
+            "stack() must be a top-level SELECT item — wrapping it in another function \
+             (`abs(stack(…))`) is not supported",
+        ));
+    }
+    audit_function(f)?;
+    if has_duplicate_treatment(f) {
+        return Err(QsdbError::unsupported("stack(DISTINCT …) is not supported"));
+    }
+
+    // `n` 必须是**正整数字面量**：动态的 n 会让输出行数依赖数据。
+    let args = arg_exprs(f)?;
+    let n = args.first().and_then(|e| match unnest_expr(e) {
+        Expr::Value(v) => match &v.value {
+            Value::Number(s, _) => s.parse::<usize>().ok(),
+            _ => None,
+        },
+        _ => None,
+    });
+    let Some(n) = n.filter(|n| *n > 0) else {
+        return Err(QsdbError::unsupported(
+            "stack()'s first argument must be a positive integer literal (the number of \
+             key/value pairs) — a data-dependent count would make the output row count \
+             depend on the data",
+        ));
+    };
+    let want = 2usize.checked_mul(n).and_then(|x| x.checked_add(1));
+    if want != Some(args.len()) {
+        return Err(QsdbError::invalid(format!(
+            "stack({n}, …) needs exactly {} arguments (1 count + {n} key/value pairs), got {}",
+            2 * n + 1,
+            args.len()
+        )));
+    }
+
+    // —— 与聚合/窗口/GROUP BY 混用：显式拒 ——
+    // 理由**不是"没实现"**：重写会把聚合放进**每个分支各算一遍**，而 Spark 是
+    // "先分组、再对分组结果展开"。两者**不报错、只错值**，正是本仓最不接受的一类。
+    let is_agg_like = |e: &Expr| match unnest_expr(e) {
+        Expr::Function(f) => {
+            f.over.is_some()
+                || is_agg_name(&fn_name(f))
+                || crate::expr::udaf::lookup(&fn_name(f)).is_some()
+        }
+        _ => false,
+    };
+    let no_group_by = matches!(&sel.group_by, GroupByExpr::Expressions(v, _) if v.is_empty());
+    if !no_group_by || sel.having.is_some() {
+        return Err(QsdbError::unsupported(
+            "stack() cannot be combined with GROUP BY / HAVING — the rewrite would aggregate \
+             once per stack branch, which silently differs from grouping-then-expanding",
+        ));
+    }
+    for (i, it) in sel.projection.iter().enumerate() {
+        if let Some(e) = proj_item_expr(it) {
+            let hit = if i == si {
+                args.iter().any(|a| any_subexpr(a, &is_agg_like))
+            } else {
+                any_subexpr(e, &is_agg_like)
+            };
+            if hit {
+                return Err(QsdbError::unsupported(
+                    "stack() cannot be combined with aggregate / window functions — the sibling \
+                     projection is replicated into every stack branch, so the aggregate would \
+                     run once per branch",
+                ));
+            }
+        }
+    }
+
+    // —— 重写：n 个分支，`stack` 那两项落在原位 ——
+    let mut branches: Vec<SetExpr> = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut projection: Vec<SelectItem> = Vec::with_capacity(sel.projection.len() + 1);
+        projection.extend_from_slice(&sel.projection[..si]);
+        projection.push(SelectItem::ExprWithAlias {
+            expr: args[1 + 2 * i].clone(),
+            alias: aliases[0].clone(),
+        });
+        projection.push(SelectItem::ExprWithAlias {
+            expr: args[2 + 2 * i].clone(),
+            alias: aliases[1].clone(),
+        });
+        projection.extend_from_slice(&sel.projection[si + 1..]);
+        let mut branch = (**sel).clone();
+        branch.projection = projection;
+        // `SELECT DISTINCT` 的去重范围是**整行**，`UNION`（非 ALL）恰好就是这个语义
+        // ⇒ 提升到集合算子那一层，分支里清掉。
+        branch.distinct = None;
+        branches.push(SetExpr::Select(Box::new(branch)));
+    }
+    let quantifier = if sel.distinct.is_some() {
+        SetQuantifier::Distinct
+    } else {
+        SetQuantifier::All
+    };
+    let mut body = branches.remove(0);
+    for b in branches {
+        body = SetExpr::SetOperation {
+            left: Box::new(body),
+            op: SetOperator::Union,
+            set_quantifier: quantifier,
+            right: Box::new(b),
+        };
+    }
+    // 外层的 `WITH` / `ORDER BY` / `LIMIT` **原样挂在外面** —— 它们本来就是对
+    // "展开后的结果集"生效的，语义不需要挪。
+    //
+    // 剩下的 `stack`（同一个投影里写了多个）交给**递归**：分支被重新绑定时会再进来
+    // 一次，自然得到 n₁ × n₂ 行 —— 与 Spark 一致。
+    Ok(Some(Query {
+        body: Box::new(body),
+        ..q.clone()
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// `PIVOT`（行转列）：绑定期重写成「条件聚合 + GROUP BY」
+// ---------------------------------------------------------------------------
+
+/// 收集表达式里**引用到的列名**（取限定名的最后一段）。
+///
+/// `PIVOT` 要靠它算"其余列"：聚合表达式里引用的列**不进 `GROUP BY`**
+/// （否则分组粒度变细，**数字全错但一条错都不报** —— 见设计稿 §3.2）。
+fn collect_ident_names(e: &sqlparser::ast::Expr, out: &mut Vec<String>) {
+    use sqlparser::ast::Expr as E;
+    match e {
+        E::Identifier(id) => out.push(id.value.clone()),
+        E::CompoundIdentifier(parts) => {
+            if let Some(last) = parts.last() {
+                out.push(last.value.clone());
+            }
+        }
+        _ => {}
+    }
+    let mut kids = Vec::new();
+    expr_children(e, &mut kids);
+    for k in kids {
+        collect_ident_names(k, out);
+    }
+}
+
+/// 单个 `TableFactor` → `(计划, 列)`。**FROM 主表位置**用；`PIVOT` 的内层表也走这里。
+///
+/// 抽出来是为了 `PIVOT` —— 它的内层表因子要按**同一套**规则解析
+/// （实表 / 表函数 / CTE / 派生表 / 再套一层 `PIVOT`），另写一份迟早会漂移。
+fn resolve_from_factor(
+    relation: &sqlparser::ast::TableFactor,
+    visible: &VisibleCtes,
+    resolver: &TableResolver,
+    cte_defs: &mut Vec<CteDef>,
+) -> Result<(LogicalPlan, SchemaCtx)> {
+    use sqlparser::ast::TableFactor;
+    match relation {
+        TableFactor::Table {
+            name,
+            args: Some(tf_args),
+            ..
+        } => resolve_table_function(&object_name_single(name.clone())?, &tf_args.args),
+        TableFactor::Function { name, args, .. } => {
+            resolve_table_function(&object_name_single(name.clone())?, args)
+        }
+        TableFactor::Table { name, .. } => {
+            resolve_table_source(&object_name_single(name.clone())?, visible, resolver)
+        }
+        TableFactor::Derived { subquery, .. } => {
+            let (sub, child_defs) =
+                translate_select_inner((**subquery).clone(), resolver, visible)?;
+            cte_defs.extend(child_defs);
+            let cols = plan_output_columns(&sub)?;
+            Ok((sub, SchemaCtx { cols }))
+        }
+        TableFactor::Pivot {
+            table,
+            aggregate_functions,
+            value_column,
+            value_source,
+            default_on_null,
+            alias,
+        } => {
+            let (_, plan, cols) = translate_pivot(
+                table,
+                aggregate_functions,
+                value_column,
+                value_source,
+                default_on_null.as_ref(),
+                alias.as_ref(),
+                visible,
+                resolver,
+                cte_defs,
+            )?;
+            Ok((plan, SchemaCtx { cols }))
+        }
+        other => Err(QsdbError::unsupported(format!("FROM {other:?} not supported"))),
+    }
+}
+
+/// `FROM (子查询) t PIVOT ( agg(e) AS a FOR c IN (v₁ AS n₁, …, v_k AS n_k) )`
+/// —— **行转列**，绑定期重写成**条件聚合 + `GROUP BY`**：
+///
+/// ```sql
+/// SELECT <其余列…>,
+///        agg(CASE WHEN c = v₁ THEN e END) AS n₁,
+///        …
+///        agg(CASE WHEN c = v_k THEN e END) AS n_k
+/// FROM 子查询 GROUP BY <其余列…>
+/// ```
+/// 这正是 Spark 内部把 `Pivot` 落成的形状 —— 不新增算子，执行层一行都不用改。
+///
+/// **「其余列」的判据**（设计稿 §3.2）：内层列 − `FOR` 的列 − 聚合表达式引用到的列。
+/// ⚠️ 少减一列 ⇒ 分组变细 ⇒ **数字全错但一条错都不报**，故与真 Spark 逐值对账过。
+///
+/// 边界一律**显式拒**：`IN` 含子查询/`ANY`（那才是"输出 schema 依赖数据"）、
+/// `IN` 值没有 `AS` 别名、多聚合、多个 `FOR` 列、`DEFAULT ON NULL`。
+fn translate_pivot(
+    inner: &sqlparser::ast::TableFactor,
+    aggregate_functions: &[sqlparser::ast::ExprWithAlias],
+    value_column: &[sqlparser::ast::Expr],
+    value_source: &sqlparser::ast::PivotValueSource,
+    default_on_null: Option<&sqlparser::ast::Expr>,
+    alias: Option<&sqlparser::ast::TableAlias>,
+    visible: &VisibleCtes,
+    resolver: &TableResolver,
+    cte_defs: &mut Vec<CteDef>,
+) -> Result<(String, LogicalPlan, Vec<(String, LogicalType)>)> {
+    use sqlparser::ast::*;
+    let (in_plan, in_ctx) = resolve_from_factor(inner, visible, resolver, cte_defs)?;
+    let in_cols = in_ctx.cols.clone();
+
+    if default_on_null.is_some() {
+        return Err(QsdbError::unsupported("PIVOT … DEFAULT ON NULL"));
+    }
+    if value_column.len() != 1 {
+        return Err(QsdbError::unsupported(
+            "PIVOT with more than one FOR column",
+        ));
+    }
+    let values = match value_source {
+        PivotValueSource::List(v) => v,
+        PivotValueSource::Any(_) => {
+            return Err(QsdbError::unsupported(
+                "PIVOT … FOR … IN (ANY) — the output column set would depend on the data, \
+                 which conflicts with resolving the schema at bind time",
+            ));
+        }
+        PivotValueSource::Subquery(_) => {
+            return Err(QsdbError::unsupported(
+                "PIVOT … FOR … IN (SELECT …) — the output column set would depend on the \
+                 data, which conflicts with resolving the schema at bind time",
+            ));
+        }
+    };
+    if values.is_empty() {
+        return Err(QsdbError::invalid("PIVOT … IN () is empty"));
+    }
+    // 输出列名：优先用用户写的 `AS`；没写就按 Spark 的规则取**字面量的文本形式**
+    // （见 `literal_column_name` —— 语料里 11 个块是 `IN ('1','2',…)` 这个形态，
+    //  且下游就是按 `` `1` ``、`` `2` `` 引用的）。取不出来 ⇒ 显式拒，不猜。
+    let mut out_names: Vec<String> = Vec::with_capacity(values.len());
+    for v in values {
+        let name = match &v.alias {
+            Some(a) => a.value.clone(),
+            None => literal_column_name(&v.expr).ok_or_else(|| {
+                QsdbError::unsupported(
+                    "PIVOT … IN value has no `AS <column>` alias and no name can be derived \
+                     from it (only plain literals have a defined name) — write the alias \
+                     explicitly, as in `FOR c IN ('1' AS v1)`",
+                )
+            })?,
+        };
+        out_names.push(name);
+    }
+    if aggregate_functions.len() != 1 {
+        return Err(QsdbError::unsupported(format!(
+            "PIVOT with {} aggregates — only a single aggregate is supported \
+             (the output column naming rule for several aggregates is not settled)",
+            aggregate_functions.len()
+        )));
+    }
+
+    // `FOR` 的必须是内层表的一个**裸列**（按名字定位，列序即内层列序）
+    let pivot_expr = unnest_expr(&value_column[0]);
+    let pivot_name = match pivot_expr {
+        Expr::Identifier(id) => id.value.clone(),
+        Expr::CompoundIdentifier(parts) => match parts.last() {
+            Some(last) => last.value.clone(),
+            None => return Err(QsdbError::invalid("PIVOT … FOR has an empty column name")),
+        },
+        _ => {
+            return Err(QsdbError::unsupported(
+                "PIVOT … FOR must be a plain column reference",
+            ));
+        }
+    };
+    let Some(pi) = in_cols
+        .iter()
+        .position(|(n, _)| n.eq_ignore_ascii_case(&pivot_name))
+    else {
+        return Err(QsdbError::invalid(format!(
+            "PIVOT … FOR {pivot_name}: no such column in the pivoted input"
+        )));
+    };
+
+    let agg_item = &aggregate_functions[0];
+    let Expr::Function(f0) = unnest_expr(&agg_item.expr) else {
+        return Err(QsdbError::unsupported(
+            "PIVOT's aggregate must be an aggregate function call, e.g. `SUM(x) AS x`",
+        ));
+    };
+    let agg_name = fn_name(f0);
+    if !is_agg_name(&agg_name) || f0.over.is_some() || has_duplicate_treatment(f0) {
+        return Err(QsdbError::unsupported(format!(
+            "PIVOT's aggregate must be one of count/sum/min/max/avg (got `{agg_name}`); \
+             DISTINCT / window forms are not supported"
+        )));
+    }
+    let agg_args = arg_exprs(f0)?;
+    if agg_args.len() != 1 {
+        return Err(QsdbError::unsupported(
+            "PIVOT's aggregate must take exactly one argument (COUNT(*) is not supported)",
+        ));
+    }
+    // 判据要在**原表达式**上取：聚合表达式引用到的列不进 GROUP BY
+    let mut referenced: Vec<String> = Vec::new();
+    collect_ident_names(agg_args[0], &mut referenced);
+
+    // 逐值条件聚合：`agg(CASE WHEN c = vᵢ THEN e END)`
+    let mut aggs_out: Vec<AggExpr> = Vec::with_capacity(values.len());
+    for (vi, v) in values.iter().enumerate() {
+        let condition = Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new(in_cols[pi].0.clone()))),
+            op: BinaryOperator::Eq,
+            right: Box::new(v.expr.clone()),
+        };
+        let case_expr = Expr::Case {
+            // 合成 AST 没有原文 token（`AttachedToken` 只是给 Display 保留空白/注释用）
+            case_token: sqlparser::ast::helpers::attached_token::AttachedToken::empty(),
+            end_token: sqlparser::ast::helpers::attached_token::AttachedToken::empty(),
+            operand: None,
+            conditions: vec![CaseWhen {
+                condition,
+                result: agg_args[0].clone(),
+            }],
+            else_result: None,
+        };
+        // 复用既有聚合绑定：把 `agg(e)` 的**参数**换成上面那个 `CASE`
+        // （函数名/重载都交给 `try_bind_agg`，不在 PIVOT 里重写一遍类型推导）
+        let mut synthetic = f0.clone();
+        synthetic.args = FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(case_expr))],
+            clauses: Vec::new(),
+        });
+        synthetic.filter = None;
+        let mut agg = try_bind_agg(&synthetic, &in_ctx)?.ok_or_else(|| {
+            QsdbError::invalid(format!("PIVOT's aggregate `{agg_name}` did not bind"))
+        })?;
+        agg.out_name = out_names[vi].clone();
+        aggs_out.push(agg);
+    }
+
+    // 「其余列」：内层列 − FOR 列 − 聚合引用到的列（**按位置**，同名歧义不参与）
+    let mut group: Vec<PhysExpr> = Vec::new();
+    for (i, (n, t)) in in_cols.iter().enumerate() {
+        if i == pi || referenced.iter().any(|r| r.eq_ignore_ascii_case(n)) {
+            continue;
+        }
+        group.push(PhysExpr::Column {
+            idx: i,
+            name: n.clone(),
+            ty: t.clone(),
+        });
+    }
+
+    let plan = LogicalPlan::Aggregate {
+        input: Box::new(in_plan),
+        group,
+        aggs: aggs_out,
+    };
+    let out_cols = plan_output_columns(&plan)?;
+    let name = alias
+        .map(|a| a.name.value.clone())
+        .unwrap_or_else(|| "pivot".to_string());
+    Ok((name, plan, out_cols))
+}
+
 fn translate_select_inner(
     q: sqlparser::ast::Query,
     resolver: &TableResolver,
@@ -3157,6 +3839,11 @@ fn translate_select_inner(
             ancestors,
         );
     }
+    // `stack`（列转行）：命中就先重写成 `UNION ALL` 再重新绑定（见 `try_rewrite_stack`）。
+    // **必须在这里**——下面的 `match *q.body` 会把 `q` 部分移动，而重写要整条 `Query`。
+    if let Some(rewritten) = try_rewrite_stack(&q)? {
+        return translate_select_inner(rewritten, resolver, ancestors);
+    }
     let select = match *q.body {
         SetExpr::Select(s) => {
             audit_select(&s)?;
@@ -3201,31 +3888,7 @@ fn translate_select_inner(
     // 无 FROM → 单行零列源（SELECT 1+1 / SELECT CURRENT_DATE）
     let (mut plan, mut ctx): (LogicalPlan, SchemaCtx) = match from_items.first() {
         None => (LogicalPlan::OneRow, SchemaCtx { cols: Vec::new() }),
-        Some(tw) => match &tw.relation {
-            TableFactor::Table {
-                name,
-                args: Some(tf_args),
-                ..
-            } => resolve_table_function(&object_name_single(name.clone())?, &tf_args.args)?,
-            TableFactor::Function { name, args, .. } => {
-                resolve_table_function(&object_name_single(name.clone())?, args)?
-            }
-            TableFactor::Table { name, .. } => {
-                resolve_table_source(&object_name_single(name.clone())?, &visible, resolver)?
-            }
-            TableFactor::Derived { subquery, .. } => {
-                let (sub, child_defs) =
-                    translate_select_inner((**subquery).clone(), resolver, &visible)?;
-                cte_defs.extend(child_defs);
-                let cols = plan_output_columns(&sub)?;
-                (sub, SchemaCtx { cols })
-            }
-            other => {
-                return Err(QsdbError::unsupported(format!(
-                    "FROM {other:?} not supported"
-                )));
-            }
-        },
+        Some(tw) => resolve_from_factor(&tw.relation, &visible, resolver, &mut cte_defs)?,
     };
 
     // JOIN 链（SQL-2：等值 INNER/LEFT）
@@ -3346,6 +4009,14 @@ fn translate_select_inner(
                     .map(|a| a.name.value.clone())
                     .unwrap_or_else(|| "subquery".into());
                 (name, sub, cols)
+            }
+            // `A JOIN (…) t PIVOT (…) ON …`：JOIN 右侧的 PIVOT **显式拒**（语料里没有）。
+            // 拒绝文案要给出**怎么改**，而不是把语法树 Debug-print 出去。
+            TableFactor::Pivot { .. } => {
+                return Err(QsdbError::unsupported(
+                    "PIVOT on the right side of a JOIN is not supported — \
+                     put the PIVOT in a derived table and join that",
+                ));
             }
             other => return Err(QsdbError::unsupported(format!("JOIN target {other:?}"))),
         };
@@ -5707,12 +6378,11 @@ fn like_from_phys(
 
 /// 已绑定表达式的比较（CASE 简单形态 / nullif 用）：对齐逻辑同 bind_cmp。
 fn bind_cmp_phys(op: CmpOp, lb: PhysExpr, rb: PhysExpr) -> Result<PhysExpr> {
-    // NULL 比较短路（x = NULL 恒 UNKNOWN → 条件不取）
-    if matches!(lb, PhysExpr::Lit(Literal::Null)) || matches!(rb, PhysExpr::Lit(Literal::Null)) {
-        return Ok(PhysExpr::Lit(Literal::Null));
-    }
     let (lb, rb) = promote_temporal_lit(lb, rb)?;
     let (lb, rb) = promote_string_lit(lb, rb);
+    if null_cmp_short_circuit(&lb, &rb) {
+        return Ok(PhysExpr::Lit(Literal::Null));
+    }
     let lt = lb.data_type();
     let rt = rb.data_type();
     let common = cmp_common_type(&lt, &rt)?;
@@ -6001,14 +6671,15 @@ fn bind_cmp(
 ) -> Result<PhysExpr> {
     let lb = bind_expr(l, ctx)?;
     let rb = bind_expr(r, ctx)?;
-    // NULL 比较短路（Kleene 语义由 null boolean 常量承载）
-    if matches!(lb, PhysExpr::Lit(Literal::Null)) || matches!(rb, PhysExpr::Lit(Literal::Null)) {
-        return Ok(PhysExpr::Lit(Literal::Null));
-    }
     // F16：temporal 列 × 字符串字面量 → 绑定期字面量提升（白名单隐式转换）。
     // 谓词保持 typed → min/max 裁剪与谓词下推不受影响；解析失败给出字面量指引。
     let (lb, rb) = promote_temporal_lit(lb, rb)?;
     let (lb, rb) = promote_string_lit(lb, rb);
+    // NULL 比较短路（Kleene 语义由 null boolean 常量承载）——
+    // **必须放在两个提升之后**，见 `null_cmp_short_circuit` 的说明。
+    if null_cmp_short_circuit(&lb, &rb) {
+        return Ok(PhysExpr::Lit(Literal::Null));
+    }
     let lt = lb.data_type();
     let rt = rb.data_type();
     let common = cmp_common_type(&lt, &rt)?;
@@ -6036,6 +6707,23 @@ fn bind_cmp(
 
 fn is_lit(e: &PhysExpr) -> bool {
     matches!(e, PhysExpr::Lit(_))
+}
+
+/// 比较的一侧是 NULL 字面量 ⇒ 整条比较恒 UNKNOWN（Kleene 语义）。
+///
+/// ⚠️ **判据必须放在两个 `promote_*` 之后**（2026-10-16 修，卡住 9 个块）。
+///
+/// 缘起：语料里"空串当零"的惯用写法 —— `CASE WHEN SUM_VALUE = '' THEN 0 …`，
+/// `SUM_VALUE` 是 `DECIMAL(38,8)`。`promote_string_lit` 按 Spark 语义把转不动的
+/// 字符串变成 **`Lit(Null)`**（`''` 转不成小数），可这个 NULL 是**提升之后**才出现的，
+/// 而短路当时挂在提升**之前** ⇒ 轮到 `cmp_common_type` 时看到的是
+/// `DECIMAL(38,8)` 对 `Lit(Null)`，而 `Lit(Null).data_type()` 的兜底是 **`Boolean`**
+/// ⇒ 报 `cannot compare DECIMAL(38, 8) with BOOLEAN`。
+///
+/// 那是**把一个"答案恒为 NULL"的比较说成了类型错误** —— 报错方向完全指错，
+/// 而 Spark 那边 `SUM_VALUE = ''` 就是 NULL（`WHEN` 不取，落到 `ELSE`）。
+fn null_cmp_short_circuit(lb: &PhysExpr, rb: &PhysExpr) -> bool {
+    matches!(lb, PhysExpr::Lit(Literal::Null)) || matches!(rb, PhysExpr::Lit(Literal::Null))
 }
 
 /// 一侧 temporal、另一侧字符串**字面量** → 按目标类型解析提升

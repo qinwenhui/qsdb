@@ -2,7 +2,7 @@
 //!
 //! M2 起支持 SQL-0/1；server 子命令 M3 开放。
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -1061,15 +1061,36 @@ fn print_result(r: &SqlResult, elapsed: std::time::Duration) {
             for b in batches {
                 push_rows(&mut table, b);
             }
-            // 列宽（上限 24）
+            // ------------------------------------------------------------------
+            // 单元格截断 —— **只在往终端上打的时候做**（2026-10-17 修）
+            //
+            // ⚠️ 这段此前有三个问题，且**已经连坑三次**：
+            //   ① 无条件截断 ⇒ 输出被程序消费时**静默丢数据**（`SHOW TABLES` 的长表名
+            //      被拿去做 `DESCRIBE`，39 张表被静默跳过）；
+            //   ② 长列名被截进 DDL，拼出语法错；
+            //   ③ `&v[..21]` 是**按字节**切片 ⇒ 撞上多字节字符（中文列名）直接
+            //      **panic**（`end byte index 21 is not a char boundary`），
+            //      而前半屏已经打出去了，看上去像"查询失败"。
+            //
+            // 现在：**重定向/管道 ⇒ 一个字都不截**（程序拿到的是完整值）；
+            // 终端 ⇒ 仍截断（那是给眼睛看的，`…` 是可见的，不是静默）。
+            let tty = std::io::stdout().is_terminal();
+            let head = |s: &str| -> String {
+                if tty && s.chars().count() > 24 {
+                    // 按**字符**取，不是按字节 —— 边界必须落在字符上
+                    format!("{}…", s.chars().take(21).collect::<String>())
+                } else {
+                    s.to_string()
+                }
+            };
+            // 列宽按**字符数**算（`{:<width$}` 的填充也是按字符），否则中文列错位
             let width: Vec<usize> = (0..schema.fields().len())
                 .map(|c| {
                     table
                         .iter()
-                        .map(|r| r.get(c).map(|s| s.len()).unwrap_or(0))
+                        .map(|r| r.get(c).map(|s| head(s).chars().count()).unwrap_or(0))
                         .max()
                         .unwrap_or(0)
-                        .min(24)
                 })
                 .collect();
             let sep: String = width
@@ -1082,11 +1103,7 @@ fn print_result(r: &SqlResult, elapsed: std::time::Duration) {
                     .iter()
                     .enumerate()
                     .map(|(c, v)| {
-                        let v = if v.len() > 24 {
-                            format!("{}…", &v[..21])
-                        } else {
-                            v.clone()
-                        };
+                        let v = head(v);
                         format!(" {:<width$} ", v, width = width[c])
                     })
                     .collect();

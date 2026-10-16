@@ -387,3 +387,39 @@ fn scalar_over_aggregate() {
         ) == vec!["NULL", "b", "c"]
     );
 }
+
+/// **数值/小数列 与 字符串字面量** 的比较：转不动的字符串 ⇒ 整条比较是 `NULL`
+/// （Spark `ansi.enabled=false` 的语义），**不是**类型错误。
+///
+/// 2026-10-16：语料里"空串当零"的惯用写法
+/// `CASE WHEN SUM_VALUE = '' THEN 0 ELSE SUM_VALUE END`（`SUM_VALUE` 是
+/// `DECIMAL(38,8)`）**一下卡住 9 个块**，报的是
+/// `cannot compare DECIMAL(38, 8) with BOOLEAN` —— 方向完全指错。
+///
+/// 病根：`promote_string_lit` 按 Spark 语义把转不动的字符串变成 `Lit(Null)`，
+/// 可 "一侧是 NULL 就短路" 当时挂在提升**之前**，于是轮到 `cmp_common_type` 时
+/// 拿到的是 `DECIMAL(38,8)` 对 `Lit(Null)`，而 `Lit(Null).data_type()` 的兜底
+/// 恰好是 **`Boolean`** ⇒ 报出上面那条莫名其妙的错。
+#[test]
+fn 数值与字符串字面量比较_转不动给_null_而不是报错() {
+    let (db, _r) = setup("strlit_cmp");
+    // 空串（语料里的真实形状）：整条比较 NULL ⇒ `WHEN` 不取，落到 `ELSE`
+    assert!(
+        q(
+            &db,
+            "SELECT tenant, CASE WHEN amount = '' THEN 0 ELSE amount END FROM t"
+        )
+        .iter()
+        .all(|r| !r.ends_with("|0")),
+        "空串比较必须是 NULL（WHEN 不取）"
+    );
+    // 直接看比较结果本身：全 NULL
+    assert!(q(&db, "SELECT amount = '' FROM t").iter().all(|r| r == "NULL"));
+    assert!(q(&db, "SELECT amount <> '' FROM t").iter().all(|r| r == "NULL"));
+    // 同族的整数 / 浮点 / 能转动的字符串
+    assert!(q(&db, "SELECT cnt = 'z' FROM t").iter().all(|r| r == "NULL"));
+    assert!(q(&db, "SELECT score = 'z' FROM t").iter().all(|r| r == "NULL"));
+    assert!(q(&db, "SELECT CAST(1 AS BIGINT) = '1'").iter().all(|r| r == "true"));
+    // 显式 NULL 仍然短路（这条一直都在，别被上面的改动带跑）
+    assert!(q(&db, "SELECT cnt = NULL FROM t").iter().all(|r| r == "NULL"));
+}
