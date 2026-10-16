@@ -2040,9 +2040,24 @@ fn finalize_col(table: &GroupTable, ai: usize, agg: &AggExpr, n: usize) -> Resul
                     let SumCol::Dec(v) = &table.sums[ai] else {
                         return Err(QsdbError::type_err("sum column kind mismatch (internal)"));
                     };
+                    // ⚠️ **溢出必须报错，不许静默变 NULL**：`i256` 能装 76 位，而输出
+                    //   类型声明的是 `min(p+10, 38)` —— 装不下时 `to_i128()` 回 `None`，
+                    //   直接 collect 成 `Option` 就等于把「求和超范围」说成「这组全空」。
+                    //   两个含义天差地别，而调用方无从分辨（2026-10-16 修）。
                     let out: Decimal128Array = (0..n)
-                        .map(|g| if cnt[g] == 0 { None } else { v[g].to_i128() })
-                        .collect();
+                        .map(|g| {
+                            if cnt[g] == 0 {
+                                return Ok(None);
+                            }
+                            v[g].to_i128().map(Some).ok_or_else(|| {
+                                QsdbError::invalid(
+                                    "sum(DECIMAL) 超出 DECIMAL 能表示的范围（38 位十进制）—— \
+                                     结果装不进声明的输出精度。请缩窄精度或分批计算；\
+                                     本仓不做静默截断、也不回 NULL",
+                                )
+                            })
+                        })
+                        .collect::<Result<_>>()?;
                     Ok(Arc::new(out.with_data_type(DataType::Decimal128(
                         m.precision,
                         m.scale,
@@ -2095,7 +2110,7 @@ fn finalize_col(table: &GroupTable, ai: usize, agg: &AggExpr, n: usize) -> Resul
                     .zip(cnt.iter())
                     .map(|(x, c)| {
                         if *c == 0 {
-                            return None;
+                            return Ok(None);
                         }
                         let cnt_v = i256::from_i128(*c as i128);
                         let q = *x / cnt_v;
@@ -2112,9 +2127,15 @@ fn finalize_col(table: &GroupTable, ai: usize, agg: &AggExpr, n: usize) -> Resul
                         } else {
                             q
                         };
-                        adj.to_i128()
+                        // 同 sum：**溢出报错，不回 NULL**（2026-10-16 修）
+                        adj.to_i128().map(Some).ok_or_else(|| {
+                            QsdbError::invalid(
+                                "avg(DECIMAL) 超出 DECIMAL 能表示的范围（38 位十进制）—— \
+                                 结果装不进声明的输出精度；本仓不静默截断、也不回 NULL",
+                            )
+                        })
                     })
-                    .collect();
+                    .collect::<Result<_>>()?;
                 Ok(Arc::new(out.with_data_type(DataType::Decimal128(
                     m.precision,
                     m.scale,

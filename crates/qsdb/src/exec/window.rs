@@ -31,7 +31,11 @@
 //! （`QUERY_MEMORY_LIMIT` / `MEMORY_PRESSURE`），不硬做。
 //! 这是设计边界，见 `docs/内存预算与溢出设计.md` §四 4.2。
 //!
-//! 已知后置：SUM/AVG 不支持 Decimal 参数（显式报错）。
+//! **DECIMAL 支持（2026-10-16）**：`sum/avg/min/max` 均可用于 `DECIMAL` 参数
+//! （电量/电费/电价这类核心列几乎全是它）。精度口径与非窗口聚合**逐字一致**：
+//! `sum` ⇒ `min(p+10,38), s`；`avg` ⇒ `min(p+10,38), max(s,4)`（HALF_UP）；
+//! `min/max` ⇒ 参数类型。**累加用 arrow 自带的 `i256`**（零新依赖），
+//! 装不回声明精度时**显式报错，不回 NULL**。
 //!
 //! 取值口径（两条路径**同一套**）：帧内**一个非 NULL 都没有**（含空帧）⇒
 //! SUM/MIN/MAX/AVG 输出 **NULL**（此前输出 0 / NaN —— 那是错值，2026-10-15 修）；
@@ -42,12 +46,12 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, UInt32Array,
-    UInt32Builder,
+    Array, ArrayRef, BooleanArray, Decimal128Array, Float64Array, Int64Array, StringArray,
+    UInt32Array, UInt32Builder,
 };
 use arrow::compute::kernels::sort::{SortColumn, lexsort_to_indices};
 use arrow::compute::{concat, interleave, take};
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef, i256};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
 use crate::error::{QsdbError, Result};
@@ -171,15 +175,30 @@ impl WindowFn {
         use crate::types::LogicalType;
         match self {
             Self::RowNumber | Self::Rank | Self::DenseRank | Self::Count(..) => LogicalType::Int64,
+            // ⚠️ **`Decimal` 必须排在 `t if t.is_numeric()` 前面**：
+            //   `Decimal::is_numeric()` 为真 ⇒ 顺序反了这条臂就是**死代码**，
+            //   `sum(d) OVER ()` 的输出类型会变成 **BIGINT**（值被当整数显示）。
+            //   实测（2026-10-16）：这条一直是错的，只是此前 `sum(decimal) OVER`
+            //   直接报"不支持"、**从没走到取类型那一步**，所以从没暴露。
+            //   非窗口聚合那边用的是严格 `match input`（Decimal 显式一条），没这个坑。
             Self::Sum(e, _) => match e.data_type() {
-                LogicalType::Float32 | LogicalType::Float64 => LogicalType::Float64,
-                t if t.is_numeric() => LogicalType::Int64,
                 LogicalType::Decimal(m) => {
                     LogicalType::Decimal(crate::types::DecimalMeta::sum_result(m))
                 }
+                LogicalType::Float32 | LogicalType::Float64 => LogicalType::Float64,
+                t if t.is_numeric() => LogicalType::Int64,
                 _ => LogicalType::Int64,
             },
-            Self::Avg(..) => LogicalType::Float64,
+            // ⚠️ **与非窗口聚合对齐**：那边 `avg(DECIMAL)` 走 HALF_UP 精确路径、
+            // 输出 `Decimal`；窗口此前一律 Float64 ⇒ **同一个函数两条路给出不同类型**，
+            // 而窗口那条对电量/电费这种列是**有损**的（Float64 只有 ~15 位有效数字，
+            // DECIMAL(30,8) 有 30 位）。金融/结算场景这条不能含糊。
+            Self::Avg(e, _) => match e.data_type() {
+                LogicalType::Decimal(m) => {
+                    LogicalType::Decimal(crate::types::DecimalMeta::avg_result(m))
+                }
+                _ => LogicalType::Float64,
+            },
             Self::Min(e, _) | Self::Max(e, _) => e.data_type(),
             Self::Lag(e, ..) | Self::Lead(e, ..) => e.data_type(),
         }
@@ -669,9 +688,58 @@ fn compute_window_fn(
                     }
                     finish_float(out, &empty_rows, &seg_start)
                 }
+                crate::types::LogicalType::Decimal(_) => {
+                    // DECIMAL：sum/avg 走 i256 **精确**累加（与聚合那边同一套），
+                    // min/max 取 i128 极值（不做算术，值本身就装得下）
+                    let dec = arg_arr
+                        .as_any()
+                        .downcast_ref::<Decimal128Array>()
+                        .ok_or_else(|| {
+                            QsdbError::type_err("decimal window arg downcast failed (internal)")
+                        })?;
+                    let mut acc = i256::from_i128(0);
+                    let mut ext: Option<i128> = None;
+                    let mut cnt = 0i64;
+                    let mut out_d = vec![0i128; n];
+                    let mut empty_rows: Vec<u32> = Vec::new();
+                    for i in 0..n {
+                        if partition_start[i] {
+                            acc = i256::from_i128(0);
+                            ext = None;
+                            cnt = 0;
+                        }
+                        if !dec.is_null(i) {
+                            let v = dec.value(i);
+                            acc += i256::from_i128(v);
+                            cnt += 1;
+                            ext = Some(match ext {
+                                None => v,
+                                Some(e) if is_min => e.min(v),
+                                Some(e) if is_max => e.max(v),
+                                Some(e) => e,
+                            });
+                        } else if cnt == 0 {
+                            empty_rows.push(i as u32);
+                        }
+                        out_d[i] = if is_avg {
+                            // cnt == 0 的行由 `empty_rows` 统一置 NULL（见 finish_dec）
+                            if cnt == 0 { 0 } else { dec_avg(acc, cnt)? }
+                        } else if is_min || is_max {
+                            ext.unwrap_or(0)
+                        } else {
+                            dec_fit(acc, "sum")?
+                        };
+                    }
+                    finish_dec(
+                        out_d,
+                        &empty_rows,
+                        &seg_start,
+                        out_meta(f, &arg.data_type())?,
+                    )
+                }
                 other => {
                     return Err(QsdbError::unsupported(format!(
-                        "window {fname} over {other:?} (support: integer/float args)"
+                        "window {fname} over {other:?} (support: integer/float/decimal args)"
                     )));
                 }
             };
@@ -772,6 +840,27 @@ fn agg_name(f: &WindowFn) -> &'static str {
 ///
 /// **`empty_rows` 为空时走原快路径**（`Vec<T>` 直出、零额外分配）—— 没有 NULL
 /// 的数据（含基准里的）一分钱都不多付；有 NULL 时才付一次 `Vec<Option<T>>`。
+/// DECIMAL 版收敛（形状与 [`finish_int`] 一致：**只有真有空帧时才付 `Option` 的代价**）。
+fn finish_dec(
+    vals: Vec<i128>,
+    empty_rows: &[u32],
+    seg_start: &[bool],
+    m: crate::types::DecimalMeta,
+) -> ArrayRef {
+    let dt = DataType::Decimal128(m.precision, m.scale);
+    if empty_rows.is_empty() {
+        let mut v = vals;
+        backfill_segments(&mut v, seg_start);
+        return Arc::new(Decimal128Array::from(v).with_data_type(dt));
+    }
+    let mut opts: Vec<Option<i128>> = vals.into_iter().map(Some).collect();
+    for &i in empty_rows {
+        opts[i as usize] = None;
+    }
+    backfill_segments(&mut opts, seg_start);
+    Arc::new(Decimal128Array::from(opts).with_data_type(dt))
+}
+
 fn finish_int(vals: Vec<i64>, empty_rows: &[u32], seg_start: &[bool]) -> ArrayRef {
     if empty_rows.is_empty() {
         let mut v = vals;
@@ -859,13 +948,127 @@ fn framed_agg(
                 }
             }
         }
+        crate::types::LogicalType::Decimal(_) => {
+            let Some(vals) = dec_vals(arg_arr, n) else {
+                return Err(QsdbError::type_err("decimal window arg downcast failed"));
+            };
+            if is_extreme {
+                let out = framed_extreme(&vals, frame, partition_start, n, want_min);
+                Arc::new(Decimal128Array::from(out).with_data_type({
+                    let m = dec_meta(&arg_type)?;
+                    DataType::Decimal128(m.precision, m.scale)
+                }))
+            } else {
+                let big: Vec<Option<i256>> = vals.iter().map(|v| v.map(i256::from_i128)).collect();
+                let (sums, cnts) = framed_prefix(n, partition_start, frame, &big);
+                let out: Vec<Option<i128>> = if is_avg {
+                    sums.iter()
+                        .zip(cnts.iter())
+                        .map(|(s, c)| match s {
+                            Some(v) if *c > 0 => dec_avg(*v, *c).map(Some),
+                            _ => Ok(None),
+                        })
+                        .collect::<Result<_>>()?
+                } else {
+                    sums.iter()
+                        .map(|s| match s {
+                            Some(v) => dec_fit(*v, "sum").map(Some),
+                            None => Ok(None),
+                        })
+                        .collect::<Result<_>>()?
+                };
+                let m = out_meta(f, &arg_type)?;
+                Arc::new(
+                    Decimal128Array::from(out)
+                        .with_data_type(DataType::Decimal128(m.precision, m.scale)),
+                )
+            }
+        }
         other => {
             return Err(QsdbError::unsupported(format!(
-                "window {fname} over {other:?} (support: integer/float args)"
+                "window {fname} over {other:?} (support: integer/float/decimal args)"
             )));
         }
     };
     align_output(f, arr)
+}
+
+// ---------------------------------------------------------------------------
+// DECIMAL 的窗口聚合（2026-10-16）
+//
+// 起因：`sum(d) OVER (…)` 此前报 `support: integer/float args` —— 而**电量/电费/
+// 电价这类核心列几乎全是 `DECIMAL(30,8)`**，窗口累计是日清最常用的形状之一。
+//
+// 三条精度口径**逐字对齐非窗口聚合**（不另立一套，否则同一个函数两条路给不同值）：
+// - `sum`  → `i256` 精确累加，输出 `Decimal(sum_result(m))` ＝ `min(p+10, 38), s`
+// - `avg`  → `HALF_UP(sum / count)`，输出 `Decimal(avg_result(m))` ＝ `min(p+10,38), max(s,4)`
+// - `min/max` → 输出**参数类型**（值本身就是 i128，不做算术）
+// ---------------------------------------------------------------------------
+
+/// 把 `i256` 累加值装回 `i128`。**装不下就报错，不许静默变 NULL。**
+///
+/// 输出类型声明的是 `min(p+10, 38)`，而 `i256` 能装 76 位 —— 两者都可能不够。
+/// 非窗口聚合那边此前是 `.to_i128()` 直接 collect 成 `Option` ⇒ **溢出变 NULL**：
+/// 「求和装不下」被说成「这组全空」，两个含义天差地别，而调用方无从分辨。
+/// 本仓纪律是**宁可报错，不给错值** —— 这里照办。
+fn dec_fit(v: i256, what: &str) -> Result<i128> {
+    v.to_i128().ok_or_else(|| {
+        QsdbError::invalid(format!(
+            "{what} 超出 DECIMAL 能表示的范围（38 位十进制）——              结果装不进声明的输出精度。请缩窄精度（如 `CAST(… AS DECIMAL(30,8))`）             或分批计算；**本仓不做静默截断、也不回 NULL**"
+        ))
+    })
+}
+
+/// `avg(decimal)`：`HALF_UP(sum / count)`，与非窗口聚合逐字一致。
+fn dec_avg(sum: i256, cnt: i64) -> Result<i128> {
+    if cnt <= 0 {
+        return Err(QsdbError::type_err("avg with zero count (internal)"));
+    }
+    let d = i256::from_i128(cnt as i128);
+    let q = sum / d;
+    let r = sum % d;
+    let round_up =
+        r != i256::from_i128(0) && r.wrapping_mul(i256::from_i128(2)).wrapping_abs() >= d;
+    let adj = if !round_up {
+        q
+    } else if sum >= i256::from_i128(0) {
+        q + i256::from_i128(1)
+    } else {
+        q - i256::from_i128(1)
+    };
+    dec_fit(adj, "avg")
+}
+
+/// 一批 `Decimal128` 值（按行取；NULL → `None`）。
+fn dec_vals(arr: &ArrayRef, n: usize) -> Option<Vec<Option<i128>>> {
+    let d = arr.as_any().downcast_ref::<Decimal128Array>()?;
+    Some(
+        (0..n)
+            .map(|i| if d.is_null(i) { None } else { Some(d.value(i)) })
+            .collect(),
+    )
+}
+
+/// 窗口 DECIMAL 聚合的输出精度（与非窗口聚合同一套规则）。
+fn dec_meta(t: &crate::types::LogicalType) -> Result<crate::types::DecimalMeta> {
+    match t {
+        crate::types::LogicalType::Decimal(m) => Ok(*m),
+        other => Err(QsdbError::type_err(format!(
+            "窗口 DECIMAL 聚合：参数类型应为 Decimal，实得 {other:?}（内部错误）"
+        ))),
+    }
+}
+
+fn out_meta(
+    f: &WindowFn,
+    arg_type: &crate::types::LogicalType,
+) -> Result<crate::types::DecimalMeta> {
+    let m = dec_meta(arg_type)?;
+    Ok(match f {
+        WindowFn::Sum(..) => crate::types::DecimalMeta::sum_result(m),
+        WindowFn::Avg(..) => crate::types::DecimalMeta::avg_result(m),
+        _ => m,
+    })
 }
 
 /// 把聚合窗口的输出**对齐到声明类型**。
