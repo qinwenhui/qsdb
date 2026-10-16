@@ -408,7 +408,7 @@ struct BuildState {
 /// 键 → build 行号列表。单整数键（Int/Date/Boolean/Timestamp）用 i64 直查。
 enum HashIndex {
     I64(I64Map<Vec<u32>>),
-    Bytes(BytesMap<Vec<u32>>),
+    Bytes(RowIndex),
 }
 
 impl HashIndex {
@@ -1255,34 +1255,214 @@ fn build_index(side: &BuildSide, build_keys: &[PhysExpr]) -> Result<HashIndex> {
             return Ok(HashIndex::I64(m));
         }
     }
-    let mut m: BytesMap<Vec<u32>> = BytesMap::default();
+    // 直接往**同一个** arena 索引里灌（旧实现是"每批各建一张 BytesMap 再逐键合并"
+    // —— 那要每行一次 `buf.clone()`，且合并时还要再搬一次键字节）。
+    let mut m = RowIndex::default();
+    let mut buf: Vec<u8> = Vec::new();
     for (bi, b) in side.batches.iter().enumerate() {
         let mut key_cols: Vec<ArrayRef> = Vec::with_capacity(build_keys.len());
         for k in build_keys {
             key_cols.push(eval::eval(k, b)?);
         }
-        let sub = build_bytes_index(&key_cols, b.num_rows());
         let off = side.base[bi] as u32;
-        for (k, rows) in sub {
-            let e = m.entry(k).or_default();
-            e.extend(rows.into_iter().map(|r| r + off));
+        for row in 0..b.num_rows() {
+            encode_join_key(&key_cols, row, &mut buf);
+            if buf.first() == Some(&0) {
+                continue; // 任一键 NULL → 不入索引（SQL 语义）
+            }
+            m.push(&buf, off + row as u32);
         }
     }
     Ok(HashIndex::Bytes(m))
 }
 
-/// 字节键索引构建（多键/字符串/浮点路径）。
-fn build_bytes_index(key_cols: &[ArrayRef], nrows: usize) -> BytesMap<Vec<u32>> {
-    let mut index: BytesMap<Vec<u32>> = BytesMap::default();
-    let mut buf: Vec<u8> = Vec::new();
-    for row in 0..nrows {
-        encode_join_key(key_cols, row, &mut buf);
-        if buf.first() == Some(&0) {
-            continue; // 任一键 NULL → 不入索引（SQL 语义）
+/// 共享同一 64 位哈希的键 id 列表（`One` 内联覆盖绝大多数；撞哈希才升级）。
+///
+/// ⚠️ 哈希**只用来定位候选**，相等判定一律回 arena 比真值 —— 只信哈希就是有
+/// 碰撞概率的**静默错值**（`agg.rs::GroupTable` 那条注释同款）。
+struct KeySlot {
+    first: u32,
+    rest: Vec<u32>,
+}
+
+impl KeySlot {
+    /// 该哈希下的全部键 id（`std::slice::from_ref` 让"只有一个"也是一段切片）。
+    fn ids(&self) -> &[u32] {
+        if self.rest.is_empty() {
+            std::slice::from_ref(&self.first)
+        } else {
+            &self.rest
         }
-        index.entry(buf.clone()).or_default().push(row as u32);
     }
-    index
+    fn push(&mut self, id: u32) {
+        if self.rest.is_empty() {
+            let f = self.first;
+            self.rest.push(f);
+        }
+        self.rest.push(id);
+    }
+}
+
+/// 同一键的建侧行号：`One` 内联（绝大多数键只有一行），第二次出现才升级成 `Vec`。
+enum SmallRows {
+    One(u32),
+    Many(Vec<u32>),
+}
+
+impl SmallRows {
+    fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::One(r) => std::slice::from_ref(r),
+            Self::Many(v) => v,
+        }
+    }
+}
+
+/// 键 → 建侧行号，**每行零分配**。
+///
+/// ## 为什么不用 `BytesMap<Vec<u32>>`
+///
+/// 那要**每行 `buf.clone()` 一次堆分配**。实测（2026-10-16，电力日清
+/// **240 万行 × 3 键**(VARCHAR, DATE, INT) 的 join，`QSDB_JOIN_PROF`）：
+/// **建侧 3.68s**（折合**每行 1.5µs ≈ 4500 周期**）、探侧 2.84s —— 就是这些分配。
+///
+/// ## 形态（照搬 `agg.rs::GroupTable`，那里为同一个问题调过）
+///
+/// 键字节进**单一 arena**，索引里只留 `(起始, 长度)`；**首个行号内联** ⇒
+/// **1:1 的数据（真实 join 的绝大多数）全程零分配**。
+#[derive(Default)]
+struct RowIndex {
+    arena: Vec<u8>,
+    keys: Vec<(u32, u32, SmallRows)>,
+    by_hash: std::collections::HashMap<u64, KeySlot, BuildByteHasher>,
+}
+
+impl RowIndex {
+    fn key_of(&self, id: u32) -> &[u8] {
+        let (o, l, _) = self.keys[id as usize];
+        &self.arena[o as usize..(o + l) as usize]
+    }
+
+    fn find(&self, key: &[u8]) -> Option<u32> {
+        let slot = self.by_hash.get(&hash_bytes(key))?;
+        slot.ids()
+            .iter()
+            .copied()
+            .find(|&id| self.key_of(id) == key)
+    }
+
+    /// 建侧：把 `row` 记到 `key` 名下。
+    fn push(&mut self, key: &[u8], row: u32) {
+        let h = hash_bytes(key);
+        if let Some(id) = self.find(key) {
+            let e = &mut self.keys[id as usize];
+            match &mut e.2 {
+                SmallRows::One(f) => {
+                    let f = *f;
+                    e.2 = SmallRows::Many(vec![f, row]);
+                }
+                SmallRows::Many(v) => v.push(row),
+            }
+            return;
+        }
+        let off = self.arena.len() as u32;
+        self.arena.extend_from_slice(key);
+        let id = self.keys.len() as u32;
+        self.keys.push((off, key.len() as u32, SmallRows::One(row)));
+        match self.by_hash.get_mut(&h) {
+            Some(slot) => slot.push(id),
+            None => {
+                self.by_hash.insert(
+                    h,
+                    KeySlot {
+                        first: id,
+                        rest: Vec::new(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// 探侧：返回该键的全部建侧行号（没有则 `None`）。
+    fn get(&self, key: &[u8]) -> Option<&[u32]> {
+        let id = self.find(key)?;
+        Some(self.keys[id as usize].2.as_slice())
+    }
+}
+
+/// 键 → 计数（`count(*)` 下推用）。同 [`RowIndex`] 的形态，值只是一个 u64
+/// ⇒ 连"首元素内联"都不需要，每个键一个槽。
+#[derive(Default)]
+struct CountIndex {
+    arena: Vec<u8>,
+    /// (起始, 长度, 计数)
+    keys: Vec<(u32, u32, u64)>,
+    by_hash: std::collections::HashMap<u64, KeySlot, BuildByteHasher>,
+}
+
+impl CountIndex {
+    fn key_of(&self, id: u32) -> &[u8] {
+        let (o, l, _) = self.keys[id as usize];
+        &self.arena[o as usize..(o + l) as usize]
+    }
+
+    fn bump(&mut self, key: &[u8]) {
+        let h = hash_bytes(key);
+        if let Some(slot) = self.by_hash.get(&h) {
+            if let Some(&id) = slot.ids().iter().find(|&&id| self.key_of(id) == key) {
+                self.keys[id as usize].2 += 1;
+                return;
+            }
+        }
+        let off = self.arena.len() as u32;
+        self.arena.extend_from_slice(key);
+        let id = self.keys.len() as u32;
+        self.keys.push((off, key.len() as u32, 1));
+        match self.by_hash.get_mut(&h) {
+            Some(slot) => slot.push(id),
+            None => {
+                self.by_hash.insert(
+                    h,
+                    KeySlot {
+                        first: id,
+                        rest: Vec::new(),
+                    },
+                );
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// 内存估算（`ctx` 记账用）：arena + 键槽 + 哈希表。键字节是**单一 arena**
+    /// ⇒ 比旧的"每行一个 `Vec<u8>`"少一大堆分配器开销与碎片。
+    fn estimated_bytes(&self) -> u64 {
+        self.arena.capacity() as u64
+            + self.keys.capacity() as u64 * std::mem::size_of::<(u32, u32, u64)>() as u64
+            + self.by_hash.capacity() as u64 * (std::mem::size_of::<(u64, KeySlot)>() as u64)
+    }
+
+    fn get(&self, key: &[u8]) -> Option<u64> {
+        let slot = self.by_hash.get(&hash_bytes(key))?;
+        let id = slot
+            .ids()
+            .iter()
+            .copied()
+            .find(|&id| self.key_of(id) == key)?;
+        Some(self.keys[id as usize].2)
+    }
+}
+
+/// 键字节的 FxHash（与 `BytesMap` 的 `BuildByteHasher` 同族；**不必**与它一致
+/// —— 上面两张表是自洽的独立索引）。
+fn hash_bytes(k: &[u8]) -> u64 {
+    use std::hash::BuildHasher;
+    use std::hash::Hasher;
+    let mut h = BuildByteHasher.build_hasher();
+    h.write(k);
+    h.finish()
 }
 
 /// 单个 probe 批的连接。
@@ -1816,7 +1996,7 @@ enum CountMap {
         miss: u64,
     },
     I64(I64Map<u64>),
-    Bytes(BytesMap<u64>),
+    Bytes(CountIndex),
 }
 
 impl JoinCountExec {
@@ -1863,7 +2043,7 @@ impl JoinCountExec {
         let t0 = std::time::Instant::now();
         let use_i64 = Self::int_key_ok(&self.build_keys);
         let mut i64_map: I64Map<u64> = I64Map::default();
-        let mut bytes_map: BytesMap<u64> = BytesMap::default();
+        let mut bytes_map = CountIndex::default();
         // 稠密直索引候选：单整数键时先收集键值（build 侧通常远小于 probe）
         let mut dense_keys: Vec<i64> = Vec::new();
         let mut buf: Vec<u8> = Vec::new();
@@ -1891,7 +2071,7 @@ impl JoinCountExec {
                 if buf.first() == Some(&0) {
                     continue; // NULL 键不匹配（SQL 语义）
                 }
-                *bytes_map.entry(buf.clone()).or_insert(0) += 1;
+                bytes_map.bump(&buf);
             }
         }
         // 稠密判定：span ≤ 16M 用直索引（16M × 4B = 64MB 上界）
@@ -1917,12 +2097,7 @@ impl JoinCountExec {
             }
         }
         // 右表为空 → 结果 0（用空 i64 map 表示）
-        let est = i64_map.capacity() as u64 * 24
-            + bytes_map
-                .keys()
-                .map(|k| k.capacity() as u64 + 40)
-                .sum::<u64>()
-            + bytes_map.capacity() as u64 * 8;
+        let est = i64_map.capacity() as u64 * 24 + bytes_map.estimated_bytes();
         self.res.grow(est)?;
         self.counts = Some(if use_i64 && bytes_map.is_empty() {
             CountMap::I64(i64_map)
@@ -2037,7 +2212,7 @@ impl ExecNode for JoinCountExec {
                     let hit = if buf.first() == Some(&0) {
                         None
                     } else {
-                        m.get(&buf).copied()
+                        m.get(&buf)
                     };
                     total += hit.unwrap_or(miss);
                 }

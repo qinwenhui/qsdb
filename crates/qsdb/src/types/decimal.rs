@@ -96,12 +96,20 @@ impl std::fmt::Display for DecimalMeta {
 // ---------------------------------------------------------------------------
 
 impl DecimalMeta {
-    /// `x + y` / `x - y`：max(p1-s1, p2-s2) + max(s1,s2) + 1, max(s1,s2)
+    /// `x + y` / `x - y`：`max(p1-s1, p2-s2) + max(s1,s2) + 1, max(s1,s2)`，**超 38 照样封顶**。
+    ///
+    /// ⚠️ 此前这里**直接 `try_new`、没有 `adjust`** ⇒ `(38,8)+(38,8)` 算出 39 就
+    /// **绑定期报错**（用户实测撞到：`DECIMAL precision 39 out of range`），
+    /// 而真 Spark 给 **`decimal(38,7)`**（实测）—— 同一个 `adjust` 公式对加减也成立：
+    /// `(39,8) ⇒ max(38-31, min(8,6)) = 7`、`(39,0) ⇒ 0`、`(39,20) ⇒ 19` ✓ 三格全中。
+    ///
+    /// ⚠️ 只把 `mul/div/mod` 封顶而漏掉加减，是**上一批的漏测**：那张 Spark 对照表里
+    /// 只有 `(30,8)+(30,8)`（= 31，**不触发封顶**）⇒ 这条路径从没被验过。
     pub fn add_result(a: Self, b: Self) -> Result<Self> {
         let s = a.scale.max(b.scale);
         let ip = (i16::from(a.precision) - i16::from(a.scale))
             .max(i16::from(b.precision) - i16::from(b.scale));
-        Self::try_new((ip + i16::from(s) + 1) as u8, s)
+        Self::adjust(ip + i16::from(s) + 1, i16::from(s))
     }
 
     /// `x - y` 与加法同矩阵。
@@ -565,7 +573,12 @@ mod tests {
         let d = |p: u8, s: i8| m(p, s);
         // (表达式, 期望)
         let cases: Vec<(&str, DecimalMeta, DecimalMeta)> = vec![
-            // ── 加 / 减：Spark decimal(31,8) —— 我们本来就对
+            // ── 加 / 减
+            //
+            // ⚠️ **会封顶的格子也必须在表里**：上一批只验了 `(30,8)+(30,8)=31`
+            // 这个**不触发封顶**的格子，于是 add/sub 的封顶路径从没被验过 ——
+            // 2026-10-16 用户实测撞到 `DECIMAL precision 39 out of range`
+            // （`(38,8)+(38,8)` 算出 39 就报错），而真 Spark 给 `decimal(38,7)`。
             (
                 "(30,8)+(30,8)",
                 d(31, 8),
@@ -575,6 +588,32 @@ mod tests {
                 "(30,8)-(10,2)",
                 d(31, 8),
                 DecimalMeta::sub_result(d(30, 8), d(10, 2)).unwrap(),
+            ),
+            // 封顶五格（真 Spark 实测值）
+            (
+                "(38,8)+(38,8)",
+                d(38, 7),
+                DecimalMeta::add_result(d(38, 8), d(38, 8)).unwrap(),
+            ),
+            (
+                "(38,8)-(38,8)",
+                d(38, 7),
+                DecimalMeta::sub_result(d(38, 8), d(38, 8)).unwrap(),
+            ),
+            (
+                "(38,0)+(38,0)",
+                d(38, 0),
+                DecimalMeta::add_result(d(38, 0), d(38, 0)).unwrap(),
+            ),
+            (
+                "(38,20)+(38,20)",
+                d(38, 19),
+                DecimalMeta::add_result(d(38, 20), d(38, 20)).unwrap(),
+            ),
+            (
+                "(30,8)+(38,8)",
+                d(38, 7),
+                DecimalMeta::add_result(d(30, 8), d(38, 8)).unwrap(),
             ),
             // ── 乘
             (
