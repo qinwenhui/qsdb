@@ -183,6 +183,29 @@ enum Cmd {
         #[arg(long)]
         data: Option<PathBuf>,
     },
+    /// **物理快照**：把整个库**原样**拷到 `<目录>`（含 generation / epoch /
+    /// 段边界 / 磁盘格式版本）—— 主备、时间点回滚、整机搬迁用它。
+    ///
+    /// ⚠️ 与 `dump` 的区别：`dump` 出的是**给别人读的数据**（Spark/pyarrow 能读，
+    /// 但恢复出来是"另一份等价的库"）；`backup` 出的是**这个库本身**
+    /// （只有 QSDB 能读）。
+    ///
+    /// ⚠️ 备份期间**别做 DDL**（`CREATE`/`DROP`/`ALTER`）—— 本条会持 catalog 锁
+    /// 挡住它们。并发**写入**是安全的。
+    Backup {
+        #[arg(long)]
+        path: PathBuf,
+        /// 快照落到这个目录（必须不存在或为空）
+        #[arg(long)]
+        to: PathBuf,
+    },
+    /// 从**物理快照**恢复（目标库必须为空）。
+    Recover {
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long)]
+        from: PathBuf,
+    },
     /// 从 `dump --data` 产出的目录**恢复**（结构 + 数据）。
     ///
     /// ⚠️ **目标库必须是空的**（一张表都没有）—— 不做静默覆盖：往半个库里灌备份，
@@ -271,6 +294,8 @@ fn main() {
             writer_epoch,
             from,
         } => restore(path, writer_epoch, &from),
+        Cmd::Backup { path, to } => backup(&path, &to),
+        Cmd::Recover { path, from } => recover(&path, &from),
         Cmd::Admin {
             path,
             trash_grace_secs,
@@ -668,6 +693,49 @@ fn open_with_epoch(path: &std::path::Path, writer_epoch: u64) -> Qsdb {
         Ok(db) => db,
         Err(e) => {
             eprintln!("open {} failed: {e}", path.display());
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `qsdb backup`：打一份物理快照。
+fn backup(path: &std::path::Path, to: &std::path::Path) {
+    let db = open_with_epoch(path, 0);
+    match qsdb::backup::snapshot(db.store(), to) {
+        Ok(info) => {
+            eprintln!(
+                "已备份 {} 张表 / {} 个文件 / {:.1}MB → {}
+（磁盘格式 v{}，内核 {}）",
+                info.tables.len(),
+                info.files,
+                info.bytes as f64 / 1048576.0,
+                to.display(),
+                info.manifest_format,
+                info.kernel_version
+            );
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `qsdb recover`：从物理快照恢复。
+fn recover(path: &std::path::Path, from: &std::path::Path) {
+    let db = open_with_epoch(path, 0);
+    match qsdb::backup::recover(db.store(), from) {
+        Ok(info) => {
+            eprintln!(
+                "已恢复 {} 张表 / {} 个文件 / {:.1}MB → {}",
+                info.tables.len(),
+                info.files,
+                info.bytes as f64 / 1048576.0,
+                path.display()
+            );
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
             std::process::exit(1);
         }
     }
