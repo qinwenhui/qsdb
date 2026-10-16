@@ -6951,6 +6951,24 @@ pub(crate) fn split_pushdown(expr: &PhysExpr) -> (Option<Predicate>, Option<Phys
             };
             (p, residual)
         }
+        // **`Or`**：`IN (a, b, c)` 会被绑成 `x=a OR x=b OR x=c`，所以这条决定了
+        // **多值 IN 能不能下推**（2026-10-16 用户问到才发现：此前 `Or` 掉进兜底，
+        // 于是多值 IN **完全不下推** —— 分区裁剪与 min/max 段裁剪都拿不到它）。
+        //
+        // ⚠️ 与 `And` 的规则**不同**，别看错：
+        // - `And`：**一侧能推就推一侧**，另一侧留在行过滤（两个条件是"都要满足"，
+        //   推一个不改变结果）；
+        // - `Or`：**必须两侧都能推**才整体下推。只推一侧会**多滤掉行** ——
+        //   另一个分支满足的那些行本该留下。推不动就**整体留作残余**，绝不半推。
+        //
+        // 分区求值器 `scan::eval_on_partition` 本来就实现了 `Or`（三值逻辑），
+        // 所以这里能推出去，分区裁剪与段裁剪就都用得上。
+        // 判据是「**两侧都能推、且都没有残余**」—— 忽略残余会漏掉推不动的那半，
+        // 结果**多滤掉本该留下的行**。宁可不推。
+        PhysExpr::Or(l, r) => match (split_pushdown(l), split_pushdown(r)) {
+            ((Some(a), None), (Some(b), None)) => (Some(Predicate::or(a, b)), None),
+            _ => (None, Some(expr.clone())),
+        },
         _ => (None, Some(expr.clone())),
     }
 }
