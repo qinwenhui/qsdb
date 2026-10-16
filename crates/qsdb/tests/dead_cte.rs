@@ -182,3 +182,46 @@ fn 裁剪不改变结果() {
         vec!["1|10", "2|20", "3|30"]
     );
 }
+
+/// 逗号连接 `FROM a, b` ≡ 交叉连接（Spark 语义）。
+/// 语料里 8 个块在用这个写法（`FROM t6, t1`）。
+#[test]
+fn 逗号连接当交叉连接() {
+    let (db, _r) = setup("commajoin");
+    db.sql("CREATE TABLE u (c INT)").unwrap();
+    db.sql("INSERT INTO u VALUES (100), (200)").unwrap();
+    // ⚠️ 本仓规则：**裸名只解析左侧**，右表的列要限定（`u.c`）。
+    // 语料里那 8 个块正是全限定的写法（`SELECT t6.POINT, t1.PHID …`），所以不受影响。
+    let got = rows(&db, "SELECT a, u.c FROM t, u ORDER BY a, u.c");
+    // 3 行 × 2 行 = 6 行
+    assert_eq!(
+        got,
+        vec!["1|100", "1|200", "2|100", "2|200", "3|100", "3|200"]
+    );
+    // 与显式 CROSS JOIN 逐值相同
+    assert_eq!(
+        got,
+        rows(&db, "SELECT a, u.c FROM t CROSS JOIN u ORDER BY a, u.c")
+    );
+    // 逗号 + WHERE（笛卡尔后再过滤）—— 语料里正是这个形状
+    assert_eq!(
+        rows(&db, "SELECT a, u.c FROM t, u WHERE u.c = a * 100 ORDER BY a"),
+        vec!["1|100", "2|200"]
+    );
+}
+
+/// `concat(...)` —— Spark 的多参拼接；NULL 传播与 `||` 一致。
+#[test]
+fn concat_多参拼接() {
+    let (db, _r) = setup("concat");
+    assert_eq!(rows(&db, "SELECT concat('2@', CAST(1 AS STRING))"), vec!["2@1"]);
+    assert_eq!(rows(&db, "SELECT concat('a', 'b', 'c')"), vec!["abc"]);
+    assert_eq!(rows(&db, "SELECT concat('a')"), vec!["a"]);
+    // 任一为 NULL ⇒ NULL
+    assert_eq!(rows(&db, "SELECT concat('a', NULL)"), vec![""]);
+    // 列上逐行
+    assert_eq!(
+        rows(&db, "SELECT concat('p', CAST(a AS STRING)) FROM t ORDER BY a"),
+        vec!["p1", "p2", "p3"]
+    );
+}

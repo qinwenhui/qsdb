@@ -3168,10 +3168,29 @@ fn translate_select_inner(
             )));
         }
     };
-    if select.from.len() > 1 {
-        return Err(QsdbError::unsupported(
-            "multi-FROM (comma join) not supported",
-        ));
+    // **逗号连接**（`FROM a, b`）—— Spark 语义就是**交叉连接**。
+    //
+    // 不另开一条执行路径：把 `from[1..]` 折成额外的 `Join`（`CROSS JOIN`，无 ON）
+    // 接到第一个 `TableWithJoins` 的 joins 后面，下面同一段代码就把它们当 CROSS JOIN
+    // 处理（`JOIN` 链本来就是左深树，`FROM a, b JOIN c ON …` 折成
+    // `a × b ⋈ c` 仍然正确）。
+    //
+    // 日清分那批 SQL 里 `FROM t6, t1` 这种写法有 8 个块在用。
+    let mut from_items: Vec<sqlparser::ast::TableWithJoins> = select.from.clone();
+    if from_items.len() > 1 {
+        let mut first = from_items.remove(0);
+        for extra in from_items {
+            first.joins.push(sqlparser::ast::Join {
+                relation: extra.relation,
+                global: false,
+                join_operator: sqlparser::ast::JoinOperator::CrossJoin(
+                    sqlparser::ast::JoinConstraint::None,
+                ),
+            });
+            // `FROM a, b JOIN c ON …`：b 自己那一串 joins 原样接在后面
+            first.joins.extend(extra.joins);
+        }
+        from_items = vec![first];
     }
     // CTE（非递归）：WITH name AS (...) 内联展开为子计划。
     // 定义期即分配 cte_id；祖先 CTE 可见（后定义可引用先定义，链式）。
@@ -3180,7 +3199,7 @@ fn translate_select_inner(
 
     // FROM 主表：实表 / 表函数（read_parquet）/ CTE（本级 → 祖先）/ 派生表；
     // 无 FROM → 单行零列源（SELECT 1+1 / SELECT CURRENT_DATE）
-    let (mut plan, mut ctx): (LogicalPlan, SchemaCtx) = match select.from.first() {
+    let (mut plan, mut ctx): (LogicalPlan, SchemaCtx) = match from_items.first() {
         None => (LogicalPlan::OneRow, SchemaCtx { cols: Vec::new() }),
         Some(tw) => match &tw.relation {
             TableFactor::Table {
@@ -3216,8 +3235,7 @@ fn translate_select_inner(
     // { value: "a", span: Span(Location(1,40)..Location(1,41)) }]), …`），人和驱动都
     // 读不出重点——真正有用的信息只是"你不认识哪种写法"。见 `join_op_name`。
     let no_joins: Vec<sqlparser::ast::Join> = Vec::new();
-    let joins = select
-        .from
+    let joins = from_items
         .first()
         .map(|t| t.joins.as_slice())
         .unwrap_or_else(|| no_joins.as_slice());
@@ -4943,6 +4961,18 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
     use sqlparser::ast::Expr as E;
     match e {
         E::Identifier(id) => {
+            // ★ **双引号 = 字符串字面量**（Spark 非 ANSI 语义，也就是默认语义）。
+            //
+            // 日清分那批 SQL 写的是 `CAST("变动成本补偿" AS STRING)`、`CAST("80" AS STRING)`
+            // —— 而 sqlparser 的 GenericDialect 把 `"…"` 当**带引号标识符**，于是我们去找
+            // 一个叫「变动成本补偿」的**列**，报 `column '变动成本补偿' not found`。
+            //
+            // Spark 的既定规则是：**双引号是字符串、反引号才是标识符**
+            // （`spark.sql.ansi.enabled=false` 下的默认行为，语料正是跑在这上面）。
+            // 本仓本来就用反引号引标识符，所以这条不产生歧义。
+            if id.quote_style == Some('"') {
+                return Ok(PhysExpr::Lit(Literal::Utf8(id.value.clone())));
+            }
             // `resolve_opt`：**重名会 Err**（F30），不再静默取第一个
             let idx = ctx
                 .resolve_opt(&id.value)?
@@ -5060,6 +5090,28 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
                 )));
             }
             bind_fold(kind, &args, ctx)
+        }
+        // `concat(a, b, …)` —— **Spark 的内置多参拼接**（NULL 传播与 `||` 一致：
+        // 任一为 NULL ⇒ 结果 NULL）。本仓已有二元 `Concat` 节点，这里折成左深树即可。
+        //
+        // ⚠️ 交接文档里我一度把 `concat` 标成"已支持" —— **实测是不支持的**
+        // （`unknown function 'concat'`），这是第 5 次"文档说 ✅、实测不 ✅"。
+        // 语料里 13 次，形状是 `concat('2@', CAST(x AS STRING))`。
+        E::Function(f) if f.name.to_string().eq_ignore_ascii_case("concat") && f.over.is_none() => {
+            let args = arg_exprs(f)?;
+            if args.is_empty() {
+                return Err(QsdbError::invalid("concat(...) requires >= 1 argument"));
+            }
+            let vt = LogicalType::Varchar { max_chars: None };
+            let mut acc: Option<PhysExpr> = None;
+            for a in args {
+                let e = bind_expr(a, ctx)?.cast_to(vt.clone());
+                acc = Some(match acc {
+                    None => e,
+                    Some(prev) => PhysExpr::Concat(Box::new(prev), Box::new(e)),
+                });
+            }
+            Ok(acc.expect("args 非空"))
         }
         E::Function(f) if f.name.to_string().eq_ignore_ascii_case("nullif") && f.over.is_none() => {
             let args = arg_exprs(f)?;
@@ -5703,12 +5755,42 @@ fn common_supertype(a: &LogicalType, b: &LogicalType) -> LogicalType {
             (Lt::Decimal(x), Lt::Decimal(y)) => {
                 Lt::Decimal(if y.scale > x.scale { *y } else { *x })
             }
-            // decimal 与整数：decimal 承接
-            (Lt::Decimal(d), x) | (x, Lt::Decimal(d)) if x.is_integer() => Lt::Decimal(*d),
+            // decimal 与整数：decimal 承接，**但整数侧必须留出它自己的位数**。
+            //
+            // ⚠️ 不留位会当场炸：`COALESCE(整数列, 0.0)` 里 `0.0` 是 `DECIMAL(1,1)`，
+            // 整数列被 cast 过去，值 `1` 就装不下（1.0 要 2 位）⇒
+            // `value 1.0 overflows DECIMAL(1, 1)`。语料里 3 个块卡在这条上。
+            (Lt::Decimal(d), x) | (x, Lt::Decimal(d)) if x.is_integer() => {
+                let p = d
+                    .precision
+                    .saturating_add(int_type_digits(x))
+                    .min(38);
+                Lt::Decimal(DecimalMeta::try_new(p, d.scale).unwrap_or(*d))
+            }
             _ => wider_int(a, b),
         }
     } else {
         a.clone()
+    }
+}
+
+/// 整数类型在**与 DECIMAL 统一时**占的位数（`common_supertype` 用）。
+///
+/// 实测真 Spark 3.5.2（2026-10-16）：
+/// `coalesce(cast(1 AS TINYINT), 0.0)` ⇒ `decimal(4,1)`、
+/// `coalesce(cast(1 AS INT), 0.0)` ⇒ `decimal(11,1)`、
+/// `coalesce(cast(1 AS BIGINT), 0.0)` ⇒ `decimal(21,1)`
+/// ⇒ 位数 = **3 / 5 / 10 / 20**（各宽度**全值域**的十进制位数：2^8→3、2^16→5、2^32→10、2^64→20）。
+///
+/// ⚠️ 与 `int_operand_precision`（**算术**路径用）**不是同一张表**：那边字面量按
+/// **值本身的位数**（`(18,4)/4` ⇒ `decimal(20,6)`，也是实测过的），只有列才落到类型宽度。
+/// 这里拿到的**只有类型、没有值**，所以只能按类型宽度。
+fn int_type_digits(t: &LogicalType) -> u8 {
+    match t {
+        LogicalType::Int8 => 3,
+        LogicalType::Int16 => 5,
+        LogicalType::Int32 => 10,
+        _ => 20,
     }
 }
 

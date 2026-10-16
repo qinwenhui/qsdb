@@ -180,3 +180,25 @@ fn 除零给_null_而不是报错() {
         "1.5000000000000"
     );
 }
+
+/// **`COALESCE(整数列, 0.0)` 的公共超类型必须给整数留位**。
+///
+/// 真 Spark 3.5.2 实测（2026-10-16）：`coalesce(cast(1 AS INT), 0.0)` ⇒ `decimal(11,1)`、
+/// tinyint ⇒ `decimal(4,1)`、bigint ⇒ `decimal(21,1)`（= 1 + 3/5/10/20）。
+///
+/// 不留位会当场炸：`0.0` 是 `DECIMAL(1,1)`，整数列 cast 过去，值 `1` 装不下
+/// （1.0 要 2 位）⇒ `value 1.0 overflows DECIMAL(1, 1)`。语料里 3 个块卡在这条上。
+#[test]
+fn coalesce_整数与小数留位() {
+    let (db, _r) = setup("decimal_int_promote");
+    db.sql("CREATE TABLE s (i INT, ti TINYINT, b BIGINT)").unwrap();
+    db.sql("INSERT INTO s VALUES (1, 1, 1)").unwrap();
+    // 关键：**不再报溢出**，且整数侧的值原样保住
+    assert_eq!(cell(&db, "SELECT coalesce(i, 0.0) FROM s"), "1.0");
+    assert_eq!(cell(&db, "SELECT coalesce(ti, 0.0) FROM s"), "1.0");
+    assert_eq!(cell(&db, "SELECT coalesce(b, 0.0) FROM s"), "1.0");
+    // 类型也钉一下：decimal(11,1) ⇒ 显示成 1.0（scale 1）
+    assert_eq!(cell(&db, "SELECT nvl(i, 0.0) FROM s"), "1.0");
+    // 小数侧的值不受影响
+    assert_eq!(cell(&db, "SELECT coalesce(CAST(NULL AS INT), 0.0)"), "0.0");
+}
