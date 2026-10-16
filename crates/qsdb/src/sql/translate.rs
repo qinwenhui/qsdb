@@ -4810,10 +4810,19 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
             };
             finish_case(conds, else_expr)
         }
+        // `NVL(a, b)` 是 **Spark SQL 的内置函数**（= 两参的 coalesce，
+        // 实测真 Spark 3.5.2：`SELECT nvl(0.2, 1)` ⇒ `0.2`）。日清那批结算 SQL 在用。
+        // 与 `coalesce` 走同一条绑定路，只是**参数个数固定 2**。
         E::Function(f)
-            if f.name.to_string().eq_ignore_ascii_case("coalesce") && f.over.is_none() =>
+            if (f.name.to_string().eq_ignore_ascii_case("coalesce")
+                || f.name.to_string().eq_ignore_ascii_case("nvl"))
+                && f.over.is_none() =>
         {
+            let is_nvl = f.name.to_string().eq_ignore_ascii_case("nvl");
             let args = arg_exprs(f)?;
+            if is_nvl && args.len() != 2 {
+                return Err(QsdbError::invalid("nvl(a, b) requires exactly 2 arguments"));
+            }
             if args.len() < 2 {
                 return Err(QsdbError::invalid("coalesce requires >= 2 arguments"));
             }

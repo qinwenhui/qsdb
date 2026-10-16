@@ -109,31 +109,74 @@ impl DecimalMeta {
         Self::add_result(a, b)
     }
 
-    /// `x * y`：p1+p2, s1+s2
+    /// `x * y`：标准矩阵 `p1+p2+1, s1+s2`；**超 38 时按 Spark 的规则封顶**：
+    ///
+    /// ```text
+    /// p ≤ 38  ⇒ (p, s)
+    /// 否则    ⇒ (38, max(38-(p-s), min(s, 6)))
+    /// ```
+    ///
+    /// **这条公式是拿真 Spark 3.5.2 反推、六组实测逐一对上的**（`.14` 上跑的）：
+    ///
+    /// | 表达式 | 计算值 | Spark `typeof` |
+    /// |---|---|---|
+    /// | `(10,2)×(10,2)` | (21,4) | `decimal(21,4)` |
+    /// | `(30,8)×(30,8)` | (61,16) | `decimal(38,6)` |
+    /// | `(25,5)×(25,5)` | (51,10) | `decimal(38,6)` |
+    /// | `(38,0)×(38,0)` | (77,0) | `decimal(38,0)` |
+    /// | `(30,20)×(30,20)` | (61,40) | `decimal(38,17)` |
+    /// | `(38,10)×(38,16)` | (77,26) | `decimal(38,6)` |
+    ///
+    /// ⚠️ **为什么不用 DuckDB 的规则**（"保 scale 截精度" ⇒ `(30,8)×(30,8)` 给 `(38,16)`）：
+    /// 用户那批日清结算 SQL 是 **Spark SQL** 写的，口径按 Spark 对齐。两者只在
+    /// "需要封顶"时才分叉。
+    ///
+    /// ⚠️ 封顶**会丢精度**（Spark 的已知行为，见 SPARK-22036）——所以真正的溢出
+    /// 必须由**运行期**的 `checked_mul` 报错兜住，**不能静默回绕**
+    /// （见 `expr::eval` 的 `ArithOp::Mul`）。
     pub fn mul_result(a: Self, b: Self) -> Result<Self> {
-        Self::try_new(a.precision + b.precision, a.scale + b.scale)
+        Self::adjust(
+            i16::from(a.precision) + i16::from(b.precision) + 1,
+            i16::from(a.scale) + i16::from(b.scale),
+        )
     }
 
-    /// `x / y`：p1+s2+max(s1+s2, 4), max(s1+s2, 4)；超 38 时截 scale 保整数位
-    ///（精度损失退化为 HALF_UP 取整，而非绑定期报错）。
-    pub fn div_result(a: Self, b: Self) -> Result<Self> {
-        let s = i32::from((a.scale + b.scale).max(4));
-        let p = i32::from(a.precision) + i32::from(b.scale) + s;
+    /// 把**算出来的** `(p, s)` 按 Spark 的规则封顶到 38：`p ≤ 38` 原样，
+    /// 否则 `(38, max(38-(p-s), min(s, 6)))`。
+    ///
+    /// 这个调整式是**拿真 Spark 3.5.2 反推、十三个用例逐一对上**的
+    /// （乘 6 + 除 4 + avg 3，见 `mul_result` / `div_result` / `avg_result` 的表）。
+    fn adjust(p: i16, s: i16) -> Result<Self> {
         if p <= 38 {
             Self::try_new(p as u8, s as i8)
         } else {
-            let int_digits = (i32::from(a.precision) - i32::from(a.scale)).max(1);
-            let s = s.min(38 - int_digits).max(0);
-            Self::try_new((int_digits + s) as u8, s as i8)
+            let ns = (38 - (p - s)).max(s.min(6));
+            Self::try_new(Self::MAX_PRECISION, ns as i8)
         }
     }
 
-    /// `x % y`：|余数| < min(|x|,|y|)——整数位取两侧大者，scale 取两侧大者。
+    /// `x / y`：Spark 的规则 `p1-s1+s2+R, R`，其中 `R = max(6, s1+p2+1)`，再封顶。
+    ///
+    /// ⚠️ **此前这条是错的**（用的是"p1+s2+max(s1+s2,4)"），实测真 Spark：
+    /// `(10,2)/(10,3)` ⇒ `decimal(24,13)`（我们旧规则给 (18,5)）、
+    /// `(5,1)/(10,2)` ⇒ `(18,12)`、`(10,2)/(5,1)` ⇒ `(17,8)`、
+    /// `(30,8)/(30,8)` ⇒ `(38,8)`（旧规则给 (38,16)）。
+    /// **除法口径错 = 结算金额错**，所以这条按 Spark 逐格对齐。
+    pub fn div_result(a: Self, b: Self) -> Result<Self> {
+        let r = (i16::from(a.scale) + i16::from(b.precision) + 1).max(6);
+        let p = i16::from(a.precision) - i16::from(a.scale) + i16::from(b.scale) + r;
+        Self::adjust(p, r)
+    }
+
+    /// `x % y`：Spark 的规则 `min(p1-s1, p2-s2) + max(s1,s2), max(s1,s2)`。
+    ///
+    /// ⚠️ **整数位取的是 `min` 不是 `max`**（余数的绝对值 < 两侧较小者的绝对值），
+    /// 此前写成 `max` ⇒ `(30,8)%(10,2)` 给 `(30,8)`，Spark 是 **`(16,8)`**。
     pub fn mod_result(a: Self, b: Self) -> Result<Self> {
         let s = a.scale.max(b.scale);
         let ip = (i16::from(a.precision) - i16::from(a.scale))
-            .max(i16::from(b.precision) - i16::from(b.scale));
-        Self::try_new((ip + i16::from(s)).clamp(1, 38) as u8, s)
+            .min(i16::from(b.precision) - i16::from(b.scale));
+        Self::adjust(ip + i16::from(s), i16::from(s))
     }
 
     /// `sum(x)`：min(p+10, 38), s
@@ -144,11 +187,15 @@ impl DecimalMeta {
         }
     }
 
-    /// `avg(x)`：min(p+10, 38), max(s, 4)
+    /// `avg(x)`：Spark 的规则 `min(38, p+4), s+4`。
+    ///
+    /// ⚠️ **此前这条也是错的**（用的是 `min(38,p+10), max(s,4)`）。实测真 Spark：
+    /// `avg((30,8))` ⇒ `decimal(34,12)`、`avg((10,2))` ⇒ `(14,6)`、
+    /// `avg((38,10))` ⇒ `(38,14)` —— 三条都是 `(min(38,p+4), s+4)` ✓。
     pub fn avg_result(a: Self) -> Self {
         Self {
-            precision: a.precision.saturating_add(10).min(Self::MAX_PRECISION),
-            scale: a.scale.max(4),
+            precision: a.precision.saturating_add(4).min(Self::MAX_PRECISION),
+            scale: a.scale.saturating_add(4),
         }
     }
 }
@@ -314,8 +361,13 @@ mod tests {
     // -- 精度矩阵（表驱动） ---------------------------------------------------
 
     #[test]
+    /// ⚠️ **2026-10-16 按真 Spark 3.5.2 重新对过一遍** —— 这条测试原来钉的
+    /// **除 / 取模 / avg / 乘**四组期望是**旧口径**（乘的 +1、除的整套公式、
+    /// 取模的 max→min、avg 的 +10/+4），拿真 Spark 逐格比对时发现**全是错的**。
+    /// 现在这条只留"我们自己的口径自洽"，**与 Spark 的对齐钉在
+    /// `spark_precision_matrix`**（那里每一行都是实测值）。
     fn precision_matrix_explicit() {
-        // 加/减
+        // 加/减：与 Spark 一致（本就没改）
         assert_eq!(
             DecimalMeta::add_result(m(18, 4), m(18, 4)).unwrap(),
             m(19, 4)
@@ -325,33 +377,46 @@ mod tests {
             DecimalMeta::sub_result(m(18, 4), m(18, 4)).unwrap(),
             m(19, 4)
         );
-        // 乘
+        // 乘：**+1**（Spark：(10,2)×(10,2) ⇒ (21,4)）；不再"超 38 就报错"，
+        // 而是**封顶**（Spark：(38,0)×(38,0) ⇒ (38,0)）
         assert_eq!(
             DecimalMeta::mul_result(m(18, 4), m(18, 4)).unwrap(),
-            m(36, 8)
+            m(37, 8)
         );
-        assert_eq!(DecimalMeta::mul_result(m(5, 2), m(3, 1)).unwrap(), m(8, 3));
-        assert!(DecimalMeta::mul_result(m(20, 0), m(20, 0)).is_err()); // 40 > 38
-        // 除（参考文档公式：p1+s2+max(s1+s2,4), max(s1+s2,4)）
+        assert_eq!(
+            DecimalMeta::mul_result(m(5, 2), m(3, 1)).unwrap(),
+            m(9, 3),
+            "p = 5+3+1 = 9, s = 2+1 = 3"
+        );
+        assert_eq!(
+            DecimalMeta::mul_result(m(20, 0), m(20, 0)).unwrap(),
+            m(38, 0),
+            "封顶到 38、scale 0（Spark 实测）"
+        );
+        // 除：Spark 的 `p1-s1+s2+R, R`，R = max(6, s1+p2+1)
         assert_eq!(
             DecimalMeta::div_result(m(18, 4), m(18, 4)).unwrap(),
-            m(30, 8)
+            m(38, 20),
+            "R = max(6, 4+18+1) = 23 ⇒ p = 18-4+4+23 = 41 > 38 ⇒ 封顶 (38, max(38-18, 6)) = (38,20)"
         );
-        assert_eq!(DecimalMeta::div_result(m(5, 0), m(2, 0)).unwrap(), m(9, 4));
-        // 宽 decimal 除法：超 38 截 scale 保整数位（不再绑定期报错）
+        assert_eq!(
+            DecimalMeta::div_result(m(5, 0), m(2, 0)).unwrap(),
+            m(11, 6),
+            "R = max(6, 0+2+1) = 6 ⇒ p = 5-0+0+6 = 11, s = 6（≤38，不封顶）"
+        );
         assert_eq!(
             DecimalMeta::div_result(m(38, 20), m(38, 20)).unwrap(),
-            m(38, 20)
+            m(38, 6)
         );
         assert_eq!(
             DecimalMeta::div_result(m(38, 0), m(38, 0)).unwrap(),
-            m(38, 0)
+            m(38, 6)
         );
         // 聚合
         assert_eq!(DecimalMeta::sum_result(m(28, 6)), m(38, 6));
         assert_eq!(DecimalMeta::sum_result(m(30, 0)), m(38, 0));
-        assert_eq!(DecimalMeta::avg_result(m(10, 2)), m(20, 4));
-        assert_eq!(DecimalMeta::avg_result(m(10, 6)), m(20, 6));
+        assert_eq!(DecimalMeta::avg_result(m(10, 2)), m(14, 6));
+        assert_eq!(DecimalMeta::avg_result(m(10, 6)), m(14, 10));
     }
 
     #[test]
@@ -484,5 +549,123 @@ mod tests {
             let text = format_decimal(v, s);
             assert_eq!(parse_decimal(&text, meta).unwrap(), v, "text={text}");
         }
+    }
+
+    /// ★ **运算结果的精度矩阵必须与 Spark 逐格一致** —— 2026-10-16 拿 `.14` 上的
+    /// **真 Spark 3.5.2** 把这些格子全跑了一遍（`SELECT typeof(CAST(1 AS DECIMAL(p,s)) OP ...)`），
+    /// 发现我们的 **除 / 取模 / avg 三条一直是错的**。
+    ///
+    /// 为什么这条测试格外要紧：**精度口径错 = 结算金额错**。而且这类错**不报错** ——
+    /// 形状对、值也能算出来，只是**位数不对**（多截一位小数、或少一位整数），
+    /// 只有拿另一个引擎逐格对才看得见。
+    ///
+    /// ⚠️ 下面每一行都是**实测值**，不是从文档抄的。改这张表之前先拿真 Spark 复核。
+    #[test]
+    fn spark_precision_matrix() {
+        let d = |p: u8, s: i8| m(p, s);
+        // (表达式, 期望)
+        let cases: Vec<(&str, DecimalMeta, DecimalMeta)> = vec![
+            // ── 加 / 减：Spark decimal(31,8) —— 我们本来就对
+            (
+                "(30,8)+(30,8)",
+                d(31, 8),
+                DecimalMeta::add_result(d(30, 8), d(30, 8)).unwrap(),
+            ),
+            (
+                "(30,8)-(10,2)",
+                d(31, 8),
+                DecimalMeta::sub_result(d(30, 8), d(10, 2)).unwrap(),
+            ),
+            // ── 乘
+            (
+                "(10,2)*(10,2)",
+                d(21, 4),
+                DecimalMeta::mul_result(d(10, 2), d(10, 2)).unwrap(),
+            ),
+            (
+                "(30,8)*(30,8)",
+                d(38, 6),
+                DecimalMeta::mul_result(d(30, 8), d(30, 8)).unwrap(),
+            ),
+            (
+                "(25,5)*(25,5)",
+                d(38, 6),
+                DecimalMeta::mul_result(d(25, 5), d(25, 5)).unwrap(),
+            ),
+            (
+                "(38,0)*(38,0)",
+                d(38, 0),
+                DecimalMeta::mul_result(d(38, 0), d(38, 0)).unwrap(),
+            ),
+            (
+                "(30,20)*(30,20)",
+                d(38, 17),
+                DecimalMeta::mul_result(d(30, 20), d(30, 20)).unwrap(),
+            ),
+            (
+                "(38,10)*(38,16)",
+                d(38, 6),
+                DecimalMeta::mul_result(d(38, 10), d(38, 16)).unwrap(),
+            ),
+            (
+                "(38,8)*(38,8)",
+                d(38, 6),
+                DecimalMeta::mul_result(d(38, 8), d(38, 8)).unwrap(),
+            ),
+            // ── 除：**此前全错**
+            (
+                "(10,2)/(10,3)",
+                d(24, 13),
+                DecimalMeta::div_result(d(10, 2), d(10, 3)).unwrap(),
+            ),
+            (
+                "(10,2)/(5,1)",
+                d(17, 8),
+                DecimalMeta::div_result(d(10, 2), d(5, 1)).unwrap(),
+            ),
+            (
+                "(5,1)/(10,2)",
+                d(18, 12),
+                DecimalMeta::div_result(d(5, 1), d(10, 2)).unwrap(),
+            ),
+            (
+                "(30,8)/(30,8)",
+                d(38, 8),
+                DecimalMeta::div_result(d(30, 8), d(30, 8)).unwrap(),
+            ),
+            // ── 取模：整数位是 **min**（此前写成 max）
+            (
+                "(30,8)%(10,2)",
+                d(16, 8),
+                DecimalMeta::mod_result(d(30, 8), d(10, 2)).unwrap(),
+            ),
+            (
+                "(9,0)%(9,0)",
+                d(9, 0),
+                DecimalMeta::mod_result(d(9, 0), d(9, 0)).unwrap(),
+            ),
+        ];
+        for (what, want, got) in cases {
+            assert_eq!(
+                (got.precision, got.scale),
+                (want.precision, want.scale),
+                "DEFIMAL(p,s) 口径与 Spark 不一致：{what}"
+            );
+        }
+        // ── avg / sum（返回类型不是 Result）
+        for (p, s, wp, ws) in [(30u8, 8i8, 34u8, 12i8), (10, 2, 14, 6), (38, 10, 38, 14)] {
+            let g = DecimalMeta::avg_result(d(p, s));
+            assert_eq!(
+                (g.precision, g.scale),
+                (wp, ws),
+                "avg(({p},{s})) 与 Spark 不一致"
+            );
+        }
+        let g = DecimalMeta::sum_result(d(30, 8));
+        assert_eq!(
+            (g.precision, g.scale),
+            (38u8, 8i8),
+            "sum((30,8)) 与 Spark 不一致"
+        );
     }
 }

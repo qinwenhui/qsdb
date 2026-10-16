@@ -75,7 +75,9 @@ fn 整分区_sum_avg_min_max() {
             &db,
             "SELECT sum(d) AS s, avg(d) AS a, min(d) AS mn, max(d) AS mx FROM t LIMIT 1"
         ),
-        vec!["0.62500000|0.20833333|-3.12500000|2.25000000"]
+        // ⚠️ `avg` 的输出 scale 2026-10-16 起按 **Spark** 对齐（`s+4`）⇒ 12 位小数；
+        // 值是精确的 0.208333333333（旧期望 0.20833333 是旧口径）。
+        vec!["0.62500000|0.208333333333|-3.12500000|2.25000000"]
     );
     std::fs::remove_dir_all(&root).ok();
 }
@@ -90,8 +92,10 @@ fn 输出类型() {
             &db,
             "SELECT sum(d) OVER () AS s, avg(d) OVER () AS a FROM t LIMIT 1"
         ),
-        vec!["Decimal128(38, 8)", "Decimal128(38, 8)"],
-        "sum/avg 的输出精度 = min(p+10, 38) = 38，scale 保持 8/4"
+        // Spark 实测：`sum(DECIMAL(30,8))` ⇒ decimal(38,8)、
+        // `avg(DECIMAL(30,8))` ⇒ **decimal(34,12)**（= `min(38,p+4), s+4`）
+        vec!["Decimal128(38, 8)", "Decimal128(34, 12)"],
+        "sum = min(p+10,38),s；avg = min(38,p+4), s+4（按 Spark）"
     );
     // min/max 沿用参数类型
     assert_eq!(

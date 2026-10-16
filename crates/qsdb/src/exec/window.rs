@@ -723,7 +723,16 @@ fn compute_window_fn(
                         }
                         out_d[i] = if is_avg {
                             // cnt == 0 的行由 `empty_rows` 统一置 NULL（见 finish_dec）
-                            if cnt == 0 { 0 } else { dec_avg(acc, cnt)? }
+                            if cnt == 0 {
+                                0
+                            } else {
+                                dec_avg(
+                                    acc,
+                                    cnt,
+                                    dec_meta(&arg.data_type())?.scale,
+                                    out_meta(f, &arg.data_type())?.scale,
+                                )?
+                            }
                         } else if is_min || is_max {
                             ext.unwrap_or(0)
                         } else {
@@ -961,11 +970,13 @@ fn framed_agg(
             } else {
                 let big: Vec<Option<i256>> = vals.iter().map(|v| v.map(i256::from_i128)).collect();
                 let (sums, cnts) = framed_prefix(n, partition_start, frame, &big);
+                let in_scale = dec_meta(&arg_type)?.scale;
+                let out_sc = out_meta(f, &arg_type)?.scale;
                 let out: Vec<Option<i128>> = if is_avg {
                     sums.iter()
                         .zip(cnts.iter())
                         .map(|(s, c)| match s {
-                            Some(v) if *c > 0 => dec_avg(*v, *c).map(Some),
+                            Some(v) if *c > 0 => dec_avg(*v, *c, in_scale, out_sc).map(Some),
                             _ => Ok(None),
                         })
                         .collect::<Result<_>>()?
@@ -1020,18 +1031,37 @@ fn dec_fit(v: i256, what: &str) -> Result<i128> {
 }
 
 /// `avg(decimal)`：`HALF_UP(sum / count)`，与非窗口聚合逐字一致。
-fn dec_avg(sum: i256, cnt: i64) -> Result<i128> {
+fn dec_avg(sum: i256, cnt: i64, in_scale: i8, out_scale: i8) -> Result<i128> {
     if cnt <= 0 {
         return Err(QsdbError::type_err("avg with zero count (internal)"));
     }
     let d = i256::from_i128(cnt as i128);
-    let q = sum / d;
-    let r = sum % d;
+    // ⚠️ **输出 scale 可能 ≠ 输入 scale**（Spark 的 `avg` 规则是 `s+4`）⇒ 输出小数位
+    // 更多时把**分子**（unscaled 和）放大 `10^(s_out - s_in)`。
+    //
+    // 漏掉这一步不会报错，只会**把数算小**：2026-10-16 实测 `avg(DECIMAL(30,8)) OVER ()`
+    // 回 `0.000020833333` 而不是 `0.208333333333` —— 小了 1 万倍。
+    // **同一处病在聚合那条路（`exec::agg`）也有一份，必须一起改**，
+    // 否则"窗口 avg"与"聚合 avg"会给出不同的数（本文件那条逐值对撞测试会当场抓到）。
+    let shift = i32::from(out_scale) - i32::from(in_scale);
+    let (num, den) = if shift >= 0 {
+        (
+            sum * i256::from_i128(crate::types::decimal::pow10(shift as u32)),
+            d,
+        )
+    } else {
+        (
+            sum,
+            d * i256::from_i128(crate::types::decimal::pow10((-shift) as u32)),
+        )
+    };
+    let q = num / den;
+    let r = num % den;
     let round_up =
-        r != i256::from_i128(0) && r.wrapping_mul(i256::from_i128(2)).wrapping_abs() >= d;
+        r != i256::from_i128(0) && r.wrapping_mul(i256::from_i128(2)).wrapping_abs() >= den;
     let adj = if !round_up {
         q
-    } else if sum >= i256::from_i128(0) {
+    } else if num >= i256::from_i128(0) {
         q + i256::from_i128(1)
     } else {
         q - i256::from_i128(1)

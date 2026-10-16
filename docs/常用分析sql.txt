@@ -1,362 +1,324 @@
 WITH t1 AS (
-    SELECT
-        PHID, pdate, month, settle_month,
-        plant_id, plant_name,
-        unit_id, unit_name,
-        power_company_id, power_company_name,
-        power_type, power_type_name,
-        settle_type, settle_type_name,
-        trade_types, trade_types_name,
-        data_type, tpoint, value, update_by
-    FROM t_cal_day_assess_unit
-    WHERE ASSESS_TYPE = '8'
-      AND PDATE IN ('2026-04-01')
-      AND SETTLE_MONTH = '2026-04-01'
+SELECT PHID,pdate,month,settle_month,is_refund,is_refund_name,plant_id,plant_name,unit_id,unit_name,power_company_id,power_company_name,power_type,power_type_name,settle_type,settle_type_name,trade_types,trade_types_name,assess_type,assess_type_name,data_type,data_name,tpoint,value,version,update_time,update_by,update_name FROM  t_cal_day_assess_unit WHERE (ASSESS_TYPE = '8') AND (PDATE IN ( '2026-04-01' )) AND (SETTLE_MONTH = '2026-04-01')
 ),
 t2 AS (
-    SELECT
-        pdate, month, plant_id, plant_name,
-        unit_id, unit_name,
-        power_company_id, power_company_name,
-        power_type, power_type_name,
-        settle_type, settle_type_name,
-        trade_types, trade_types_name,
-        tpoint, price
-    FROM t_cal_day_real_unit
-    WHERE PDATE IN ('2026-04-01')
-      AND SETTLE_TYPE = '5'
+SELECT PHID,pdate,month,plant_id,plant_name,unit_id,unit_name,power_company_id,power_company_name,power_type,power_type_name,settle_type,settle_type_name,trade_types,trade_types_name,unit_capacity,tpoint,energy,price,version,update_time,update_by,update_name,app_type,app_type_name,base_type,base_type_name FROM  t_cal_day_real_unit WHERE (PDATE IN ( '2026-04-01' )) AND (SETTLE_TYPE = '5')
 ),
 t3 AS (
-    SELECT pdate, version_id
-    FROM t_cal_day_calculate_version
-    WHERE PDATE IN ('2026-04-01')
-      AND VERSION_ID IN ('78_20260401_1')
+SELECT PHID,pdate,month,version_id,status,status_name,update_time,update_by,update_name,compute_done_time,create_time,create_by,create_name,settle_period,settle_period_name,market_type,market_type_name,is_refund,is_solid FROM  t_cal_day_calculate_version WHERE (PDATE IN ( '2026-04-01' )) AND (VERSION_ID IN ( '78_20260401_1' ))
 ),
 t4 AS (
-    SELECT
-        PHID, pdate, month, settle_month,
-        plant_id, plant_name,
-        unit_id, unit_name,
-        power_company_id, power_company_name,
-        power_type, power_type_name,
-        settle_type, settle_type_name,
-        trade_types, trade_types_name,
-        data_type, tpoint, value, update_by
-    FROM t_cal_day_assess_unit
-    WHERE ASSESS_TYPE = '5'
-      AND PDATE IN ('2026-04-01')
-      AND SETTLE_MONTH = '2026-04-01'
-      AND SETTLE_TYPE = '5'
+SELECT PHID,pdate,month,settle_month,is_refund,is_refund_name,plant_id,plant_name,unit_id,unit_name,power_company_id,power_company_name,power_type,power_type_name,settle_type,settle_type_name,trade_types,trade_types_name,assess_type,assess_type_name,data_type,data_name,tpoint,value,version,update_time,update_by,update_name FROM  t_cal_day_assess_unit WHERE (ASSESS_TYPE = '5') AND (PDATE IN ( '2026-04-01' )) AND (SETTLE_MONTH = '2026-04-01') AND (SETTLE_TYPE = '5')
 ),
 t5 AS (
-    SELECT
-        pdate, month,
-        plant_id, plant_name,
-        unit_id, unit_name,
-        power_company_id, power_company_name,
-        power_type, power_type_name,
-        settle_type, settle_type_name,
-        trade_types, trade_types_name,
-        app_type, app_type_name,
-        base_type, base_type_name,
-        min_capacity, update_by
-    FROM t_cal_day_unit
-    WHERE PDATE IN ('2026-04-01')
-      AND SETTLE_TYPE = '5'
+SELECT PHID,pdate,plant_id,plant_name,unit_id,unit_name,power_company_id,power_company_name,power_type,power_type_name,settle_type,settle_type_name,trade_types,trade_types_name,yx_plant_id,yx_plant_name,yx_unit_id,yx_unit_name,approve_cost,electricity_consume_rate,gas_first_price,gas_second_price,limit_hour,not_gas_price,sulfur_price,saltpetre_price,dust_price,ultra_low_emission_price,not_gas_total_price,unit_capacity,max_output_power,month_hour,price_adjust_standard,standard_coefficient,first_subsidy_standard,second_subsidy_standard,update_time,update_by,update_name,app_type,app_type_name,base_type,base_type_name,month,power_group_name,max_capacity,min_capacity,coil_price,voltage_level_code,voltage_level_name,license_capacity,plant_group_id,plant_group_name,winter_max_capacity,summer_max_capacity,max_power_generation,min_power_generation,rated_pump_power,mechanism_power_ratio,power_price_class,power_supply_bureau,power_supply_name,bas_power_ratio,is_ahead_clear,is_ahead_clear_name FROM  t_cal_day_unit WHERE (PDATE IN ( '2026-04-01' )) AND (SETTLE_TYPE = '5')
 ),
 t6 AS (
-    SELECT PHID, pdate, month, settle_month, plant_id, plant_name,
-           unit_id, unit_name, power_company_id, power_company_name,
-           power_type, power_type_name, settle_type, settle_type_name,
-           trade_types, trade_types_name, data_type, tpoint, value, update_by
-    FROM t1 WHERE DATA_TYPE = '16'
+SELECT * FROM t1 WHERE DATA_TYPE='16'
 ),
 t7 AS (
-    SELECT PHID, pdate, month, settle_month, plant_id, plant_name,
-           unit_id, unit_name, power_company_id, power_company_name,
-           power_type, power_type_name, settle_type, settle_type_name,
-           trade_types, trade_types_name, data_type, tpoint, value, update_by
-    FROM t1 WHERE DATA_TYPE = '14'
+SELECT * FROM t1 WHERE DATA_TYPE='14'
 ),
 t8 AS (
-    SELECT PHID, pdate, month, settle_month, plant_id, plant_name,
-           unit_id, unit_name, power_company_id, power_company_name,
-           power_type, power_type_name, settle_type, settle_type_name,
-           trade_types, trade_types_name, data_type, tpoint, value, update_by
-    FROM t1 WHERE DATA_TYPE = '13'
+SELECT * FROM t1 WHERE DATA_TYPE='13'
 ),
 t9 AS (
-    SELECT PHID, pdate, month, settle_month, plant_id, plant_name,
-           unit_id, unit_name, power_company_id, power_company_name,
-           power_type, power_type_name, settle_type, settle_type_name,
-           trade_types, trade_types_name, data_type, tpoint, value, update_by
-    FROM t1 WHERE DATA_TYPE = '15'
+SELECT * FROM t1 WHERE DATA_TYPE='15'
 ),
 t10 AS (
-    SELECT PHID, pdate, month, settle_month, plant_id, plant_name,
-           unit_id, unit_name, power_company_id, power_company_name,
-           power_type, power_type_name, settle_type, settle_type_name,
-           trade_types, trade_types_name, data_type, tpoint, value, update_by
-    FROM t4 WHERE DATA_TYPE = '12'
+SELECT * FROM t4 WHERE DATA_TYPE='12'
 ),
 t11 AS (
-    SELECT PHID, pdate, month, settle_month, plant_id, plant_name,
-           unit_id, unit_name, power_company_id, power_company_name,
-           power_type, power_type_name, settle_type, settle_type_name,
-           trade_types, trade_types_name, data_type, tpoint, value, update_by
-    FROM t4 WHERE DATA_TYPE = '18'
+SELECT * FROM t4 WHERE DATA_TYPE='18'
 ),
 t12 AS (
-    SELECT PHID, pdate, month, settle_month, plant_id, plant_name,
-           unit_id, unit_name, power_company_id, power_company_name,
-           power_type, power_type_name, settle_type, settle_type_name,
-           trade_types, trade_types_name, data_type, tpoint, value, update_by
-    FROM t4 WHERE DATA_TYPE = '7'
+SELECT * FROM t4 WHERE DATA_TYPE='7'
 ),
 t13 AS (
-    SELECT t5.month, t5.pdate, t5.update_by,
-           t5.plant_id, t5.plant_name,
-           t5.unit_id, t5.unit_name,
-           t5.power_company_id, t5.power_company_name,
-           t5.power_type, t5.power_type_name,
-           t5.settle_type, t5.settle_type_name,
-           t5.trade_types, t5.trade_types_name,
-           t5.app_type, t5.app_type_name,
-           t5.base_type, t5.base_type_name,
-           t5.min_capacity,
-           t2.tpoint, t2.price
-    FROM t5
-    INNER JOIN t2 ON t5.month = t2.month
-                  AND t5.pdate = t2.pdate
-                  AND t5.plant_id = t2.plant_id
-                  AND t5.unit_id = t2.unit_id
+SELECT t5.MONTH, t5.PDATE, t5.UPDATE_BY, t5.PLANT_ID, t5.PLANT_NAME, t5.UNIT_ID, t5.UNIT_NAME, t5.POWER_COMPANY_ID, t5.POWER_COMPANY_NAME, t5.POWER_TYPE, t5.POWER_TYPE_NAME, t5.SETTLE_TYPE, t5.SETTLE_TYPE_NAME, t5.TRADE_TYPES, t5.TRADE_TYPES_NAME, t5.APP_TYPE, t5.APP_TYPE_NAME, t5.BASE_TYPE, t5.BASE_TYPE_NAME, t5.MIN_CAPACITY, t2.TPOINT, t2.PRICE FROM t5 INNER JOIN t2 ON t5.MONTH = t2.MONTH AND t5.PDATE = t2.PDATE AND t5.PLANT_ID = t2.PLANT_ID AND t5.UNIT_ID = t2.UNIT_ID
 ),
 t14 AS (
-    SELECT PHID, pdate, month, settle_month, plant_id, plant_name,
-           unit_id, unit_name, power_company_id, power_company_name,
-           power_type, power_type_name, settle_type, settle_type_name,
-           trade_types, trade_types_name, tpoint, value AS label, update_by
-    FROM t6
+SELECT
+  `PHID`,
+  `pdate`,
+  `month`,
+  `settle_month`,
+  `is_refund`,
+  `is_refund_name`,
+  `plant_id`,
+  `plant_name`,
+  `unit_id`,
+  `unit_name`,
+  `power_company_id`,
+  `power_company_name`,
+  `power_type`,
+  `power_type_name`,
+  `settle_type`,
+  `settle_type_name`,
+  `trade_types`,
+  `trade_types_name`,
+  `assess_type`,
+  `assess_type_name`,
+  `data_type`,
+  `data_name`,
+  `tpoint`,
+  `value` AS `label`,
+  `version`,
+  `update_time`,
+  `update_by`,
+  `update_name`
+FROM t6
 ),
 t15 AS (
-    SELECT PHID, pdate, month, settle_month, plant_id, plant_name,
-           unit_id, unit_name, power_company_id, power_company_name,
-           power_type, power_type_name, settle_type, settle_type_name,
-           trade_types, trade_types_name, tpoint, value AS limit_power, update_by
-    FROM t7
+SELECT
+  `PHID`,
+  `pdate`,
+  `month`,
+  `settle_month`,
+  `is_refund`,
+  `is_refund_name`,
+  `plant_id`,
+  `plant_name`,
+  `unit_id`,
+  `unit_name`,
+  `power_company_id`,
+  `power_company_name`,
+  `power_type`,
+  `power_type_name`,
+  `settle_type`,
+  `settle_type_name`,
+  `trade_types`,
+  `trade_types_name`,
+  `assess_type`,
+  `assess_type_name`,
+  `data_type`,
+  `data_name`,
+  `tpoint`,
+  `value` AS `limit_power`,
+  `version`,
+  `update_time`,
+  `update_by`,
+  `update_name`
+FROM t7
 ),
 t16 AS (
-    SELECT PHID, pdate, month, settle_month, plant_id, plant_name,
-           unit_id, unit_name, power_company_id, power_company_name,
-           power_type, power_type_name, settle_type, settle_type_name,
-           trade_types, trade_types_name, tpoint, value AS max_power, update_by
-    FROM t8
+SELECT
+  `PHID`,
+  `pdate`,
+  `month`,
+  `settle_month`,
+  `is_refund`,
+  `is_refund_name`,
+  `plant_id`,
+  `plant_name`,
+  `unit_id`,
+  `unit_name`,
+  `power_company_id`,
+  `power_company_name`,
+  `power_type`,
+  `power_type_name`,
+  `settle_type`,
+  `settle_type_name`,
+  `trade_types`,
+  `trade_types_name`,
+  `assess_type`,
+  `assess_type_name`,
+  `data_type`,
+  `data_name`,
+  `tpoint`,
+  `value` AS `max_power`,
+  `version`,
+  `update_time`,
+  `update_by`,
+  `update_name`
+FROM t8
 ),
 t17 AS (
-    SELECT PHID, pdate, month, settle_month, plant_id, plant_name,
-           unit_id, unit_name, power_company_id, power_company_name,
-           power_type, power_type_name, settle_type, settle_type_name,
-           trade_types, trade_types_name, tpoint, value AS limit_time, update_by
-    FROM t9
+SELECT
+  `PHID`,
+  `pdate`,
+  `month`,
+  `settle_month`,
+  `is_refund`,
+  `is_refund_name`,
+  `plant_id`,
+  `plant_name`,
+  `unit_id`,
+  `unit_name`,
+  `power_company_id`,
+  `power_company_name`,
+  `power_type`,
+  `power_type_name`,
+  `settle_type`,
+  `settle_type_name`,
+  `trade_types`,
+  `trade_types_name`,
+  `assess_type`,
+  `assess_type_name`,
+  `data_type`,
+  `data_name`,
+  `tpoint`,
+  `value` AS `limit_time`,
+  `version`,
+  `update_time`,
+  `update_by`,
+  `update_name`
+FROM t9
 ),
 t18 AS (
-    SELECT PHID, pdate, month, settle_month, plant_id, plant_name,
-           unit_id, unit_name, power_company_id, power_company_name,
-           power_type, power_type_name, settle_type, settle_type_name,
-           trade_types, trade_types_name, tpoint, value AS xdsc, update_by
-    FROM t10
+SELECT
+  `PHID`,
+  `pdate`,
+  `month`,
+  `settle_month`,
+  `is_refund`,
+  `is_refund_name`,
+  `plant_id`,
+  `plant_name`,
+  `unit_id`,
+  `unit_name`,
+  `power_company_id`,
+  `power_company_name`,
+  `power_type`,
+  `power_type_name`,
+  `settle_type`,
+  `settle_type_name`,
+  `trade_types`,
+  `trade_types_name`,
+  `assess_type`,
+  `assess_type_name`,
+  `data_type`,
+  `data_name`,
+  `tpoint`,
+  `value` AS `xdsc`,
+  `version`,
+  `update_time`,
+  `update_by`,
+  `update_name`
+FROM t10
 ),
 t19 AS (
-    SELECT PHID, pdate, month, settle_month, plant_id, plant_name,
-           unit_id, unit_name, power_company_id, power_company_name,
-           power_type, power_type_name, settle_type, settle_type_name,
-           trade_types, trade_types_name, tpoint, value AS unit_min_power, update_by
-    FROM t11
+SELECT
+  `PHID`,
+  `pdate`,
+  `month`,
+  `settle_month`,
+  `is_refund`,
+  `is_refund_name`,
+  `plant_id`,
+  `plant_name`,
+  `unit_id`,
+  `unit_name`,
+  `power_company_id`,
+  `power_company_name`,
+  `power_type`,
+  `power_type_name`,
+  `settle_type`,
+  `settle_type_name`,
+  `trade_types`,
+  `trade_types_name`,
+  `assess_type`,
+  `assess_type_name`,
+  `data_type`,
+  `data_name`,
+  `tpoint`,
+  `value` AS `unit_min_power`,
+  `version`,
+  `update_time`,
+  `update_by`,
+  `update_name`
+FROM t11
 ),
 t20 AS (
-    SELECT PHID, pdate, month, settle_month, plant_id, plant_name,
-           unit_id, unit_name, power_company_id, power_company_name,
-           power_type, power_type_name, settle_type, settle_type_name,
-           trade_types, trade_types_name, tpoint, value AS xd_value, update_by
-    FROM t12
+SELECT
+  `PHID`,
+  `pdate`,
+  `month`,
+  `settle_month`,
+  `is_refund`,
+  `is_refund_name`,
+  `plant_id`,
+  `plant_name`,
+  `unit_id`,
+  `unit_name`,
+  `power_company_id`,
+  `power_company_name`,
+  `power_type`,
+  `power_type_name`,
+  `settle_type`,
+  `settle_type_name`,
+  `trade_types`,
+  `trade_types_name`,
+  `assess_type`,
+  `assess_type_name`,
+  `data_type`,
+  `data_name`,
+  `tpoint`,
+  `value` AS `xd_value`,
+  `version`,
+  `update_time`,
+  `update_by`,
+  `update_name`
+FROM t12
 ),
 t21 AS (
-    SELECT month, pdate, update_by, plant_id, plant_name,
-           unit_id, unit_name, power_company_id, power_company_name,
-           power_type, power_type_name, settle_type, settle_type_name,
-           trade_types, trade_types_name, app_type, app_type_name,
-           base_type, base_type_name, tpoint, price
-    FROM t13 WHERE base_type = '17'
+SELECT * FROM t13 WHERE BASE_TYPE='17'
 ),
 t22 AS (
-    SELECT t16.pdate, t16.month, t16.plant_id, t16.plant_name,
-           t16.unit_id, t16.unit_name, t16.power_company_id, t16.power_company_name,
-           t16.power_type, t16.power_type_name, t16.settle_type, t16.settle_type_name,
-           t16.trade_types, t16.trade_types_name, t16.tpoint,
-           t16.max_power, t17.limit_time
-    FROM t16
-    LEFT JOIN t17 ON t16.pdate = t17.pdate
-                  AND t16.month = t17.month
-                  AND t16.plant_id = t17.plant_id
-                  AND t16.unit_id = t17.unit_id
-                  AND t16.tpoint = t17.tpoint
+SELECT t16.PDATE, t16.MONTH, t16.PLANT_ID, t16.PLANT_NAME, t16.UNIT_ID, t16.UNIT_NAME, t16.POWER_COMPANY_ID, t16.POWER_COMPANY_NAME, t16.POWER_TYPE, t16.POWER_TYPE_NAME, t16.SETTLE_TYPE, t16.SETTLE_TYPE_NAME, t16.TRADE_TYPES, t16.TRADE_TYPES_NAME, t16.TPOINT, t16.MAX_POWER, t17.LIMIT_TIME FROM t16 LEFT JOIN t17 ON t16.PDATE = t17.PDATE AND t16.MONTH = t17.MONTH AND t16.PLANT_ID = t17.PLANT_ID AND t16.UNIT_ID = t17.UNIT_ID AND t16.TPOINT = t17.TPOINT
 ),
 t23 AS (
-    SELECT t20.xd_value, t13.month, t13.pdate, t13.update_by,
-           t13.plant_id, t13.plant_name, t13.unit_id, t13.unit_name,
-           t13.power_company_id, t13.power_company_name,
-           t13.power_type, t13.power_type_name,
-           t13.settle_type, t13.settle_type_name,
-           t13.trade_types, t13.trade_types_name,
-           t13.app_type, t13.app_type_name,
-           t13.base_type, t13.base_type_name,
-           t13.min_capacity, t13.tpoint, t13.price
-    FROM t20
-    INNER JOIN t13 ON t20.pdate = t13.pdate
-                    AND t20.plant_id = t13.plant_id
-                    AND t20.unit_id = t13.unit_id
-                    AND t20.tpoint = t13.tpoint
+SELECT t20.XD_VALUE, t13.MONTH, t13.PDATE, t13.UPDATE_BY, t13.PLANT_ID, t13.PLANT_NAME, t13.UNIT_ID, t13.UNIT_NAME, t13.POWER_COMPANY_ID, t13.POWER_COMPANY_NAME, t13.POWER_TYPE, t13.POWER_TYPE_NAME, t13.SETTLE_TYPE, t13.SETTLE_TYPE_NAME, t13.TRADE_TYPES, t13.TRADE_TYPES_NAME, t13.APP_TYPE, t13.APP_TYPE_NAME, t13.BASE_TYPE, t13.BASE_TYPE_NAME, t13.MIN_CAPACITY, t13.TPOINT, t13.PRICE FROM t20 INNER JOIN t13 ON t20.PDATE = t13.PDATE AND t20.PLANT_ID = t13.PLANT_ID AND t20.UNIT_ID = t13.UNIT_ID AND t20.TPOINT = t13.TPOINT
 ),
 t24 AS (
-    SELECT t22.pdate, t22.month, t22.plant_id, t22.plant_name,
-           t22.unit_id, t22.unit_name, t22.power_company_id, t22.power_company_name,
-           t22.power_type, t22.power_type_name, t22.settle_type, t22.settle_type_name,
-           t22.trade_types, t22.trade_types_name, t22.tpoint,
-           t22.max_power, t22.limit_time, t14.label
-    FROM t22
-    LEFT JOIN t14 ON t22.pdate = t14.pdate
-                  AND t22.month = t14.month
-                  AND t22.plant_id = t14.plant_id
-                  AND t22.unit_id = t14.unit_id
-                  AND t22.tpoint = t14.tpoint
+SELECT t22.PDATE, t22.MONTH, t22.PLANT_ID, t22.PLANT_NAME, t22.UNIT_ID, t22.UNIT_NAME, t22.POWER_COMPANY_ID, t22.POWER_COMPANY_NAME, t22.POWER_TYPE, t22.POWER_TYPE_NAME, t22.SETTLE_TYPE, t22.SETTLE_TYPE_NAME, t22.TRADE_TYPES, t22.TRADE_TYPES_NAME, t22.TPOINT, t22.MAX_POWER, t22.LIMIT_TIME, t14.LABEL FROM t22 LEFT JOIN t14 ON t22.PDATE = t14.PDATE AND t22.MONTH = t14.MONTH AND t22.PLANT_ID = t14.PLANT_ID AND t22.UNIT_ID = t14.UNIT_ID AND t22.TPOINT = t14.TPOINT
 ),
 t25 AS (
-    SELECT t18.xdsc, t23.xd_value, t23.month, t23.pdate,
-           t23.plant_id, t23.plant_name, t23.unit_id, t23.unit_name,
-           t23.power_company_id, t23.power_company_name,
-           t23.power_type, t23.power_type_name,
-           t23.settle_type, t23.settle_type_name,
-           t23.trade_types, t23.trade_types_name,
-           t23.app_type, t23.app_type_name,
-           t23.base_type, t23.base_type_name,
-           t23.min_capacity, t23.tpoint, t23.price
-    FROM t18
-    INNER JOIN t23 ON t18.pdate = t23.pdate
-                    AND t18.plant_id = t23.plant_id
-                    AND t18.unit_id = t23.unit_id
-                    AND t18.tpoint = t23.tpoint
+SELECT t18.XDSC, t23.XD_VALUE, t23.MONTH, t23.PDATE, t23.PLANT_ID, t23.PLANT_NAME, t23.UNIT_ID, t23.UNIT_NAME, t23.POWER_COMPANY_ID, t23.POWER_COMPANY_NAME, t23.POWER_TYPE, t23.POWER_TYPE_NAME, t23.SETTLE_TYPE, t23.SETTLE_TYPE_NAME, t23.TRADE_TYPES, t23.TRADE_TYPES_NAME, t23.APP_TYPE, t23.APP_TYPE_NAME, t23.BASE_TYPE, t23.BASE_TYPE_NAME, t23.MIN_CAPACITY, t23.TPOINT, t23.PRICE FROM t18 INNER JOIN t23 ON t18.PDATE = t23.PDATE AND t18.PLANT_ID = t23.PLANT_ID AND t18.UNIT_ID = t23.UNIT_ID AND t18.TPOINT = t23.TPOINT
 ),
 t26 AS (
-    SELECT t24.max_power, t24.limit_time, t24.label, t24.limit_power,
-           t24.pdate, t24.month, t24.plant_id, t24.plant_name,
-           t24.unit_id, t24.unit_name, t24.power_company_id, t24.power_company_name,
-           t24.power_type, t24.power_type_name, t24.settle_type, t24.settle_type_name,
-           t24.trade_types, t24.trade_types_name, t24.tpoint
-    FROM t24
-    INNER JOIN t15 ON t24.pdate = t15.pdate
-                   AND t24.month = t15.month
-                   AND t24.plant_id = t15.plant_id
-                   AND t24.unit_id = t15.unit_id
-                   AND t24.tpoint = t15.tpoint
+SELECT t24.PDATE, t24.MONTH, t24.PLANT_ID, t24.PLANT_NAME, t24.UNIT_ID, t24.UNIT_NAME, t24.POWER_COMPANY_ID, t24.POWER_COMPANY_NAME, t24.POWER_TYPE, t24.POWER_TYPE_NAME, t24.SETTLE_TYPE, t24.SETTLE_TYPE_NAME, t24.TRADE_TYPES, t24.TRADE_TYPES_NAME, t24.TPOINT, t24.MAX_POWER, t24.LIMIT_TIME, t24.LABEL, t15.LIMIT_POWER FROM t24 INNER JOIN t15 ON t24.PDATE = t15.PDATE AND t24.MONTH = t15.MONTH AND t24.PLANT_ID = t15.PLANT_ID AND t24.UNIT_ID = t15.UNIT_ID AND t24.TPOINT = t15.TPOINT
 ),
 t27 AS (
-    SELECT t25.xdsc, t25.xd_value, t25.month, t25.pdate,
-           t25.plant_id, t25.plant_name, t25.unit_id, t25.unit_name,
-           t25.power_company_id, t25.power_company_name,
-           t25.power_type, t25.power_type_name,
-           t25.settle_type, t25.settle_type_name,
-           t25.trade_types, t25.trade_types_name,
-           t25.app_type, t25.app_type_name,
-           t25.base_type, t25.base_type_name,
-           t25.min_capacity, t25.tpoint, t25.price, t19.unit_min_power
-    FROM t25
-    INNER JOIN t19 ON t25.pdate = t19.pdate
-                    AND t25.plant_id = t19.plant_id
-                    AND t25.unit_id = t19.unit_id
-                    AND t25.tpoint = t19.tpoint
+SELECT t25.XDSC, t25.XD_VALUE, t25.MONTH, t25.PDATE, t25.PLANT_ID, t25.PLANT_NAME, t25.UNIT_ID, t25.UNIT_NAME, t25.POWER_COMPANY_ID, t25.POWER_COMPANY_NAME, t25.POWER_TYPE, t25.POWER_TYPE_NAME, t25.SETTLE_TYPE, t25.SETTLE_TYPE_NAME, t25.TRADE_TYPES, t25.TRADE_TYPES_NAME, t25.APP_TYPE, t25.APP_TYPE_NAME, t25.BASE_TYPE, t25.BASE_TYPE_NAME, t25.MIN_CAPACITY, t25.TPOINT, t25.PRICE, t19.UNIT_MIN_POWER FROM t25 INNER JOIN t19 ON t25.PDATE = t19.PDATE AND t25.PLANT_ID = t19.PLANT_ID AND t25.UNIT_ID = t19.UNIT_ID AND t25.TPOINT = t19.TPOINT
 ),
 t28 AS (
-    SELECT t26.max_power, t26.limit_time, t26.label, t26.limit_power,
-           t21.month, t21.pdate, t21.plant_id, t21.plant_name,
-           t21.unit_id, t21.unit_name, t21.power_company_id, t21.power_company_name,
-           t21.power_type, t21.power_type_name,
-           t21.settle_type, t21.settle_type_name,
-           t21.trade_types, t21.trade_types_name,
-           t21.app_type, t21.app_type_name,
-           t21.base_type, t21.base_type_name,
-           t21.tpoint, t21.price
-    FROM t26
-    RIGHT JOIN t21 ON t26.pdate = t21.pdate
-                    AND t26.plant_id = t21.plant_id
-                    AND t26.unit_id = t21.unit_id
-                    AND t26.tpoint = t21.tpoint
+SELECT t26.MAX_POWER, t26.LIMIT_TIME, t26.LABEL, t26.LIMIT_POWER, t21.MONTH, t21.PDATE, t21.PLANT_ID, t21.PLANT_NAME, t21.UNIT_ID, t21.UNIT_NAME, t21.POWER_COMPANY_ID, t21.POWER_COMPANY_NAME, t21.POWER_TYPE, t21.POWER_TYPE_NAME, t21.SETTLE_TYPE, t21.SETTLE_TYPE_NAME, t21.TRADE_TYPES, t21.TRADE_TYPES_NAME, t21.APP_TYPE, t21.APP_TYPE_NAME, t21.BASE_TYPE, t21.BASE_TYPE_NAME, t21.TPOINT, t21.PRICE FROM t26 RIGHT JOIN t21 ON t26.PDATE = t21.PDATE AND t26.PLANT_ID = t21.PLANT_ID AND t26.UNIT_ID = t21.UNIT_ID AND t26.TPOINT = t21.TPOINT
 ),
 t29 AS (
-    SELECT t27.xdsc, t27.xd_value, t27.month, t27.pdate,
-           t27.plant_id, t27.plant_name, t27.unit_id, t27.unit_name,
-           t27.power_company_id, t27.power_company_name,
-           t27.power_type, t27.power_type_name,
-           t27.settle_type, t27.settle_type_name,
-           t27.trade_types, t27.trade_types_name,
-           t27.app_type, t27.app_type_name,
-           t27.base_type, t27.base_type_name,
-           t27.min_capacity, t27.tpoint, t27.price, t27.unit_min_power,
-           t3.version_id
-    FROM t27
-    INNER JOIN t3 ON t27.pdate = t3.pdate
+SELECT t27.XDSC, t27.XD_VALUE, t27.MONTH, t27.PDATE, t27.PLANT_ID, t27.PLANT_NAME, t27.UNIT_ID, t27.UNIT_NAME, t27.POWER_COMPANY_ID, t27.POWER_COMPANY_NAME, t27.POWER_TYPE, t27.POWER_TYPE_NAME, t27.SETTLE_TYPE, t27.SETTLE_TYPE_NAME, t27.TRADE_TYPES, t27.TRADE_TYPES_NAME, t27.APP_TYPE, t27.APP_TYPE_NAME, t27.BASE_TYPE, t27.BASE_TYPE_NAME, t27.MIN_CAPACITY, t27.TPOINT, t27.PRICE, t27.UNIT_MIN_POWER, t3.VERSION_ID FROM t27 INNER JOIN t3 ON t27.PDATE = t3.PDATE
 ),
 t30 AS (
-    SELECT t28.max_power, t28.limit_time, t28.label, t28.limit_power,
-           t28.month, t28.pdate, t28.plant_id, t28.plant_name,
-           t28.unit_id, t28.unit_name, t28.power_company_id, t28.power_company_name,
-           t28.power_type, t28.power_type_name,
-           t28.settle_type, t28.settle_type_name,
-           t28.trade_types, t28.trade_types_name,
-           t28.app_type, t28.app_type_name,
-           t28.base_type, t28.base_type_name,
-           t28.tpoint, t28.price, t3.version_id
-    FROM t28
-    INNER JOIN t3 ON t28.pdate = t3.pdate
+SELECT t28.MAX_POWER, t28.LIMIT_TIME, t28.LABEL, t28.LIMIT_POWER, t28.MONTH, t28.PDATE, t28.PLANT_ID, t28.PLANT_NAME, t28.UNIT_ID, t28.UNIT_NAME, t28.POWER_COMPANY_ID, t28.POWER_COMPANY_NAME, t28.POWER_TYPE, t28.POWER_TYPE_NAME, t28.SETTLE_TYPE, t28.SETTLE_TYPE_NAME, t28.TRADE_TYPES, t28.TRADE_TYPES_NAME, t28.APP_TYPE, t28.APP_TYPE_NAME, t28.BASE_TYPE, t28.BASE_TYPE_NAME, t28.TPOINT, t28.PRICE, t3.VERSION_ID FROM t28 INNER JOIN t3 ON t28.PDATE = t3.PDATE
 ),
 t31 AS (
-    SELECT *,
-           CAST('限低考核电费' AS VARCHAR(64)) AS settle_item_name,
-           CAST((COALESCE(xd_value, 0.0) - COALESCE(unit_min_power, 0.0)) * COALESCE(xdsc, 0.0) AS DECIMAL(38,8)) AS energy,
-           CAST(ABS(COALESCE(price, 0.0)) * NVL(0.2, 1) AS DECIMAL(38,8)) AS price_1,
-           CAST(-1 * CAST((COALESCE(xd_value, 0.0) - COALESCE(unit_min_power, 0.0)) * COALESCE(xdsc, 0.0) AS DECIMAL(38,8))
-                * CAST(ABS(COALESCE(price, 0.0)) * NVL(0.2, 1) AS DECIMAL(38,8)) AS DECIMAL(38,8)) AS jzxdkh,
-           CAST('07_4_2' AS VARCHAR(20)) AS settle_item,
-           CAST(SYS_GUID() AS VARCHAR(64)) AS PHID,
-           CAST('admin6' AS VARCHAR(32)) AS update_by
-    FROM t29
+SELECT
+*
+,CAST('限低考核电费' as STRING) AS `settle_item_name`,
+CAST((COALESCE(`XD_VALUE`,0.0)-COALESCE(`UNIT_MIN_POWER`,0.0))*COALESCE(`XDSC`,0.0) as DECIMAL(38,8)) AS `energy`,
+CAST(abs(COALESCE(`PRICE`,0.0))*nvl((0.2),1) as DECIMAL(38,8)) AS `price_1`,
+CAST(-1*CAST((COALESCE(`XD_VALUE`,0.0)-COALESCE(`UNIT_MIN_POWER`,0.0))*COALESCE(`XDSC`,0.0) as DECIMAL(38,8))*CAST(abs(COALESCE(`PRICE`,0.0))*nvl((0.2),1) as DECIMAL(38,8)) as DECIMAL(38,8)) AS `jzxdkh`,
+CAST('07_4_2' as STRING) AS `settle_item`,
+CAST(uuid() as STRING) AS `PHID`,
+CAST(CAST('admin6' AS STRING) as STRING) AS `update_by`
+FROM t29
 ),
 t32 AS (
-    SELECT *,
-           CAST('抽蓄限低考核电费' AS VARCHAR(64)) AS settle_item_name,
-           CAST(-1 * CAST((COALESCE(limit_power, 0.0) - COALESCE(max_power, 0.0))
-                * CAST(CASE WHEN COALESCE(label, 0.0) = 1 THEN CAST(2 AS DECIMAL(38,8)) ELSE CAST(1 AS DECIMAL(38,8)) END AS DECIMAL(38,8))
-                * COALESCE(limit_time, 0.0) AS DECIMAL(38,8))
-                * CAST(ABS(COALESCE(price, 0.0)) AS DECIMAL(38,8)) * 0.2 AS DECIMAL(38,8)) AS cx_fee,
-           CAST('07_4_2' AS VARCHAR(20)) AS settle_item,
-           CAST(ABS(COALESCE(price, 0.0)) AS DECIMAL(38,8)) AS khdj,
-           CAST(SYS_GUID() AS VARCHAR(64)) AS PHID,
-           CAST('admin6' AS VARCHAR(32)) AS update_by,
-           CAST(CASE WHEN COALESCE(label, 0.0) = 1 THEN CAST(2 AS DECIMAL(38,8)) ELSE CAST(1 AS DECIMAL(38,8)) END AS DECIMAL(38,8)) AS double_xs,
-           CAST((COALESCE(limit_power, 0.0) - COALESCE(max_power, 0.0))
-                * CAST(CASE WHEN COALESCE(label, 0.0) = 1 THEN CAST(2 AS DECIMAL(38,8)) ELSE CAST(1 AS DECIMAL(38,8)) END AS DECIMAL(38,8))
-                * COALESCE(limit_time, 0.0) AS DECIMAL(38,8)) AS khdl
-    FROM t30
+SELECT
+*
+,CAST('抽蓄限低考核电费' as STRING) AS `settle_item_name`,
+CAST(-1*CAST((COALESCE(`LIMIT_POWER`,0.0)-COALESCE(`MAX_POWER`,0.0))*CAST(CASE when (COALESCE(`LABEL`,0.0) = 1 ) THEN CAST((2) AS DECIMAL(38, 8)) ELSE CAST(1 AS DECIMAL(38, 8)) END as DECIMAL(38,8))*COALESCE(`LIMIT_TIME`,0.0) as DECIMAL(38,8))*CAST(abs(COALESCE(`PRICE`,0.0)) as DECIMAL(38,8))*(0.2) as DECIMAL(38,8)) AS `cx_fee`,
+CAST('07_4_2' as STRING) AS `settle_item`,
+CAST(abs(COALESCE(`PRICE`,0.0)) as DECIMAL(38,8)) AS `khdj`,
+CAST(uuid() as STRING) AS `PHID`,
+CAST(CAST('admin6' AS STRING) as STRING) AS `update_by`,
+CAST(CASE when (COALESCE(`LABEL`,0.0) = 1 ) THEN CAST((2) AS DECIMAL(38, 8)) ELSE CAST(1 AS DECIMAL(38, 8)) END as DECIMAL(38,8)) AS `double_xs`,
+CAST((COALESCE(`LIMIT_POWER`,0.0)-COALESCE(`MAX_POWER`,0.0))*CAST(CASE when (COALESCE(`LABEL`,0.0) = 1 ) THEN CAST((2) AS DECIMAL(38, 8)) ELSE CAST(1 AS DECIMAL(38, 8)) END as DECIMAL(38,8))*COALESCE(`LIMIT_TIME`,0.0) as DECIMAL(38,8)) AS `khdl`
+FROM t30
 ),
 t33 AS (
-    SELECT * FROM t31 WHERE base_type <> '17'
+SELECT * FROM t31 WHERE BASE_TYPE<>'17'
 ),
 t34 AS (
-    SELECT t32.month, t32.pdate, t32.plant_id, t32.plant_name,
-           t32.unit_id, t32.unit_name, t32.power_company_id, t32.power_company_name,
-           t32.power_type, t32.power_type_name, t32.settle_type, t32.settle_type_name,
-           t32.trade_types, t32.trade_types_name, t32.app_type, t32.app_type_name,
-           t32.base_type, t32.base_type_name, t32.tpoint, t32.settle_item_name,
-           t32.cx_fee, t32.Phid, t32.settle_item, t32.version_id, t32.update_by
-    FROM t32
-)
-SELECT * FROM t34;
+SELECT t32.MONTH,t32.PDATE,t32.PLANT_ID,t32.PLANT_NAME,t32.UNIT_ID,t32.UNIT_NAME,t32.POWER_COMPANY_ID,t32.POWER_COMPANY_NAME,t32.POWER_TYPE,t32.POWER_TYPE_NAME,t32.SETTLE_TYPE,t32.SETTLE_TYPE_NAME,t32.TRADE_TYPES,t32.TRADE_TYPES_NAME,t32.APP_TYPE,t32.APP_TYPE_NAME,t32.BASE_TYPE,t32.BASE_TYPE_NAME,t32.TPOINT,t32.SETTLE_ITEM_NAME,t32.CX_FEE,t32.PHID,t32.SETTLE_ITEM,t32.VERSION_ID,t32.UPDATE_BY FROM t32
+) SELECT * FROM t34

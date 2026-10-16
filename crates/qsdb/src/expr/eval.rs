@@ -288,6 +288,15 @@ fn eval_val(expr: &PhysExpr, batch: &RecordBatch) -> Result<EvalVal> {
         PhysExpr::Fn { name, args, .. } => {
             let def = super::scalar::lookup(name)?;
             let n = batch.num_rows();
+            // ⚠️ **逐行非确定性函数要在这里特判**：`uuid()` / `sys_guid()` 必须
+            // 每行不同（它是当**主键**用的），而下面那条约定是"输出 1 个元素 ⇒
+            // 当常量广播" ⇒ 不特判的话**整批会拿到同一个 UUID**，主键全撞还
+            // 一声不响。详见 `scalar::uuid_strings`。
+            if args.is_empty()
+                && (name.eq_ignore_ascii_case("uuid") || name.eq_ignore_ascii_case("sys_guid"))
+            {
+                return Ok(EvalVal::Arr(super::scalar::uuid_strings(n)));
+            }
             let mut arg_vals: Vec<ArrayRef> = Vec::with_capacity(args.len());
             for a in args {
                 arg_vals.push(eval_val(a, batch)?.materialize(n)?);
@@ -414,7 +423,15 @@ fn decimal_arith(op: ArithOp, l: &EvalVal, r: &EvalVal, ty: &LogicalType) -> Res
             ArithOp::Sub => align_scale(a, lsa, rs)? - align_scale(b, lsb, rs)?,
             ArithOp::Mul => {
                 // 结果 scale = sa + sb（binder 保证 rs == sa + sb）
-                let raw = a * b;
+                //
+                // ⚠️ **必须 checked**：`mul_result` 按 Spark 的规则把精度**封顶到 38**
+                // （(30,8)×(30,8) ⇒ (38,6)，见 `types::decimal::mul_result`），
+                // 于是"真装不下"的值只能靠这里报错兜住 —— 用裸 `*` 会**静默回绕**，
+                // 那就是本仓一路在消灭的静默错值。（Spark 非 ANSI 模式下这类溢出回
+                // NULL；本仓的口径是**报错**，与 `sum` 溢出同一条纪律。）
+                let raw = a
+                    .checked_mul(b)
+                    .ok_or_else(|| QsdbError::type_err("decimal multiply overflow"))?;
                 rescale_i256(raw, i32::from(lsa) + i32::from(lsb), i32::from(rs))?
             }
             ArithOp::Div => {

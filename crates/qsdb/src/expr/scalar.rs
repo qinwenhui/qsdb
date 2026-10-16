@@ -569,6 +569,24 @@ fn build() -> HashMap<&'static str, Arc<ScalarFnDef>> {
         }),
     );
 
+    // ── `uuid()`（别名 `sys_guid()`）───────────────────────────────
+    // 这里只登记**类型**（binder 要查得到才能过）；真正的求值在 `expr::eval` 里
+    // **特判**——因为要**逐行**给不同的值，而注册表的约定是"1 个元素 ⇒ 常量广播"。
+    // 详见 `uuid_strings` 的说明。这条 `eval` 不会在主路径上被调用。
+    for name in ["uuid", "sys_guid"] {
+        let fname: &'static str = name;
+        m.insert(
+            name,
+            Arc::new(ScalarFnDef {
+                ret_ty: Arc::new(move |args| match args {
+                    [] => Ok(LogicalType::Varchar { max_chars: None }),
+                    _ => Err(QsdbError::type_err(format!("{fname}() takes no arguments"))),
+                }),
+                eval: Arc::new(|_args| Ok(uuid_strings(1))),
+            }),
+        );
+    }
+
     // ── 当前时间（无参：current_date / current_timestamp / now）──────
     // UTC（无时区会话概念；Date32 天 = secs/86400 直取）
     m.insert(
@@ -607,6 +625,79 @@ fn build() -> HashMap<&'static str, Arc<ScalarFnDef>> {
     }
 
     m
+}
+
+/// **逐行**生成 UUID v4 字符串（`uuid()`，以及 `sys_guid()` 这个别名）。
+///
+/// ## 为什么它不按普通标量函数注册
+///
+/// 注册表的约定是「**返回 1 个元素 ⇒ 当常量广播**」（见 `expr::eval` 的
+/// `PhysExpr::Fn`）。而 `uuid()` 必须**每行不同** —— 它在这批日清结算 SQL 里是拿去
+/// 当**主键**的（`CAST(SYS_GUID() AS VARCHAR(64)) AS PHID`）：整批同一个 UUID
+/// 等于主键全撞，**数据坏了还不报错**。所以求值处对它**特判**，走这一支。
+///
+/// ## 语义（对齐 Spark，实测 `.14` 上的 Spark 3.5.2）
+///
+/// - Spark 的 `uuid()` 返回**规范 36 字符**（`8-4-4-4-12`）的 UUID v4，**非确定性**；
+/// - ⚠️ **Spark 里没有 `sys_guid()`**（实测 `[UNRESOLVED_ROUTINE] Cannot resolve
+///   function 'sys_guid'`）—— 它是 Oracle 的函数名。这里**收作别名**，
+///   为的是让那批既有 SQL 能原样跑；真正的 Spark 名字是 `uuid()`。
+///
+/// ## 零新依赖
+///
+/// 本仓不许加依赖（无 `uuid` crate）⇒ 128 位由 `(纳秒时间, 进程内计数器)` 两轮
+/// splitmix64 混合得到。**够"不重复"**（计数器保证同进程内单调），不是密码学随机 ——
+/// 与 Spark 自己"每分区一个 RandomUUIDGenerator"的量级相当。
+pub(crate) fn uuid_strings(n: usize) -> ArrayRef {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    /// splitmix64 的混合函数（零依赖、雪崩性好）。
+    fn mix(mut z: u64) -> u64 {
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    let mut out = arrow::array::StringBuilder::new();
+    for _ in 0..n {
+        // 时间源用**纳秒全分辨率**（一次系统调用拿全 128 位再折成 64）
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| {
+                let n = d.as_nanos();
+                (n as u64) ^ ((n >> 64) as u64)
+            })
+            .unwrap_or(0);
+        let hi = mix(t ^ SEQ
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let lo = mix(hi ^ 0x94D0_49BB_1331_11EB);
+        // 36 字节固定布局，直接写、不经过 `format!`（每行一次堆分配不值得）
+        let mut buf = [0u8; 36];
+        write_uuid(buf.as_mut(), hi, lo);
+        out.append_value(std::str::from_utf8(&buf).unwrap_or_default());
+    }
+    Arc::new(out.finish())
+}
+
+/// 把两个 u64 写成 `8-4-4-4-12` 的 UUID 文本（版本位 = 4、variant 位 = 10xx）。
+fn write_uuid(buf: &mut [u8], hi: u64, lo: u64) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut nib = [0u8; 32];
+    for i in 0..16 {
+        nib[i] = ((hi >> (60 - 4 * i)) & 0xf) as u8;
+        nib[16 + i] = ((lo >> (60 - 4 * i)) & 0xf) as u8;
+    }
+    nib[12] = 4; // 版本 4
+    nib[16] = (nib[16] & 0x3) | 0x8; // RFC 4122 variant
+    let mut j = 0usize;
+    for (i, v) in nib.iter().enumerate() {
+        if i == 8 || i == 12 || i == 16 || i == 20 {
+            buf[j] = b'-';
+            j += 1;
+        }
+        buf[j] = HEX[*v as usize];
+        j += 1;
+    }
 }
 
 /// epoch 秒（current_date 用）。

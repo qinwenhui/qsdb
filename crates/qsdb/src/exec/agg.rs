@@ -2130,13 +2130,41 @@ fn finalize_col(table: &GroupTable, ai: usize, agg: &AggExpr, n: usize) -> Resul
                             return Ok(None);
                         }
                         let cnt_v = i256::from_i128(*c as i128);
-                        let q = *x / cnt_v;
-                        let rem = *x % cnt_v;
+                        // ⚠️ **输出 scale 可能 ≠ 输入 scale**（Spark 的 `avg` 规则是 `s+4`）
+                        // ⇒ 把**分母**放大 `10^(s_out - s_in)`，等价于把商放大同样倍数。
+                        //
+                        // 不这么做就是"声明 scale 8、却按 scale 4 除" ⇒ **值小 1 万倍**。
+                        // 2026-10-16 实测：`avg(DECIMAL(18,4))` 回 `0.00301750` 而不是
+                        // `30.1750` —— **不报错、只是数小了**，最坏的一种。
+                        // 旧规则 `max(s,4)` 在被测的 s=4 上恰好等于输入 scale，所以一直蒙对。
+                        let in_scale = match agg.arg.as_ref().map(|a| a.data_type()) {
+                            Some(LogicalType::Decimal(sm)) => sm.scale,
+                            _ => m.scale,
+                        };
+                        let shift = i32::from(m.scale) - i32::from(in_scale);
+                        // 输出 scale **更大** ⇒ 放大**分子**（unscaled = avg × 10^s_out）；
+                        // 更小 ⇒ 放大**分母**（先除、再交给下面按 scale 取整）。
+                        let (num, den) = if shift >= 0 {
+                            (
+                                *x * i256::from_i128(crate::types::decimal::pow10(shift as u32)),
+                                cnt_v,
+                            )
+                        } else {
+                            (
+                                *x,
+                                cnt_v
+                                    * i256::from_i128(crate::types::decimal::pow10(
+                                        (-shift) as u32,
+                                    )),
+                            )
+                        };
+                        let q = num / den;
+                        let rem = num % den;
                         let two = i256::from_i128(2);
                         let round_up = rem != i256::from_i128(0)
-                            && rem.wrapping_mul(two).wrapping_abs() >= cnt_v;
+                            && rem.wrapping_mul(two).wrapping_abs() >= den;
                         let adj = if round_up {
-                            if *x >= i256::from_i128(0) {
+                            if num >= i256::from_i128(0) {
                                 q + i256::from_i128(1)
                             } else {
                                 q - i256::from_i128(1)

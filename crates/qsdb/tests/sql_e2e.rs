@@ -299,7 +299,16 @@ fn select_projection_filter() {
     // decimal 算术（i256 精确）
     assert!(q(&db, "SELECT amount + 1.5 FROM events WHERE cnt = 1") == vec!["12.0000"]);
     assert!(q(&db, "SELECT amount * 2 FROM events WHERE cnt = 2") == vec!["40.5000"]);
-    assert!(q(&db, "SELECT amount / 4 FROM events WHERE cnt = 2") == vec!["5.0625"]);
+    // ⚠️ 除法**只看值**、不钉中间 scale：`DECIMAL(18,4) / 4` 的输出 scale 由
+    // 精度矩阵决定（2026-10-16 起按 **Spark** 对齐，Spark 给 `decimal(20,6)`，
+    // 我们因为"整数常量按 i64 定成 DECIMAL(19,0)"暂时给 `(38,24)` —— 值都是精确的
+    // `5.0625`，只是尾随零个数不同）。字面量定类型那处还没对齐，见 docs/进度与待办。
+    assert!(
+        q(
+            &db,
+            "SELECT CAST(amount / 4 AS DECIMAL(18,4)) FROM events WHERE cnt = 2"
+        ) == vec!["5.0625"]
+    );
     // 除零
     assert!(db.sql("SELECT cnt / 0 FROM events").is_err());
     // 谓词下推跨类型 cast（int 列 vs decimal 字面量）
