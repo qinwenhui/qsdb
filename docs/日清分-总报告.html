@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>日清分计算总报告 · QSDB</title>
+<style>
+  .report {
+    color-scheme: light;
+    --surface-0: #f6f5f2;  --surface-1: #fcfcfb;  --border: #e5e4e0;
+    --text-1: #0b0b0b;     --text-2: #52514e;     --text-3: #8a8984;
+    --grid: #f0efec;       --track: #cde2fb;
+    --s1: #2a78d6;  --s2: #eb6834;
+    --good: #0ca30c; --good-ink: #006300;
+    --tip-bg: #ffffff; --tip-bd: #d8d7d2;
+  }
+  .report.dark {
+    color-scheme: dark;
+    --surface-0: #141413;  --surface-1: #1a1a19;  --border: #2e2e2c;
+    --text-1: #ffffff;     --text-2: #c3c2b7;     --text-3: #8f8e86;
+    --grid: #262624;       --track: #1c3a63;
+    --s1: #3987e5;  --s2: #d95926;
+    --good: #0ca30c; --good-ink: #4fc24f;
+    --tip-bg: #232322; --tip-bd: #3a3a37;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--surface-0); }
+  .report {
+    font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    color: var(--text-1); background: var(--surface-0);
+    max-width: 1100px; margin: 0 auto; padding: 28px 20px 60px;
+    font-size: 14px; line-height: 1.55;
+  }
+  .rep-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  h1 { font-size: 24px; margin: 0 0 6px; font-weight: 650; }
+  .meta { color: var(--text-2); font-size: 13px; }
+  .meta b { color: var(--text-1); font-weight: 600; }
+  .chip { display: inline-block; border: 1px solid var(--border); border-radius: 999px;
+          padding: 1px 10px; margin: 2px 4px 2px 0; font-size: 12px; color: var(--text-2); background: var(--surface-1); }
+  .toggle { border: 1px solid var(--border); background: var(--surface-1); color: var(--text-2);
+            border-radius: 8px; padding: 5px 12px; font-size: 13px; cursor: pointer; }
+  h2 { font-size: 17px; margin: 30px 0 10px; font-weight: 650; }
+  h2 .sub { font-weight: 400; color: var(--text-3); font-size: 13px; margin-left: 8px; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); gap: 10px; margin-top: 14px; }
+  .tile { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+  .tile .lb { font-size: 12.5px; color: var(--text-2); }
+  .tile .v { font-size: 27px; font-weight: 600; margin-top: 3px; letter-spacing: -0.01em; }
+  .tile .v small { font-size: 14px; font-weight: 500; color: var(--text-2); margin-left: 2px; }
+  .tile .sub { font-size: 12px; color: var(--text-3); margin-top: 3px; }
+  .hero .v { font-size: 40px; }
+  .status { display: flex; align-items: center; gap: 8px; background: var(--surface-1);
+            border: 1px solid var(--border); border-radius: 12px; padding: 12px 16px; margin-top: 10px;
+            font-size: 13.5px; color: var(--text-2); flex-wrap: wrap; }
+  .status .ok { color: var(--good-ink); font-weight: 600; }
+  .status .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--good);
+                 box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 18%, transparent); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 860px) { .grid2 { grid-template-columns: 1fr; } }
+  .card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px 10px; }
+  .card h3 { margin: 0 0 2px; font-size: 14.5px; font-weight: 600; }
+  .card .cap { color: var(--text-3); font-size: 12.5px; margin-bottom: 10px; }
+  svg { display: block; width: 100%; height: auto; }
+  svg text { font-family: inherit; }
+  .tip { position: fixed; z-index: 9; pointer-events: none; background: var(--tip-bg);
+         border: 1px solid var(--tip-bd); border-radius: 8px; padding: 7px 10px;
+         font-size: 12.5px; color: var(--text-1); box-shadow: 0 4px 14px rgba(0,0,0,.14);
+         opacity: 0; transition: opacity .08s; max-width: 340px; }
+  .tip b { font-weight: 650; }
+  .tip .k { color: var(--text-2); }
+  .note { color: var(--text-3); font-size: 12.5px; margin-top: 8px; }
+  details { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px;
+            padding: 12px 18px; margin-top: 14px; }
+  summary { cursor: pointer; font-weight: 600; font-size: 14.5px; }
+  .tblwrap { overflow-x: auto; margin-top: 10px; }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px;
+          font-variant-numeric: tabular-nums; }
+  th { text-align: left; color: var(--text-2); font-weight: 600; padding: 6px 10px;
+       border-bottom: 1px solid var(--border); white-space: nowrap; }
+  td { padding: 5px 10px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  td.num, th.num { text-align: right; }
+  .foot { margin-top: 26px; color: var(--text-3); font-size: 12.5px; }
+</style>
+</head>
+<body>
+<div class="report" id="report">
+  <div class="rep-head">
+    <div>
+      <h1>日清分计算总报告</h1>
+      <div class="meta">
+        口径 <b>2025-10-01</b> · 版本 <b>78_20251001_1</b>（全库数据最多的日期 × 中间表数据最多的版本）<br>
+        <span class="chip">118 任务 / 154 SQL 块</span><span class="chip">12 层依赖</span>
+        <span class="chip">68 张 pdate 分区表</span><span class="chip">qsdb server 常驻</span>
+        <span class="chip">.14 真机 16 核</span>
+      </div>
+    </div>
+    <button class="toggle" onclick="toggleTheme()">明暗切换</button>
+  </div>
+
+  <div class="kpis">
+    <div class="tile hero"><div class="lb">总墙钟 · 中位（5 轮）</div>
+      <div class="v">2,098<small>ms</small></div>
+      <div class="sub">最快 2,003 · 最慢 2,180 · 极差 8.1%</div></div>
+    <div class="tile"><div class="lb">正确性</div><div class="v">154<span style="font-size:16px;color:var(--text-2)">/154</span></div>
+      <div class="sub">5 轮全过 · 0 错误</div></div>
+    <div class="tile"><div class="lb">输入面 / 轮</div><div class="v">3,091<small>万行</small></div>
+      <div class="sub">按块计含重复读；版本切片 269 万</div></div>
+    <div class="tile"><div class="lb">输出</div><div class="v">78,376<small>行</small></div>
+      <div class="sub">154 块合计</div></div>
+    <div class="tile"><div class="lb">吞吐（输入面）</div><div class="v">1,473<small>万行/秒</small></div>
+      <div class="sub">版本切片口径 128 万行/秒</div></div>
+    <div class="tile"><div class="lb">常驻内存 · 峰值</div><div class="v">993<small>MB</small></div>
+      <div class="sub">每查询峰值中位 23 MB</div></div>
+  </div>
+
+  <div class="status"><span class="dot"></span>
+    <span class="ok">全部通过</span>
+    <span>5 轮运行 154/154 块 OK、0 错误（轮次墙钟：<b id="roundStr"></b> ms）；
+    旧切片上 147 块与真 Spark 行数逐块一致、26 块逐格+列名对账一致。</span>
+  </div>
+
+  <h2>执行时间 <span class="sub">统计零侵入：计时在客户端、内存读 /proc、引擎热路径未动</span></h2>
+  <div class="grid2">
+    <div class="card">
+      <h3>5 轮总墙钟</h3>
+      <div class="cap">ms · 单位越低越好；轮次间极差 8.1%（无长尾漂移）</div>
+      <div id="c_rounds"></div>
+    </div>
+    <div class="card">
+      <h3>关键链（DAG 串行地板）</h3>
+      <div class="cap">八跳合计 <b id="floorStr"></b> ms —— 墙钟的结构性下限</div>
+      <div id="c_chain"></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <h3>最慢的 10 个块（跨轮中位）</h3>
+    <div class="cap">条 = 中位；浅色轨道 = 最快～最慢区间；悬浮看明细</div>
+    <div id="c_slow"></div>
+  </div>
+
+  <h2>内存</h2>
+  <div class="kpis">
+    <div class="tile"><div class="lb">常驻 · 峰值 VmHWM</div><div class="v">993<small>MB</small></div>
+      <div class="sub">服务开着要多少（含热缓存）</div></div>
+    <div class="tile"><div class="lb">常驻 · 稳态 VmRSS</div><div class="v">900<small>MB</small></div>
+      <div class="sub">5 轮中位</div></div>
+    <div class="tile"><div class="lb">每查询峰值 · 中位</div><div class="v">23<small>MB</small></div>
+      <div class="sub">子进程口径</div></div>
+    <div class="tile"><div class="lb">每查询峰值 · 最大</div><div class="v">366<small>MB</small></div>
+      <div class="sub">单查询上界样本</div></div>
+  </div>
+
+  <h2>数据量与吞吐 <span class="sub">中位轮 2,098 ms</span></h2>
+  <div class="grid2">
+    <div class="card">
+      <h3>输入面 Top 10 表（2025-10-01）</h3>
+      <div class="cap">蓝 = 当天行数；橙 = 其中版本 78_20251001_1 切片</div>
+      <div id="c_input"></div>
+      <div class="note">基表（t_cal_*）多数无 version_id 列 —— 版本只活在登记表与中间表。</div>
+    </div>
+    <div class="card">
+      <h3>吞吐与总账</h3>
+      <div class="cap">中位轮口径</div>
+      <table>
+        <tr><th>指标</th><th class="num">值</th></tr>
+        <tr><td>输入面（按块计，含重复读）· 当天</td><td class="num">30,907,852 行</td></tr>
+        <tr><td>输入面 · 版本切片</td><td class="num">2,688,429 行</td></tr>
+        <tr><td>输入吞吐 · 当天口径</td><td class="num"><b>≈1,473 万行/秒</b></td></tr>
+        <tr><td>输入吞吐 · 版本切片口径</td><td class="num">≈128 万行/秒</td></tr>
+        <tr><td>输出合计</td><td class="num">78,376 行（≈3.7 万行/秒）</td></tr>
+        <tr><td>输出非 0 的块</td><td class="num">104 / 154</td></tr>
+        <tr><td>块墙钟合计（含争用）</td><td class="num">11,929 ms</td></tr>
+      </table>
+      <div class="note">上层块的输出（t_dnl_* 中间表的本版本切片）即下层块的输入 —— 依赖关系由此而来。</div>
+    </div>
+  </div>
+
+  <details>
+    <summary>附录 A · 输入表台账（57 张全量）</summary>
+    <div class="tblwrap"><table id="t_input"></table></div>
+  </details>
+  <details>
+    <summary>附录 B · 逐块台账（154 块全量：引用面 → 输出量 → 墙钟）</summary>
+    <div class="tblwrap"><table id="t_blocks"></table></div>
+  </details>
+
+  <div class="foot">
+    统计零侵入：计时在客户端完成、内存读 /proc、引擎热路径一行未动；
+    本报告由 <code>work/daily_report.py</code>（数据）与 <code>work/build_html_report.py</code>（本页）自动生成。
+  </div>
+</div>
+<div class="tip" id="tip"></div>
+
+<script>
+window.onerror = function (msg, src, line, col) {
+  var d = document.createElement('div');
+  d.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#d03b3b;color:#fff;padding:8px;font:12px monospace;z-index:99';
+  d.textContent = 'JS ERROR: ' + msg + ' @' + line + ':' + col;
+  document.body.appendChild(d);
+};
+const DATA = {"rounds": [2180, 2113, 2098, 2079, 2003], "roundMedian": 2098, "floor": 1442, "chain": [["L0-29", 306], ["L2-06", 125], ["L3-05", 120], ["L4-05", 138], ["L5-04", 24], ["L6-01", 25], ["L7-02", 272], ["L8-02", 432]], "slowest": [["L8-02_02", 335, 304, 340, "3832"], ["L7-02_01", 236, 223, 243, "6480"], ["L0-05_01", 204, 105, 444, "432"], ["L0-08_01", 169, 59, 396, "576"], ["L0-04_02", 166, 64, 470, "288"], ["L0-03_01", 160, 124, 463, "480"], ["L0-02_01", 159, 106, 406, "120"], ["L0-07_01", 136, 41, 459, "528"], ["L3-01_01", 128, 120, 145, "828"], ["L0-06_01", 127, 62, 443, "1440"]], "input": [["t_dnl_day_24result_unit", "1746840", "550944", "52608", "48"], ["t_dnl_day_24result_custom", "302832", "152760", "2256", "10"], ["t_dnl_day_result_unit_report", "281324", "69936", "7896", "6"], ["t_dnl_day_result_unit", "130041", "59113", "7560", "3"], ["t_dnl_day_24result_salecompany", "153336", "43248", "4536", "10"], ["t_cal_day_assess_unit", "1410600", "27216", "—", "20"], ["t_cal_day_trade_result_long", "845928", "20880", "—", "31"], ["t_dnl_day_24result_global", "78480", "20520", "2328", "4"], ["t_dnl_day_result_salecompany_report", "32628", "9020", "902", "5"], ["t_dnl_day_result_salecompany", "16336", "8712", "902", "3"], ["t_jygl_da_arc_unitnlbase", "419376", "8640", "—", "1"], ["t_cal_day_compensate_unit", "453056", "6912", "—", "6"], ["t_dnl_day_energy_custom", "40464", "6480", "648", "9"], ["t_cal_day_trade_result_renew", "1159584", "6048", "—", "11"], ["t_cal_day_energy_unit", "214081", "4032", "—", "39"], ["t_cal_day_ahead_unit", "166872", "3168", "—", "25"], ["t_cal_day_real_unit", "170688", "3168", "—", "24"], ["t_dnl_day_result_custom_report", "24604", "2050", "205", "5"], ["t_dnl_day_result_custom", "10277", "1980", "205", "3"], ["t_dnl_base_energy_coefficient", "3576", "1560", "144", "5"], ["t_dnl_day_result_global", "6944", "920", "105", "4"], ["t_cal_day_ahead_custom", "61089", "648", "—", "7"], ["t_cal_day_energy_custom", "1193544", "648", "—", "6"], ["t_cal_day_ahead_unit_report", "15280", "264", "—", "2"], ["t_cal_day_custom", "412325", "225", "—", "23"], ["t_cal_day_agent_relation", "337075", "220", "—", "3"], ["t_cal_day_energy_unit_report", "9716", "168", "—", "2"], ["t_cal_day_unit", "61549", "150", "—", "62"], ["t_cal_day_calculate_version", "2774", "132", "1", "129"], ["t_cal_day_start_unit", "5567", "72", "—", "2"], ["t_cal_day_dgyg_long_result", "432", "48", "—", "6"], ["t_cal_day_energy_dgyg", "2400750", "48", "—", "2"], ["t_cal_day_spot_custom_price", "5546", "48", "—", "33"], ["t_cal_day_trans_prov_data_equl_custom", "919", "48", "—", "12"], ["t_cal_day_trans_prov_data_equl_unit", "4946", "48", "—", "17"], ["t_cal_day_sale_company", "5112", "22", "—", "22"], ["t_cal_day_publish_log", "212", "18", "0", "2"], ["t_dnl_holiday", "214", "1", "—", "4"], ["t_cal_day_ahead_dgyg", "2400408", "0", "—", "4"], ["t_cal_day_dgyg", "100037", "0", "—", "10"], ["t_cal_day_green_flexible_result_long", "3264", "0", "—", "4"], ["t_cal_day_trans_prov_long_block_custom", "24", "0", "—", "11"], ["t_cal_day_trans_prov_long_block_unit", "4608", "0", "—", "3"], ["t_cal_day_trans_prov_long_custom", "393336", "0", "—", "16"], ["t_cal_day_trans_prov_long_unit", "4800", "0", "—", "7"], ["t_dnl_day_24result_dwdg", "103968", "0", "0", "13"], ["t_dnl_day_24result_yxgd", "7680", "0", "0", "13"], ["t_dnl_day_result_dwdg_report", "748", "0", "0", "5"], ["t_dnl_day_result_yxgd_report", "801", "0", "0", "5"], ["t_dnl_day_unit_output", "72", "0", "—", "3"], ["t_xqc_day_trade_result_account", "20280", "0", "—", "7"], ["t_bas_point24", "24", "（无 pdate，全量参与）", "—", "11"], ["t_cal_mon_market_long_price", "284", "（无 pdate，全量参与）", "—", "6"], ["t_cal_mon_unit_bdcbbctzbz", "170", "（无 pdate，全量参与）", "—", "2"], ["t_cal_node", "711", "（无 pdate，全量参与）", "—", "8"], ["t_dnl_mon_pur_energy_limit_unit", "200", "（无 pdate，全量参与）", "—", "1"], ["t_jygl_mon_unit_bdcbbctzbz", "621", "（无 pdate，全量参与）", "—", "4"]], "blocks": [["L9-01_05", "t_dnl_day_24result_unit(550,944/52,608)、t_dnl_day_24result_custom(152,760/2,256)、t_dnl_day_24result_salecompany(43,248/4,536) 等9张", "747,228", "59,401", "24", "55"], ["L9-01_04", "t_dnl_day_24result_unit(550,944/52,608)、t_dnl_day_24result_custom(152,760/2,256)、t_dnl_day_24result_salecompany(43,248/4,536) 等9张", "747,228", "59,401", "24", "50"], ["L9-01_03", "t_dnl_day_24result_unit(550,944/52,608)、t_dnl_day_24result_custom(152,760/2,256)、t_dnl_day_24result_salecompany(43,248/4,536) 等9张", "747,228", "59,401", "24", "59"], ["L9-01_02", "t_dnl_day_24result_unit(550,944/52,608)、t_dnl_day_24result_custom(152,760/2,256)、t_dnl_day_24result_salecompany(43,248/4,536) 等9张", "747,228", "59,401", "24", "70"], ["L9-01_01", "t_dnl_day_24result_unit(550,944/52,608)、t_dnl_day_24result_custom(152,760/2,256)、t_dnl_day_24result_salecompany(43,248/4,536) 等9张", "747,228", "59,401", "24", "65"], ["L7-01_01", "t_dnl_day_24result_unit(550,944/52,608)、t_dnl_day_24result_custom(152,760/2,256)、t_dnl_day_24result_salecompany(43,248/4,536) 等5张", "746,952", "59,400", "2,160", "122"], ["L8-03_05", "t_dnl_day_24result_unit(550,944/52,608)、t_dnl_day_result_unit_report(69,936/7,896)、t_dnl_day_result_salecompany_report(9,020/902) 等6张", "631,950", "61,611", "0", "4"], ["L8-03_04", "t_dnl_day_24result_unit(550,944/52,608)、t_dnl_day_result_unit_report(69,936/7,896)、t_dnl_day_result_salecompany_report(9,020/902) 等6张", "631,950", "61,611", "75", "25"], ["L8-03_03", "t_dnl_day_24result_unit(550,944/52,608)、t_dnl_day_result_unit_report(69,936/7,896)、t_dnl_day_result_salecompany_report(9,020/902) 等6张", "631,950", "61,611", "330", "58"], ["L8-03_02", "t_dnl_day_24result_unit(550,944/52,608)、t_dnl_day_result_unit_report(69,936/7,896)、t_dnl_day_result_salecompany_report(9,020/902) 等6张", "631,950", "61,611", "3,276", "155"], ["L8-03_01", "t_dnl_day_24result_unit(550,944/52,608)、t_dnl_day_result_unit_report(69,936/7,896)、t_dnl_day_result_salecompany_report(9,020/902) 等6张", "631,950", "61,611", "0", "5"], ["L8-02_02", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_assess_unit(27,216/—)、t_cal_day_trade_result_long(20,880/—) 等14张", "630,355", "54,937", "3,832", "305"], ["L8-02_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_assess_unit(27,216/—)、t_cal_day_trade_result_long(20,880/—) 等14张", "630,355", "54,937", "5", "12"], ["L7-02_01", "t_dnl_day_24result_unit(550,944/52,608)、t_dnl_day_result_unit(59,113/7,560)、t_cal_day_unit(150/—) 等5张", "610,339", "60,169", "6,480", "243"], ["L3-02_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_assess_unit(27,216/—)、t_cal_day_energy_unit(4,032/—) 等7张", "585,642", "52,609", "0", "81"], ["L3-01_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_assess_unit(27,216/—)、t_cal_day_energy_unit(4,032/—) 等7张", "585,642", "52,609", "828", "145"], ["L3-05_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_trade_result_long(20,880/—)、t_dnl_day_energy_custom(6,480/648) 等14张", "585,146", "53,506", "1,728", "73"], ["L2-06_02", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_trade_result_long(20,880/—)、t_dnl_day_energy_custom(6,480/648) 等10张", "583,484", "53,362", "5", "66"], ["L2-06_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_trade_result_long(20,880/—)、t_dnl_day_energy_custom(6,480/648) 等10张", "583,484", "53,362", "120", "76"], ["L4-05_02", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_trade_result_long(20,880/—)、t_cal_day_compensate_unit(6,912/—) 等5张", "582,900", "52,609", "1,440", "67"], ["L4-05_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_trade_result_long(20,880/—)、t_cal_day_compensate_unit(6,912/—) 等5张", "582,900", "52,609", "1,440", "86"], ["L4-02_02", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_trade_result_long(20,880/—)、t_cal_day_energy_unit(4,032/—) 等7张", "576,211", "52,609", "72", "80"], ["L4-02_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_trade_result_long(20,880/—)、t_cal_day_energy_unit(4,032/—) 等7张", "576,211", "52,609", "72", "57"], ["L0-49_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_trade_result_long(20,880/—)、t_cal_day_ahead_unit(3,168/—) 等5张", "575,124", "52,609", "432", "48"], ["L5-01_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_ahead_unit(3,168/—)、t_cal_day_real_unit(3,168/—) 等12张", "558,429", "52,609", "120", "62"], ["L1-05_02", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_trade_result_renew(6,048/—)、t_cal_day_unit(150/—) 等5张", "557,274", "52,609", "0", "34"], ["L1-05_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_trade_result_renew(6,048/—)、t_cal_day_unit(150/—) 等5张", "557,274", "52,609", "0", "54"], ["L1-04_02", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_trade_result_renew(6,048/—)、t_cal_day_unit(150/—) 等5张", "557,274", "52,609", "432", "81"], ["L1-04_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_trade_result_renew(6,048/—)、t_cal_day_unit(150/—) 等5张", "557,274", "52,609", "432", "61"], ["L5-03_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_energy_unit(4,032/—)、t_cal_day_unit(150/—) 等5张", "555,258", "52,609", "1,026", "63"], ["L4-04_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_energy_unit(4,032/—)、t_cal_day_unit(150/—) 等5张", "555,258", "52,609", "1,728", "61"], ["L1-07_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_energy_unit(4,032/—)、t_cal_day_unit(150/—) 等4张", "555,258", "52,609", "288", "41"], ["L6-01_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_energy_unit(4,032/—)", "554,976", "52,608", "1,728", "21"], ["L3-06_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_energy_unit(4,032/—)", "554,976", "52,608", "576", "62"], ["L2-05_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_energy_unit(4,032/—)", "554,976", "52,608", "432", "79"], ["L2-02_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_energy_unit(4,032/—)", "554,976", "52,608", "432", "103"], ["L4-03_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_ahead_unit(3,168/—)、t_cal_day_calculate_version(132/1) 等4张", "554,292", "52,609", "528", "45"], ["L5-02_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_ahead_unit(3,168/—)、t_cal_day_calculate_version(132/1) 等4张", "554,244", "52,609", "1,728", "24"], ["L2-04_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_unit(150/—)、t_cal_day_calculate_version(132/1) 等4张", "551,226", "52,609", "108", "78"], ["L5-04_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_unit(150/—)", "551,094", "52,608", "1,728", "18"], ["L2-03_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_unit(150/—)", "551,094", "52,608", "1,728", "95"], ["L2-01_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_unit(150/—)", "551,094", "52,608", "576", "59"], ["L1-12_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_unit(150/—)", "551,094", "52,608", "0", "65"], ["L1-11_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_unit(150/—)", "551,094", "52,608", "528", "76"], ["L1-10_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_unit(150/—)", "551,094", "52,608", "288", "85"], ["L1-08_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_unit(150/—)", "551,094", "52,608", "432", "24"], ["L1-06_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_unit(150/—)", "551,094", "52,608", "1,728", "71"], ["L1-03_01", "t_dnl_day_24result_unit(550,944/52,608)、t_cal_day_unit(150/—)", "551,094", "52,608", "576", "59"], ["L2-10_01", "t_dnl_day_24result_custom(152,760/2,256)、t_dnl_day_24result_salecompany(43,248/4,536)、t_cal_day_energy_custom(648/—) 等4张", "196,788", "6,793", "189", "73"], ["L2-11_01", "t_dnl_day_24result_custom(152,760/2,256)、t_dnl_day_energy_custom(6,480/648)、t_cal_day_custom(225/—)", "159,465", "2,904", "120", "63"], ["L3-07_01", "t_dnl_day_24result_custom(152,760/2,256)、t_cal_day_custom(225/—)、t_cal_day_calculate_version(132/1) 等4张", "153,117", "2,257", "210", "50"], ["L1-09_01", "t_dnl_day_24result_custom(152,760/2,256)", "152,760", "2,256", "48", "48"], ["L10-01_01", "t_dnl_day_result_unit_report(69,936/7,896)、t_dnl_day_24result_global(20,520/2,328)", "90,456", "10,224", "104", "131"], ["L9-02_02", "t_dnl_day_result_unit(59,113/7,560)、t_dnl_day_result_salecompany(8,712/902)、t_dnl_day_result_custom(1,980/205) 等5张", "69,955", "8,668", "24", "8"], ["L9-02_01", "t_dnl_day_result_unit(59,113/7,560)、t_dnl_day_result_salecompany(8,712/902)、t_dnl_day_result_custom(1,980/205) 等5张", "69,955", "8,668", "32", "33"], ["L2-09_01", "t_dnl_day_24result_salecompany(43,248/4,536)、t_dnl_day_energy_custom(6,480/648)、t_cal_day_sale_company(22/—)", "49,750", "5,184", "528", "25"], ["L3-04_01", "t_dnl_day_24result_salecompany(43,248/4,536)、t_cal_day_calculate_version(132/1)、t_cal_day_sale_company(22/—) 等4张", "43,402", "4,537", "858", "48"], ["L1-14_01", "t_dnl_day_24result_salecompany(43,248/4,536)", "43,248", "4,536", "120", "37"], ["L0-12_01", "t_cal_day_assess_unit(27,216/—)、t_cal_day_energy_unit(4,032/—)、t_cal_day_ahead_unit(3,168/—) 等7张", "37,866", "1", "1,728", "178"], ["L0-44_01", "t_cal_day_assess_unit(27,216/—)、t_cal_day_energy_unit(4,032/—)、t_cal_day_real_unit(3,168/—) 等6张", "34,698", "1", "1,728", "85"], ["L0-40_01", "t_cal_day_assess_unit(27,216/—)、t_cal_day_energy_unit(4,032/—)、t_cal_day_real_unit(3,168/—) 等5张", "34,698", "1", "0", "29"], ["L0-27_01", "t_cal_day_assess_unit(27,216/—)、t_cal_day_energy_unit(4,032/—)、t_cal_day_real_unit(3,168/—) 等5张", "34,698", "1", "432", "164"], ["L0-37_02", "t_cal_day_assess_unit(27,216/—)、t_cal_day_energy_unit(4,032/—)、t_cal_day_real_unit(3,168/—) 等4张", "34,548", "1", "0", "40"], ["L0-37_01", "t_cal_day_assess_unit(27,216/—)、t_cal_day_energy_unit(4,032/—)、t_cal_day_real_unit(3,168/—) 等4张", "34,548", "1", "288", "115"], ["L0-47_01", "t_cal_day_assess_unit(27,216/—)、t_cal_day_real_unit(3,168/—)、t_cal_day_unit(150/—) 等4张", "30,666", "1", "1,728", "60"], ["L0-42_01", "t_cal_day_assess_unit(27,216/—)、t_cal_day_real_unit(3,168/—)、t_cal_day_unit(150/—) 等4张", "30,666", "1", "576", "64"], ["L0-21_01", "t_cal_day_assess_unit(27,216/—)、t_cal_day_real_unit(3,168/—)、t_cal_day_unit(150/—) 等5张", "30,666", "1", "1,728", "70"], ["L0-04_02", "t_cal_day_assess_unit(27,216/—)、t_cal_day_real_unit(3,168/—)、t_cal_day_unit(150/—) 等4张", "30,666", "1", "288", "166"], ["L0-04_01", "t_cal_day_assess_unit(27,216/—)、t_cal_day_real_unit(3,168/—)、t_cal_day_unit(150/—) 等4张", "30,666", "1", "288", "241"], ["L0-55_01", "t_cal_day_assess_unit(27,216/—)、t_cal_day_ahead_unit(3,168/—)、t_cal_day_calculate_version(132/1)", "30,516", "1", "432", "55"], ["L0-51_01", "t_cal_day_assess_unit(27,216/—)、t_cal_day_real_unit(3,168/—)、t_cal_day_calculate_version(132/1)", "30,516", "1", "432", "25"], ["L0-26_01", "t_cal_day_assess_unit(27,216/—)、t_cal_day_real_unit(3,168/—)、t_cal_day_calculate_version(132/1)", "30,516", "1", "0", "33"], ["L0-18_01", "t_cal_day_assess_unit(27,216/—)、t_cal_day_real_unit(3,168/—)、t_cal_day_calculate_version(132/1)", "30,516", "1", "3,456", "121"], ["L0-01_01", "t_cal_day_assess_unit(27,216/—)、t_cal_day_ahead_unit(3,168/—)、t_cal_day_calculate_version(132/1)", "30,516", "1", "0", "213"], ["L4-01_03", "t_cal_day_trade_result_long(20,880/—)、t_cal_day_ahead_unit(3,168/—)、t_dnl_base_energy_coefficient(1,560/144) 等7张", "25,938", "145", "240", "75"], ["L4-01_02", "t_cal_day_trade_result_long(20,880/—)、t_cal_day_ahead_unit(3,168/—)、t_dnl_base_energy_coefficient(1,560/144) 等7张", "25,938", "145", "240", "85"], ["L4-01_01", "t_cal_day_trade_result_long(20,880/—)、t_cal_day_ahead_unit(3,168/—)、t_dnl_base_energy_coefficient(1,560/144) 等7张", "25,938", "145", "720", "101"], ["L0-57_01", "t_cal_day_trade_result_long(20,880/—)、t_cal_day_ahead_unit(3,168/—)、t_cal_day_unit(150/—) 等5张", "24,378", "1", "0", "33"], ["L0-32_01", "t_cal_day_trade_result_long(20,880/—)、t_cal_day_ahead_unit(3,168/—)、t_cal_day_unit(150/—) 等5张", "24,378", "1", "528", "57"], ["L0-05_01", "t_cal_day_trade_result_long(20,880/—)、t_cal_day_ahead_unit(3,168/—)、t_cal_day_unit(150/—) 等5张", "24,378", "1", "432", "205"], ["L0-39_01", "t_cal_day_trade_result_long(20,880/—)、t_cal_day_ahead_unit(3,168/—)、t_cal_day_unit(150/—) 等4张", "24,330", "1", "0", "33"], ["L0-15_01", "t_cal_day_trade_result_long(20,880/—)、t_cal_day_ahead_unit(3,168/—)、t_cal_day_calculate_version(132/1) 等4张", "24,228", "1", "576", "141"], ["L0-46_01", "t_cal_day_trade_result_long(20,880/—)、t_cal_day_ahead_unit(3,168/—)、t_cal_day_calculate_version(132/1) 等4张", "24,180", "1", "576", "80"], ["L3-03_01", "t_cal_day_trade_result_long(20,880/—)、t_dnl_base_energy_coefficient(1,560/144)、t_cal_day_unit(150/—) 等4张", "22,722", "145", "240", "49"], ["L0-07_01", "t_cal_day_trade_result_long(20,880/—)、t_cal_day_ahead_custom(648/—)、t_cal_day_agent_relation(220/—) 等9张", "21,950", "1", "528", "181"], ["L0-64_01", "t_cal_day_trade_result_long(20,880/—)、t_cal_day_ahead_custom(648/—)、t_cal_day_custom(225/—) 等7张", "21,933", "1", "120", "76"], ["L0-52_01", "t_cal_day_trade_result_long(20,880/—)、t_cal_day_custom(225/—)、t_cal_day_calculate_version(132/1)", "21,237", "1", "240", "48"], ["L0-65_01", "t_cal_day_trade_result_long(20,880/—)、t_cal_day_unit(150/—)、t_cal_day_calculate_version(132/1)", "21,162", "1", "288", "41"], ["L0-62_01", "t_cal_day_trade_result_long(20,880/—)、t_cal_day_unit(150/—)、t_cal_day_calculate_version(132/1)", "21,162", "1", "1", "46"], ["L0-50_01", "t_cal_day_trade_result_long(20,880/—)、t_cal_day_unit(150/—)、t_cal_day_calculate_version(132/1)", "21,162", "1", "2,640", "56"], ["L0-38_01", "t_cal_day_trade_result_long(20,880/—)、t_cal_day_unit(150/—)、t_cal_day_calculate_version(132/1)", "21,162", "1", "2,160", "49"], ["L0-35_01", "t_cal_day_trade_result_long(20,880/—)、t_cal_day_unit(150/—)、t_cal_day_calculate_version(132/1)", "21,162", "1", "576", "100"], ["L0-25_01", "t_cal_day_trade_result_long(20,880/—)、t_cal_day_unit(150/—)、t_cal_day_calculate_version(132/1)", "21,162", "1", "0", "38"], ["L0-20_01", "t_cal_day_trade_result_long(20,880/—)、t_cal_day_unit(150/—)、t_cal_day_calculate_version(132/1)", "21,162", "1", "288", "49"], ["L0-30_01", "t_cal_day_trade_result_long(20,880/—)、t_cal_day_calculate_version(132/1)、t_cal_day_sale_company(22/—)", "21,034", "1", "600", "151"], ["L8-01_01", "t_dnl_day_24result_global(20,520/2,328)、t_cal_day_calculate_version(132/1)、t_cal_day_trans_prov_data_equl_custom(48/—) 等6张", "20,748", "2,329", "24", "13"], ["L0-06_01", "t_jygl_da_arc_unitnlbase(8,640/—)、t_cal_day_compensate_unit(6,912/—)、t_cal_day_energy_unit(4,032/—) 等5张", "19,866", "1", "1,440", "201"], ["L11-01_01", "t_dnl_day_result_salecompany(8,712/902)、t_dnl_day_result_custom(1,980/205)、t_dnl_day_result_global(920/105)", "11,612", "1,212", "81", "29"], ["L0-24_01", "t_cal_day_compensate_unit(6,912/—)、t_cal_day_energy_unit(4,032/—)、t_cal_day_unit(150/—) 等5张", "11,226", "1", "1,440", "75"], ["L0-29_05", "t_cal_day_trade_result_renew(6,048/—)、t_cal_day_energy_unit(4,032/—)、t_cal_day_energy_custom(648/—) 等6张", "11,107", "1", "1,056", "48"], ["L0-29_04", "t_cal_day_trade_result_renew(6,048/—)、t_cal_day_energy_unit(4,032/—)、t_cal_day_energy_custom(648/—) 等6张", "11,107", "1", "0", "33"], ["L0-29_03", "t_cal_day_trade_result_renew(6,048/—)、t_cal_day_energy_unit(4,032/—)、t_cal_day_energy_custom(648/—) 等6张", "11,107", "1", "648", "60"], ["L0-29_02", "t_cal_day_trade_result_renew(6,048/—)、t_cal_day_energy_unit(4,032/—)、t_cal_day_energy_custom(648/—) 等6张", "11,107", "1", "0", "113"], ["L0-29_01", "t_cal_day_trade_result_renew(6,048/—)、t_cal_day_energy_unit(4,032/—)、t_cal_day_energy_custom(648/—) 等6张", "11,107", "1", "240", "137"], ["L0-56_01", "t_cal_day_energy_unit(4,032/—)、t_cal_day_ahead_unit(3,168/—)、t_cal_day_real_unit(3,168/—) 等5张", "10,650", "1", "0", "32"], ["L0-33_01", "t_cal_day_energy_unit(4,032/—)、t_cal_day_ahead_unit(3,168/—)、t_cal_day_real_unit(3,168/—) 等4张", "10,500", "1", "1,728", "126"], ["L0-23_01", "t_cal_day_energy_unit(4,032/—)、t_cal_day_ahead_unit(3,168/—)、t_cal_day_real_unit(3,168/—) 等4张", "10,500", "1", "1,440", "102"], ["L0-22_01", "t_cal_day_energy_unit(4,032/—)、t_cal_day_ahead_unit(3,168/—)、t_cal_day_real_unit(3,168/—) 等4张", "10,500", "1", "432", "97"], ["L0-08_01", "t_cal_day_energy_unit(4,032/—)、t_cal_day_ahead_unit(3,168/—)、t_cal_day_real_unit(3,168/—) 等4张", "10,500", "1", "576", "205"], ["L1-02_01", "t_dnl_day_energy_custom(6,480/648)、t_cal_day_ahead_custom(648/—)、t_cal_day_agent_relation(220/—) 等8张", "7,550", "649", "528", "122"], ["L1-01_01", "t_dnl_day_energy_custom(6,480/648)、t_cal_day_ahead_custom(648/—)、t_cal_day_agent_relation(220/—) 等7张", "7,550", "649", "528", "47"], ["L1-16_01", "t_dnl_day_energy_custom(6,480/648)、t_cal_day_ahead_custom(648/—)、t_cal_day_custom(225/—) 等6张", "7,533", "649", "120", "43"], ["L1-15_01", "t_dnl_day_energy_custom(6,480/648)、t_cal_day_ahead_custom(648/—)、t_cal_day_custom(225/—) 等6张", "7,533", "649", "120", "56"], ["L0-41_02", "t_cal_day_energy_unit(4,032/—)、t_cal_day_ahead_unit(3,168/—)、t_cal_day_unit(150/—) 等4张", "7,482", "1", "432", "24"], ["L0-41_01", "t_cal_day_energy_unit(4,032/—)、t_cal_day_ahead_unit(3,168/—)、t_cal_day_unit(150/—) 等4张", "7,482", "1", "432", "66"], ["L0-54_01", "t_cal_day_trade_result_renew(6,048/—)、t_cal_day_custom(225/—)、t_cal_day_calculate_version(132/1)", "6,405", "1", "48", "32"], ["L0-02_01", "t_cal_day_trade_result_renew(6,048/—)、t_cal_day_calculate_version(132/1)、t_cal_day_sale_company(22/—)", "6,202", "1", "120", "205"], ["L0-53_01", "t_cal_day_energy_unit(4,032/—)、t_cal_day_unit(150/—)、t_cal_day_calculate_version(132/1) 等4张", "4,362", "1", "288", "47"], ["L0-48_01", "t_cal_day_energy_unit(4,032/—)、t_cal_day_unit(150/—)、t_cal_day_calculate_version(132/1)", "4,314", "1", "288", "52"], ["L0-03_01", "t_cal_day_energy_unit(4,032/—)、t_cal_day_calculate_version(132/1)、t_jygl_mon_unit_bdcbbctzbz(-1/—)", "4,164", "1", "480", "220"], ["L0-61_01", "t_cal_day_ahead_unit(3,168/—)、t_cal_day_unit(150/—)、t_cal_day_calculate_version(132/1) 等6张", "3,498", "1", "0", "63"], ["L0-28_01", "t_cal_day_ahead_unit(3,168/—)、t_cal_day_unit(150/—)、t_cal_day_calculate_version(132/1) 等6张", "3,498", "1", "0", "73"], ["L0-45_04", "t_cal_day_custom(225/—)、t_cal_day_calculate_version(132/1)、t_cal_day_trans_prov_data_equl_unit(48/—) 等6张", "453", "1", "0", "29"], ["L0-45_03", "t_cal_day_custom(225/—)、t_cal_day_calculate_version(132/1)、t_cal_day_trans_prov_data_equl_unit(48/—) 等6张", "453", "1", "0", "52"], ["L0-45_02", "t_cal_day_custom(225/—)、t_cal_day_calculate_version(132/1)、t_cal_day_trans_prov_data_equl_unit(48/—) 等6张", "453", "1", "0", "36"], ["L0-45_01", "t_cal_day_custom(225/—)、t_cal_day_calculate_version(132/1)、t_cal_day_trans_prov_data_equl_unit(48/—) 等6张", "453", "1", "0", "27"], ["L0-13_02", "t_cal_day_custom(225/—)、t_cal_day_calculate_version(132/1)、t_cal_day_sale_company(22/—) 等4张", "379", "1", "0", "168"], ["L0-13_01", "t_cal_day_custom(225/—)、t_cal_day_calculate_version(132/1)、t_cal_day_sale_company(22/—) 等4张", "379", "1", "0", "161"], ["L0-60_03", "t_cal_day_custom(225/—)、t_cal_day_calculate_version(132/1)、t_cal_day_trans_prov_long_custom(0/—)", "357", "1", "0", "45"], ["L0-60_02", "t_cal_day_custom(225/—)、t_cal_day_calculate_version(132/1)、t_cal_day_trans_prov_long_custom(0/—)", "357", "1", "0", "18"], ["L0-60_01", "t_cal_day_custom(225/—)、t_cal_day_calculate_version(132/1)、t_cal_day_trans_prov_long_custom(0/—)", "357", "1", "0", "53"], ["L0-36_01", "t_cal_day_custom(225/—)、t_cal_day_calculate_version(132/1)、t_cal_day_green_flexible_result_long(0/—)", "357", "1", "0", "20"], ["L0-59_01", "t_cal_day_unit(150/—)、t_cal_day_calculate_version(132/1)、t_cal_day_green_flexible_result_long(0/—)", "282", "1", "0", "36"], ["L0-34_01", "t_cal_day_unit(150/—)、t_cal_day_calculate_version(132/1)、t_cal_day_trans_prov_long_unit(0/—)", "282", "1", "0", "121"], ["L0-11_01", "t_cal_day_unit(150/—)、t_cal_day_calculate_version(132/1)、t_cal_day_trans_prov_long_unit(0/—)", "282", "1", "0", "110"], ["L0-10_01", "t_cal_day_unit(150/—)、t_cal_day_calculate_version(132/1)、t_cal_day_green_flexible_result_long(0/—)", "282", "1", "0", "147"], ["L0-17_04", "t_cal_day_calculate_version(132/1)、t_cal_day_trans_prov_data_equl_unit(48/—)、t_cal_day_spot_custom_price(48/—) 等6张", "250", "1", "0", "18"], ["L0-17_03", "t_cal_day_calculate_version(132/1)、t_cal_day_trans_prov_data_equl_unit(48/—)、t_cal_day_spot_custom_price(48/—) 等6张", "250", "1", "0", "49"], ["L0-17_02", "t_cal_day_calculate_version(132/1)、t_cal_day_trans_prov_data_equl_unit(48/—)、t_cal_day_spot_custom_price(48/—) 等6张", "250", "1", "0", "47"], ["L0-17_01", "t_cal_day_calculate_version(132/1)、t_cal_day_trans_prov_data_equl_unit(48/—)、t_cal_day_spot_custom_price(48/—) 等6张", "250", "1", "0", "139"], ["L0-63_01", "t_cal_day_calculate_version(132/1)、t_cal_day_spot_custom_price(48/—)、t_cal_day_dgyg_long_result(48/—) 等5张", "228", "1", "0", "13"], ["L0-43_01", "t_cal_day_calculate_version(132/1)、t_cal_day_spot_custom_price(48/—)、t_cal_day_dgyg_long_result(48/—) 等5张", "228", "1", "0", "51"], ["L0-19_01", "t_cal_day_calculate_version(132/1)、t_cal_day_spot_custom_price(48/—)、t_cal_day_energy_dgyg(48/—) 等6张", "228", "1", "0", "45"], ["L0-16_01", "t_cal_day_calculate_version(132/1)、t_cal_day_spot_custom_price(48/—)、t_cal_day_energy_dgyg(48/—) 等6张", "228", "1", "0", "134"], ["L1-13_02", "t_cal_day_calculate_version(132/1)、t_cal_day_dgyg_long_result(48/—)、t_dnl_day_24result_dwdg(0/0) 等5张", "180", "1", "0", "21"], ["L1-13_01", "t_cal_day_calculate_version(132/1)、t_cal_day_dgyg_long_result(48/—)、t_dnl_day_24result_dwdg(0/0) 等5张", "180", "1", "0", "38"], ["L0-58_01", "t_cal_day_calculate_version(132/1)、t_cal_day_dgyg_long_result(48/—)、t_cal_day_dgyg(0/—)", "180", "1", "0", "47"], ["L0-14_01", "t_cal_day_calculate_version(132/1)、t_cal_day_dgyg_long_result(48/—)、t_cal_day_dgyg(0/—)", "180", "1", "0", "129"], ["L0-31_03", "t_cal_day_calculate_version(132/1)、t_cal_day_sale_company(22/—)、t_cal_day_trans_prov_long_custom(0/—)", "154", "1", "0", "99"], ["L0-31_02", "t_cal_day_calculate_version(132/1)、t_cal_day_sale_company(22/—)、t_cal_day_trans_prov_long_custom(0/—)", "154", "1", "0", "43"], ["L0-31_01", "t_cal_day_calculate_version(132/1)、t_cal_day_sale_company(22/—)、t_cal_day_trans_prov_long_custom(0/—)", "154", "1", "0", "94"], ["L0-09_01", "t_cal_day_calculate_version(132/1)、t_cal_day_sale_company(22/—)、t_cal_day_green_flexible_result_long(0/—)", "154", "1", "0", "185"], ["L2-08_01", "t_cal_day_calculate_version(132/1)、t_dnl_day_24result_dwdg(0/0)、t_cal_day_dgyg(0/—) 等4张", "132", "1", "0", "71"], ["L2-07_01", "t_cal_day_calculate_version(132/1)、t_dnl_day_24result_yxgd(0/0)、t_cal_day_dgyg(0/—) 等4张", "132", "1", "0", "65"]]};
+
+/* ── 主题 ── */
+const rep = document.getElementById('report');
+function setTheme(t) {
+  rep.classList.toggle('dark', t === 'dark');
+  try { localStorage.setItem('rep-theme', t); } catch (e) {}
+  if (typeof fmt === 'function') renderAll();
+}
+function toggleTheme() {
+  setTheme(rep.classList.contains('dark') ? 'light' : 'dark');
+}
+function initTheme() {
+  let t = null;
+  try { t = localStorage.getItem('rep-theme'); } catch (e) {}
+  if (!t) t = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  rep.classList.toggle('dark', t === 'dark');
+}
+function C() {
+  const d = rep.classList.contains('dark');
+  return d
+    ? { s1: '#3987e5', s2: '#d95926', track: '#1c3a63', grid: '#262624',
+        t1: '#ffffff', t2: '#c3c2b7', t3: '#8f8e86', bd: '#2e2e2c' }
+    : { s1: '#2a78d6', s2: '#eb6834', track: '#cde2fb', grid: '#f0efec',
+        t1: '#0b0b0b', t2: '#52514e', t3: '#8a8984', bd: '#e5e4e0' };
+}
+const fmt = n => Number(n).toLocaleString('en-US');
+
+/* ── 提示层 ── */
+const tip = document.getElementById('tip');
+function tipShow(html, ev) {
+  tip.innerHTML = html; tip.style.opacity = 1;
+  const x = Math.min(ev.clientX + 14, window.innerWidth - 360);
+  tip.style.left = x + 'px';
+  tip.style.top = (ev.clientY + 14) + 'px';
+}
+function tipHide() { tip.style.opacity = 0; }
+
+/* ── SVG 帮手：只在数据端做 4px 圆角（贴基线端直角）── */
+function colTop(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h);
+  return `M${x},${y + h} L${x},${y + r} Q${x},${y} ${x + r},${y} L${x + w - r},${y} Q${x + w},${y} ${x + w},${y + r} L${x + w},${y + h} Z`;
+}
+function barRight(x, y, w, h, r) {
+  r = Math.min(r, w, h / 2);
+  return `M${x},${y} L${x + w - r},${y} Q${x + w},${y} ${x + w},${y + r} L${x + w},${y + h - r} Q${x + w},${y + h} ${x + w - r},${y + h} L${x},${y + h} Z`;
+}
+
+/* ── ① 5 轮墙钟：柱状，单色（量级比较）── */
+function drawRounds() {
+  const el = document.getElementById('c_rounds');
+  const W = el.clientWidth || 480, H = 210, padL = 46, padB = 26, padT = 18;
+  const data = DATA.rounds, max = 2400;
+  const iw = W - padL - 12, ih = H - padT - padB;
+  const med = DATA.roundMedian;
+  let s = `<svg viewBox="0 0 ${W} ${H}">`;
+  for (const g of [1200, 1800, 2400]) {
+    const y = padT + ih - ih * g / max;
+    s += `<line x1="${padL}" y1="${y}" x2="${W - 8}" y2="${y}" stroke="${C().grid}" stroke-width="1"/>` +
+         `<text x="${padL - 6}" y="${y + 4}" text-anchor="end" font-size="10.5" fill="${C().t3}">${g / 1000}s</text>`;
+  }
+  const bw = 40, gap = (iw - bw * data.length) / (data.length + 1);
+  data.forEach((v, i) => {
+    const x = padL + gap + i * (bw + gap);
+    const h = ih * v / max, y = padT + ih - h;
+    const isMed = v === med;
+    s += `<path d="${colTop(x, y, bw, h, 4)}" fill="${C().s1}" opacity="${isMed ? 1 : 0.82}"/>` +
+         `<text x="${x + bw / 2}" y="${y - 5}" text-anchor="middle" font-size="11" fill="${C().t2}">${fmt(v)}</text>` +
+         `<rect x="${x - gap / 2}" y="${padT}" width="${bw + gap}" height="${ih}" fill="transparent"/>` +
+         `<text x="${x + bw / 2}" y="${padT + ih + 16}" text-anchor="middle" font-size="11" fill="${C().t3}">第 ${i + 1} 轮${isMed ? '（中位）' : ''}</text>`;
+  });
+  s += `<line x1="${padL}" y1="${padT + ih}" x2="${W - 8}" y2="${padT + ih}" stroke="${C().bd}" stroke-width="1"/></svg>`;
+  el.innerHTML = s;
+  el.querySelectorAll('rect[fill="transparent"]').forEach((r, i) => {
+    r.addEventListener('pointermove', ev => tipShow(
+      `<b>第 ${i + 1} 轮</b>　<b>${fmt(data[i])} ms</b><br><span class="k">154 块 · 0 错误</span>`, ev));
+    r.addEventListener('pointerleave', tipHide);
+  });
+}
+
+/* ── 通用水平条 ── */
+function hbars(elId, rows, opts) {
+  const el = document.getElementById(elId);
+  const rowH = opts.rowH || 30, gap = opts.gap != null ? opts.gap : 8;
+  const W = el.clientWidth || 480, padL = opts.padL || 118, padR = 64;
+  const H = rows.length * (rowH + gap) + 8;
+  const iw = W - padL - padR;
+  let s = `<svg viewBox="0 0 ${W} ${H}">`;
+  rows.forEach((r, i) => {
+    const y = 4 + i * (rowH + gap);
+    s += `<text x="${padL - 8}" y="${y + rowH / 2 + 4}" text-anchor="end" font-size="11.5" fill="${C().t2}">${r.label}</text>`;
+    if (opts.track) {
+      const tx = padL + iw * r.trackMin / opts.max, tw = iw * (r.trackMax - r.trackMin) / opts.max;
+      s += `<rect x="${tx}" y="${y + rowH / 2 - 2}" width="${Math.max(tw, 2)}" height="4" rx="2" fill="${C().track}"/>`;
+    }
+    const w = Math.max(iw * r.value / opts.max, 2);
+    s += `<path d="${barRight(padL, y + 2, w, rowH - 4, 4)}" fill="${r.color || C().s1}"/>` +
+         `<text x="${padL + w + 7}" y="${y + rowH / 2 + 4}" font-size="11" fill="${C().t2}">${r.dlabel}</text>` +
+         `<rect x="0" y="${y - gap / 2}" width="${W}" height="${rowH + gap}" fill="transparent"/>`;
+  });
+  s += '</svg>';
+  el.innerHTML = s;
+  el.querySelectorAll('rect[fill="transparent"]').forEach((r, i) => {
+    r.addEventListener('pointermove', ev => tipShow(opts.tip(rows[i]), ev));
+    r.addEventListener('pointerleave', tipHide);
+  });
+}
+
+/* ── ② 关键链 ── */
+function drawChain() {
+  hbars('c_chain', DATA.chain.map(c => ({
+    label: c[0], value: c[1], dlabel: fmt(c[1]) + ' ms',
+    tipHtml: `<b>${c[0]}</b>　<b>${fmt(c[1])} ms</b>` })), {
+    max: 480, rowH: 22, gap: 7, padL: 76,
+    tip: r => r.tipHtml });
+}
+
+/* ── ③ 最慢 10 块：中位条 + 最快～最慢轨道 ── */
+function drawSlow() {
+  hbars('c_slow', DATA.slowest.map(r => ({
+    label: r[0], value: r[1], min: r[2], max: r[3], rows: r[4],
+    trackMin: r[2], trackMax: r[3], dlabel: fmt(r[1]) })), {
+    max: 480, rowH: 24, gap: 9, padL: 92, track: true,
+    tip: r => `<b>${r.label}</b>　中位 <b>${fmt(r.value)} ms</b><br>` +
+              `<span class="k">最快 ${fmt(r.min)} · 最慢 ${fmt(r.max)} · 输出 ${fmt(r.rows)} 行</span>` });
+}
+
+/* ── ④ 输入面 Top10：双系列（当天 / 版本切片）── */
+function drawInput() {
+  const el = document.getElementById('c_input');
+  const rows = DATA.input.slice(0, 10);   // 卡片只画 Top 10；全量在附录 A
+  const rowH = 15, gap = 13, W = el.clientWidth || 480, padL = 168, padR = 70;
+  const H = rows.length * (rowH * 2 + gap) + 10;
+  const iw = W - padL - padR;
+  const max = 560000;
+  let s = `<svg viewBox="0 0 ${W} ${H}">
+    <rect x="${padL}" y="0" width="10" height="10" rx="2" fill="${C().s1}"/>
+    <text x="${padL + 15}" y="9" font-size="11" fill="${C().t2}">当天行数</text>
+    <rect x="${padL + 78}" y="0" width="10" height="10" rx="2" fill="${C().s2}"/>
+    <text x="${padL + 93}" y="9" font-size="11" fill="${C().t2}">版本切片</text>`;
+  rows.forEach((r, i) => {
+    // INPUT 行 = [表名, 全表, 当天, 版本切片, 被引用数] —— 图里画 **当天/版本**，
+    // 全表只在悬浮里出现（此前错拿全表画"当天"，蓝条全部顶格，量级全错）。
+    const y = 20 + i * (rowH * 2 + gap);
+    s += `<text x="${padL - 8}" y="${y + rowH + 3}" text-anchor="end" font-size="10.5" fill="${C().t2}">${r[0]}</text>`;
+    const day = Number(r[2]);
+    const w1 = Math.max(iw * day / max, 2);
+    s += `<path d="${barRight(padL, y, w1, rowH - 2, 3)}" fill="${C().s1}"/>` +
+         `<text x="${padL + w1 + 5}" y="${y + rowH - 4}" font-size="9.5" fill="${C().t2}">${day >= 10000 ? (day / 10000).toFixed(1) + '万' : fmt(day)}</text>`;
+    if (r[3] !== '—') {
+      const v = Number(r[3]);
+      const w2 = Math.max(iw * v / max, 2);
+      s += `<path d="${barRight(padL, y + rowH, w2, rowH - 2, 3)}" fill="${C().s2}"/>` +
+           `<text x="${padL + w2 + 5}" y="${y + rowH * 2 - 4}" font-size="9.5" fill="${C().t2}">${v >= 10000 ? (v / 10000).toFixed(1) + '万' : fmt(v)}</text>`;
+    } else {
+      s += `<text x="${padL + 4}" y="${y + rowH * 2 - 4}" font-size="9.5" fill="${C().t3}">无 version_id 列</text>`;
+    }
+    s += `<rect x="0" y="${y - 4}" width="${W}" height="${rowH * 2 + gap}" fill="transparent"/>`;
+  });
+  s += '</svg>';
+  el.innerHTML = s;
+  el.querySelectorAll('rect[fill="transparent"]').forEach((r, i) => {
+    const d = DATA.input[i];
+    r.addEventListener('pointermove', ev => tipShow(
+      `<b>${d[0]}</b><br><span class="k">全表</span> <b>${d[1]}</b>　` +
+      `<span class="k">当天</span> <b>${d[2]}</b><br><span class="k">版本切片</span> <b>${d[3]}</b>　` +
+      `<span class="k">被 ${d[4]} 块引用</span>`, ev));
+    r.addEventListener('pointerleave', tipHide);
+  });
+}
+
+/* ── 附录表 ── */
+function fillTable(id, head, rows, numCols) {
+  const t = document.getElementById(id);
+  let s = '<thead><tr>' + head.map((h, i) =>
+    `<th class="${numCols.includes(i) ? 'num' : ''}">${h}</th>`).join('') + '</tr></thead><tbody>';
+  for (const r of rows) {
+    s += '<tr>' + r.map((c, i) => `<td class="${numCols.includes(i) ? 'num' : ''}">${c}</td>`).join('') + '</tr>';
+  }
+  t.innerHTML = s + '</tbody>';
+}
+
+function renderAll() {
+  document.getElementById('roundStr').textContent = DATA.rounds.join('、');
+  document.getElementById('floorStr').textContent = fmt(DATA.floor);
+  drawRounds(); drawChain(); drawSlow(); drawInput();
+  fillTable('t_input',
+    ['输入表', '全表行数', '当天行数', '版本切片', '被引用块数'],
+    DATA.input, [1, 2, 3, 4]);
+  fillTable('t_blocks',
+    ['块', '引用的输入表（当天/版本切片）', '输入面·当天', '输入面·切片', '输出行', '墙钟 ms'],
+    DATA.blocks, [2, 3, 4, 5]);
+}
+window.addEventListener('resize', () => { clearTimeout(window.__rt); window.__rt = setTimeout(renderAll, 150); });
+initTheme();
+renderAll();
+</script>
+</body>
+</html>
