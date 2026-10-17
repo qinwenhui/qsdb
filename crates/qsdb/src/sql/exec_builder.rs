@@ -1674,6 +1674,62 @@ fn distinct_row_upper_bound(db: &Qsdb, plan: &LogicalPlan) -> Option<u64> {
     db.scan_metadata_count(&def.name, None).ok()?
 }
 
+/// v2 去重相 1 的**分片输入**（`docs/去重分区路v2设计.md` §2.2）。
+///
+/// 沿 `Project*`/`Filter*` 剥到底（两者逐行保序 ⇒ 对行不相交分片可分配送）
+/// 到逻辑 `Scan`：取行不相交分片后，**每片在 `ShardScope` 下重建完整输入
+/// 子树**（与 join 分片路同款套路）。分片基础扫描带着逻辑谓词创建 ——
+/// `ShardScope` 命中时 `build_inner` **不再**套谓词，语义是烤进分片的
+/// 文件/行组划分里的（`try_shard_source` 同一做法，漏了 = 静默少行）。
+///
+/// 中途遇到任何别的节点（join/集合/窗口/派生表…）或扫描不可分片 ⇒
+/// `None`：调用方退回单节点顺序相 1 —— 性能回退，语义与不分片完全等价
+/// （与 `try_shard_source` 的 `.ok()?` 口径一致）。
+fn distinct_shard_inputs(
+    db: &Qsdb,
+    plan: &LogicalPlan,
+    scan_proj: &Option<Vec<String>>,
+    ctx: &Arc<crate::query::QueryContext>,
+) -> Option<Vec<Box<dyn ExecNode>>> {
+    let mut cur = plan;
+    let (table, predicate) = loop {
+        match cur {
+            LogicalPlan::Project { input, .. } | LogicalPlan::Filter { input, .. } => {
+                cur = input;
+            }
+            LogicalPlan::Scan { def, predicate, .. } => {
+                break (def.name.clone(), predicate.clone());
+            }
+            _ => return None,
+        }
+    };
+    let scan = db
+        .scan_with_context(
+            ScanRequest {
+                table: table.clone(),
+                predicate,
+                projection: scan_proj.clone(),
+                ..Default::default()
+            },
+            Arc::clone(ctx),
+        )
+        .ok()?;
+    let shards = scan.shard(shard_count(), false)?;
+    let table_ref = &table;
+    let plan_ref = plan;
+    let ctx_ref = ctx;
+    let scan_proj_ref = scan_proj;
+    use rayon::prelude::*;
+    shards
+        .into_par_iter()
+        .map(|s| {
+            let _scope = ShardScope::set(table_ref, s);
+            build_inner(db, plan_ref, scan_proj_ref.clone(), ctx_ref)
+        })
+        .collect::<Result<Vec<_>>>()
+        .ok()
+}
+
 /// `count(*) over DISTINCT` 是否走**融合计数**（[`crate::exec::DistinctCountExec`]）。
 ///
 /// 单独成函数是为了让它**可断言**：融合**静默不触发**只会让性能数字变难看，
@@ -1770,11 +1826,31 @@ fn build_aggregate(
                         | arrow::datatypes::DataType::Date32
                 );
             if !fixed_width_key {
+                let utf8_single = fs.len() == 1
+                    && matches!(fs[0].data_type(), arrow::datatypes::DataType::Utf8);
                 if let Some(rows) = distinct_row_upper_bound(db, input) {
                     let nparts = distinct_parts();
                     let reserve = rows.saturating_mul(DISTINCT_SHUFFLE_BYTES_PER_ROW);
-                    if nparts > 1 {
-                        if let Ok(res) = ctx.try_reserve(reserve) {
+                    if let Ok(res) = ctx.try_reserve(reserve) {
+                        // ★ **单 Utf8 键 → v2 排序去重**（`docs/去重分区路v2设计.md`）。
+                        //
+                        // .14 相拆账（2026-10-17）：v1 分区路相 1（顺序）228ms +
+                        // 相 2（并行）420ms，相 2 是 250 万次随机哈希表插入的
+                        // 内存延迟墙（~1.3µs/行）。v2 条目零拷贝 + 排序去重，
+                        // 输入可分片时相 1 也并行。
+                        // `QSDB_NO_DISTINCT_V2=1` 回 v1（A/B 对照与回归锚点）。
+                        if utf8_single && std::env::var("QSDB_NO_DISTINCT_V2").is_err() {
+                            let inputs = match distinct_shard_inputs(db, input, scan_proj, ctx) {
+                                Some(shards) => shards,
+                                None => vec![node],
+                            };
+                            return Ok(Box::new(
+                                crate::exec::SortedDistinctCountExec::new(
+                                    inputs, out_schema, nparts, res, Arc::clone(ctx),
+                                ),
+                            ));
+                        }
+                        if nparts > 1 {
                             return Ok(Box::new(crate::exec::PartitionedDistinctCountExec::new(
                                 node,
                                 out_schema,

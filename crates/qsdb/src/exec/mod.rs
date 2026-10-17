@@ -1318,6 +1318,8 @@ impl PartitionedDistinctCountExec {
         let n = self.nparts;
         let mut parts: Vec<PartBuf> = (0..n).map(|_| PartBuf::default()).collect();
         let mut buf: Vec<u8> = Vec::with_capacity(64);
+        let prof = std::env::var("QSDB_DISTINCT_PROF").is_ok();
+        let t0 = std::time::Instant::now();
         while let Some(b) = self.input.next() {
             self.ctx.check()?;
             let batch = b?;
@@ -1339,14 +1341,16 @@ impl PartitionedDistinctCountExec {
                 self.accounted = est;
             }
         }
-        if std::env::var("QSDB_DISTINCT_PROF").is_ok() {
+        if prof {
             eprintln!(
-                "[distinct-count] 哈希分区并行：{n} 分区，缓冲 {}MB",
-                parts.iter().map(PartBuf::bytes).sum::<u64>() / (1024 * 1024)
+                "[distinct-count] 哈希分区并行：{n} 分区，缓冲 {}MB，相1（顺序路由）{:?}",
+                parts.iter().map(PartBuf::bytes).sum::<u64>() / (1024 * 1024),
+                t0.elapsed()
             );
         }
         // 相 2：各分区独立去重 —— **键集不相交 ⇒ 组数直接相加**
         use rayon::prelude::*;
+        let t1 = std::time::Instant::now();
         let total: u64 = parts
             .into_par_iter()
             .map(|p| {
@@ -1357,11 +1361,260 @@ impl PartitionedDistinctCountExec {
                 t.len() as u64
             })
             .sum();
+        if prof {
+            eprintln!("[distinct-count] 相2（并行建组）{:?}，共 {total} 组", t1.elapsed());
+        }
         Ok(total)
     }
 }
 
 impl ExecNode for PartitionedDistinctCountExec {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+    fn next(&mut self) -> Option<Result<RecordBatch>> {
+        if self.emitted {
+            return None;
+        }
+        self.emitted = true;
+        match self.run() {
+            Ok(total) => Some(DistinctCountExec::one_row_static(total, &self.schema)),
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `count(*) over DISTINCT` 的**排序去重**路（v2，第十三批）—— 见
+// `docs/去重分区路v2设计.md`。与 v1（[`PartitionedDistinctCountExec`]）的
+// 三点结构差异（都来自 .14 的相拆账实测：相 1 顺序 228ms、相 2 并行 420ms）：
+//
+//   1. **条目零拷贝**：相 1 不再"编码 → 拷进分区 arena"，只存
+//      `(哈希, 行引用)` 16 字节定长条目 —— 键字节留在箭头缓冲（Arc 保活），
+//      v1 的"三拷"省掉两拷；
+//   2. **哈希只算一次**：相 1 算完存进条目，路由/排序/分桶全用存下的值 ——
+//      v1 的 route/insert 两套哈希口径问题在这里结构性不存在；
+//   3. **相 2 排序去重**：条目按哈希排序后线性扫 —— 同哈希必相邻，把
+//      250 万次随机哈希表插入（内存延迟墙，实测 ~1.3µs/行）换成
+//      L3 内排序 + 顺序扫（随机访问只在"留样比真字节"的首次触碰发生）。
+//
+// 输入可分片（剥 `Project*`/`Filter*` 到 Scan，gate 在 `exec_builder`）时
+// `inputs` 是 N 个行不相交分片节点，相 1 并行路由；否则 1 个节点顺序跑 ——
+// 两种形态走同一套代码。适用面：**单 Utf8 键**才进这条路（多键/混合键留 v1）。
+
+/// 一个去重条目：`h` 是键哈希（NULL/非空用 tag 混进哈希），`br` 打包
+/// `(batch_idx << 32) | row` —— 行字节在 `cols[batch_idx]` 的箭头缓冲里。
+#[derive(Clone, Copy)]
+struct DistEntry {
+    h: u64,
+    br: u64,
+}
+
+/// 相 1 单分片的产出：各分区条目 + 本片各批的键列（条目引用的字节在这里）。
+struct DistShardOut {
+    parts: Vec<Vec<DistEntry>>,
+    cols: Vec<arrow::array::StringArray>,
+}
+
+/// 行字节比较：都 NULL ⇒ 相等；一方 NULL ⇒ 不等；否则比字符串字节。
+/// **哈希碰撞必须落到这条** —— 只信哈希 = 静默错值。
+fn dist_entry_eq(cols: &[arrow::array::StringArray], a: u64, b: u64) -> bool {
+    let x = &cols[(a >> 32) as usize];
+    let y = &cols[(b >> 32) as usize];
+    let (ar, br) = (a as u32 as usize, b as u32 as usize);
+    match (x.is_null(ar), y.is_null(br)) {
+        (true, true) => true,
+        (true, false) | (false, true) => false,
+        (false, false) => x.value(ar).as_bytes() == y.value(br).as_bytes(),
+    }
+}
+
+/// 排序后的线性去重：返回**不同值的个数**。
+///
+/// 同哈希 run 内逐个与**全部留样**比真字节 —— 碰撞时留样长到 2+，
+/// 不同值永不被吞。`kept` 跨 run 复用（免每 run 一次堆分配）。
+fn dist_dedup_sorted(cols: &[arrow::array::StringArray], es: &mut [DistEntry]) -> u64 {
+    es.sort_unstable_by_key(|e| e.h);
+    let mut count = 0u64;
+    let mut kept: Vec<u64> = Vec::with_capacity(4);
+    let mut i = 0;
+    while i < es.len() {
+        count += 1;
+        let h = es[i].h;
+        kept.clear();
+        kept.push(es[i].br);
+        let mut j = i + 1;
+        while j < es.len() && es[j].h == h {
+            let br = es[j].br;
+            if !kept.iter().any(|&k| dist_entry_eq(cols, k, br)) {
+                kept.push(br);
+                count += 1;
+            }
+            j += 1;
+        }
+        i = j;
+    }
+    count
+}
+
+pub struct SortedDistinctCountExec {
+    /// 1 个 = 顺序相 1；N 个 = 行不相交分片（相 1 并行路由）
+    inputs: Vec<Box<dyn ExecNode>>,
+    nparts: usize,
+    ctx: Arc<crate::query::QueryContext>,
+    /// 相 1 缓冲的内存预留（活到本节点销毁；预检由调用方按 行数×32B 给足）
+    res: crate::memory::Reservation,
+    accounted: u64,
+    emitted: bool,
+    schema: SchemaRef,
+}
+
+impl SortedDistinctCountExec {
+    pub fn new(
+        inputs: Vec<Box<dyn ExecNode>>,
+        out_schema: SchemaRef,
+        nparts: usize,
+        res: crate::memory::Reservation,
+        ctx: Arc<crate::query::QueryContext>,
+    ) -> Self {
+        Self {
+            inputs,
+            nparts: nparts.max(1),
+            ctx,
+            res,
+            accounted: 0,
+            emitted: false,
+            schema: out_schema,
+        }
+    }
+
+    /// 相 1：单分片顺序路由。**零拷贝**：每行只哈希 `value(i)` 的字节切片
+    /// 并落一个 16B 条目；键列以 Arc 克隆保活（实到不是 Utf8 —— 比如字典
+    /// 编码 —— 就逐批 cast 一次，罕见路；schema 闸门已判过 Utf8）。
+    fn route_one(
+        mut input: Box<dyn ExecNode>,
+        nparts: usize,
+        ctx: &Arc<crate::query::QueryContext>,
+    ) -> Result<DistShardOut> {
+        let n = nparts;
+        let mut parts: Vec<Vec<DistEntry>> = (0..n).map(|_| Vec::new()).collect();
+        let mut cols: Vec<arrow::array::StringArray> = Vec::new();
+        let key = PhysExpr::Column {
+            idx: 0,
+            name: input.schema().field(0).name().clone(),
+            ty: crate::types::LogicalType::try_from_arrow(input.schema().field(0).data_type())
+                .unwrap_or(crate::types::LogicalType::Int64),
+        };
+        while let Some(b) = input.next() {
+            ctx.check()?;
+            let batch = b?;
+            let arr = eval::eval(&key, &batch)?;
+            let col = match arr.as_any().downcast_ref::<arrow::array::StringArray>() {
+                Some(c) => c.clone(),
+                None => {
+                    let casted = arrow::compute::cast(&arr, &arrow::datatypes::DataType::Utf8)
+                        .map_err(|e| {
+                            QsdbError::unsupported(format!("去重键列转 Utf8 失败: {e}"))
+                        })?;
+                    casted
+                        .as_any()
+                        .downcast_ref::<arrow::array::StringArray>()
+                        .ok_or_else(|| {
+                            QsdbError::unsupported("去重键列 cast 后仍不是 Utf8（内部错误）")
+                        })?
+                        .clone()
+                }
+            };
+            let base = cols.len() as u64;
+            for row in 0..col.len() {
+                // tag 混进哈希：NULL 与空串哈希不同值（正确性靠字节比对，
+                // 这只是少一次无谓比较）；NULL 不产生字节。
+                let (tag, bytes): (u64, &[u8]) = if col.is_null(row) {
+                    (0, &[])
+                } else {
+                    (1, col.value(row).as_bytes())
+                };
+                let h = agg::fxhash_bytes(bytes) ^ tag.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                // Lemire 整数桶：免除法；路由/排序/分桶全用这个存下的 h
+                let p = ((h as u128 * n as u128) >> 64) as usize;
+                parts[p].push(DistEntry {
+                    h,
+                    br: (base << 32) | row as u64,
+                });
+            }
+            cols.push(col);
+        }
+        Ok(DistShardOut { parts, cols })
+    }
+
+    fn run(&mut self) -> Result<u64> {
+        use rayon::prelude::*;
+        let prof = std::env::var("QSDB_DISTINCT_PROF").is_ok();
+        let nshard = self.inputs.len();
+        let t0 = std::time::Instant::now();
+        // ── 相 1：分片并行路由 ──
+        let outs: Vec<DistShardOut> = std::mem::take(&mut self.inputs)
+            .into_par_iter()
+            .map(|node| Self::route_one(node, self.nparts, &self.ctx))
+            .collect::<Result<_>>()?;
+        // ── 拼接 + 批号全局重编号（一次线性扫；条目 16B/条）──
+        let mut parts: Vec<Vec<DistEntry>> = (0..self.nparts).map(|_| Vec::new()).collect();
+        let mut cols: Vec<arrow::array::StringArray> = Vec::new();
+        let mut rows = 0u64;
+        for out in outs {
+            let base = cols.len() as u64;
+            rows += out.parts.iter().map(|v| v.len() as u64).sum::<u64>();
+            cols.extend(out.cols);
+            for (p, v) in out.parts.into_iter().enumerate() {
+                if base != 0 {
+                    parts[p]
+                        .extend(v.into_iter().map(|mut e| {
+                            e.br += base << 32;
+                            e
+                        }));
+                } else {
+                    parts[p].extend(v);
+                }
+            }
+        }
+        // 记账（预检已在调用方按 行数×32B 给足；这里按实补差额，尽力而为）
+        let est: u64 = parts.iter().map(|v| v.capacity() as u64 * 16).sum::<u64>()
+            + cols
+                .iter()
+                .map(|c| c.get_array_memory_size() as u64)
+                .sum::<u64>();
+        if est > self.accounted {
+            let _ = self.res.grow(est - self.accounted);
+            self.accounted = est;
+        }
+        if prof {
+            eprintln!(
+                "[distinct-v2] 分区 {}，分片 {}，条目 {}（{}MB），键列 {}MB，相1 {:?}",
+                self.nparts,
+                nshard,
+                rows,
+                parts.iter().map(|v| v.capacity() as u64 * 16).sum::<u64>()
+                    / (1024 * 1024),
+                cols.iter().map(|c| c.get_array_memory_size() as u64).sum::<u64>()
+                    / (1024 * 1024),
+                t0.elapsed()
+            );
+        }
+        // ── 相 2：排序去重 —— 键集不相交 ⇒ 组数直接相加 ──
+        let t1 = std::time::Instant::now();
+        let cols_ref = &cols;
+        let total: u64 = parts
+            .into_par_iter()
+            .map(|mut es| dist_dedup_sorted(cols_ref, &mut es))
+            .sum();
+        if prof {
+            eprintln!("[distinct-v2] 相2 {:?}，共 {total} 组", t1.elapsed());
+        }
+        Ok(total)
+    }
+}
+
+impl ExecNode for SortedDistinctCountExec {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -1613,5 +1866,56 @@ impl ExecNode for HashAggExec {
             Err(e) => return Some(Err(e)),
         };
         Some(Ok(out))
+    }
+}
+
+/// v2 排序去重的**碰撞路径**单元测试（`docs/去重分区路v2设计.md` §三）。
+/// 随机数据撞不出 64 位哈希碰撞 ⇒ 伪造同哈希条目，确定性地走到
+/// "同哈希 run 内比真字节"那条分支 —— 这类优化的失败模式是静默少数/多数，
+/// 只看"跑得通"完全看不出来。
+#[cfg(test)]
+mod distinct_v2_tests {
+    use super::*;
+    use arrow::array::StringArray;
+
+    fn col(vals: &[Option<&str>]) -> StringArray {
+        StringArray::from(vals.to_vec())
+    }
+
+    fn e(h: u64, batch: u32, row: u32) -> DistEntry {
+        DistEntry {
+            h,
+            br: ((batch as u64) << 32) | row as u64,
+        }
+    }
+
+    /// 同哈希 run 里 "a"/"b"/"a" 是 **2** 个值 —— 碰撞不能吞值，重复不能多数。
+    #[test]
+    fn 排序去重_同哈希不同值必须都算() {
+        let cols = vec![col(&[Some("a"), Some("b"), Some("a"), Some("c")])];
+        let mut es = vec![
+            e(7, 0, 0), // a
+            e(7, 0, 1), // b ← 与 a 伪造同哈希（碰撞）
+            e(7, 0, 2), // a ← 重复
+            e(9, 0, 3), // c
+        ];
+        assert_eq!(dist_dedup_sorted(&cols, &mut es), 3, "碰撞算 2 + 独立值 1");
+    }
+
+    /// NULL 是一个独立值；NULL 与空串不相等（tag 与字节双判，最坏同哈希 run）。
+    #[test]
+    fn 排序去重_null与空串是两个值() {
+        let cols = vec![col(&[None, Some(""), None, Some("")])];
+        let mut es = vec![e(5, 0, 0), e(5, 0, 1), e(5, 0, 2), e(5, 0, 3)];
+        assert_eq!(dist_dedup_sorted(&cols, &mut es), 2, "NULL 与 '' 各算一个");
+    }
+
+    /// 跨批引用（br 高 32 位是批号）+ 乱序输入（排序归位）。
+    #[test]
+    fn 排序去重_跨批与乱序() {
+        let cols = vec![col(&[Some("x")]), col(&[Some("y"), Some("x")])];
+        let mut es = vec![e(42, 1, 1), e(42, 0, 0), e(42, 1, 0)];
+        // x(批0行0) 与 x(批1行1) 跨批同值；y(批1行0) 不同 ⇒ 2 个值
+        assert_eq!(dist_dedup_sorted(&cols, &mut es), 2);
     }
 }
