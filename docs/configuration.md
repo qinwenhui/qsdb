@@ -69,6 +69,7 @@
 | 全局内存预算 | `--memory-budget-mb` / **4096** | ❌（open 期定死） | 全库执行内存 + 缓存总上界；0 = 不限。超预算 → 503 `MEMORY_PRESSURE`（**可退避重试**）。**这是「进程内存上界」的承诺落点** |
 | 单查询内存上限 | `--query-memory-limit-mb` / **4096** | ✅（`PUT /api/v1/config`） | 单查询自己的配额；0 = 不限。超限 → 400 `QUERY_MEMORY_LIMIT`（改查询才有用） |
 | 并发查询上限 | `--max-concurrent-queries` / **0（不限）** | ❌（当前版） | 0 = 不限；超限直接 503 `TOO_MANY_QUERIES`（不排队，可退避重试）。**只管条数、不承担内存职责**（内存归预算管）——先前默认 16 是因为"它是唯一的系统级内存上界"，预算落地后该理由不成立，且按条数限流会误伤轻查询 |
+| 会话空闲回收 | `--session-idle-timeout-mins` / **0（关）** | ❌ | 超时会话按"踢人"路径清理（取消在跑查询 + 吊销 token，之后 401 `SESSION_REVOKED`）。默认关的理由：踢错活跃会话的代价大于泄漏代价（会话对象 ~百字节级，泄漏是审计噪音不是内存问题） |
 | 写缓冲阈值 | WriteBufferOptions（代码默认 64 批/128MB） | ❌ | 攒批自动 flush |
 | compaction 触发 | CompactOptions（代码默认 ≥4 段且均值 <64MB） | ❌ | 见 `qsdb admin compact` |
 | Flight 监听口 | `--flight-bind` / 关 | ❌ | Arrow Flight 数据面（h2c，独立于 HTTP）；需 `--features flight` 编译（默认关闭守二进制红线）。鉴权复用 `--token`（Bearer metadata）。do_get ticket=SQL；do_put 首帧 descriptor cmd=`table:<名>` |
@@ -86,9 +87,26 @@
 **认证方式**（server）：
 | 方式 | 形态 | 说明 |
 |---|---|---|
-| Bearer 用户 token | `Authorization: Bearer <token>` | `POST /api/v1/auth/login`（Basic）签发，进程内存态（重启重登） |
-| Basic | `Authorization: Basic base64(user:pass)` | 每次请求校验（~5ms 密码哈希） |
-| `--token` 超级凭证 | `Authorization: Bearer <--token值>` | Admin 等效（运维后门，保留） |
+| Bearer 用户 token | `Authorization: Bearer <token>` | `POST /api/v1/auth/login`（Basic）签发，进程内存态（重启重登）；`sess-` 前缀，绑定一个会话（见下） |
+| Basic | `Authorization: Basic base64(user:pass)` | 每次请求校验（~5ms 密码哈希）；无会话 |
+| `--token` 超级凭证 | `Authorization: Bearer <--token值>` | Admin 等效（运维后门，保留）；无会话 |
+
+**会话**（十六批 M-A；`POST /api/v1/auth/login` 签发 token 时建立，进程内存态，重启即失效）：
+
+- 会话对象：`id` / `user` / `role`（登录时快照，展示用）/ `client`（ip:port + UA）/
+  `createdAtMs` / `lastActiveMs`（**每个认证请求刷新**）/ `defaultDb`（`USE` 的落点，
+  初始 `default`）/ 累计统计（`queriesTotal`、`rowsWritten`）
+- 端点：`GET /api/v1/sessions`（admin 列全量，含在跑查询）、
+  `GET /api/v1/sessions/{id}`（admin 或本会话自查）、
+  `DELETE /api/v1/sessions/{id}`（admin **踢人**：取消在跑查询 + 吊销 token，
+  之后该 token 一律 401 `SESSION_REVOKED`）、
+  `PUT /api/v1/sessions/current/database`（设默认库，库名按挂载白名单校验，
+  未挂载 404）
+- 空闲回收：`--session-idle-timeout-mins`（默认 0 = 永不回收，见服务器级表）
+- 可观测：`GET /metrics` 的 `qsdb_sessions` gauge；在跑查询经
+  `GET /api/v1/queries` 回显 `sessionId`
+- Basic / 超级 token / 开放模式**不建会话**（不可被踢、无默认库可设）——会话
+  只属于"登录"这个动作
 
 **用户存储**：`_catalog/users.json`（进程外可直接读不可改——密码哈希 + catalog 锁内原子写）。
 

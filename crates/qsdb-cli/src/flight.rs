@@ -65,7 +65,7 @@ impl QsdbFlightService {
     ) -> Result<(String, qsdb::sql::SqlResult), Status> {
         let ctx = self
             .state
-            .register_query(Self::client_query_id(meta)?, None, sql.to_string())
+            .register_query(Self::client_query_id(meta)?, None, sql.to_string(), None)
             .map_err(|msg| {
                 // 并发闸拒绝：与 HTTP 面同一个码（RESOURCE_EXHAUSTED = 可退避重试）
                 crate::error_code::grpc_status_msg(

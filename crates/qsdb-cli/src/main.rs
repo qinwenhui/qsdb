@@ -101,6 +101,12 @@ enum Cmd {
         /// 公平性）时按机器容量显式给。
         #[arg(long, default_value_t = 0)]
         max_concurrent_queries: usize,
+        /// **会话空闲回收**（分钟；0 = 永不回收，默认关）。超时会话按"踢人"
+        /// 路径清理（取消在跑查询 + 吊销 token，之后 401 `SESSION_REVOKED`）。
+        /// 默认关的理由：踢错活跃会话的代价大于泄漏代价（会话对象 ~百字节级，
+        /// 泄漏是审计噪音不是内存问题）。
+        #[arg(long, default_value_t = 0)]
+        session_idle_timeout_mins: u64,
         /// **溢出目录**（排序/聚合/join 落盘用；默认 `<库根>/_spill`）。
         ///
         /// 溢出量可以很大（5M 行排序就是几十上百 MB）——**默认与数据同盘**，
@@ -526,6 +532,7 @@ fn main() {
             writer_epoch,
             cache_mb,
             max_concurrent_queries,
+            session_idle_timeout_mins,
             spill_dir,
             memory_budget_mb,
             query_memory_limit_mb,
@@ -657,6 +664,7 @@ fn main() {
                 commits,
                 auto_compact_secs,
                 Some(max_concurrent_queries),
+                Some(session_idle_timeout_mins),
                 // MB → 字节；未显式给则 None（让配置文件优先，再由 serve 兜 4GB）
                 query_memory_limit_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
                 config.as_deref(),

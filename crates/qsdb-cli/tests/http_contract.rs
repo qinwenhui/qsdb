@@ -139,6 +139,9 @@ fn http(port: u16, method: &str, path: &str, headers: &[(&str, &str)], body: &[u
         req.push_str(&format!("{k}: {v}\r\n"));
     }
     req.push_str("\r\n");
+    if std::env::var("QSDB_HTTP_DEBUG").is_ok() {
+        eprintln!("--- REQ ---\n{req}{}", String::from_utf8_lossy(body));
+    }
     s.write_all(req.as_bytes()).unwrap();
     s.write_all(body).unwrap();
     let mut raw = Vec::new();
@@ -197,6 +200,31 @@ fn query(port: u16, sql: &str, qid: Option<&str>) -> Resp {
     }
     let body = serde_json::json!({ "sql": sql }).to_string();
     http(port, "POST", "/api/v1/query", &h, body.as_bytes())
+}
+
+/// 带任意鉴权头的查询（会话契约用）。
+fn query_auth(port: u16, sql: &str, qid: Option<&str>, auth: &[(&str, &str)]) -> Resp {
+    let mut h: Vec<(&str, &str)> = vec![("Content-Type", "application/json")];
+    h.extend_from_slice(auth);
+    if let Some(id) = qid {
+        h.push(("X-QSDB-Query-Id", id));
+    }
+    let body = serde_json::json!({ "sql": sql }).to_string();
+    http(port, "POST", "/api/v1/query", &h, body.as_bytes())
+}
+
+/// Basic 登录 → token + sessionId（M-A）。
+fn login(port: u16, user: &str, pass: &str) -> Resp {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+    let auth = format!("Basic {b64}");
+    http(
+        port,
+        "POST",
+        "/api/v1/auth/login",
+        &[("Authorization", auth.as_str())],
+        b"",
+    )
 }
 
 /// 带 params 的查询（协议面：`{"sql": …, "params": [...]}`）。
@@ -1280,7 +1308,7 @@ fn error_catalog_endpoint_and_no_off_catalog_codes() {
     // 条数与代码侧枚举一致（docs/error-codes.md ↔ enum 的逐字对账在单测里）
     // 条数（集成测试看不到 crate 内部枚举，故这里写死；**逐字对账在 `error_code.rs`
     // 的单测里**，那条才是防漂移的权威）
-    assert_eq!(codes.len(), 24, "目录应列出全部码（数错说明漏挂在 ALL 上）");
+    assert_eq!(codes.len(), 25, "目录应列出全部码（数错说明漏挂在 ALL 上）");
     for c in &codes {
         for k in ["code", "http", "retry", "category", "sqlState"] {
             assert!(c.get(k).is_some(), "目录条目缺字段 {k}: {c}");
@@ -1664,5 +1692,226 @@ fn result_column_names_over_http() {
             .contains("ambiguous"),
         "{}",
         String::from_utf8_lossy(&r.body)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. 会话（十六批 M-A）：登录建会话 / 列表与归属 / 踢人 / 吊销专属码
+// ---------------------------------------------------------------------------
+
+/// 会话生命周期：Basic 登录签发会话 → 查询挂归属 → 踢人取消在跑查询 →
+/// token 得 `SESSION_REVOKED`。
+///
+/// 契约核心：**被踢 ≠ 没登录**。笼统 401 会让客户端拿同一把 token 反复重试
+/// （反正"再登一次"和"再试一次"看起来一个样）；专属码告诉驱动"这把 token
+/// 永远不会好，重新登录"。
+#[test]
+fn session_lifecycle_kick_revocation_and_attribution() {
+    let srv = Server::start(&["--token", "s3cret"]);
+    let p = srv.port;
+    let admin = [("Authorization", "Bearer s3cret")];
+
+    // ① 建 reader 用户并以 Basic 登录 → token + sessionId
+    let r = query_auth(
+        p,
+        "CREATE USER bob WITH PASSWORD 'pass456' ROLE reader",
+        None,
+        &admin,
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let r = login(p, "bob", "pass456");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let v = r.json();
+    let tok = v["token"].as_str().unwrap().to_string();
+    let sid = v["sessionId"].as_str().unwrap().to_string();
+    assert!(sid.starts_with("s-"), "会话 id 形态: {sid}");
+    assert_eq!(v["role"], "reader");
+    let bearer = format!("Bearer {tok}");
+    let bob = [("Authorization", bearer.as_str())];
+
+    // ② 带 token 查询可用；会话在 admin 视角可见（归属 + 统计 + client 定格）
+    let r = query_auth(p, "SELECT 1", None, &bob);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let r = http(p, "GET", "/api/v1/sessions", &admin, b"");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let sessions = r.json()["sessions"].as_array().unwrap().clone();
+    assert_eq!(sessions.len(), 1, "只有一个登录会话: {sessions:?}");
+    let s0 = &sessions[0];
+    assert_eq!(s0["id"], sid.as_str());
+    assert_eq!(s0["user"], "bob");
+    assert_eq!(s0["role"], "reader");
+    assert_eq!(s0["defaultDb"], "default");
+    assert!(
+        s0["queriesTotal"].as_u64().unwrap() >= 1,
+        "发起过的查询要计入统计"
+    );
+    assert!(
+        s0["client"].as_str().unwrap().contains("127.0.0.1"),
+        "client 要定格 ip:port: {:?}",
+        s0["client"]
+    );
+
+    // ③ 权限边界：reader 列会话 → 403；看**自己的**详情 → 200；踢人（即使踢自己）→ 403
+    let r = http(p, "GET", "/api/v1/sessions", &bob, b"");
+    assert_eq!(r.status, 403);
+    assert_eq!(r.code(), "FORBIDDEN");
+    let r = http(p, "GET", &format!("/api/v1/sessions/{sid}"), &bob, b"");
+    assert_eq!(
+        r.status,
+        200,
+        "本会话可自查: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let r = http(p, "DELETE", &format!("/api/v1/sessions/{sid}"), &bob, b"");
+    assert_eq!(r.status, 403);
+
+    // ④ 踢"有在跑查询"的会话：查询被取消 + token 变 401 SESSION_REVOKED
+    let r = query_auth(p, "CREATE TABLE t (a BIGINT, b BIGINT)", None, &admin);
+    assert_eq!(r.status, 200);
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/write?table=t&mode=append",
+        &[("Content-Type", "application/octet-stream"), admin[0]],
+        &ipc_two_int_cols(3000),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let sql = "SELECT count(*) FROM t a JOIN t b ON a.a > b.a".to_string();
+    let tb = format!("Bearer {tok}");
+    let run =
+        std::thread::spawn(move || query_auth(p, &sql, None, &[("Authorization", tb.as_str())]));
+    std::thread::sleep(Duration::from_millis(400));
+    // 在跑查询挂上 sessionId（踢人靠注册表反查的就是它）
+    let r = http(p, "GET", "/api/v1/queries", &admin, b"");
+    assert_eq!(r.status, 200);
+    let txt = String::from_utf8_lossy(&r.body).to_string();
+    assert!(txt.contains(&sid), "在跑查询应带 sessionId={sid}: {txt}");
+    // 踢
+    let r = http(p, "DELETE", &format!("/api/v1/sessions/{sid}"), &admin, b"");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["kicked"], sid.as_str());
+    assert_eq!(r.json()["cancelledQueries"], 1);
+    let r = run.join().expect("thread");
+    assert_eq!(
+        r.status,
+        400,
+        "被踢会话的在跑查询应被取消: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(r.code(), "QUERY_CANCELLED");
+    // token 失效 → 专属码（不是笼统 UNAUTHORIZED）
+    let r = query_auth(p, "SELECT 1", None, &bob);
+    assert_eq!(r.status, 401);
+    assert_eq!(r.code(), "SESSION_REVOKED");
+    // 再踢 → 404
+    let r = http(p, "DELETE", &format!("/api/v1/sessions/{sid}"), &admin, b"");
+    assert_eq!(r.status, 404);
+    assert_eq!(r.code(), "NOT_FOUND");
+
+    // ⑤ 凭证形态判定：伪造 sess- → SESSION_REVOKED；随机串 → UNAUTHORIZED；
+    //    错密码登录 → UNAUTHORIZED（它没有"被踢"，是单纯没登进去）
+    let r = query_auth(
+        p,
+        "SELECT 1",
+        None,
+        &[("Authorization", "Bearer sess-forged")],
+    );
+    assert_eq!(r.status, 401);
+    assert_eq!(r.code(), "SESSION_REVOKED");
+    let r = query_auth(
+        p,
+        "SELECT 1",
+        None,
+        &[("Authorization", "Bearer random-junk")],
+    );
+    assert_eq!(r.status, 401);
+    assert_eq!(r.code(), "UNAUTHORIZED");
+    let r = login(p, "bob", "wrong");
+    assert_eq!(r.status, 401);
+    assert_eq!(r.code(), "UNAUTHORIZED");
+}
+
+/// `PUT /api/v1/sessions/current/database`：设会话默认库（`USE` 的 REST 落点）。
+/// M-A 单库：唯一挂载是 `default`；未挂载的库名显式 404，拼错键 400，
+/// 无会话的请求（超级 token / Basic）403。
+#[test]
+fn session_default_db_endpoint() {
+    let srv = Server::start(&["--token", "s3cret"]);
+    let p = srv.port;
+    let admin = [("Authorization", "Bearer s3cret")];
+
+    // ① 超级 token 没有会话 → 403（没有"本会话"可设）
+    let r = http(
+        p,
+        "PUT",
+        "/api/v1/sessions/current/database",
+        &[("Content-Type", "application/json"), admin[0]],
+        br#"{"database":"default"}"#,
+    );
+    assert_eq!(r.status, 403, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.code(), "FORBIDDEN");
+
+    // ② 登录 carol → 设默认库（幂等：值同为 default）
+    let r = query_auth(
+        p,
+        "CREATE USER carol WITH PASSWORD 'pw789' ROLE writer",
+        None,
+        &admin,
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let r = login(p, "carol", "pw789");
+    assert_eq!(r.status, 200);
+    let v = r.json();
+    let tok = v["token"].as_str().unwrap().to_string();
+    let sid = v["sessionId"].as_str().unwrap().to_string();
+    let bearer = format!("Bearer {tok}");
+    let carol = [("Authorization", bearer.as_str())];
+
+    let r = http(
+        p,
+        "PUT",
+        "/api/v1/sessions/current/database",
+        &[("Content-Type", "application/json"), carol[0]],
+        br#"{"database":"default"}"#,
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["sessionId"], sid.as_str());
+    assert_eq!(r.json()["defaultDb"], "default");
+
+    // ③ 未挂载的库 → 404 NOT_FOUND（显式拒绝；M-B 多库后这里改按挂载表判）
+    let r = http(
+        p,
+        "PUT",
+        "/api/v1/sessions/current/database",
+        &[("Content-Type", "application/json"), carol[0]],
+        br#"{"database":"settle"}"#,
+    );
+    assert_eq!(r.status, 404);
+    assert_eq!(r.code(), "NOT_FOUND");
+    assert!(
+        String::from_utf8_lossy(&r.body).contains("not mounted"),
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+
+    // ④ 拼错键 → 400（严格化与 /query 同款）
+    let r = http(
+        p,
+        "PUT",
+        "/api/v1/sessions/current/database",
+        &[("Content-Type", "application/json"), carol[0]],
+        br#"{"databse":"default"}"#,
+    );
+    assert_eq!(r.status, 400);
+    assert_eq!(r.code(), "INVALID_ARGUMENT");
+
+    // ⑤ 会话自查可见 defaultDb；metrics 有会话 gauge
+    let r = http(p, "GET", &format!("/api/v1/sessions/{sid}"), &carol, b"");
+    assert_eq!(r.status, 200);
+    assert_eq!(r.json()["defaultDb"], "default");
+    let r = http(p, "GET", "/metrics", &[], b"");
+    assert!(
+        String::from_utf8_lossy(&r.body).contains("qsdb_sessions 1"),
+        "metrics 应有会话 gauge"
     );
 }

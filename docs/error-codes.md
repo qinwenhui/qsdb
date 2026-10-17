@@ -69,6 +69,7 @@ retry, category, sqlState}` 全表——驱动冷启动即可自配置映射，�
 | `INVALID_IPC` | 400 | no | request | `/write` 的 Arrow IPC 流非法（缺 schema / 截断 / 列不匹配） | 修客户端编码 | `08P01` |
 | `NOT_FOUND` | 404 | no | resource | **资源端点**（`/files`、`/tables/{t}/schema` 等）的对象不存在 | 资源名写错？ | `42704` |
 | `UNAUTHORIZED` | 401 | no | auth | 缺凭证 / 凭证无效 / token 过期 | 重新登录换 token | `28000` |
+| `SESSION_REVOKED` | 401 | no | auth | **会话已失效**（被 `DELETE /api/v1/sessions/{id}` 踢出 / 空闲回收 / 服务端重启——会话不持久化）。与 `UNAUTHORIZED` 的区分：客户端**别再拿这把 token 重试**，它永远不会好 | 重新登录换新 token | `28000` |
 | `FORBIDDEN` | 403 | no | auth | 凭证有效但角色不足（reader 写、非 admin 改配置） | 换角色或申请授权 | `42501` |
 | `TOO_MANY_QUERIES` | 503 | yes | capacity | 并发查询超上限（`--max-concurrent-queries`） | **退避重试**（此时段并发已满） | `53300` |
 | `MEMORY_PRESSURE` | 503 | yes | capacity | **全库内存预算**此刻耗尽（`--memory-budget-mb`；多为**他人占用**） | **退避重试**（别的查询跑完就好）；持续则调大预算 | `53000` |

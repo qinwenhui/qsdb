@@ -23,7 +23,7 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use qsdb::sql::SqlResult;
 use qsdb::write_buffer::{WriteBuffer, WriteBufferOptions};
@@ -35,6 +35,81 @@ use crate::error_code::ErrorCode;
 pub struct QueryEntry {
     pub ctx: Arc<qsdb::query::QueryContext>,
     pub sql: String,
+    /// 归属会话（十六批 M-A）。None = Basic / 超级 token / 开放模式的请求
+    /// （它们没有登录会话，不可被"踢"）。会话的**在跑查询**不冗余存进
+    /// Session——注册表是唯一真源，`GET /api/v1/sessions` 反查同源，
+    /// 防两处记账漂移。
+    pub session: Option<Arc<Session>>,
+}
+
+/// 会话累计统计（原子，登录后全程无锁更新）。
+#[derive(Default)]
+pub struct SessionStats {
+    /// 发起的查询总数（含 SQL 写入；注册时计）
+    pub queries_total: AtomicU64,
+    /// 写入行数累计（`/write` 端点 + SQL DML 的 rowsAffected）
+    pub rows_written: AtomicU64,
+}
+
+/// 会话（十六批 M-A）：登录签发，进程内存态，重启即失效（重登零成本）。
+///
+/// 判定用角色**永远现查**（`role_at_login` 只是展示快照——M-C 库级 grants
+/// 落地后管理员改权限要立即生效，这是 M7-A 既有纪律）。
+pub struct Session {
+    /// 服务端生成，与 token 1:1
+    pub id: String,
+    /// 登录用户名（审计与展示；`__token__` = 超级凭证，`anonymous` = 开放模式）
+    pub user: String,
+    /// 登录时角色快照（展示用）
+    pub role_at_login: qsdb::users::Role,
+    /// ip:port + User-Agent（登录时定格）
+    pub client: String,
+    /// 创建时刻（epoch ms，展示用）
+    pub created_at_ms: u64,
+    /// 最近活跃（epoch ms；**每个认证请求 touch 一次**，一次 `store(Relaxed)`）
+    pub last_active_ms: AtomicU64,
+    /// 会话默认库（`USE` 的落点；M-A 单库恒 "default"，M-B 多库由挂载表校验）
+    pub default_db: std::sync::Mutex<String>,
+    pub stats: SessionStats,
+}
+
+impl Session {
+    fn epoch_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// 空闲毫秒数（现在 − 最近活跃）。
+    fn idle_ms(&self) -> u64 {
+        Self::epoch_ms().saturating_sub(self.last_active_ms.load(Ordering::Relaxed))
+    }
+
+    /// 当前默认库（克隆出锁）。
+    fn default_db(&self) -> String {
+        self.default_db
+            .lock()
+            .map(|d| d.clone())
+            .unwrap_or_default()
+    }
+
+    /// 会话条目的 JSON 形态（列表与详情共用；`running` 由注册表反查注入）。
+    fn to_json(&self, running: Vec<String>) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "user": self.user,
+            "role": self.role_at_login.name(),
+            "client": self.client,
+            "createdAtMs": self.created_at_ms,
+            "lastActiveMs": self.last_active_ms.load(Ordering::Relaxed),
+            "idleMs": self.idle_ms(),
+            "defaultDb": self.default_db(),
+            "runningQueries": running,
+            "queriesTotal": self.stats.queries_total.load(Ordering::Relaxed),
+            "rowsWritten": self.stats.rows_written.load(Ordering::Relaxed),
+        })
+    }
 }
 
 /// 服务共享状态。
@@ -42,8 +117,12 @@ pub struct AppState {
     /// 提交事件环形缓冲（T2）。钩子在**开库时**就装好了（`main.rs`），
     /// 这里只是持一份用来服务 `GET /api/v1/watch`。
     pub commits: Arc<crate::commit_log::CommitLog>,
-    /// 用户 token 表（token → role；登录签发，进程内存态）
-    pub tokens: std::sync::Mutex<std::collections::HashMap<String, qsdb::users::Role>>,
+    /// 会话表（token → session；登录签发，进程内存态）。
+    /// 十六批 M-A：由 `token → Role` 升级而来，同一把锁、同一处签发/吊销。
+    pub sessions: std::sync::Mutex<HashMap<String, Arc<Session>>>,
+    /// 挂载库名（M-A 单库恒 `["default"]`；M-B 多库由 `--mount` 填充——
+    /// 会话默认库 / 之后的库名解析都按这份白名单校验）。
+    pub mounts: Vec<String>,
     pub db: Arc<Qsdb>,
     pub writer: WriteBuffer,
     pub token: Option<String>,
@@ -65,7 +144,8 @@ impl AppState {
         let writer = db.writer(WriteBufferOptions::default());
         Self {
             commits,
-            tokens: std::sync::Mutex::new(HashMap::new()),
+            sessions: std::sync::Mutex::new(HashMap::new()),
+            mounts: vec!["default".to_string()],
             db,
             writer,
             token,
@@ -81,11 +161,14 @@ impl AppState {
     /// 未被占用则原样采用（驱动即可零扫描地 cancel）；**已被运行中查询占用则
     /// 回退服务端生成**——不报错、不顶掉在跑的那条，调用方以返回的 ctx 为准
     /// （响应回显实际 id）。
+    ///
+    /// `session` = 归属会话（注册时计一次 `queriesTotal`；踢人靠注册表反查）。
     pub(crate) fn register_query(
         &self,
         want_id: Option<String>,
         timeout_ms: Option<u64>,
         sql: String,
+        session: Option<&Arc<Session>>,
     ) -> std::result::Result<Arc<qsdb::query::QueryContext>, String> {
         let mut q = self
             .queries
@@ -104,11 +187,15 @@ impl AppState {
             }
             _ => self.db.new_query_context(timeout_ms),
         };
+        if let Some(s) = session {
+            s.stats.queries_total.fetch_add(1, Ordering::Relaxed);
+        }
         q.insert(
             ctx.query_id.clone(),
             QueryEntry {
                 ctx: Arc::clone(&ctx),
                 sql,
+                session: session.cloned(),
             },
         );
         Ok(ctx)
@@ -119,6 +206,56 @@ impl AppState {
             q.remove(id);
         }
     }
+
+    /// **踢会话**：移出会话表 + 取消它在跑的全部查询（复用既有 cancel 路径）。
+    /// 返回取消条数；`None` = 会话不存在。空闲回收与 `DELETE /sessions/{id}` 同走这里。
+    pub(crate) fn revoke_session(&self, id: &str) -> Option<usize> {
+        let mut map = self.sessions.lock().ok()?;
+        let token = map.iter().find(|(_, s)| s.id == id)?.0.clone();
+        map.remove(&token);
+        drop(map);
+        let mut cancelled = 0;
+        if let Ok(q) = self.queries.lock() {
+            for e in q.values() {
+                if e.session.as_ref().is_some_and(|s| s.id == id) {
+                    e.ctx.cancel();
+                    cancelled += 1;
+                }
+            }
+        }
+        Some(cancelled)
+    }
+}
+
+/// 登录签发的会话 token 前缀。带此前缀却不在会话表 = 已被踢 / 服务重启过
+/// → 客户端拿到 401 `SESSION_REVOKED`（别再重试这把 token），而不是笼统的
+/// `UNAUTHORIZED`。
+const SESSION_TOKEN_PREFIX: &str = "sess-";
+
+fn new_session_id() -> String {
+    format!("s-{}", new_token())
+}
+
+fn new_session_token() -> String {
+    format!("{SESSION_TOKEN_PREFIX}{}", new_token())
+}
+
+/// 空闲回收扫描（`--session-idle-timeout-mins` 的周期体；独立成函数供单测注入）。
+/// 超时会话一律走 [`AppState::revoke_session`]（取消在跑查询 + 吊销 token）。
+pub(crate) fn sweep_idle_sessions(state: &AppState, timeout: std::time::Duration) -> usize {
+    let limit_ms = timeout.as_millis() as u64;
+    let expired: Vec<String> = match state.sessions.lock() {
+        Ok(m) => m
+            .values()
+            .filter(|s| s.idle_ms() > limit_ms)
+            .map(|s| s.id.clone())
+            .collect(),
+        Err(_) => return 0,
+    };
+    expired
+        .iter()
+        .filter_map(|id| state.revoke_session(id))
+        .count()
 }
 
 /// 简易指标（prometheus 文本输出）。
@@ -151,7 +288,7 @@ impl Metrics {
         self.write_count.fetch_add(1, Ordering::Relaxed);
         self.write_rows.fetch_add(rows, Ordering::Relaxed);
     }
-    fn render(&self, tables: usize, bytes: u64) -> String {
+    fn render(&self, tables: usize, bytes: u64, sessions: usize) -> String {
         let qc = self.query_count.load(Ordering::Relaxed);
         let wn = self.write_count.load(Ordering::Relaxed);
         format!(
@@ -163,6 +300,7 @@ impl Metrics {
              # HELP qsdb_write_seconds_avg avg write latency\n# TYPE qsdb_write_seconds_avg gauge\nqsdb_write_seconds_avg {}\n\
              # HELP qsdb_tables tables\n# TYPE qsdb_tables gauge\nqsdb_tables {}\n\
              # HELP qsdb_store_bytes total store bytes\n# TYPE qsdb_store_bytes gauge\nqsdb_store_bytes {}\n\
+             # HELP qsdb_sessions current login sessions\n# TYPE qsdb_sessions gauge\nqsdb_sessions {}\n\
              # HELP qsdb_memory_used_bytes memory in use (exec = materializing operators, cache = decoded LRU)\n# TYPE qsdb_memory_used_bytes gauge\nqsdb_memory_used_bytes{{pool=\"exec\"}} {}\nqsdb_memory_used_bytes{{pool=\"cache\"}} {}\n\
              # HELP qsdb_memory_budget_bytes global memory budget (0 = unlimited)\n# TYPE qsdb_memory_budget_bytes gauge\nqsdb_memory_budget_bytes {}\n\
              # HELP qsdb_queries_rejected_total queries rejected by admission control\n# TYPE qsdb_queries_rejected_total counter\nqsdb_queries_rejected_total{{reason=\"concurrency\"}} {}\nqsdb_queries_rejected_total{{reason=\"memory\"}} {}\n",
@@ -182,6 +320,7 @@ impl Metrics {
             },
             tables,
             bytes,
+            sessions,
             self.mem_exec.load(Ordering::Relaxed),
             self.mem_cache.load(Ordering::Relaxed),
             self.mem_budget.load(Ordering::Relaxed),
@@ -219,6 +358,8 @@ pub async fn serve(
     commits: Arc<crate::commit_log::CommitLog>,
     auto_compact_secs: Option<u64>,
     max_concurrent_queries: Option<usize>,
+    // 会话空闲回收（分钟；`Some(0)`/`None` = 永不回收，设计文档 §3.3 默认关）
+    session_idle_timeout_mins: Option<u64>,
     // 单查询执行内存闸门（字节；`Some(0)` = 显式不限，`None` = 未指定，交由
     // 配置文件 / 兜底默认决定）。
     query_memory_limit_bytes: Option<u64>,
@@ -270,6 +411,16 @@ pub async fn serve(
         .route("/api/v1/queries", get(list_queries))
         .route("/api/v1/watch", get(watch))
         .route("/api/v1/queries/{id}/cancel", post(cancel_query))
+        // 会话（十六批 M-A）：静态段先于 `{id}` 匹配，`current` 不会被参数路由吞掉
+        .route("/api/v1/sessions", get(list_sessions))
+        .route(
+            "/api/v1/sessions/current/database",
+            put(set_session_database),
+        )
+        .route(
+            "/api/v1/sessions/{id}",
+            get(get_session).delete(kick_session),
+        )
         .route("/api/v1/config", get(get_config).put(put_config))
         .layer(write_layer)
         .with_state(Arc::clone(&state));
@@ -322,6 +473,31 @@ pub async fn serve(
         })
     });
 
+    // 会话空闲回收（可选，默认关）：周期扫 `last_active_at`，超时会话按
+    // "踢人"路径清理（取消在跑查询 + 吊销 token）。默认关的理由：踢错活跃
+    // 会话的代价大于泄漏代价（会话对象 ~百字节级，泄漏是审计噪音不是内存问题）。
+    let idle_task = session_idle_timeout_mins.filter(|&m| m > 0).map(|mins| {
+        let st = Arc::clone(&state);
+        let timeout = std::time::Duration::from_secs(mins.saturating_mul(60));
+        // 扫描周期 = min(60s, 超时/2)，下限 1s——最长滞后半个超时窗
+        let period = (timeout / 2).min(std::time::Duration::from_secs(60));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(period.max(std::time::Duration::from_secs(1)));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let st = Arc::clone(&st);
+                let _ = tokio::task::spawn_blocking(move || {
+                    let n = sweep_idle_sessions(&st, timeout);
+                    if n > 0 {
+                        eprintln!("swept {n} idle session(s)");
+                    }
+                })
+                .await;
+            }
+        })
+    });
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
     // 回显**实际绑定**的地址（而非入参）：`--addr 127.0.0.1:0` 才能被用起来，
     // 测试/编排也能据此拿到真实端口。
@@ -347,13 +523,20 @@ pub async fn serve(
         let _ = tokio::signal::ctrl_c().await;
         eprintln!("shutting down…");
     };
-    let result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await;
+    // ConnectInfo：登录端点要定格客户端 ip:port（Session.client）
+    let result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await;
     if let Some(t) = compact_task {
         t.abort();
     }
     if let Some(t) = staging_task {
+        t.abort();
+    }
+    if let Some(t) = idle_task {
         t.abort();
     }
     #[cfg(feature = "flight")]
@@ -370,62 +553,117 @@ pub async fn serve(
 // handlers
 // ---------------------------------------------------------------------------
 
-/// 认证结果：角色（None = 401）。
-/// 优先级：Bearer 用户 token > Basic 用户名密码 > Bearer 超级 token > 超级 token 直连 > 开放。
-fn auth_role(state: &AppState, headers: &HeaderMap) -> Option<qsdb::users::Role> {
+/// 认证结果（十六批 M-A 起**三态**）：
+/// - `Pass`：通过。`session` = 登录签发的会话（Basic / 超级 token / 开放模式为 None）；
+/// - `Deny`：未认证（缺凭证 / 凭证无效）→ 401 `UNAUTHORIZED`；
+/// - `Revoked`：**会话形 token**（`sess-` 前缀）已不在会话表（被踢 / 空闲回收 /
+///   服务重启）→ 401 `SESSION_REVOKED`——客户端该重新登录，别再重试这把 token。
+enum Authed {
+    Pass {
+        role: qsdb::users::Role,
+        session: Option<Arc<Session>>,
+    },
+    Deny,
+    Revoked,
+}
+
+/// 认证入口。优先级：Bearer 会话 token > Basic 用户名密码 > Bearer 超级 token > 开放。
+/// 命中会话时**顺带 touch `last_active_at`**（一次 `store(Relaxed)`，无锁竞争面）。
+fn authenticate(state: &AppState, headers: &HeaderMap) -> Authed {
     let auth_header = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
-    // 用户 token 表（登录后签发的 Bearer）
     if let Some(h) = &auth_header {
         if let Some(token) = h.strip_prefix("Bearer ") {
-            if let Some(role) = state.tokens.lock().ok()?.get(token).copied() {
-                return Some(role);
+            // 会话表（登录后签发的 Bearer）：命中即 touch 并带回会话
+            let hit = state
+                .sessions
+                .lock()
+                .ok()
+                .and_then(|m| m.get(token).cloned());
+            if let Some(s) = hit {
+                s.last_active_ms
+                    .store(Session::epoch_ms(), Ordering::Relaxed);
+                return Authed::Pass {
+                    role: s.role_at_login,
+                    session: Some(s),
+                };
+            }
+            // 会话形 token 却不在表里 = 已吊销（专属码，别落进笼统 401）
+            if token.starts_with(SESSION_TOKEN_PREFIX) {
+                return Authed::Revoked;
             }
         }
     }
-    // Basic 用户名密码
+    // Basic 用户名密码（无会话：每请求现校验，~5ms 哈希）。
+    // 校验失败**落穿**到超级 token / 开放检查（与既有行为一致：完全开放的服务器
+    // 忽略凭证形态；有用户的服务器会在开放检查里 Deny）。
     if let Some(h) = &auth_header {
         if let Some(b64) = h.strip_prefix("Basic ") {
             if let Some(role) = auth_basic(state, b64) {
-                return Some(role);
+                return Authed::Pass {
+                    role,
+                    session: None,
+                };
             }
         }
     }
-    // 超级 token（向后兼容：Admin 等效）
+    // 超级 token（向后兼容：Admin 等效；无会话）
     match (&state.token, &auth_header) {
         (Some(expect), Some(h)) => {
             if h.strip_prefix("Bearer ")
                 .map(|t| t == expect.as_str())
                 .unwrap_or(false)
             {
-                return Some(qsdb::users::Role::Admin);
+                Authed::Pass {
+                    role: qsdb::users::Role::Admin,
+                    session: None,
+                }
+            } else {
+                Authed::Deny
             }
-            None
         }
-        (Some(_), None) => None,
+        (Some(_), None) => Authed::Deny,
         // 无 token 配置 = 用户体系关闭？若有用户文件则要求认证，否则开放
         (None, _) => {
             let has_users = qsdb::users::UserStore::read_all(state.db.store())
                 .map(|u| !u.is_empty())
                 .unwrap_or(false);
             if has_users {
-                None // 有用户但未认证 → 401
+                Authed::Deny // 有用户但未认证 → 401
             } else {
-                Some(qsdb::users::Role::Admin) // 完全开放（现状兼容）
+                Authed::Pass {
+                    role: qsdb::users::Role::Admin, // 完全开放（现状兼容）
+                    session: None,
+                }
             }
         }
     }
 }
 
+/// 兼容旧调用（只关心角色；`Deny`/`Revoked` 都归 None → 401）。
+fn auth_role(state: &AppState, headers: &HeaderMap) -> Option<qsdb::users::Role> {
+    match authenticate(state, headers) {
+        Authed::Pass { role, .. } => Some(role),
+        _ => None,
+    }
+}
+
+/// Basic 解码 + 校验（返回角色；用户名由登录端点另行解析）。
 fn auth_basic(state: &AppState, b64: &str) -> Option<qsdb::users::Role> {
+    basic_credentials(b64)
+        .and_then(|(user, pass)| qsdb::users::UserStore::verify(state.db.store(), &user, &pass))
+}
+
+/// Basic 头 → (用户名, 密码)。
+fn basic_credentials(b64: &str) -> Option<(String, String)> {
     use base64::Engine;
     let decoded = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
     let text = String::from_utf8(decoded).ok()?;
     let (user, pass) = text.split_once(':')?;
-    qsdb::users::UserStore::verify(state.db.store(), user, pass)
+    Some((user.to_string(), pass.to_string()))
 }
 
 /// 兼容旧调用（仅查 401）。
@@ -523,19 +761,239 @@ fn parse_bool_param(name: &str, v: Option<&str>) -> std::result::Result<bool, St
     }
 }
 
-/// POST /api/v1/auth/login：Basic 认证 → 签发 Bearer token（进程内存态）。
-async fn auth_login(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let Some(role) = auth_role(&s, &headers) else {
-        return ErrorCode::Unauthorized.response("invalid credentials");
+/// POST /api/v1/auth/login：Basic 认证 → 签发 Bearer token + **建立会话**（M-A）。
+///
+/// 会话与 token 1:1、进程内存态（重启即失效，重登零成本）。响应回显
+/// `sessionId` / `defaultDb`，客户端可自查归属（`GET /api/v1/sessions/{id}`）。
+/// 用旧 token 重登 = 另开一个新会话（旧的照常可用/可被独立踢出）。
+async fn auth_login(
+    State(s): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let auth_header = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    // **先判吊销**（在一切放行逻辑之前）：会话形 token 已不在表 = 被踢 / 重启过
+    // ——别让它换到新会话，直接 401 `SESSION_REVOKED`。
+    if let Some(h) = &auth_header {
+        if let Some(token) = h.strip_prefix("Bearer ") {
+            if token.starts_with(SESSION_TOKEN_PREFIX) {
+                let known = s
+                    .sessions
+                    .lock()
+                    .map(|m| m.contains_key(token))
+                    .unwrap_or(false);
+                if !known {
+                    return ErrorCode::SessionRevoked
+                        .response("session revoked or expired; re-login");
+                }
+            }
+        }
+    }
+    // 凭证解析：(用户名, 角色)。失败 → 各自的 401。
+    let cred = (|| {
+        let h = auth_header.as_deref()?;
+        if let Some(b64) = h.strip_prefix("Basic ") {
+            let (user, pass) = basic_credentials(b64)?;
+            let role = qsdb::users::UserStore::verify(s.db.store(), &user, &pass)?;
+            return Some((user, role));
+        }
+        if let Some(token) = h.strip_prefix("Bearer ") {
+            // 旧会话重登：沿用其身份
+            if let Some(old) = s.sessions.lock().ok().and_then(|m| m.get(token).cloned()) {
+                return Some((old.user.clone(), old.role_at_login));
+            }
+            if s.token.as_deref() == Some(token) {
+                return Some(("__token__".to_string(), qsdb::users::Role::Admin));
+            }
+        }
+        None
+    })();
+    let (user, role) = match cred {
+        Some(c) => c,
+        None => {
+            // 完全开放（无用户 + 无超级 token）：照常可登（anonymous 会话）；
+            // 其余（配了凭证但没给对）→ 401。
+            let has_users = qsdb::users::UserStore::read_all(s.db.store())
+                .map(|u| !u.is_empty())
+                .unwrap_or(false);
+            if s.token.is_none() && !has_users {
+                ("anonymous".to_string(), qsdb::users::Role::Admin)
+            } else {
+                return ErrorCode::Unauthorized.response("invalid credentials");
+            }
+        }
     };
-    let token = new_token();
-    if let Ok(mut t) = s.tokens.lock() {
-        t.insert(token.clone(), role);
+    let token = new_session_token();
+    let session = Arc::new(Session {
+        id: new_session_id(),
+        user: user.clone(),
+        role_at_login: role,
+        client: format!(
+            "{}; {}",
+            addr,
+            headers
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-")
+        ),
+        created_at_ms: Session::epoch_ms(),
+        last_active_ms: AtomicU64::new(Session::epoch_ms()),
+        default_db: std::sync::Mutex::new("default".to_string()),
+        stats: SessionStats::default(),
+    });
+    let session_id = session.id.clone();
+    if let Ok(mut m) = s.sessions.lock() {
+        m.insert(token.clone(), session);
     }
     Json(serde_json::json!({
         "token": token,
+        "sessionId": session_id,
         "role": role.name(),
-        "note": "process-lifetime token; restart requires re-login"
+        "defaultDb": "default",
+        "note": "process-lifetime token + session; restart requires re-login"
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// 会话端点（十六批 M-A；设计文档 §3.2）
+// ---------------------------------------------------------------------------
+
+/// `GET /api/v1/sessions`：列全部会话（admin 专属）。
+///
+/// 在跑查询由**查询注册表反查**（唯一真源，不冗余存进 Session）。
+async fn list_sessions(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let Some(role) = auth_role(&s, &headers) else {
+        return ErrorCode::Unauthorized.response("unauthorized");
+    };
+    if !role.is_admin() {
+        return ErrorCode::Forbidden.response("session list requires admin");
+    }
+    // 注册表反查：session id → 在跑 query ids
+    let running: HashMap<String, Vec<String>> = match s.queries.lock() {
+        Ok(q) => {
+            let mut m: HashMap<String, Vec<String>> = HashMap::new();
+            for (qid, e) in q.iter() {
+                if let Some(sess) = &e.session {
+                    m.entry(sess.id.clone()).or_default().push(qid.clone());
+                }
+            }
+            m
+        }
+        Err(_) => return ErrorCode::Internal.response("registry poisoned"),
+    };
+    let mut entries: Vec<Arc<Session>> = match s.sessions.lock() {
+        Ok(m) => m.values().cloned().collect(),
+        Err(_) => return ErrorCode::Internal.response("session table poisoned"),
+    };
+    entries.sort_by(|a, b| (a.created_at_ms, &a.id).cmp(&(b.created_at_ms, &b.id)));
+    let list: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|sess| sess.to_json(running.get(&sess.id).cloned().unwrap_or_default()))
+        .collect();
+    let count = list.len();
+    Json(serde_json::json!({ "sessions": list, "count": count })).into_response()
+}
+
+/// `GET /api/v1/sessions/{id}`：单会话详情（admin 或**本会话**自查）。
+async fn get_session(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let (role, own) = match authenticate(&s, &headers) {
+        Authed::Pass { role, session } => (role, session.is_some_and(|x| x.id == id)),
+        Authed::Revoked => return ErrorCode::SessionRevoked.response("session revoked; re-login"),
+        Authed::Deny => return ErrorCode::Unauthorized.response("unauthorized"),
+    };
+    if !role.is_admin() && !own {
+        return ErrorCode::Forbidden
+            .response("session detail requires admin or the session itself");
+    }
+    let running: Vec<String> = match s.queries.lock() {
+        Ok(q) => q
+            .iter()
+            .filter(|(_, e)| e.session.as_ref().is_some_and(|x| x.id == id))
+            .map(|(qid, _)| qid.clone())
+            .collect(),
+        Err(_) => return ErrorCode::Internal.response("registry poisoned"),
+    };
+    let found = s
+        .sessions
+        .lock()
+        .ok()
+        .and_then(|m| m.values().find(|x| x.id == id).cloned());
+    match found {
+        Some(sess) => Json(sess.to_json(running)).into_response(),
+        None => ErrorCode::NotFound.response(format!("session {id} not found")),
+    }
+}
+
+/// `DELETE /api/v1/sessions/{id}`：**踢人**（admin 专属）——取消在跑的全部查询
+/// （复用既有 cancel 路径）+ 吊销 token。被踢会话的下一个请求 401
+/// `SESSION_REVOKED`。
+async fn kick_session(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(role) = auth_role(&s, &headers) else {
+        return ErrorCode::Unauthorized.response("unauthorized");
+    };
+    if !role.is_admin() {
+        return ErrorCode::Forbidden.response("kicking sessions requires admin");
+    }
+    match s.revoke_session(&id) {
+        Some(cancelled) => {
+            Json(serde_json::json!({ "kicked": id, "cancelledQueries": cancelled })).into_response()
+        }
+        None => ErrorCode::NotFound.response(format!("session {id} not found")),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionDatabaseBody {
+    database: String,
+}
+
+/// `PUT /api/v1/sessions/current/database`：设**本会话**默认库
+/// （SQL `USE db` 的 REST 落点；body `{"database": "…"}`）。
+///
+/// 库名按挂载白名单校验——不存在的库**显式 404**（M-A 单库恒 `default`；
+/// M-B 多库后由 `--mount` 填充这份白名单）。无会话的请求（Basic / 超级
+/// token / 开放模式）显式 403：它们没有"本会话"可设。
+async fn set_session_database(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    StructuredJson(body): StructuredJson<SessionDatabaseBody>,
+) -> Response {
+    let session = match authenticate(&s, &headers) {
+        Authed::Pass { session, .. } => session,
+        Authed::Revoked => return ErrorCode::SessionRevoked.response("session revoked; re-login"),
+        Authed::Deny => return ErrorCode::Unauthorized.response("unauthorized"),
+    };
+    let Some(sess) = session else {
+        return ErrorCode::Forbidden.response(
+            "setting a default database requires a login session (POST /api/v1/auth/login)",
+        );
+    };
+    if !s.mounts.iter().any(|m| m == &body.database) {
+        return ErrorCode::NotFound.response(format!(
+            "database {:?} is not mounted (mounted: {})",
+            body.database,
+            s.mounts.join(", ")
+        ));
+    }
+    if let Ok(mut d) = sess.default_db.lock() {
+        *d = body.database; // 保存失败的唯一形态是锁中毒（进程已坏），由后续请求暴露
+    }
+    Json(serde_json::json!({
+        "sessionId": sess.id,
+        "defaultDb": sess.default_db(),
     }))
     .into_response()
 }
@@ -662,6 +1120,7 @@ async fn health(State(_s): State<Arc<AppState>>) -> impl IntoResponse {
 
 async fn metrics(State(s): State<Arc<AppState>>) -> Response {
     refresh_mem_gauges(&s);
+    let sessions = s.sessions.lock().map(|m| m.len()).unwrap_or(0);
     let (tables, bytes) = match tokio::task::spawn_blocking({
         let db = Arc::clone(&s.db);
         move || db.stats()
@@ -676,7 +1135,7 @@ async fn metrics(State(s): State<Arc<AppState>>) -> Response {
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4",
         )],
-        s.metrics.render(tables, bytes),
+        s.metrics.render(tables, bytes, sessions),
     )
         .into_response()
 }
@@ -760,8 +1219,12 @@ async fn query(
     headers: HeaderMap,
     StructuredJson(body): StructuredJson<QueryBody>,
 ) -> Response {
-    let Some(role) = auth_role(&s, &headers) else {
-        return ErrorCode::Unauthorized.response("unauthorized");
+    let (role, session) = match authenticate(&s, &headers) {
+        Authed::Pass { role, session } => (role, session),
+        Authed::Revoked => {
+            return ErrorCode::SessionRevoked.response("session revoked or expired; re-login");
+        }
+        Authed::Deny => return ErrorCode::Unauthorized.response("unauthorized"),
     };
     s.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
     // format 值校验（拼错如 "arrow" 此前静默回 JSON——静默失败在协议面危险）
@@ -800,7 +1263,7 @@ async fn query(
             }
         },
     };
-    let ctx = match s.register_query(want_id, timeout_ms, body.sql.clone()) {
+    let ctx = match s.register_query(want_id, timeout_ms, body.sql.clone(), session.as_ref()) {
         Ok(ctx) => ctx,
         Err(msg) => {
             s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
@@ -934,6 +1397,9 @@ async fn query(
                 // **结构化回执**（J12）：`command` + `rowsAffected` 让驱动不必解析
                 // `message` 文案（码表文档明确"文案不做兼容承诺"）。
                 // 字段只在有意义时出现（DDL 无行数）——老客户端读 `message` 不受影响。
+                if let (Some(s), Some(n)) = (&session, rows_affected) {
+                    s.stats.rows_written.fetch_add(n, Ordering::Relaxed);
+                }
                 let mut body = serde_json::json!({
                     "queryId": query_id,
                     "message": message,
@@ -994,9 +1460,13 @@ async fn write(
     StructuredQuery(p): StructuredQuery<WriteParams>,
     body: axum::body::Bytes,
 ) -> Response {
-    if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
-        return ErrorCode::Unauthorized.response("unauthorized");
-    }
+    let session = match authenticate(&s, &headers) {
+        Authed::Pass { session, .. } => session,
+        Authed::Revoked => {
+            return ErrorCode::SessionRevoked.response("session revoked or expired; re-login");
+        }
+        Authed::Deny => return ErrorCode::Unauthorized.response("unauthorized"),
+    };
     if s.db.read_only() {
         return ErrorCode::ReadOnly.response("database is read-only");
     }
@@ -1145,6 +1615,9 @@ async fn write(
     match result {
         Ok(Ok(rows)) => {
             s.metrics.observe_write(elapsed, rows);
+            if let Some(sess) = &session {
+                sess.stats.rows_written.fetch_add(rows, Ordering::Relaxed);
+            }
             Json(serde_json::json!({
                 "rows": rows,
                 "mode": mode_out,
@@ -1391,6 +1864,7 @@ async fn list_queries(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Res
                     "elapsedMs": e.ctx.elapsed().as_millis() as u64,
                     "memoryBytes": e.ctx.memory_used(),
                     "cancelled": e.ctx.is_cancelled(),
+                    "sessionId": e.session.as_ref().map(|x| x.id.clone()),
                 })
             })
             .collect(),
@@ -1815,3 +2289,122 @@ fn _body_hint(_: Body) {}
 // HashMap 引用占位
 #[allow(unused)]
 fn _hm_hint(_: HashMap<String, String>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 空库 + 空 AppState（内存态会话表不落盘，Qsdb 只是给注册表供给 ctx）。
+    fn test_state() -> (Arc<AppState>, std::path::PathBuf) {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("qsdb_session_ut_{}_{}", std::process::id(), uniq));
+        let _ = std::fs::remove_dir_all(&root);
+        let db = Arc::new(Qsdb::open(&root, qsdb::QsdbOptions::default()).expect("open temp db"));
+        let state = Arc::new(AppState::new(
+            db,
+            None,
+            crate::commit_log::CommitLog::new(),
+            0,
+        ));
+        (state, root)
+    }
+
+    /// 造一个会话；`idle_ms_ago` = 把 last_active 拨回多少毫秒（测空闲回收）。
+    /// 返回 (token, session)。
+    fn make_session(id: &str, idle_ms_ago: u64) -> (String, Arc<Session>) {
+        let now = Session::epoch_ms();
+        let s = Arc::new(Session {
+            id: id.to_string(),
+            user: "bob".to_string(),
+            role_at_login: qsdb::users::Role::Reader,
+            client: "127.0.0.1:1; ut".to_string(),
+            created_at_ms: now,
+            last_active_ms: AtomicU64::new(now - idle_ms_ago),
+            default_db: std::sync::Mutex::new("default".to_string()),
+            stats: SessionStats::default(),
+        });
+        (new_session_token(), s)
+    }
+
+    /// M-A 验收第一条：踢会话 ⇒ 它的在跑查询全取消、别人的不连坐、token 失效。
+    #[test]
+    fn revoke_kicks_session_and_cancels_its_queries() {
+        let (state, root) = test_state();
+        let (tok_a, sa) = make_session("s-a", 0);
+        let (tok_b, sb) = make_session("s-b", 0);
+        state
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(tok_a.clone(), Arc::clone(&sa));
+        state
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(tok_b.clone(), Arc::clone(&sb));
+
+        // a 跑两条（其中一条带客户端 id）、b 跑一条
+        let q1 = state
+            .register_query(None, None, "SELECT 1".into(), Some(&sa))
+            .unwrap();
+        let q2 = state
+            .register_query(Some("drv-x".into()), None, "SELECT 2".into(), Some(&sa))
+            .unwrap();
+        let q3 = state
+            .register_query(None, None, "SELECT 3".into(), Some(&sb))
+            .unwrap();
+        assert_eq!(state.queries.lock().unwrap().len(), 3);
+        assert_eq!(
+            sa.stats.queries_total.load(Ordering::Relaxed),
+            2,
+            "注册时计一次 queriesTotal"
+        );
+
+        let cancelled = state.revoke_session("s-a").expect("session exists");
+        assert_eq!(cancelled, 2, "a 的两条都该被取消");
+        assert!(q1.is_cancelled() && q2.is_cancelled());
+        assert!(!q3.is_cancelled(), "b 的查询不该被连坐");
+        // a 的 token 已失效、b 的还在
+        assert!(!state.sessions.lock().unwrap().contains_key(&tok_a));
+        assert!(state.sessions.lock().unwrap().contains_key(&tok_b));
+        // 再踢一次 → None（不存在）
+        assert!(state.revoke_session("s-a").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 空闲回收只踢超时的：活跃会话原样保留。
+    #[test]
+    fn sweep_idle_kicks_only_expired() {
+        let (state, root) = test_state();
+        let (tok_old, s_old) = make_session("s-old", 10 * 60 * 1000); // 空闲 10 分钟
+        let (tok_new, s_new) = make_session("s-new", 0);
+        {
+            let mut m = state.sessions.lock().unwrap();
+            m.insert(tok_old.clone(), Arc::clone(&s_old));
+            m.insert(tok_new.clone(), Arc::clone(&s_new));
+        }
+        let swept = sweep_idle_sessions(&state, std::time::Duration::from_secs(60));
+        assert_eq!(swept, 1, "只回收超时那一个");
+        let alive: Vec<String> = state
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .map(|s| s.id.clone())
+            .collect();
+        assert_eq!(alive, vec!["s-new"]);
+        assert!(state.sessions.lock().unwrap().contains_key(&tok_new));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 会话 token 前缀契约：签发的都在 `sess-` 下——这是"吊销可判定"的根据
+    /// （不在表里的 `sess-*` ⇒ 401 SESSION_REVOKED，而非笼统 401）。
+    #[test]
+    fn session_tokens_are_prefixed() {
+        let (tok, _) = make_session("s-x", 0);
+        assert!(tok.starts_with(SESSION_TOKEN_PREFIX));
+        assert!(new_session_id().starts_with("s-"));
+    }
+}

@@ -16,7 +16,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use qsdb::{NotFoundKind, QsdbError};
 
-/// 目录里的全部错误码（20 个）。
+/// 目录里的全部错误码（25 个）。
 ///
 /// 顺序 = 文档 §三 表格顺序 = 目录端点输出顺序，便于对账。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +43,9 @@ pub enum ErrorCode {
     InvalidIpc,
     // ---- auth ----
     Unauthorized,
+    /// 会话已失效（被踢出 / 空闲回收 / 服务端重启）——与"从未认证"分开：
+    /// 客户端不该再拿这把 token 重试，直接重新登录（十六批 M-A）
+    SessionRevoked,
     Forbidden,
     // ---- capacity ----
     TooManyQueries,
@@ -57,7 +60,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// 全量清单（目录端点与漂移测试的唯一来源）。
-    pub const ALL: [ErrorCode; 24] = [
+    pub const ALL: [ErrorCode; 25] = [
         Self::QueryTimeout,
         Self::QueryCancelled,
         Self::QueryMemoryLimit,
@@ -75,6 +78,7 @@ impl ErrorCode {
         Self::InvalidIpc,
         Self::NotFound,
         Self::Unauthorized,
+        Self::SessionRevoked,
         Self::Forbidden,
         Self::TooManyQueries,
         Self::MemoryPressure,
@@ -104,6 +108,7 @@ impl ErrorCode {
             Self::InvalidIpc => "INVALID_IPC",
             Self::NotFound => "NOT_FOUND",
             Self::Unauthorized => "UNAUTHORIZED",
+            Self::SessionRevoked => "SESSION_REVOKED",
             Self::Forbidden => "FORBIDDEN",
             Self::TooManyQueries => "TOO_MANY_QUERIES",
             Self::MemoryPressure => "MEMORY_PRESSURE",
@@ -134,7 +139,7 @@ impl ErrorCode {
                 StatusCode::CONFLICT
             }
             Self::NotFound => StatusCode::NOT_FOUND,
-            Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::Unauthorized | Self::SessionRevoked => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::TooManyQueries | Self::MemoryPressure | Self::ReadOnly => {
                 StatusCode::SERVICE_UNAVAILABLE
@@ -171,7 +176,7 @@ impl ErrorCode {
             | Self::CursorTooOld
             | Self::NotFound => "resource",
             Self::InvalidArgument | Self::InvalidIpc => "request",
-            Self::Unauthorized | Self::Forbidden => "auth",
+            Self::Unauthorized | Self::SessionRevoked | Self::Forbidden => "auth",
             Self::TooManyQueries | Self::MemoryPressure | Self::ReadOnly => "capacity",
             Self::MetadataError | Self::IoError => "storage",
             Self::Internal => "internal",
@@ -204,7 +209,7 @@ impl ErrorCode {
             Self::InvalidArgument => "42000",
             Self::InvalidIpc => "08P01",
             Self::NotFound => "42704",
-            Self::Unauthorized => "28000",
+            Self::Unauthorized | Self::SessionRevoked => "28000",
             Self::Forbidden => "42501",
             Self::TooManyQueries => "53300",
             Self::MemoryPressure => "53000",
@@ -287,7 +292,7 @@ impl ErrorCode {
             Self::QueryCancelled => Code::Cancelled,
             Self::TooManyQueries | Self::MemoryPressure => Code::ResourceExhausted,
             Self::ReadOnly => Code::FailedPrecondition,
-            Self::Unauthorized => Code::Unauthenticated,
+            Self::Unauthorized | Self::SessionRevoked => Code::Unauthenticated,
             Self::Forbidden => Code::PermissionDenied,
             Self::Unsupported => Code::Unimplemented,
             Self::NotFound => Code::NotFound,
