@@ -268,3 +268,106 @@ qsdb server --path /data/db --addr 0.0.0.0:9430 --writer-epoch 1
 
 默认全 0 时两项都是 no-op（与旧版行为完全一致）；只有运维显式抬高过 epoch 之后，
 忘配 / 配小的进程才会被拦下。
+
+---
+
+## 附录 A：调试与剖面开关（`QSDB_*` 环境变量全量收编，十六批 M-D）
+
+**命名纪律**：`QSDB_NO_*` = 关掉一项已落地的优化（A/B 对照与回归锚点用）；
+`QSDB_*_PROF` / `*_TIMING` = 剖面计时（stderr 输出）；`QSDB_*_CAP`/`QSDB_*_PARTS` =
+探针/调参上限。**存在性即生效**（`is_ok()` 判定，值不重要），除非另行标注。
+
+### A.1 性能 A/B 开关（**生产不要设**——关掉的都是已验收的默认优化）
+
+| 开关 | 关掉什么 | 出处 |
+|---|---|---|
+| `QSDB_NO_FUSED_JOIN` | join 融合执行（回逐算子物化） | join 优化批 |
+| `QSDB_NO_JOIN_DENSE` | join build 侧的稠密直索引（回哈希表路） | join 批；`join_group` 形态 |
+| `QSDB_NO_DISTINCT_V2` | `SELECT DISTINCT` utf8 单列 v2 路（回 v1） | distinct v2 批 |
+| `QSDB_NO_DISTINCT_FUSE` | Distinct+聚合融合（回两算子串行） | 融合批 |
+| `QSDB_JOIN_NO_PROJ` | join build 侧键列投影（回整宽物化） | 三表 join 实测批 |
+| `QSDB_NO_DENSE_GROUP` | 整型 group-by 密集直索引（回槽表路） | 十五批 |
+| `QSDB_SCAN_SERIAL` | 扫描并行化（强制单线程；"并行改变行为"的 A/B 用） | par_scan |
+
+### A.2 探针 / 调参（有语义的值；生产默认即甜点，别乱动）
+
+| 开关 | 默认 | 语义 |
+|---|---|---|
+| `QSDB_SHARDS` | 4（**封顶 16**） | 聚合/去重并行分片数。实测：16 分片内存 ~3× 只快 ~20%（5M 行口径）；**默认 4 即甜点**。计划级并行 merge 未做前，更高分片主要吃内存 |
+| `QSDB_DENSE_GROUP_CAP` | 8_000_000 槽（=32MB） | 整型密集直索引的值域跨度上限；超过即坠回哈希槽表。调大 = 更宽的值域走密集路（内存线性涨：4B/槽）；进程内测试可改（每次进批读 env） |
+| `QSDB_DISTINCT_PARTS` | 按基数自适应 | Distinct 去重的强制分区数（测试注入用） |
+
+### A.3 剖面 / 计时（**stderr 打点**，性能调查用；开着会拖慢并污染日志）
+
+| 开关 | 输出内容 |
+|---|---|
+| `QSDB_JOIN_PROF` | join 各阶段计时与行数（build/probe/补轮） |
+| `QSDB_AGG_PROF` | 聚合各阶段计时 |
+| `QSDB_AGG_TIMING` | 聚合语句级分段计时 |
+| `QSDB_WRITE_PROF` | 写路径分段计时（对齐/落段） |
+| `QSDB_INSERT_PROF` | INSERT 分段计时（对齐/落段/批数） |
+| `QSDB_DISTINCT_PROF` | 去重各阶段计时（含溢出） |
+| `QSDB_OCC_PROF` | 远端 OCC 提交的重试/竞争采样（hdfs/s3 后端） |
+| `QSDB_JOIN_SHARD_PROF` | join 分片级剖面 |
+| `QSDB_PLAN_DUMP` | 计划形状 dump（曾抓出多表 join 退化叉积 113× 的形状错） |
+
+---
+
+## 附录 B：生产部署模板（十六批 M-D）
+
+### B.1 单库生产基线
+
+```bash
+qsdb server --path /data/qsdb   --addr 0.0.0.0:9430   --memory-budget-mb 4096   --query-memory-limit-mb 4096   --max-concurrent-queries 0   --cache-mb 256
+# --memory-budget-mb 4096        进程执行+缓存总闸；按机器内存 ~1/4 起
+# --query-memory-limit-mb 4096   单查询配额；大聚合单条超限时才调大
+# --max-concurrent-queries 0     默认不限；过载保护需要时显式给（见 B.3）
+# --cache-mb 256                 热数据缓存；宽投影快查显式调大（代价见启动期表）
+```
+
+安全基线二选一：`--token <运维密钥>`（运维后门 + 最简）**或**建用户
+（`CREATE USER … ROLE …` / `user-add`，库级 grants 见 §五·五）——
+**建了用户即要求认证**；两者都配时用户 token 优先。
+
+### B.2 多库多租户形（M-B/M-C）
+
+```bash
+qsdb server --path /data/qsdb-default   --mount settle=/data/qsdb-settle,budget-mb=2048   --mount sales=/data/qsdb-sales,read-only   --token <运维密钥>
+# 库级授权：管理面走 PUT /api/v1/users/{name}/grants（热改即生效）或
+#   qsdb admin user-add op_settle --grant settle=writer
+# 客户端：SQL 限定名 settle.t 直达（授权同判）；或登录后 USE settle
+```
+
+内存规划：**每挂载独立预算**（默认 4096MB/挂载，`budget-mb=` 覆写）——
+N 个挂载的进程上界 ≈ Σ(各挂载预算) + 各挂载缓存（`--cache-mb` 每挂载一份）。
+并发闸与用户面是**实例级**的。
+
+### B.3 容量三角与并发闸推荐值（实测出处：`多库访问控制与会话设计.md` §七）
+
+| 维度 | 实测口径（16 核，5M 行基准表） |
+|---|---|
+| 轻查询（count/点查） | **~3400 qps @128 并发**，p95<50ms，RSS 315MB——不构成瓶颈 |
+| 重聚合（10 万行结果集） | server 容量 **~16 qps**（每查询 4 分片 ×16 核即饱和）；之后**加并发只加延迟** |
+| 远程结果传输 | 10 万行结果集远程口径 ~5 qps——**结果集大小是远程吞吐第一决定因素** |
+
+**公式**：`并发闸推荐值 ≈ 期望重聚合并发数 + 轻查询余量`。纯 BI 看板/点查
+形态可保持 0（不限）；混合负载建议 **16~32**（超限 503 `TOO_MANY_QUERIES`
+可退避重试，客户端做指数退避）。内存三角：全局预算（B.1）× 单查询配额 ×
+并发条数——预算是真正的进程上界，闸只管条数。
+
+### B.4 会话与观测
+
+- 会话空闲回收：批处理/长连接场景保持默认关；面向不可信客户端的部署给
+  `--session-idle-timeout-mins 60`（超时按踢人路径清理）。
+- 观测三件：`GET /metrics`（prometheus：请求/错误/延迟/内存/拒绝/会话数）、
+  `GET /api/v1/sessions`（谁连着、在跑什么、多久没动）、
+  `GET /api/v1/queries`（在跑查询明细，可 cancel）。
+- 提交事件订阅（qsdb-sync 增量）：`GET /api/v1/watch`（事件带 `database` 字段；
+  多挂载共用一个游标序列）。
+
+### B.5 已知边界（v1 定案，部署前须知）
+
+- **跨库 JOIN/事务不支持**（501 显式拒）——需要关联的数据放同一个挂载。
+- COPY 湖导出、Flight 数据面固定走 default 挂载（限定名路由不覆盖这两面）。
+- `/files` 物理复制源固定 default 挂载（多挂载复制按各库独立起 sync 任务）。
+- 会话不持久化：重启即失效，客户端重登即可（批处理场景零成本）。
