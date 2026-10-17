@@ -868,19 +868,21 @@ fn date_format_eval(col: &ArrayRef, parts: &[FmtPart]) -> Result<ArrayRef> {
         // 一个形状卡住 38 个块 ⇒ 这里先转时间戳再走同一条渲染路。
         arrow::datatypes::DataType::Utf8 | arrow::datatypes::DataType::LargeUtf8 => {
             let ts = arrow::datatypes::DataType::Timestamp(TimeUnit::Nanosecond, None);
+            // ⚠️ **safe = true**：转不动的行给 **NULL**，不报错 —— Spark 非 ANSI
+            // 语义（`date_format('管理员','yyyy-MM-dd')` ⇒ NULL）。此前 `safe:false`
+            // 整批报错：L10-01 的输入列在本切片里混着人名（'管理员'），一条坏行
+            // 挂掉整批结算 —— 与"除零 ⇒ NULL"同一口径：数据相关的运行期状况
+            // 不该让整批挂掉。
             let casted = arrow::compute::cast_with_options(
                 col.as_ref(),
                 &ts,
                 &arrow::compute::CastOptions {
-                    safe: false,
+                    safe: true,
                     format_options: Default::default(),
                 },
             )
             .map_err(|e| {
-                QsdbError::type_err(format!(
-                    "date_format: 字符串参数转 TIMESTAMP 失败（{e}）—— \
-                     预期形如 'yyyy-MM-dd HH:mm:ss'"
-                ))
+                QsdbError::type_err(format!("date_format: 字符串列转 TIMESTAMP 失败（{e}）"))
             })?;
             return date_format_eval(&casted, parts);
         }

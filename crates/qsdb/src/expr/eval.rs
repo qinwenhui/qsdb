@@ -563,6 +563,16 @@ fn decimal_arith(op: ArithOp, l: &EvalVal, r: &EvalVal, ty: &LogicalType) -> Res
         result_meta.precision,
         result_meta.scale,
     ));
+    // **两侧都是 Const ⇒ 结果保持 Const（长度 1）** —— 与非十进制分支的
+    // `both_const → Const` 同一条纪律。
+    //
+    // ⚠️ 漏了这一收口的后果不是"多占一行"：`(1+(0.2))` 这类**常量×常量**返回
+    // `Arr(len 1)`，外层 `列 × 它` 时 `len_hint` 取到 N、而 Arr 侧**不会**再
+    // `materialize_const` ⇒ `value(1)` 越界 panic。语料 L1-01/L1-16 在旧切片上
+    // 输入恰好为空（0 行循环不到 i=1）一直没炸，换到有数据的切片当场爆。
+    if matches!(l, EvalVal::Const(_)) && matches!(r, EvalVal::Const(_)) {
+        return Ok(EvalVal::Const(Arc::new(arr)));
+    }
     Ok(EvalVal::Arr(Arc::new(arr)))
 }
 
