@@ -10,6 +10,20 @@ import sys
 BLK = sys.argv[2]
 ENGINE = sys.argv[1]
 
+# 与 run_dag.py --pdate-partitioned 同一套改写（profile 口径一致）
+import os
+import re
+_ptabs = [n for n in sorted(os.listdir("/home/qctc/qsdb-js/default"))
+          if n.startswith("t_") and n.endswith("_p")
+          and os.path.isdir("/home/qctc/qsdb-js/default/" + n)]
+_ptabs.sort(key=len, reverse=True)
+
+
+def to_partitioned(sql):
+    for b in _ptabs:
+        sql = re.sub(r"\b%s\b" % re.escape(b[:-2]), b, sql)
+    return sql
+
 
 def split_top_level(s, sep=","):
     """按括号深度切逗号。"""
@@ -94,7 +108,16 @@ if ENGINE == "qsdb":
     for i, nm in enumerate(names):
         prefix = "WITH " + ", ".join(c.strip() for c in ctes[: i + 1])
         q = "%s SELECT * FROM %s" % (prefix, nm)
-        print("%-6s %s" % (nm, run(q)), flush=True)
+        # 三遍取中位：第一遍含目录/缓存冷起，后两遍是稳态
+        import time as _t
+        results = []
+        for _ in range(3):
+            t0 = _t.perf_counter()
+            r = run(to_partitioned(q))
+            results.append((int((_t.perf_counter() - t0) * 1000), r))
+        results.sort()
+        ms, r = results[1]
+        print("%-6s %6d ms  %8s rows" % (nm, ms, r), flush=True)
 else:
     from pyspark.sql import SparkSession
     spark = (SparkSession.builder.appName("bisect")

@@ -88,6 +88,12 @@ def main():
     # 原表不动 ⇒ 想回退就把这个开关去掉。
     ap.add_argument("--pdate-partitioned", action="store_true",
                     help="表名改指向 <t>_p 分区副本（A/B 用）")
+    # **server 模式**（生产形态）：`qsdb server` 常驻，全部查询走
+    # `POST /api/v1/query` —— 热数据缓存跨查询共享（CLI 子进程模式每块冷起）。
+    # 内存口径随之改变：不再有"每块 VmHWM"，采的是 **server 进程的 VmHWM**
+    #（结束后读一次，就是常驻形态的真实足迹）。
+    ap.add_argument("--server", default=None, metavar="URL",
+                    help="如 http://127.0.0.1:9432 —— 走常驻 server 而不是每块起子进程")
     args = ap.parse_args()
 
     dag = json.load(open(args.dag, encoding="utf-8"))
@@ -135,6 +141,19 @@ def main():
     out_rows = []
     t_start = time.perf_counter()
 
+    # server 模式的 HTTP 客户端（stdlib，Python 3.6 兼容；csv 格式零解析歧义）
+    server_url = args.server
+    if server_url:
+        import urllib.request
+
+        def server_query(sql, timeout=120):
+            body = json.dumps({"sql": sql, "format": "csv"}).encode("utf-8")
+            req = urllib.request.Request(
+                server_url.rstrip("/") + "/api/v1/query", data=body,
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status, resp.read().decode("utf-8", "replace")
+
     def run_block(task, blk):
         path = os.path.join(args.dir, blk + ".sql")
         sql = open(path, encoding="utf-8").read().strip().rstrip().rstrip(";")
@@ -145,6 +164,18 @@ def main():
         if args.write and args.engine == "qsdb":
             tname = "bench_" + blk.replace("-", "_")
             sql = "CREATE TABLE %s AS %s" % (tname, sql)
+        if server_url:
+            t0 = time.perf_counter()
+            try:
+                status, txt = server_query(sql)
+                ok = status == 200
+                # csv 首行是表头；行数 = 数据行（空结果只有表头，甚至没有）
+                rows = max(0, txt.count("\n") - 1) if txt else 0
+                msg = "" if ok else " ".join(txt.split())[:300]
+            except Exception as e:  # noqa: BLE001
+                rows, ok, msg = 0, False, " ".join(str(e).split())[:300]
+            ms = int((time.perf_counter() - t0) * 1000)
+            return ("OK" if ok else "ERR", task, blk, ms, 0, rows, msg)
         if args.engine == "qsdb":
             tmp = "/tmp/qsdbrun_%s_%s.txt" % (task, blk)
             ok, ms, rss, txt = run_qsdb(sql, tmp)
@@ -201,6 +232,21 @@ def main():
     err = sum(1 for r in out_rows if r.startswith("ERR\t"))
     total = int((time.perf_counter() - t_start) * 1000)
     print("=== %s：OK %d ERR %d  总墙钟 %d ms ===" % (args.engine, ok, err, total), flush=True)
+    if server_url:
+        # 常驻形态的内存口径：采 server 进程的 VmHWM（峰值 RSS 高水位）
+        import re as _re2
+        pid = subprocess.run(["pgrep", "-f", "qsdb server --path %s" % DB],
+                             stdout=subprocess.PIPE).stdout.decode().split()
+        if pid:
+            try:
+                with open("/proc/%s/status" % pid[0]) as f:
+                    for line in f:
+                        if line.startswith("VmHWM:"):
+                            print("server VmHWM: %s kB (pid %s)" % (line.split()[1], pid[0]),
+                                  flush=True)
+                            break
+            except OSError:
+                pass
 
 
 main()
