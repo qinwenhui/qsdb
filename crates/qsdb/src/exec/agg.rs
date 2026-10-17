@@ -546,7 +546,33 @@ pub struct GroupTable {
     int_slots: Vec<(i64, u32)>,
     /// 上面那张表的 NULL 组（count-only 单 Int64 列专用）。
     count_only_null_gid: Option<u32>,
+    /// **count-only + 单 Int64 键**的密集直索引（第十五批，
+    /// `docs/整型去重密集直索引设计.md`）：`slots[k - min] = gid`，4B/槽、
+    /// 免哈希免探测。与 `int_slots` **互斥持有**（锚定/增长时清槽表，
+    /// 坠回时清 dense）；剖面依据：16B 槽表在 100 万组时 32MB = 本机 L3 的
+    /// 2 倍（cache-miss 率 45%、24.7ns/行），同路 10 万组（4MB，L3 内）
+    /// 只要 1.6ns/行。
+    dense: Option<DenseInt>,
+    /// dense 判过"span 超 CAP"⇒ **永久坠回槽路**（span 单调不减，无翻案）。
+    dense_dead: bool,
 }
+
+/// 密集直索引的槽（`docs/整型去重密集直索引设计.md` §二）。
+/// `slots[i]` = 键值 `min + i` 的 gid；`EMPTY` = 无组。
+/// **只与 `GroupTable` 同模块使用**——`key_arena` 里的规范编码是唯一真相，
+/// 这张表随时可按 arena 重建（锚定回填 / 增长重建 / 坠回重建三条路同源）。
+struct DenseInt {
+    /// 数组锚点：`slots[i]` 对应键值 `min + i`
+    min: i64,
+    /// 已见最大键值（增长时算 need span 用；命中路不更新——命中 ⇒ 该值先前
+    /// 插入过 ⇒ 归纳法 ≤ max_seen；新组与越界路才更新）
+    max_seen: i64,
+    slots: Vec<u32>,
+}
+
+/// dense 槽的空标记。是 **gid 侧**的哨兵（u32::MAX 不可能是合法 gid），
+/// 与键值无关 ⇒ `i64::MIN` 作为键值合法（count-only 的 NULL 另走专门槽）。
+const DENSE_SLOT_EMPTY: u32 = u32::MAX;
 
 impl GroupTable {
     pub fn new() -> Self {
@@ -605,6 +631,13 @@ impl GroupTable {
                 "fast_slots_inline_cap",
                 self.fast_slots_inline.capacity() as u64 * 16,
             ),
+            ("int_slots_cap", self.int_slots.capacity() as u64 * 16),
+            (
+                "dense_slots_cap",
+                self.dense
+                    .as_ref()
+                    .map_or(0, |d| d.slots.capacity() as u64 * 4),
+            ),
             (
                 "group_lits_cap",
                 self.group_lits
@@ -645,6 +678,10 @@ impl GroupTable {
         b += self.fast_slots.capacity() as u64 * 16; // (u64, u32) + padding
         b += self.fast_slots_inline.capacity() as u64 * 16; // (i64, u32) + padding
         b += self.int_slots.capacity() as u64 * 16; // count-only 单 Int64 列内联槽
+        b += self
+            .dense
+            .as_ref()
+            .map_or(0, |d| d.slots.capacity() as u64 * 4); // 密集直索引（与 int_slots 互斥）
         // HashMap<u64, Vec<u32>>：桶 + 每组一个 Vec 头
         let vec_hdr = std::mem::size_of::<Vec<u32>>() as u64;
         b += self.by_hash.capacity() as u64 * (std::mem::size_of::<(u64, Bucket)>() as u64 + 1);
@@ -1496,17 +1533,36 @@ impl GroupTable {
         }
     }
 
-    /// count-only + **单 Int64 分组列**：内联槽建组。
+    /// count-only + **单 Int64 分组列**：密集直索引优先（第十五批），
+    /// 不中或中途坠回 ⇒ 内联槽建组。
     ///
     /// 键**存在槽里** ⇒ 命中判定不碰 `key_arena`（实测这条差别 = 5.4×）。
     /// NULL 走 `count_only_null_gid`；`key_arena` 里一律写**规范编码**，
     /// 供溢出分区路由与 `insert_raw_key` 用。
+    ///
+    /// ⚠️ 与"走不走必须类型驱动"的旧纪律**不冲突**：dense 改变的只是**索引**，
+    /// 所有组（dense/槽/坠回）都经 `push_group` 建在**同一份规范编码**上
+    /// —— gid 空间唯一，坠回前已 push 的 out 前缀无需修补。
     fn assign_groups_count_only_int(&mut self, col: &Int64Array, out: &mut Vec<u32>) {
+        // dense 试锚（首批/清空后首次进入）；开关与 CAP 每次进批读一次
+        // env（每批 ~100ns，量级可忽略），不用 OnceLock——进程内测试要能改 CAP。
+        if self.dense.is_none() && !self.dense_dead && std::env::var("QSDB_NO_DENSE_GROUP").is_err()
+        {
+            self.dense_try_anchor(col);
+        }
+        let from = if self.dense.is_some() {
+            self.assign_dense(col, out)
+        } else {
+            0
+        };
+        if from >= col.len() {
+            return;
+        }
         const EMPTY: u32 = u32::MAX;
         if self.int_slots.is_empty() {
             self.rebuild_int_slots();
         }
-        for row in 0..col.len() {
+        for row in from..col.len() {
             // ⚠️ **每次都要重取**：表会在下面这个循环里扩容（`len*2 >= cap`），
             // 把 mask 提到循环外 ⇒ 扩容后仍按老宽度取模，探测只在**老区间**里走，
             // 已有键一律找不到 ⇒ 每行都新建组（**静默多数 + 内存雪崩**，
@@ -1562,6 +1618,195 @@ impl GroupTable {
         }
     }
 
+    // ── 密集直索引（第十五批，`docs/整型去重密集直索引设计.md`）──────────
+
+    /// dense 槽容量上界（默认 8M 槽 = 32MB）。每次锚定/增长时读 env——
+    /// 故意不用 OnceLock：进程内测试要能改它。
+    fn dense_cap() -> usize {
+        std::env::var("QSDB_DENSE_GROUP_CAP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&c| c > 0)
+            .unwrap_or(8_000_000)
+    }
+
+    /// 按 `key_arena` 的规范编码回填 dense 槽（锚定与增长重建共用；
+    /// arena 是唯一真相，`key_of` 只可能给出 `[1]+LE8` / `[0]` 两种形态
+    /// —— 与 `rebuild_int_slots` 同一句论证，走不到 else，else 即口径错位）。
+    fn dense_fill_from_arena(&self, slots: &mut [u32], min: i64) {
+        for gid in 0..self.len() {
+            let kb = self.key_of(gid);
+            if kb.len() == 9 && kb[0] == 1 {
+                let k = i64::from_le_bytes(kb[1..9].try_into().unwrap());
+                slots[(k - min) as usize] = gid as u32;
+            } else {
+                debug_assert!(
+                    kb.len() == 1 && kb[0] == 0,
+                    "dense 回填遇到非规范编码的组键（长度 {}）",
+                    kb.len()
+                );
+            }
+        }
+    }
+
+    /// 试锚：用**当前批**的 min/max（表非空时并上 arena 既有键的范围）
+    /// 决定要不要建 dense。span > CAP ⇒ `dense_dead`（span 单调 ⇒ 永不翻案）。
+    /// 批内无非空值 ⇒ 不锚定（纯 NULL 批交给 null 槽），下批再试。
+    ///
+    /// ⚠️ 范围必须**并上 arena**：`insert_raw_key` 灌过键的表（溢出分区形状）
+    /// 首个 ingest 批的值域盖不住既有键 ⇒ 只按批锚定会让回填下标越界。
+    fn dense_try_anchor(&mut self, col: &Int64Array) {
+        let mut lo = i64::MAX;
+        let mut hi = i64::MIN;
+        if col.null_count() == 0 {
+            for &k in col.values() {
+                if k < lo {
+                    lo = k;
+                }
+                if k > hi {
+                    hi = k;
+                }
+            }
+        } else {
+            for row in 0..col.len() {
+                if col.is_null(row) {
+                    continue;
+                }
+                let k = col.value(row);
+                if k < lo {
+                    lo = k;
+                }
+                if k > hi {
+                    hi = k;
+                }
+            }
+        }
+        // arena 既有键（含 NULL 键——顺手把 null 组认领了，见下）
+        if !self.is_empty() {
+            for gid in 0..self.len() {
+                let kb = self.key_of(gid);
+                if kb.len() == 9 && kb[0] == 1 {
+                    let k = i64::from_le_bytes(kb[1..9].try_into().unwrap());
+                    if k < lo {
+                        lo = k;
+                    }
+                    if k > hi {
+                        hi = k;
+                    }
+                } else if kb.len() == 1 && kb[0] == 0 && self.count_only_null_gid.is_none() {
+                    // `insert_raw_key` 灌进来的 NULL 组：不认领的话，下个 NULL 行
+                    // 会再建一个 [0] 组（静默多数）。
+                    self.count_only_null_gid = Some(gid as u32);
+                }
+            }
+        }
+        if lo > hi {
+            return; // 全 NULL（或空批+空表）
+        }
+        let cap = Self::dense_cap();
+        if hi as i128 - lo as i128 + 1 > cap as i128 {
+            self.dense_dead = true;
+            return;
+        }
+        let need = (hi - lo) as usize + 1;
+        let mut slots = vec![DENSE_SLOT_EMPTY; need];
+        if !self.is_empty() {
+            self.dense_fill_from_arena(&mut slots, lo);
+        }
+        self.dense = Some(DenseInt {
+            min: lo,
+            max_seen: hi,
+            slots,
+        });
+    }
+
+    /// dense 行循环。返回**处理到的行号**：== `col.len()` 整批走完；
+    /// < `col.len()` = 中途坠回槽路，调用方从该行续跑（out 前缀已就位，
+    /// gid 空间与槽路同一——见 `assign_groups_count_only_int` 头注释）。
+    fn assign_dense(&mut self, col: &Int64Array, out: &mut Vec<u32>) -> usize {
+        let n = col.len();
+        let mut row = 0usize;
+        while row < n {
+            if col.is_null(row) {
+                let g = match self.count_only_null_gid {
+                    Some(g) => g,
+                    None => {
+                        let g = self.push_group(&[0u8], &[]);
+                        self.count_only_null_gid = Some(g);
+                        g
+                    }
+                };
+                out.push(g);
+                row += 1;
+                continue;
+            }
+            let k = col.value(row);
+            let (in_range, idx) = {
+                let d = self.dense.as_ref().unwrap();
+                let i = k as i128 - d.min as i128;
+                (i >= 0 && i < d.slots.len() as i128, i.max(0) as usize)
+            };
+            if in_range {
+                let hit = self.dense.as_ref().unwrap().slots[idx];
+                if hit != DENSE_SLOT_EMPTY {
+                    out.push(hit);
+                    row += 1;
+                    continue;
+                }
+                // 新组：arena 写规范编码（唯一真相），槽里放 gid
+                let mut kb = [0u8; 9];
+                kb[0] = 1;
+                kb[1..].copy_from_slice(&k.to_le_bytes());
+                let g = self.push_group(&kb, &[]);
+                let d = self.dense.as_mut().unwrap();
+                d.slots[idx] = g;
+                if k > d.max_seen {
+                    d.max_seen = k;
+                }
+                out.push(g);
+            } else if self.dense_grow(k) {
+                continue; // 增长完成，重试本行（每批至多一两次，翻倍摊还）
+            } else {
+                return row; // 坠回：dense 已清、槽表已按 arena 重建
+            }
+            row += 1;
+        }
+        n
+    }
+
+    /// 越界值 `k`：span（并上 `k`）仍 ≤ CAP ⇒ 几何增长重建，返回 true；
+    /// 超 CAP ⇒ 坠回（清 dense、按 arena 重建槽表），返回 false。
+    ///
+    /// span 用 **i128** 算（`i64::MIN..=i64::MAX` 全域 = 2^64，不会回绕）。
+    fn dense_grow(&mut self, k: i64) -> bool {
+        let (old_min, old_max, old_len) = {
+            let d = self.dense.as_ref().unwrap();
+            (d.min, d.max_seen, d.slots.len())
+        };
+        let lo = old_min.min(k);
+        let hi = old_max.max(k);
+        let need = hi as i128 - lo as i128 + 1;
+        let cap = Self::dense_cap();
+        if need > cap as i128 {
+            self.dense = None;
+            self.dense_dead = true;
+            if self.int_slots.is_empty() {
+                self.rebuild_int_slots();
+            }
+            return false;
+        }
+        let new_alloc = (need as usize)
+            .max(old_len.saturating_mul(2))
+            .min(cap.max(1));
+        let mut slots = vec![DENSE_SLOT_EMPTY; new_alloc];
+        self.dense_fill_from_arena(&mut slots, lo);
+        let d = self.dense.as_mut().unwrap();
+        d.min = lo;
+        d.max_seen = hi;
+        d.slots = slots;
+        true
+    }
+
     pub fn insert_raw_key(&mut self, key: &[u8]) -> u32 {
         // 原始键是**绕过索引**直接进 `key_arena` 的 ⇒ 内联槽会过期
         // （同一个键可能已有槽、也可能没有）。清掉即可：下次 `ingest` 会按
@@ -1584,6 +1829,7 @@ impl GroupTable {
             }
         }
         self.int_slots.clear();
+        self.dense = None;
         self.count_only_null_gid = None;
         let h = fxhash_bytes(key);
         if let Some(b) = self.by_hash.get(&h) {
@@ -1689,6 +1935,7 @@ impl GroupTable {
             *self = other;
             self.fast_slots.clear();
             self.fast_slots_inline.clear();
+            self.dense = None;
             return;
         }
         let other_len = other.len();
@@ -1700,6 +1947,12 @@ impl GroupTable {
     pub fn merge_subset(&mut self, other: &GroupTable, ogs: Vec<usize>, agg_count: usize) {
         self.fast_slots.clear();
         self.fast_slots_inline.clear();
+        // 内联索引（int_slots / dense）都是"键 → 本表 gid"的缓存：merge 进来
+        // 的新组没经过它们的建组路 ⇒ 过期。清掉，下次 assign 按 arena 重建。
+        // （count-only 表今天没人 merge——与 fast_slots 同样的防御线。）
+        self.int_slots.clear();
+        self.count_only_null_gid = None;
+        self.dense = None;
         // 高基数下本循环是热点（组数 × 分片数）：key/lits 全部缓冲复用，
         // 免每次跨表合并的两次堆分配（原实现 14M 次 malloc 是主要开销）
         let mut key_buf: Vec<u8> = Vec::with_capacity(64);
@@ -2552,8 +2805,15 @@ mod tests {
         let mut t = GroupTable::new_count_only();
         t.ingest(&g, &[], &batch).unwrap();
         assert_eq!(t.len(), 100);
-        assert!(!t.int_slots.is_empty(), "单 Int64 列应走内联槽");
-        assert_eq!(t.by_hash.len(), 0, "内联槽这条路不写 by_hash");
+        // 第十五批起 dense 优先：span 100 ≤ CAP ⇒ 走密集直索引，int_slots 保持空
+        let d = t.dense.as_ref().expect("单 Int64 列应走 dense 直索引");
+        assert_eq!(d.slots.len(), 100, "锚定 span = 批内值域 0..99");
+        assert!(
+            d.slots.iter().all(|&g| g != u32::MAX),
+            "0..99 逐个建组后槽应全满"
+        );
+        assert!(t.int_slots.is_empty(), "dense 与 int_slots 互斥");
+        assert_eq!(t.by_hash.len(), 0, "内联索引这条路不写 by_hash");
         for gid in 0..t.len() {
             let kb = t.key_of(gid).to_vec();
             assert_eq!(
@@ -2563,6 +2823,10 @@ mod tests {
             );
         }
         assert_eq!(t.len(), 100, "raw 键不该建出新组");
+        assert!(
+            t.dense.is_none(),
+            "insert_raw_key 后 dense 已清（按 arena 再锚定）"
+        );
     }
 
     #[test]
@@ -2571,5 +2835,145 @@ mod tests {
         assert_eq!(fxhash_bytes(b"abc"), fxhash_bytes(b"abc"));
         // 非 8 倍长
         assert_ne!(fxhash_bytes(b"abcdefghijklm"), 0);
+    }
+
+    // ── dense 直索引单元测试（第十五批）────────────────────────────
+    // 不碰 env（lib 测试进程内并行线程共享环境变量，CAP 开关的对撞测试
+    // 放 tests/distinct_int_dense.rs 的 SERIAL 锁下）。增长/坠回/重锚定
+    // 全部用**确定的批边界**驱动，不依赖扫描器的分批行为。
+
+    fn int_batch(vals: &[Option<i64>]) -> RecordBatch {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("k", arrow::datatypes::DataType::Int64, true),
+        ]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vals.to_vec()))]).unwrap()
+    }
+
+    fn int_group_expr() -> Vec<PhysExpr> {
+        vec![PhysExpr::Column {
+            idx: 0,
+            name: "k".into(),
+            ty: LogicalType::Int64,
+        }]
+    }
+
+    /// 跨批增长：锚定 → 右扩两次 → 全命中批不再建组。
+    #[test]
+    fn dense_grows_across_batches() {
+        let mut t = GroupTable::new_count_only();
+        let g = int_group_expr();
+        let b1: Vec<Option<i64>> = (0..100).map(Some).collect();
+        t.ingest(&g, &[], &int_batch(&b1)).unwrap();
+        assert!(t.dense.is_some(), "批 1 应锚定 dense");
+        let b2: Vec<Option<i64>> = (1000..1100).map(Some).collect();
+        t.ingest(&g, &[], &int_batch(&b2)).unwrap();
+        let d = t.dense.as_ref().unwrap();
+        assert_eq!(d.min, 0);
+        assert_eq!(d.max_seen, 1099);
+        assert!(
+            (1100..=8_000_000).contains(&d.slots.len()),
+            "增长要盖住 need（具体分配是策略，契约是覆盖 [0, max_seen]）"
+        );
+        let b3: Vec<Option<i64>> = (5000..5100).map(Some).collect();
+        t.ingest(&g, &[], &int_batch(&b3)).unwrap();
+        let d = t.dense.as_ref().unwrap();
+        assert_eq!(d.max_seen, 5099);
+        assert_eq!(t.len(), 300);
+        // 全命中批：值都见过 ⇒ 不建新组
+        t.ingest(&g, &[], &int_batch(&b1)).unwrap();
+        t.ingest(&g, &[], &int_batch(&b3)).unwrap();
+        assert_eq!(t.len(), 300, "命中批不许建新组");
+        assert!(t.dense.is_some());
+    }
+
+    /// i64 端值逼出**中途坠回**：批 2 的 i64::MIN 让 span 变 2^64 ⇒ 超任何 CAP
+    /// ⇒ 清 dense、按 arena 重建槽表、本行起槽路接手；已有组的 gid 不变。
+    #[test]
+    fn dense_falls_back_mid_batch_on_i64_extremes() {
+        let mut t = GroupTable::new_count_only();
+        let g = int_group_expr();
+        let b1: Vec<Option<i64>> = (0..100).map(Some).collect();
+        t.ingest(&g, &[], &int_batch(&b1)).unwrap();
+        assert!(t.dense.is_some());
+        let b2 = vec![Some(i64::MIN), Some(i64::MAX), Some(55), Some(55), None];
+        t.ingest(&g, &[], &int_batch(&b2)).unwrap();
+        assert!(t.dense.is_none(), "坠回后 dense 必须已清");
+        assert!(t.dense_dead);
+        assert!(!t.int_slots.is_empty(), "坠回必须留下可用的槽表");
+        // 0..99（100 组）+ MIN + MAX + NULL = 103；55 重复
+        assert_eq!(t.len(), 103);
+        // 坠回后继续走槽路（dead 永不翻案）
+        let b3 = vec![Some(7), Some(i64::MAX), None];
+        t.ingest(&g, &[], &int_batch(&b3)).unwrap();
+        assert_eq!(t.len(), 103, "dead 后不再建组");
+    }
+
+    /// 锚定期就超 span（批内 MIN..MAX）：dense 不落地，整批槽路。
+    #[test]
+    fn dense_anchor_rejects_huge_span() {
+        let mut t = GroupTable::new_count_only();
+        let g = int_group_expr();
+        let b1 = vec![Some(i64::MIN), Some(0), Some(i64::MAX)];
+        t.ingest(&g, &[], &int_batch(&b1)).unwrap();
+        assert!(t.dense.is_none());
+        assert!(t.dense_dead, "span 单调 ⇒ 锚定超界即永死");
+        assert_eq!(t.len(), 3);
+        let b2 = vec![Some(1), Some(2), Some(3)];
+        t.ingest(&g, &[], &int_batch(&b2)).unwrap();
+        assert_eq!(t.len(), 6);
+        assert!(t.dense_dead);
+    }
+
+    /// `insert_raw_key` 灌过键的表再 ingest（溢出分区形状）：
+    /// 重锚定必须**并上 arena 既有键的范围**（只按批锚会让回填下标越界），
+    /// 且必须**认领** arena 里的 NULL 组（否则下个 NULL 行再建一个 [0] 组）。
+    #[test]
+    fn dense_reanchors_over_arena_union_and_claims_null() {
+        let mut t = GroupTable::new_count_only();
+        let g = int_group_expr();
+        let b1: Vec<Option<i64>> = (0..50).map(Some).collect();
+        t.ingest(&g, &[], &int_batch(&b1)).unwrap();
+        assert_eq!(t.len(), 50);
+        // 灌批外键 60..70 + 一个 NULL 键（规范编码）
+        for k in 60..70i64 {
+            let mut kb = [0u8; 9];
+            kb[0] = 1;
+            kb[1..].copy_from_slice(&k.to_le_bytes());
+            t.insert_raw_key(&kb);
+        }
+        let null_gid = t.insert_raw_key(&[0u8]);
+        assert_eq!(t.len(), 61);
+        assert!(t.dense.is_none(), "insert_raw_key 清 dense");
+        let mut b2: Vec<Option<i64>> = (100..150).map(Some).collect();
+        b2.push(None); // 必须落进被认领的 NULL 组，而不是新建 [0] 组
+        t.ingest(&g, &[], &int_batch(&b2)).unwrap();
+        let d = t.dense.as_ref().expect("批 2 应重锚定");
+        assert_eq!(d.min, 0, "锚点必须并上 arena 的 0..49");
+        assert_eq!(d.max_seen, 149);
+        assert_eq!(t.len(), 111, "50 + 10 + 50 + 1（NULL 组复用，不许 +2）");
+        let ng = t.count_only_null_gid.expect("NULL 组必须被认领");
+        assert_eq!(ng, null_gid, "认领的必须是 insert_raw_key 建的那个组");
+        assert_eq!(t.key_of(ng as usize), &[0u8]);
+    }
+
+    /// 纯 NULL 批先行：不锚定（无可锚值域）也不建错组；值批来了再锚定；
+    /// 后续 NULL 行与先前的 NULL 组必须是**同一个 gid**。
+    #[test]
+    fn dense_all_null_batch_then_values() {
+        let mut t = GroupTable::new_count_only();
+        let g = int_group_expr();
+        let b1 = vec![None, None, None, None, None];
+        t.ingest(&g, &[], &int_batch(&b1)).unwrap();
+        assert!(t.dense.is_none(), "全 NULL 批无可锚值域");
+        assert_eq!(t.len(), 1);
+        let null_gid = t.count_only_null_gid.unwrap();
+        let b2: Vec<Option<i64>> = (10..20).map(Some).collect();
+        t.ingest(&g, &[], &int_batch(&b2)).unwrap();
+        assert!(t.dense.is_some(), "值批应锚定");
+        assert_eq!(t.len(), 11);
+        let b3 = vec![None, Some(15)];
+        t.ingest(&g, &[], &int_batch(&b3)).unwrap();
+        assert_eq!(t.len(), 11, "NULL 与 15 都见过");
+        assert_eq!(t.count_only_null_gid, Some(null_gid), "NULL 组 gid 稳定");
     }
 }
