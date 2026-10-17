@@ -195,8 +195,7 @@ fn 字符串与日期算术仍显式拒() {
     let (db, _r) = setup("strdate");
     let e = db
         .sql_collect("SELECT DATE '2026-01-01' + CAST('x' AS STRING)")
-        .err()
-        .expect("本该报错却跑通了")
+        .expect_err("本该报错却跑通了")
         .to_string();
     assert!(e.contains("not supported"), "unexpected: {e}");
 }

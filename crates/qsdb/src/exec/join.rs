@@ -1865,6 +1865,9 @@ fn emit_prof_snapshot() {
     );
 }
 
+// 8 个参数各管一件事（探测批/建侧状态/键/输出 schema/join 类型/列收窄/残留谓词/
+// 匹配掩码），收拢成 struct 只会把名字换地方 —— 显式 allow。
+#[allow(clippy::too_many_arguments)]
 fn join_batch(
     probe_batch: &RecordBatch,
     state: &BuildState,

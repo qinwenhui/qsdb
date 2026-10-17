@@ -441,7 +441,7 @@ fn div_mod_null_on_zero(is_div: bool, l: &EvalVal, r: &EvalVal) -> Result<ArrayR
             let nulls = arrow::array::new_null_array(&out.data_type().clone(), n);
             select_arrays(&nz, &out, &nulls)
         }
-        Err(e) => Err(e.into()),
+        Err(e) => Err(e),
     }
 }
 

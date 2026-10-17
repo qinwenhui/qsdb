@@ -1913,7 +1913,7 @@ fn fused_dim_shape(
             return None;
         }
         // ③ 取数列必须全在事实表（BOT probe 侧）
-        if agg_cols.iter().any(|c| c.map_or(false, |p| p >= bot_lw)) {
+        if agg_cols.iter().any(|c| c.is_some_and(|p| p >= bot_lw)) {
             return None;
         }
         let bot_build_keys: Vec<PhysExpr> = brk_cols

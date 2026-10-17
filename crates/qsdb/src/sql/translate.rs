@@ -2760,7 +2760,7 @@ fn live_cte_names(main: &str, ctes: &[sqlparser::ast::Cte]) -> std::collections:
 
     let mut live: HashSet<usize> = HashSet::new();
     let mut queue: Vec<usize> = Vec::new();
-    for t in pick(&main) {
+    for t in pick(main) {
         if let Some(&i) = idx.get(t.as_str()) {
             queue.push(i);
         }
@@ -3398,7 +3398,7 @@ fn try_rewrite_stack(q: &sqlparser::ast::Query) -> Result<Option<sqlparser::ast:
     let Some(si) = sel
         .projection
         .iter()
-        .position(|it| proj_item_expr(it).map_or(false, &mentions_stack))
+        .position(|it| proj_item_expr(it).is_some_and(&mentions_stack))
     else {
         return Ok(None);
     };
@@ -3648,6 +3648,11 @@ fn resolve_from_factor(
 ///
 /// 边界一律**显式拒**：`IN` 含子查询/`ANY`（那才是"输出 schema 依赖数据"）、
 /// `IN` 值没有 `AS` 别名、多聚合、多个 `FOR` 列、`DEFAULT ON NULL`。
+/// PIVOT 展开产物：新表名 / 内层计划 / 输出列（名, 类型）。别名只为压签名复杂度。
+type PivotParts = (String, LogicalPlan, Vec<(String, LogicalType)>);
+
+// 9 个参数全是 sqlparser 节点/绑定上下文的直接传递，收拢只会挪名字 —— 显式 allow。
+#[allow(clippy::too_many_arguments)]
 fn translate_pivot(
     inner: &sqlparser::ast::TableFactor,
     aggregate_functions: &[sqlparser::ast::ExprWithAlias],
@@ -3658,7 +3663,7 @@ fn translate_pivot(
     visible: &VisibleCtes,
     resolver: &TableResolver,
     cte_defs: &mut Vec<CteDef>,
-) -> Result<(String, LogicalPlan, Vec<(String, LogicalType)>)> {
+) -> Result<PivotParts> {
     use sqlparser::ast::*;
     let (in_plan, in_ctx) = resolve_from_factor(inner, visible, resolver, cte_defs)?;
     let in_cols = in_ctx.cols.clone();
