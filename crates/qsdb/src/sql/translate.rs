@@ -2742,10 +2742,7 @@ fn cte_main_text(q: &sqlparser::ast::Query) -> String {
     main
 }
 
-fn live_cte_names(
-    main: &str,
-    ctes: &[sqlparser::ast::Cte],
-) -> std::collections::HashSet<String> {
+fn live_cte_names(main: &str, ctes: &[sqlparser::ast::Cte]) -> std::collections::HashSet<String> {
     use std::collections::HashSet;
     let names: HashSet<&str> = ctes.iter().map(|c| c.alias.name.value.as_str()).collect();
     let pick = |s: &str| -> HashSet<String> {
@@ -2849,8 +2846,7 @@ fn translate_set_operation(
 ) -> Result<(LogicalPlan, Vec<CteDef>)> {
     use crate::exec::SetOpKind;
     let main_text = cte_main_text(q);
-    let (visible, mut cte_defs) =
-        bind_with_ctes(q.with.as_ref(), &main_text, resolver, ancestors)?;
+    let (visible, mut cte_defs) = bind_with_ctes(q.with.as_ref(), &main_text, resolver, ancestors)?;
     let body_query = |body: Box<sqlparser::ast::SetExpr>| sqlparser::ast::Query {
         with: None,
         body,
@@ -3393,8 +3389,12 @@ fn try_rewrite_stack(q: &sqlparser::ast::Query) -> Result<Option<sqlparser::ast:
     let SetExpr::Select(sel) = q.body.as_ref() else {
         return Ok(None);
     };
-    let mentions_stack =
-        |e: &Expr| any_subexpr(e, &|x: &Expr| matches!(x, Expr::Function(f) if fn_name(f) == "stack"));
+    let mentions_stack = |e: &Expr| {
+        any_subexpr(
+            e,
+            &|x: &Expr| matches!(x, Expr::Function(f) if fn_name(f) == "stack"),
+        )
+    };
     let Some(si) = sel
         .projection
         .iter()
@@ -3625,7 +3625,9 @@ fn resolve_from_factor(
             )?;
             Ok((plan, SchemaCtx { cols }))
         }
-        other => Err(QsdbError::unsupported(format!("FROM {other:?} not supported"))),
+        other => Err(QsdbError::unsupported(format!(
+            "FROM {other:?} not supported"
+        ))),
     }
 }
 
@@ -3922,8 +3924,7 @@ fn translate_select_inner(
     }
     // CTE（非递归）：WITH name AS (...) 内联展开为子计划。
     // 定义期即分配 cte_id；祖先 CTE 可见（后定义可引用先定义，链式）。
-    let (visible, mut cte_defs) =
-        bind_with_ctes(q.with.as_ref(), &cte_main, resolver, ancestors)?;
+    let (visible, mut cte_defs) = bind_with_ctes(q.with.as_ref(), &cte_main, resolver, ancestors)?;
 
     // FROM 主表：实表 / 表函数（read_parquet）/ CTE（本级 → 祖先）/ 派生表；
     // 无 FROM → 单行零列源（SELECT 1+1 / SELECT CURRENT_DATE）
@@ -5675,11 +5676,7 @@ fn fold_coalesce(args: Vec<PhysExpr>, ty: LogicalType) -> PhysExpr {
 ///
 /// 类型规则（实测真 Spark 3.5.2 对齐）：字面量 `NULL` 参数**不参与**超类型计算
 /// （`least(1, null)` ⇒ `int`）；若全是 NULL 则落到 Int64（与 coalesce 同）。
-fn bind_fold(
-    kind: FoldKind,
-    args: &[&sqlparser::ast::Expr],
-    ctx: &SchemaCtx,
-) -> Result<PhysExpr> {
+fn bind_fold(kind: FoldKind, args: &[&sqlparser::ast::Expr], ctx: &SchemaCtx) -> Result<PhysExpr> {
     let bound: Vec<PhysExpr> = args
         .iter()
         .map(|a| bind_expr(a, ctx))
@@ -6515,10 +6512,7 @@ fn common_supertype(a: &LogicalType, b: &LogicalType) -> LogicalType {
             // 整数列被 cast 过去，值 `1` 就装不下（1.0 要 2 位）⇒
             // `value 1.0 overflows DECIMAL(1, 1)`。语料里 3 个块卡在这条上。
             (Lt::Decimal(d), x) | (x, Lt::Decimal(d)) if x.is_integer() => {
-                let p = d
-                    .precision
-                    .saturating_add(int_type_digits(x))
-                    .min(38);
+                let p = d.precision.saturating_add(int_type_digits(x)).min(38);
                 Lt::Decimal(DecimalMeta::try_new(p, d.scale).unwrap_or(*d))
             }
             _ => wider_int(a, b),

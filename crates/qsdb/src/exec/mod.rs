@@ -1363,7 +1363,10 @@ impl PartitionedDistinctCountExec {
             })
             .sum();
         if prof {
-            eprintln!("[distinct-count] 相2（并行建组）{:?}，共 {total} 组", t1.elapsed());
+            eprintln!(
+                "[distinct-count] 相2（并行建组）{:?}，共 {total} 组",
+                t1.elapsed()
+            );
         }
         Ok(total)
     }
@@ -1568,11 +1571,10 @@ impl SortedDistinctCountExec {
             cols.extend(out.cols);
             for (p, v) in out.parts.into_iter().enumerate() {
                 if base != 0 {
-                    parts[p]
-                        .extend(v.into_iter().map(|mut e| {
-                            e.br += base << 32;
-                            e
-                        }));
+                    parts[p].extend(v.into_iter().map(|mut e| {
+                        e.br += base << 32;
+                        e
+                    }));
                 } else {
                     parts[p].extend(v);
                 }
@@ -1594,9 +1596,10 @@ impl SortedDistinctCountExec {
                 self.nparts,
                 nshard,
                 rows,
-                parts.iter().map(|v| v.capacity() as u64 * 16).sum::<u64>()
-                    / (1024 * 1024),
-                cols.iter().map(|c| c.get_array_memory_size() as u64).sum::<u64>()
+                parts.iter().map(|v| v.capacity() as u64 * 16).sum::<u64>() / (1024 * 1024),
+                cols.iter()
+                    .map(|c| c.get_array_memory_size() as u64)
+                    .sum::<u64>()
                     / (1024 * 1024),
                 t0.elapsed()
             );

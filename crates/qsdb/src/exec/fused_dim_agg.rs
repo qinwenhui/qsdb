@@ -29,9 +29,9 @@ use crate::expr::{AggExpr, AggFunc, PhysExpr, eval};
 use crate::query::QueryContext;
 use crate::types::Literal;
 
+use super::ExecNode;
 use super::agg::{GroupTable, array_value_to_literal, encode_key_row, finalize_or_none};
 use super::join::{BuildSide, HashIndex, SmallRows, build_index, concat_batches};
-use super::ExecNode;
 
 /// 列号形状（`exec_builder::fused_dim_shape` 判定通过后交进来）。
 /// 全部是**裸列**（门保证），键表达式带好各自的局部空间重映射。
@@ -199,7 +199,8 @@ pub(crate) fn run_fused_dim_agg(
             bot_rows,
             top_side.num_rows(),
             table.len(),
-            t0.map(|t| t.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0),
+            t0.map(|t| t.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0),
         );
     }
     Ok((table, res))
@@ -231,8 +232,10 @@ fn accumulate(
             // 懒种子：首个配对触达该 TOP build 行
             let (bi, row) = top_side.row_of(top_row);
             let batch = &top_side.batches()[bi];
-            let cols: Vec<ArrayRef> =
-                group_cols.iter().map(|&c| batch.column(c).clone()).collect();
+            let cols: Vec<ArrayRef> = group_cols
+                .iter()
+                .map(|&c| batch.column(c).clone())
+                .collect();
             key_buf.clear();
             encode_key_row(&cols, row, key_buf);
             let lits: Vec<Literal> = cols

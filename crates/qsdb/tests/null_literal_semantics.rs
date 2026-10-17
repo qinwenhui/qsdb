@@ -36,7 +36,12 @@ fn setup(tag: &str) -> (Qsdb, std::path::PathBuf) {
 fn dump(db: &Qsdb, sql: &str) -> (Vec<String>, Vec<Vec<String>>) {
     let bs = db.sql_collect(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     let names: Vec<String> = match bs.first() {
-        Some(b) => b.schema().fields().iter().map(|f| f.name().clone()).collect(),
+        Some(b) => b
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect(),
         None => Vec::new(),
     };
     let mut rows = Vec::new();
@@ -71,7 +76,10 @@ fn union_裸_null_采纳对侧的_decimal_类型() {
     assert_eq!(rows.len(), 3);
     // 值要对：1.50 / 2.00 在，NULL 也在
     assert!(rows.iter().any(|r| r[0] == "1.50"), "{rows:?}");
-    assert!(rows.iter().any(|r| r[0].is_empty()), "NULL 行丢了: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r[0].is_empty()),
+        "NULL 行丢了: {rows:?}"
+    );
     // **下游类型**：`v = ''` 必须是 NULL（不是类型错、更不是 true/false）。
     // ⚠️ 比较要写在 **UNION 之外**：写在分支里，UNION 会把整个 SELECT 吞成分支，
     // 那比较面对的就是裸 NULL（Boolean 兜底）而不是归一后的列。
@@ -82,7 +90,10 @@ fn union_裸_null_采纳对侧的_decimal_类型() {
     );
     // 若归一仍是 Boolean，这条在绑定就报错；到不了这里
     assert_eq!(r2.len(), 3);
-    assert!(r2.iter().all(|r| r[0].is_empty() || r[0] == "NULL"), "{r2:?}");
+    assert!(
+        r2.iter().all(|r| r[0].is_empty() || r[0] == "NULL"),
+        "{r2:?}"
+    );
 }
 
 /// **NULL 分支 + BIGINT 分支**：BIGINT 不许被字符串化（曾经的 `STRING vs BIGINT`）。
@@ -126,8 +137,10 @@ fn union_裸_null_在对侧也一样() {
 #[test]
 fn 语料骨架_null_占位列过_case_空串兜底() {
     let (db, _r) = setup("corpus");
-    db.sql("CREATE TABLE t (k VARCHAR, v DECIMAL(10,2))").unwrap();
-    db.sql("INSERT INTO t VALUES ('x', 3.50), ('y', NULL)").unwrap();
+    db.sql("CREATE TABLE t (k VARCHAR, v DECIMAL(10,2))")
+        .unwrap();
+    db.sql("INSERT INTO t VALUES ('x', 3.50), ('y', NULL)")
+        .unwrap();
     let sql = "SELECT k, CASE WHEN v IS NULL THEN 0 WHEN v = '' THEN 0 ELSE v END AS c \
                FROM ( \
                  (SELECT k, v FROM t) \
@@ -154,7 +167,8 @@ fn 语料骨架_null_占位列过_case_空串兜底() {
 #[test]
 fn 字符串参与算术_转_double_再算() {
     let (db, _r) = setup("strarith");
-    db.sql("CREATE TABLE s (fee DECIMAL(10,2), energy INT)").unwrap();
+    db.sql("CREATE TABLE s (fee DECIMAL(10,2), energy INT)")
+        .unwrap();
     db.sql("INSERT INTO s VALUES (2.50, 4), (1.00, 5)").unwrap();
     let (names, rows) = dump(
         &db,
@@ -277,16 +291,24 @@ fn join_键_数值列对字符串列_必须真匹配() {
     let (db, _r) = setup("joinkey");
     db.sql("CREATE TABLE l (k INT, v VARCHAR)").unwrap();
     db.sql("CREATE TABLE r (k VARCHAR, w VARCHAR)").unwrap();
-    db.sql("INSERT INTO l VALUES (5, 'a'), (2, 'b'), (9, 'c')").unwrap();
-    db.sql("INSERT INTO r VALUES ('5', 'x'), ('2', 'y'), ('7', 'z')").unwrap();
+    db.sql("INSERT INTO l VALUES (5, 'a'), (2, 'b'), (9, 'c')")
+        .unwrap();
+    db.sql("INSERT INTO r VALUES ('5', 'x'), ('2', 'y'), ('7', 'z')")
+        .unwrap();
     let (_, rows) = dump(
         &db,
         "SELECT l.v, r.w FROM l INNER JOIN r ON l.k = r.k ORDER BY l.v",
     );
     // 5↔'5'、2↔'2' 配上；9 配不上
     assert_eq!(rows.len(), 2, "{rows:?}");
-    assert!(rows.contains(&vec!["a".to_string(), "x".to_string()]), "{rows:?}");
-    assert!(rows.contains(&vec!["b".to_string(), "y".to_string()]), "{rows:?}");
+    assert!(
+        rows.contains(&vec!["a".to_string(), "x".to_string()]),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&vec!["b".to_string(), "y".to_string()]),
+        "{rows:?}"
+    );
     // LEFT 同理：不匹配的左行保留、右段补 NULL
     let (_, r2) = dump(
         &db,
@@ -302,7 +324,10 @@ fn join_键_列对字面量() {
     let (db, _r) = setup("joinlit");
     db.sql("CREATE TABLE l (k INT, v VARCHAR)").unwrap();
     db.sql("INSERT INTO l VALUES (5, 'a'), (6, 'b')").unwrap();
-    let (_, rows) = dump(&db, "SELECT v FROM l INNER JOIN (SELECT 5 AS k) r ON l.k = r.k");
+    let (_, rows) = dump(
+        &db,
+        "SELECT v FROM l INNER JOIN (SELECT 5 AS k) r ON l.k = r.k",
+    );
     assert_eq!(rows, vec![vec!["a"]], "{rows:?}");
 }
 
@@ -312,10 +337,14 @@ fn join_键_列对字面量() {
 #[test]
 fn right_join_上的跨类型键() {
     let (db, _r) = setup("rightkey");
-    db.sql("CREATE TABLE l (d VARCHAR, t INT, v VARCHAR)").unwrap();
-    db.sql("CREATE TABLE r (d VARCHAR, p INT, w VARCHAR)").unwrap();
-    db.sql("INSERT INTO l VALUES ('d1', 1, 'a'), ('d1', 2, 'b')").unwrap();
-    db.sql("INSERT INTO r VALUES ('d1', 1, 'x'), ('d1', 3, 'y')").unwrap();
+    db.sql("CREATE TABLE l (d VARCHAR, t INT, v VARCHAR)")
+        .unwrap();
+    db.sql("CREATE TABLE r (d VARCHAR, p INT, w VARCHAR)")
+        .unwrap();
+    db.sql("INSERT INTO l VALUES ('d1', 1, 'a'), ('d1', 2, 'b')")
+        .unwrap();
+    db.sql("INSERT INTO r VALUES ('d1', 1, 'x'), ('d1', 3, 'y')")
+        .unwrap();
     // 数值列 t = 字符串列 p 的 RIGHT JOIN：l 有 2 行，r 有 2 行，匹配 1 对
     //（RIGHT 保留 r 的孤儿行）
     let (_, rows) = dump(

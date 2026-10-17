@@ -20,14 +20,16 @@ use qsdb::{Qsdb, QsdbOptions};
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn open(tag: &str) -> (Qsdb, std::path::PathBuf) {
-    let root = std::env::temp_dir().join("qsdb_fused_dim_agg").join(format!(
-        "{tag}_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let root = std::env::temp_dir()
+        .join("qsdb_fused_dim_agg")
+        .join(format!(
+            "{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
     std::fs::create_dir_all(&root).unwrap();
     let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
     (db, root)
@@ -104,10 +106,8 @@ fn assert_four_paths(db: &Qsdb, sql: &str) -> String {
 ///   b|3         （NULL 组的键是 NULL，配不上任何 d2 行 ⇒ 消失）
 fn seed(db: &Qsdb) {
     db.sql("CREATE TABLE t (g INT, v INT)").unwrap();
-    db.sql(
-        "INSERT INTO t VALUES (1,10),(1,20),(2,30),(3,40),(NULL,50),(2,NULL),(1,60)",
-    )
-    .unwrap();
+    db.sql("INSERT INTO t VALUES (1,10),(1,20),(2,30),(3,40),(NULL,50),(2,NULL),(1,60)")
+        .unwrap();
     db.sql("CREATE TABLE d (g INT, cat STRING)").unwrap();
     db.sql("INSERT INTO d VALUES (1,'a'),(1,'b'),(2,'a'),(3,NULL),(NULL,'a'),(2,'a')")
         .unwrap();
@@ -171,7 +171,11 @@ fn 大表分片_融合与现有路同值() {
                 } else {
                     Some((r % 100) as i32)
                 };
-                let v = if r % 71 == 0 { None } else { Some((r % 1000) as i32) };
+                let v = if r % 71 == 0 {
+                    None
+                } else {
+                    Some((r % 1000) as i32)
+                };
                 (g, v)
             })
             .unzip();
@@ -242,13 +246,15 @@ fn 空侧与全null键_四路对撞() {
     db.sql("DELETE FROM d2").unwrap();
     let r = assert_four_paths(&db, SQL_D2);
     assert_eq!(r, "", "d2 空 ⇒ 深度 2 零行");
-    db.sql("INSERT INTO d2 VALUES ('a',1),('a',2),('b',3),(NULL,9),('',4)").unwrap();
+    db.sql("INSERT INTO d2 VALUES ('a',1),('a',2),('b',3),(NULL,9),('',4)")
+        .unwrap();
 
     // d 清空 ⇒ 两级都零行
     db.sql("DELETE FROM d").unwrap();
     assert_eq!(assert_four_paths(&db, SQL_D1), "");
     assert_eq!(assert_four_paths(&db, SQL_D2), "");
-    db.sql("INSERT INTO d VALUES (1,'a'),(1,'b'),(2,'a'),(3,NULL),(NULL,'a'),(2,'a')").unwrap();
+    db.sql("INSERT INTO d VALUES (1,'a'),(1,'b'),(2,'a'),(3,NULL),(NULL,'a'),(2,'a')")
+        .unwrap();
 
     // t 全 NULL 键 ⇒ 两级都零行
     db.sql("DELETE FROM t").unwrap();

@@ -1547,7 +1547,11 @@ fn annotate_walk(plan: &LogicalPlan, needed: &[u32], allow_scan_read: bool) -> L
         // 同款教训）；位置越界说明空间对不上 ⇒ 停手（宁可不优化）。
         // 实测（2026-10-17）：此前在此停手 ⇒ `count(*) FROM (SELECT 列 FROM join)`
         // 整宽物化 2000 万行，1.5s；学会下钻后只物化键列。
-        LogicalPlan::Project { input, exprs, names } => {
+        LogicalPlan::Project {
+            input,
+            exprs,
+            names,
+        } => {
             let mut cols: Vec<usize> = Vec::new();
             for &p in needed {
                 let Some(e) = exprs.get(p as usize) else {
@@ -1820,10 +1824,7 @@ fn fused_dim_shape(
     if group.is_empty() {
         return None; // 无分组 = T3 计数下推 / JoinCountExec 的领地
     }
-    if aggs
-        .iter()
-        .any(|a| a.distinct || a.filter.is_some())
-    {
+    if aggs.iter().any(|a| a.distinct || a.filter.is_some()) {
         return None;
     }
     // 键全裸列 → 列号列表
@@ -1888,87 +1889,83 @@ fn fused_dim_shape(
         .collect::<Option<Vec<_>>>()?;
 
     // ── TOP probe 侧：深度 1（直接可流式）或 BOT join ──
-    let (bot_build, top_key_in_bot_build, probe_keys, probe_plan) =
-        if let LogicalPlan::Join {
-            left: bp,
-            right: bb,
-            left_keys: blk,
-            right_keys: brk,
-            join_type: bj,
-            residual: bres,
-            ..
-        } = &**top_probe
-        {
-            if *bj != crate::exec::join::JoinType::Inner || bres.is_some() {
-                return None;
-            }
-            let brk_cols = bare(brk)?;
-            let bot_lw = super::translate::plan_output_columns(bp).ok()?.len();
-            // TOP probe 键必须全在 BOT build 侧
-            let tkeys: Vec<usize> = tlk_cols
-                .iter()
-                .map(|(i, _, _)| if *i >= bot_lw { Some(i - bot_lw) } else { None })
-                .collect::<Option<Vec<_>>>()?;
-            if tkeys.is_empty() {
-                return None;
-            }
-            // ③ 取数列必须全在事实表（BOT probe 侧）
-            if agg_cols
-                .iter()
-                .any(|c| c.map_or(false, |p| p >= bot_lw))
-            {
-                return None;
-            }
-            let bot_build_keys: Vec<PhysExpr> = brk_cols
-                .iter()
-                .map(|(i, n, t)| {
-                    if *i >= bot_lw {
-                        Some(PhysExpr::Column {
-                            idx: i - bot_lw,
-                            name: n.clone(),
-                            ty: t.clone(),
-                        })
-                    } else {
-                        None
-                    }
+    let (bot_build, top_key_in_bot_build, probe_keys, probe_plan) = if let LogicalPlan::Join {
+        left: bp,
+        right: bb,
+        left_keys: blk,
+        right_keys: brk,
+        join_type: bj,
+        residual: bres,
+        ..
+    } = &**top_probe
+    {
+        if *bj != crate::exec::join::JoinType::Inner || bres.is_some() {
+            return None;
+        }
+        let brk_cols = bare(brk)?;
+        let bot_lw = super::translate::plan_output_columns(bp).ok()?.len();
+        // TOP probe 键必须全在 BOT build 侧
+        let tkeys: Vec<usize> = tlk_cols
+            .iter()
+            .map(|(i, _, _)| if *i >= bot_lw { Some(i - bot_lw) } else { None })
+            .collect::<Option<Vec<_>>>()?;
+        if tkeys.is_empty() {
+            return None;
+        }
+        // ③ 取数列必须全在事实表（BOT probe 侧）
+        if agg_cols.iter().any(|c| c.map_or(false, |p| p >= bot_lw)) {
+            return None;
+        }
+        let bot_build_keys: Vec<PhysExpr> = brk_cols
+            .iter()
+            .map(|(i, n, t)| {
+                if *i >= bot_lw {
+                    Some(PhysExpr::Column {
+                        idx: i - bot_lw,
+                        name: n.clone(),
+                        ty: t.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect::<Option<Vec<_>>>()?;
+        (
+            Some(((**bb).clone(), bot_build_keys)),
+            tkeys,
+            blk.iter()
+                .map(|k| match k {
+                    PhysExpr::Column { idx, name, ty } => PhysExpr::Column {
+                        idx: *idx,
+                        name: name.clone(),
+                        ty: ty.clone(),
+                    },
+                    other => other.clone(),
                 })
-                .collect::<Option<Vec<_>>>()?;
-            (
-                Some(((**bb).clone(), bot_build_keys)),
-                tkeys,
-                blk.iter()
-                    .map(|k| match k {
-                        PhysExpr::Column { idx, name, ty } => PhysExpr::Column {
-                            idx: *idx,
-                            name: name.clone(),
-                            ty: ty.clone(),
-                        },
-                        other => other.clone(),
-                    })
-                    .collect::<Vec<_>>(),
-                (**bp).clone(),
-            )
-        } else {
-            // 深度 1：TOP probe 键就是 probe 批上的键
-            if tlk_cols.is_empty() {
-                return None;
-            }
-            (
-                None,
-                Vec::new(),
-                tlk.iter()
-                    .map(|k| match k {
-                        PhysExpr::Column { idx, name, ty } => PhysExpr::Column {
-                            idx: *idx,
-                            name: name.clone(),
-                            ty: ty.clone(),
-                        },
-                        other => other.clone(),
-                    })
-                    .collect::<Vec<_>>(),
-                (**top_probe).clone(),
-            )
-        };
+                .collect::<Vec<_>>(),
+            (**bp).clone(),
+        )
+    } else {
+        // 深度 1：TOP probe 键就是 probe 批上的键
+        if tlk_cols.is_empty() {
+            return None;
+        }
+        (
+            None,
+            Vec::new(),
+            tlk.iter()
+                .map(|k| match k {
+                    PhysExpr::Column { idx, name, ty } => PhysExpr::Column {
+                        idx: *idx,
+                        name: name.clone(),
+                        ty: ty.clone(),
+                    },
+                    other => other.clone(),
+                })
+                .collect::<Vec<_>>(),
+            (**top_probe).clone(),
+        )
+    };
 
     let (bot_build_plan, bot_build_keys) = match bot_build {
         Some((p, k)) => (Some(p), k),
@@ -1993,11 +1990,7 @@ fn fused_dim_shape(
 /// build 侧可剥出单表、元数据行数 ≤ `JOIN_SHARD_MAX_BUILD_ROWS`（组表上界 =
 /// TOP build 行数，融合路没有组溢出通道）、表名 ≠ 被分片的基表名（自连在
 /// `ShardScope` 下两侧都认领同一分片 = 静默错配）。
-fn fused_budget_ok(
-    db: &Qsdb,
-    shape: &FusedShape,
-    base_table: Option<&str>,
-) -> bool {
+fn fused_budget_ok(db: &Qsdb, shape: &FusedShape, base_table: Option<&str>) -> bool {
     let mut build_plans: Vec<&LogicalPlan> = vec![&shape.top_build];
     if let Some(b) = &shape.bot_build {
         build_plans.push(b);
@@ -2109,8 +2102,8 @@ fn build_aggregate(
                         | arrow::datatypes::DataType::Date32
                 );
             if !fixed_width_key {
-                let utf8_single = fs.len() == 1
-                    && matches!(fs[0].data_type(), arrow::datatypes::DataType::Utf8);
+                let utf8_single =
+                    fs.len() == 1 && matches!(fs[0].data_type(), arrow::datatypes::DataType::Utf8);
                 if let Some(rows) = distinct_row_upper_bound(db, input) {
                     let nparts = distinct_parts();
                     let reserve = rows.saturating_mul(DISTINCT_SHUFFLE_BYTES_PER_ROW);
@@ -2127,11 +2120,13 @@ fn build_aggregate(
                                 Some(shards) => shards,
                                 None => vec![node],
                             };
-                            return Ok(Box::new(
-                                crate::exec::SortedDistinctCountExec::new(
-                                    inputs, out_schema, nparts, res, Arc::clone(ctx),
-                                ),
-                            ));
+                            return Ok(Box::new(crate::exec::SortedDistinctCountExec::new(
+                                inputs,
+                                out_schema,
+                                nparts,
+                                res,
+                                Arc::clone(ctx),
+                            )));
                         }
                         if nparts > 1 {
                             return Ok(Box::new(crate::exec::PartitionedDistinctCountExec::new(
@@ -2328,10 +2323,14 @@ fn build_aggregate(
         // 维表链聚合融合（非分片路，第十四批刀 C）：形状命中就在计划期
         // 一口气跑完 build+probe，finalize 成一批吐出。
         if std::env::var("QSDB_NO_FUSED_JOIN").is_err() {
-            if let Some(shape) = fused_dim_shape(input, group, aggs).filter(|s| fused_budget_ok(db, s, None)) {
+            if let Some(shape) =
+                fused_dim_shape(input, group, aggs).filter(|s| fused_budget_ok(db, s, None))
+            {
                 let mut fields: Vec<arrow::datatypes::Field> = group
                     .iter()
-                    .map(|g| arrow::datatypes::Field::new(g.display(), g.data_type().arrow_type(), true))
+                    .map(|g| {
+                        arrow::datatypes::Field::new(g.display(), g.data_type().arrow_type(), true)
+                    })
                     .collect();
                 for a in aggs {
                     fields.push(arrow::datatypes::Field::new(
@@ -2426,10 +2425,14 @@ fn build_aggregate(
     //    merge/finalize 机制零改动（finish_partitioned_merge 原样吃）。
     //    `filters`/`semis` 非空就门拒（它们的列可能来自 join 结果，融合路的
     //    probe 流没有那些列）；`QSDB_NO_FUSED_JOIN=1` A/B 对照。
-    if joins > 0 && filters.is_empty() && semis.is_empty()
+    if joins > 0
+        && filters.is_empty()
+        && semis.is_empty()
         && std::env::var("QSDB_NO_FUSED_JOIN").is_err()
     {
-        if let Some(shape) = fused_dim_shape(input, &group, &aggs).filter(|s| fused_budget_ok(db, s, Some(&table))) {
+        if let Some(shape) =
+            fused_dim_shape(input, &group, &aggs).filter(|s| fused_budget_ok(db, s, Some(&table)))
+        {
             let partials: Vec<(GroupTable, crate::memory::Reservation)> = shards
                 .into_par_iter()
                 .map(|s| {

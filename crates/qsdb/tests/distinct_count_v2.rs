@@ -132,7 +132,10 @@ fn 五万行随机串_三路对撞() {
     let expect_fused = scalar(&db, "SELECT count(DISTINCT s) FROM t");
     unsafe { std::env::remove_var("QSDB_NO_DISTINCT_FUSE") };
     unsafe { std::env::remove_var("QSDB_NO_DISTINCT_V2") };
-    assert!(expect_mat > CARD as i64, "数据必须真的有多值（got {expect_mat}）");
+    assert!(
+        expect_mat > CARD as i64,
+        "数据必须真的有多值（got {expect_mat}）"
+    );
     assert!(
         expect_mat == expect_fused + 1,
         "恰好多一个 NULL（mat={expect_mat}, fused={expect_fused}）"

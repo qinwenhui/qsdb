@@ -97,8 +97,14 @@ fn 与手写_case_group_by_逐值逐列一致() {
     // 3 组：(d1,c1) (d1,c2) (d2,c1)。**分组粒度**这一钉：多减一列就会变 5 行。
     assert_eq!(r1.len(), 3, "{r1:?}");
     // 缺席的组合 ⇒ NULL（不是 0、也不是整行消失）
-    let c2 = r1.iter().find(|r| r[0] == "d1" && r[1] == "c2").expect("缺 (d1,c2) 行");
-    assert!(c2[3].is_empty(), "c2 没有 tpoint='2' ⇒ v2 应为 NULL: {c2:?}");
+    let c2 = r1
+        .iter()
+        .find(|r| r[0] == "d1" && r[1] == "c2")
+        .expect("缺 (d1,c2) 行");
+    assert!(
+        c2[3].is_empty(),
+        "c2 没有 tpoint='2' ⇒ v2 应为 NULL: {c2:?}"
+    );
 }
 
 /// 内层是**裸表**（没有派生表包一层）时同样成立。
@@ -130,7 +136,11 @@ fn 其余列不含_for_列与聚合引用的列() {
         "SELECT * FROM (SELECT pdate, cust, tpoint, value FROM s) t \
          PIVOT (SUM(value) AS value FOR tpoint IN ('1' AS v1, '2' AS v2))",
     );
-    assert_eq!(names, vec!["pdate", "cust", "v1", "v2"], "tpoint/value 都不该出现在输出里");
+    assert_eq!(
+        names,
+        vec!["pdate", "cust", "v1", "v2"],
+        "tpoint/value 都不该出现在输出里"
+    );
 }
 
 /// **语料里的真实形状**：`stack`（列转行）→ `PIVOT`（行转列）串起来
@@ -139,8 +149,10 @@ fn 其余列不含_for_列与聚合引用的列() {
 #[test]
 fn stack_接_pivot_的语料骨架() {
     let (db, _r) = setup("chain");
-    db.sql("CREATE TABLE w (pdate VARCHAR, tpoint VARCHAR, energy DECIMAL(10,2), price DECIMAL(10,2))")
-        .unwrap();
+    db.sql(
+        "CREATE TABLE w (pdate VARCHAR, tpoint VARCHAR, energy DECIMAL(10,2), price DECIMAL(10,2))",
+    )
+    .unwrap();
     db.sql(
         "INSERT INTO w VALUES \
          ('d1','1', 10.00, 100.00), \
@@ -233,7 +245,10 @@ fn in_无别名时按字面量取名() {
 fn in_值非字面量时拒() {
     let (db, _r) = setup("nonlit");
     seed(&db);
-    let e = err_of(&db, "SELECT * FROM s PIVOT (SUM(value) AS v FOR tpoint IN (cust))");
+    let e = err_of(
+        &db,
+        "SELECT * FROM s PIVOT (SUM(value) AS v FOR tpoint IN (cust))",
+    );
     assert!(e.contains("write the alias explicitly"), "unexpected: {e}");
     let e = err_of(
         &db,
@@ -269,7 +284,10 @@ fn in_里含子查询或_any_就拒() {
         "SELECT * FROM s PIVOT (SUM(value) AS v FOR tpoint IN (SELECT tpoint FROM s))",
     );
     assert!(e.contains("depend on the data"), "unexpected: {e}");
-    let e = err_of(&db, "SELECT * FROM s PIVOT (SUM(value) AS v FOR tpoint IN (ANY))");
+    let e = err_of(
+        &db,
+        "SELECT * FROM s PIVOT (SUM(value) AS v FOR tpoint IN (ANY))",
+    );
     assert!(e.contains("depend on the data"), "unexpected: {e}");
 }
 
@@ -292,7 +310,10 @@ fn 聚合不是聚合函数就拒() {
         &db,
         "SELECT * FROM s PIVOT (abs(value) AS a FOR tpoint IN ('1' AS v1))",
     );
-    assert!(e.contains("must be one of count/sum/min/max/avg"), "unexpected: {e}");
+    assert!(
+        e.contains("must be one of count/sum/min/max/avg"),
+        "unexpected: {e}"
+    );
 }
 
 #[test]

@@ -13,14 +13,16 @@
 use qsdb::{Qsdb, QsdbOptions};
 
 fn setup(tag: &str) -> (Qsdb, std::path::PathBuf) {
-    let root = std::env::temp_dir().join("qsdb_least_greatest").join(format!(
-        "{tag}_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let root = std::env::temp_dir()
+        .join("qsdb_least_greatest")
+        .join(format!(
+            "{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
     std::fs::create_dir_all(&root).unwrap();
     let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
     (db, root)
@@ -101,9 +103,7 @@ fn 嵌套折叠_与列上的_null_混合() {
         .sql_collect("SELECT least(COALESCE(a, 0), b) AS r FROM t ORDER BY r")
         .unwrap();
     let got: Vec<String> = (0..bs[0].num_rows())
-        .map(|i| {
-            arrow::util::display::array_value_to_string(bs[0].column(0).as_ref(), i).unwrap()
-        })
+        .map(|i| arrow::util::display::array_value_to_string(bs[0].column(0).as_ref(), i).unwrap())
         .collect();
     // 行1: least(1, 5) = 1；行2: least(0, 2) = 0；行3: least(0, NULL) = 0（忽略 NULL）；
     // 行4: least(4, NULL) = 4
@@ -114,9 +114,7 @@ fn 嵌套折叠_与列上的_null_混合() {
         .sql_collect("SELECT greatest(0, least(a, b), c) AS r FROM t")
         .unwrap();
     let got: Vec<String> = (0..bs[0].num_rows())
-        .map(|i| {
-            arrow::util::display::array_value_to_string(bs[0].column(0).as_ref(), i).unwrap()
-        })
+        .map(|i| arrow::util::display::array_value_to_string(bs[0].column(0).as_ref(), i).unwrap())
         .collect();
     // 行1: least(1,5)=1，greatest(0,1,NULL)=1
     // 行2: least(NULL,2)=2，greatest(0,2,3)=3
@@ -147,7 +145,10 @@ fn cast_null_到任意类型都合法() {
         ("SELECT CAST(NULL AS VARCHAR)", ""),
         ("SELECT CAST(NULL AS DATE)", ""),
         ("SELECT coalesce(CAST(NULL AS INT), 1)", "1"),
-        ("SELECT CASE WHEN 1=2 THEN CAST(NULL AS INT) ELSE 1 END", "1"),
+        (
+            "SELECT CASE WHEN 1=2 THEN CAST(NULL AS INT) ELSE 1 END",
+            "1",
+        ),
     ] {
         assert_eq!(cell(&db, sql), want, "sql={sql}");
     }
@@ -191,7 +192,8 @@ fn 除零给_null_而不是报错() {
 #[test]
 fn coalesce_整数与小数留位() {
     let (db, _r) = setup("decimal_int_promote");
-    db.sql("CREATE TABLE s (i INT, ti TINYINT, b BIGINT)").unwrap();
+    db.sql("CREATE TABLE s (i INT, ti TINYINT, b BIGINT)")
+        .unwrap();
     db.sql("INSERT INTO s VALUES (1, 1, 1)").unwrap();
     // 关键：**不再报溢出**，且整数侧的值原样保住
     assert_eq!(cell(&db, "SELECT coalesce(i, 0.0) FROM s"), "1.0");

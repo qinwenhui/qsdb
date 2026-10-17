@@ -582,9 +582,7 @@ fn build() -> HashMap<&'static str, Arc<ScalarFnDef>> {
             ret_ty: Arc::new(|args| match args {
                 [
                     // 字符串入参按 Spark 收（可转时间戳的字符串），见 `date_format_eval`
-                    LogicalType::Date
-                    | LogicalType::Timestamp { .. }
-                    | LogicalType::Varchar { .. },
+                    LogicalType::Date | LogicalType::Timestamp { .. } | LogicalType::Varchar { .. },
                     LogicalType::Varchar { .. } | LogicalType::Int64,
                 ] => Ok(LogicalType::Varchar { max_chars: None }),
                 _ => Err(QsdbError::type_err(

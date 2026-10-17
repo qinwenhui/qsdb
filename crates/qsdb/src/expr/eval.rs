@@ -424,14 +424,8 @@ fn div_mod_null_on_zero(is_div: bool, l: &EvalVal, r: &EvalVal) -> Result<ArrayR
             };
             let rdt = ra.data_type().clone();
             let scalar = |v: i64| -> Result<ArrayRef> {
-                cast_with_options(
-                    &Int64Array::from(vec![v]),
-                    &rdt,
-                    &CastOptions::default(),
-                )
-                .map_err(|er| {
-                    QsdbError::invalid(format!("{op_name}: 构造常量失败: {er}"))
-                })
+                cast_with_options(&Int64Array::from(vec![v]), &rdt, &CastOptions::default())
+                    .map_err(|er| QsdbError::invalid(format!("{op_name}: 构造常量失败: {er}")))
             };
             let zero = scalar(0)?;
             let one = scalar(1)?;

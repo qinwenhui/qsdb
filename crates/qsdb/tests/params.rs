@@ -325,12 +325,14 @@ fn 错误面() {
     // `promote_string_lit` 与 `expr_complete::数值与字符串字面量比较_…`），
     // WHERE 过滤后就是**空结果**，不是绑定期报错。
     // （历史注：这里曾断言 "cannot compare" —— 那是字面量提升落地前的旧契约。）
-    assert!(q(
-        &db,
-        "SELECT * FROM t WHERE v = $1",
-        serde_json::json!(["abc"])
-    )
-    .is_empty());
+    assert!(
+        q(
+            &db,
+            "SELECT * FROM t WHERE v = $1",
+            serde_json::json!(["abc"])
+        )
+        .is_empty()
+    );
     // 显式类型名不认识 / 值转不过去
     assert!(
         err_of(

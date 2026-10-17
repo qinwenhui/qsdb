@@ -414,12 +414,36 @@ fn 数值与字符串字面量比较_转不动给_null_而不是报错() {
         "空串比较必须是 NULL（WHEN 不取）"
     );
     // 直接看比较结果本身：全 NULL
-    assert!(q(&db, "SELECT amount = '' FROM t").iter().all(|r| r == "NULL"));
-    assert!(q(&db, "SELECT amount <> '' FROM t").iter().all(|r| r == "NULL"));
+    assert!(
+        q(&db, "SELECT amount = '' FROM t")
+            .iter()
+            .all(|r| r == "NULL")
+    );
+    assert!(
+        q(&db, "SELECT amount <> '' FROM t")
+            .iter()
+            .all(|r| r == "NULL")
+    );
     // 同族的整数 / 浮点 / 能转动的字符串
-    assert!(q(&db, "SELECT cnt = 'z' FROM t").iter().all(|r| r == "NULL"));
-    assert!(q(&db, "SELECT score = 'z' FROM t").iter().all(|r| r == "NULL"));
-    assert!(q(&db, "SELECT CAST(1 AS BIGINT) = '1'").iter().all(|r| r == "true"));
+    assert!(
+        q(&db, "SELECT cnt = 'z' FROM t")
+            .iter()
+            .all(|r| r == "NULL")
+    );
+    assert!(
+        q(&db, "SELECT score = 'z' FROM t")
+            .iter()
+            .all(|r| r == "NULL")
+    );
+    assert!(
+        q(&db, "SELECT CAST(1 AS BIGINT) = '1'")
+            .iter()
+            .all(|r| r == "true")
+    );
     // 显式 NULL 仍然短路（这条一直都在，别被上面的改动带跑）
-    assert!(q(&db, "SELECT cnt = NULL FROM t").iter().all(|r| r == "NULL"));
+    assert!(
+        q(&db, "SELECT cnt = NULL FROM t")
+            .iter()
+            .all(|r| r == "NULL")
+    );
 }

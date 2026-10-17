@@ -91,7 +91,10 @@ fn 多值_in_与显式_or_逐值相同() {
     assert_eq!(got, vec!["7", "350", "999"]);
 
     // 大列表
-    let got = rows(&db, "SELECT count(*) FROM t WHERE k IN (1,2,3,4,5,105,205,305)");
+    let got = rows(
+        &db,
+        "SELECT count(*) FROM t WHERE k IN (1,2,3,4,5,105,205,305)",
+    );
     let want = rows(
         &db,
         "SELECT count(*) FROM t WHERE k=1 OR k=2 OR k=3 OR k=4 OR k=5 OR k=105 OR k=205 OR k=305",
@@ -116,7 +119,10 @@ fn 多值_in_与显式_or_逐值相同() {
 fn 字符串多值_in() {
     let (db, _r) = setup("str");
     seed(&db);
-    let got = rows(&db, "SELECT count(*) FROM t WHERE s IN ('v1','v500','v999')");
+    let got = rows(
+        &db,
+        "SELECT count(*) FROM t WHERE s IN ('v1','v500','v999')",
+    );
     let want = rows(
         &db,
         "SELECT count(*) FROM t WHERE s='v1' OR s='v500' OR s='v999'",
@@ -181,7 +187,10 @@ fn 分区列多值_in_结果正确() {
     }
     // 多值 IN 命中 2 个分区
     assert_eq!(
-        rows(&db2, "SELECT count(*) FROM p WHERE d IN (DATE '2026-01-02', DATE '2026-01-04')"),
+        rows(
+            &db2,
+            "SELECT count(*) FROM p WHERE d IN (DATE '2026-01-02', DATE '2026-01-04')"
+        ),
         vec!["4"]
     );
     // 与显式 OR 对撞
@@ -194,7 +203,10 @@ fn 分区列多值_in_结果正确() {
     );
     // 不存在的日期 ⇒ 0 行（分区被裁光）
     assert_eq!(
-        rows(&db2, "SELECT count(*) FROM p WHERE d IN (DATE '2026-09-09', DATE '2026-09-10')"),
+        rows(
+            &db2,
+            "SELECT count(*) FROM p WHERE d IN (DATE '2026-09-09', DATE '2026-09-10')"
+        ),
         vec!["0"]
     );
     // 全选

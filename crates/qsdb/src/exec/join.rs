@@ -452,7 +452,10 @@ impl HashIndex {
     /// 单 UTF8 键判定（`docs/join字符串键零拷贝设计.md`）。
     fn str_ok(keys: &[PhysExpr]) -> bool {
         keys.len() == 1
-            && matches!(keys[0].data_type(), crate::types::LogicalType::Varchar { .. })
+            && matches!(
+                keys[0].data_type(),
+                crate::types::LogicalType::Varchar { .. }
+            )
     }
 
     /// **探测预备态**：每批构造一次（downcast / 类型化视图 / 缓冲复用都在这一步），
@@ -461,10 +464,7 @@ impl HashIndex {
     pub(crate) fn prepare_probe<'a>(&'a self, key_cols: &'a [ArrayRef]) -> RowProbe<'a> {
         let (vals, arr) = match self {
             HashIndex::I64(_) | HashIndex::Direct { .. } => (int_col(&key_cols[0]), None),
-            HashIndex::Str(_) => (
-                None,
-                key_cols[0].as_any().downcast_ref::<StringArray>(),
-            ),
+            HashIndex::Str(_) => (None, key_cols[0].as_any().downcast_ref::<StringArray>()),
             HashIndex::Bytes(_) => (None, None),
         };
         RowProbe {
@@ -1438,15 +1438,13 @@ pub(crate) fn build_index(side: &BuildSide, build_keys: &[PhysExpr]) -> Result<H
             let mut m: I64Map<SmallRows> = I64Map::default();
             for (v, r) in kv {
                 match m.entry(v) {
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        match e.get_mut() {
-                            SmallRows::One(f) => {
-                                let f = *f;
-                                *e.get_mut() = SmallRows::Many(vec![f, r]);
-                            }
-                            SmallRows::Many(list) => list.push(r),
+                    std::collections::hash_map::Entry::Occupied(mut e) => match e.get_mut() {
+                        SmallRows::One(f) => {
+                            let f = *f;
+                            *e.get_mut() = SmallRows::Many(vec![f, r]);
                         }
-                    }
+                        SmallRows::Many(list) => list.push(r),
+                    },
                     std::collections::hash_map::Entry::Vacant(e) => {
                         e.insert(SmallRows::One(r));
                     }
@@ -1849,13 +1847,20 @@ fn emit_prof_snapshot() {
         g(&EMIT_PROF.rows_in),
         g(&EMIT_PROF.rows_out),
         g(&EMIT_PROF.needed_calls),
-        ms(ev), pct(ev),
-        ms(pr), pct(pr),
-        ms(g(&EMIT_PROF.probe_i64_ns)), ms(g(&EMIT_PROF.probe_str_ns)), ms(g(&EMIT_PROF.probe_bytes_ns)),
+        ms(ev),
+        pct(ev),
+        ms(pr),
+        pct(pr),
+        ms(g(&EMIT_PROF.probe_i64_ns)),
+        ms(g(&EMIT_PROF.probe_str_ns)),
+        ms(g(&EMIT_PROF.probe_bytes_ns)),
         ms(rs),
-        ms(pt), pct(pt),
-        ms(bt), pct(bt),
-        ms(cs), pct(cs),
+        ms(pt),
+        pct(pt),
+        ms(bt),
+        pct(bt),
+        ms(cs),
+        pct(cs),
         ms(total),
     );
 }
@@ -2614,22 +2619,10 @@ impl IntCol<'_> {
 
 fn int_col(col: &ArrayRef) -> Option<IntCol<'_>> {
     match col.data_type() {
-        DataType::Int8 => col
-            .as_any()
-            .downcast_ref::<Int8Array>()
-            .map(IntCol::I8),
-        DataType::Int16 => col
-            .as_any()
-            .downcast_ref::<Int16Array>()
-            .map(IntCol::I16),
-        DataType::Int32 => col
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .map(IntCol::I32),
-        DataType::Int64 => col
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .map(IntCol::I64),
+        DataType::Int8 => col.as_any().downcast_ref::<Int8Array>().map(IntCol::I8),
+        DataType::Int16 => col.as_any().downcast_ref::<Int16Array>().map(IntCol::I16),
+        DataType::Int32 => col.as_any().downcast_ref::<Int32Array>().map(IntCol::I32),
+        DataType::Int64 => col.as_any().downcast_ref::<Int64Array>().map(IntCol::I64),
         _ => None,
     }
 }

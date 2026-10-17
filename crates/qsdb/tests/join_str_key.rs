@@ -27,7 +27,9 @@ fn rows(db: &Qsdb, sql: &str) -> Vec<String> {
     for b in &bs {
         for i in 0..b.num_rows() {
             let cells: Vec<String> = (0..b.num_columns())
-                .map(|c| arrow::util::display::array_value_to_string(b.column(c).as_ref(), i).unwrap())
+                .map(|c| {
+                    arrow::util::display::array_value_to_string(b.column(c).as_ref(), i).unwrap()
+                })
                 .collect();
             out.push(cells.join("|"));
         }
@@ -44,8 +46,10 @@ fn 字符串键_inner_与语义对撞() {
     db.sql("CREATE TABLE t (k VARCHAR, v INT)").unwrap();
     db.sql("CREATE TABLE d (k VARCHAR, w VARCHAR)").unwrap();
     // 重复键两侧都有：'a' 各 2 行 ⇒ 2×2 = 4 对
-    db.sql("INSERT INTO t VALUES ('a', 1), ('a', 2), ('b', 3), (NULL, 9), ('', 8)").unwrap();
-    db.sql("INSERT INTO d VALUES ('a', 'x'), ('a', 'y'), ('c', 'z'), ('', 'e')").unwrap();
+    db.sql("INSERT INTO t VALUES ('a', 1), ('a', 2), ('b', 3), (NULL, 9), ('', 8)")
+        .unwrap();
+    db.sql("INSERT INTO d VALUES ('a', 'x'), ('a', 'y'), ('c', 'z'), ('', 'e')")
+        .unwrap();
 
     // INNER：a(2 行) × a(2 行) = 4 对；'' 匹配 '' = 1 对；NULL 不匹配
     let got = rows(&db, "SELECT t.v, d.w FROM t JOIN d ON t.k = d.k");
@@ -62,7 +66,8 @@ fn 字符串键_left_未匹配补_null() {
     let (db, _r) = setup("left");
     db.sql("CREATE TABLE t (k VARCHAR, v INT)").unwrap();
     db.sql("CREATE TABLE d (k VARCHAR, w VARCHAR)").unwrap();
-    db.sql("INSERT INTO t VALUES ('a', 1), ('b', 2), (NULL, 3)").unwrap();
+    db.sql("INSERT INTO t VALUES ('a', 1), ('b', 2), (NULL, 3)")
+        .unwrap();
     db.sql("INSERT INTO d VALUES ('a', 'x')").unwrap();
     let got = rows(&db, "SELECT t.v, d.w FROM t LEFT JOIN d ON t.k = d.k");
     assert_eq!(got, vec!["1|x", "2|", "3|"]);
@@ -75,7 +80,8 @@ fn 空串键参与匹配() {
     db.sql("CREATE TABLE t (k VARCHAR, v INT)").unwrap();
     db.sql("CREATE TABLE d (k VARCHAR, tag VARCHAR)").unwrap();
     db.sql("INSERT INTO t VALUES ('', 1), ('x', 2)").unwrap();
-    db.sql("INSERT INTO d VALUES ('', 'E'), ('x', 'X')").unwrap();
+    db.sql("INSERT INTO d VALUES ('', 'E'), ('x', 'X')")
+        .unwrap();
     let got = rows(&db, "SELECT t.v, d.tag FROM t JOIN d ON t.k = d.k");
     assert_eq!(got, vec!["1|E", "2|X"]);
 }
@@ -87,10 +93,13 @@ fn 三表链_第二段字符串键() {
     let (db, _r) = setup("chain");
     db.sql("CREATE TABLE t (g BIGINT, v INT)").unwrap();
     db.sql("CREATE TABLE d (g BIGINT, cat VARCHAR)").unwrap();
-    db.sql("CREATE TABLE d2 (cat VARCHAR, tag VARCHAR)").unwrap();
-    db.sql("INSERT INTO t VALUES (1, 10), (1, 11), (2, 20), (3, 30)").unwrap();
+    db.sql("CREATE TABLE d2 (cat VARCHAR, tag VARCHAR)")
+        .unwrap();
+    db.sql("INSERT INTO t VALUES (1, 10), (1, 11), (2, 20), (3, 30)")
+        .unwrap();
     db.sql("INSERT INTO d VALUES (1, 'A'), (2, 'B')").unwrap();
-    db.sql("INSERT INTO d2 VALUES ('A', 'a1'), ('A', 'a2'), ('C', 'c')").unwrap();
+    db.sql("INSERT INTO d2 VALUES ('A', 'a1'), ('A', 'a2'), ('C', 'c')")
+        .unwrap();
     let got = rows(
         &db,
         "SELECT d2.tag, count(*) c FROM t JOIN d ON t.g = d.g JOIN d2 ON d.cat = d2.cat \
@@ -110,12 +119,20 @@ fn 高基数字符串键_计数正确() {
     for i in 0..10000u32 {
         vals.push_str(&format!(",('k{}', {})", i, i));
     }
-    db.sql(&format!("INSERT INTO t VALUES {}", vals.trim_start_matches(','))).unwrap();
+    db.sql(&format!(
+        "INSERT INTO t VALUES {}",
+        vals.trim_start_matches(',')
+    ))
+    .unwrap();
     let mut vals = String::new();
     for i in (0..10000u32).step_by(2) {
         vals.push_str(&format!(",('k{}', {})", i, i * 10));
     }
-    db.sql(&format!("INSERT INTO d VALUES {}", vals.trim_start_matches(','))).unwrap();
+    db.sql(&format!(
+        "INSERT INTO d VALUES {}",
+        vals.trim_start_matches(',')
+    ))
+    .unwrap();
     let got = rows(&db, "SELECT count(*) FROM t JOIN d ON t.k = d.k");
     assert_eq!(got, vec!["5000"], "偶数键一一配对 = 5000 对");
 }

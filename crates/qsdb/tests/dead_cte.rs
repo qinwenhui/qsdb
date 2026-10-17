@@ -176,10 +176,7 @@ fn 裁剪不改变结果() {
                      SELECT a, b FROM live ORDER BY a";
     let without_dead = "WITH live AS (SELECT a, b FROM t) SELECT a, b FROM live ORDER BY a";
     assert_eq!(rows(&db, with_dead), rows(&db, without_dead));
-    assert_eq!(
-        rows(&db, without_dead),
-        vec!["1|10", "2|20", "3|30"]
-    );
+    assert_eq!(rows(&db, without_dead), vec!["1|10", "2|20", "3|30"]);
 }
 
 /// 逗号连接 `FROM a, b` ≡ 交叉连接（Spark 语义）。
@@ -204,7 +201,10 @@ fn 逗号连接当交叉连接() {
     );
     // 逗号 + WHERE（笛卡尔后再过滤）—— 语料里正是这个形状
     assert_eq!(
-        rows(&db, "SELECT a, u.c FROM t, u WHERE u.c = a * 100 ORDER BY a"),
+        rows(
+            &db,
+            "SELECT a, u.c FROM t, u WHERE u.c = a * 100 ORDER BY a"
+        ),
         vec!["1|100", "2|200"]
     );
 }
@@ -213,14 +213,20 @@ fn 逗号连接当交叉连接() {
 #[test]
 fn concat_多参拼接() {
     let (db, _r) = setup("concat");
-    assert_eq!(rows(&db, "SELECT concat('2@', CAST(1 AS STRING))"), vec!["2@1"]);
+    assert_eq!(
+        rows(&db, "SELECT concat('2@', CAST(1 AS STRING))"),
+        vec!["2@1"]
+    );
     assert_eq!(rows(&db, "SELECT concat('a', 'b', 'c')"), vec!["abc"]);
     assert_eq!(rows(&db, "SELECT concat('a')"), vec!["a"]);
     // 任一为 NULL ⇒ NULL
     assert_eq!(rows(&db, "SELECT concat('a', NULL)"), vec![""]);
     // 列上逐行
     assert_eq!(
-        rows(&db, "SELECT concat('p', CAST(a AS STRING)) FROM t ORDER BY a"),
+        rows(
+            &db,
+            "SELECT concat('p', CAST(a AS STRING)) FROM t ORDER BY a"
+        ),
         vec!["p1", "p2", "p3"]
     );
 }

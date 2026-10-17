@@ -12,14 +12,16 @@
 use qsdb::{Qsdb, QsdbOptions};
 
 fn setup(tag: &str) -> (Qsdb, std::path::PathBuf) {
-    let root = std::env::temp_dir().join("qsdb_stack_unpivot").join(format!(
-        "{tag}_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let root = std::env::temp_dir()
+        .join("qsdb_stack_unpivot")
+        .join(format!(
+            "{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
     std::fs::create_dir_all(&root).unwrap();
     let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
     (db, root)
@@ -60,8 +62,10 @@ fn dump(db: &Qsdb, sql: &str) -> (Vec<String>, Vec<Vec<String>>) {
 /// 建一张小表：`v2` 那一列**故意留 NULL**（`stack` 会把 NULL 从竖直方向搬到水平方向，
 /// 是最容易把"少一行"和"多一行 NULL"搞混的地方）。
 fn seed(db: &Qsdb) {
-    db.sql("CREATE TABLE t (a INT, b VARCHAR, v1 DECIMAL(10,2), v2 DECIMAL(10,2), v3 DECIMAL(10,2))")
-        .unwrap();
+    db.sql(
+        "CREATE TABLE t (a INT, b VARCHAR, v1 DECIMAL(10,2), v2 DECIMAL(10,2), v3 DECIMAL(10,2))",
+    )
+    .unwrap();
     db.sql(
         "INSERT INTO t VALUES \
          (1, 'x', 1.50, 2.50, 3.50), \
@@ -92,7 +96,10 @@ fn 三对_与手写_union_all_逐值一致() {
     // 钉一下确实是 6 行（2 行 × 3 对）—— 两边都错成同一个数时上面那比对不出来
     assert_eq!(r1.len(), 6);
     // NULL 原样搬过来，不当成"这一对没有"
-    assert!(r1.iter().any(|row| row[2].is_empty()), "v2 的 NULL 应在结果里: {r1:?}");
+    assert!(
+        r1.iter().any(|row| row[2].is_empty()),
+        "v2 的 NULL 应在结果里: {r1:?}"
+    );
 }
 
 /// **分支顺序 = pair 顺序**（设计稿 §2.3 明写的一条）。下游全靠它对齐，
@@ -150,9 +157,7 @@ fn 输入是_cte_时同样成立() {
 fn 十二对的上界() {
     let (db, _r) = setup("twelve");
     seed(&db);
-    let pairs: Vec<String> = (1..=12)
-        .map(|i| format!("'k{i}', {i}"))
-        .collect();
+    let pairs: Vec<String> = (1..=12).map(|i| format!("'k{i}', {i}")).collect();
     let sql = format!(
         "SELECT a, stack(12, {}) AS (dt, val) FROM t WHERE a = 1",
         pairs.join(", ")
@@ -197,7 +202,10 @@ fn 两个_stack_是笛卡尔展开() {
     );
     assert_eq!(names, vec!["a", "dt", "val", "dt2", "val2"]);
     assert_eq!(rows.len(), 4, "{rows:?}");
-    let pairs: Vec<(&str, &str)> = rows.iter().map(|r| (r[1].as_str(), r[3].as_str())).collect();
+    let pairs: Vec<(&str, &str)> = rows
+        .iter()
+        .map(|r| (r[1].as_str(), r[3].as_str()))
+        .collect();
     assert_eq!(
         pairs,
         vec![("p", "c"), ("p", "d"), ("q", "c"), ("q", "d")],
@@ -227,7 +235,10 @@ fn 与_select_star_同用() {
     let (db, _r) = setup("star");
     db.sql("CREATE TABLE s (a INT, v1 INT, v2 INT)").unwrap();
     db.sql("INSERT INTO s VALUES (1, 7, 8)").unwrap();
-    let (names, rows) = dump(&db, "SELECT *, stack(2, 'p', v1, 'q', v2) AS (dt, val) FROM s");
+    let (names, rows) = dump(
+        &db,
+        "SELECT *, stack(2, 'p', v1, 'q', v2) AS (dt, val) FROM s",
+    );
     assert_eq!(names, vec!["a", "v1", "v2", "dt", "val"]);
     assert_eq!(rows.len(), 2, "{rows:?}");
     assert_eq!(rows[0], vec!["1", "7", "8", "p", "7"]);
@@ -256,17 +267,29 @@ fn 没有两列别名就拒() {
     let e = err_of(&db, "SELECT a, stack(2, 'p', v1, 'q', v2) AS x FROM t");
     assert!(e.contains("two-column alias"), "unexpected: {e}");
     // 别名给了三个
-    let e = err_of(&db, "SELECT a, stack(2, 'p', v1, 'q', v2) AS (x, y, z) FROM t");
-    assert!(e.contains("exactly 2 output column aliases"), "unexpected: {e}");
+    let e = err_of(
+        &db,
+        "SELECT a, stack(2, 'p', v1, 'q', v2) AS (x, y, z) FROM t",
+    );
+    assert!(
+        e.contains("exactly 2 output column aliases"),
+        "unexpected: {e}"
+    );
 }
 
 #[test]
 fn 被别的表达式包住就拒() {
     let (db, _r) = setup("wrapped");
     seed(&db);
-    let e = err_of(&db, "SELECT a, stack(2, 'p', v1, 'q', v2) + 1 AS (x, y) FROM t");
+    let e = err_of(
+        &db,
+        "SELECT a, stack(2, 'p', v1, 'q', v2) + 1 AS (x, y) FROM t",
+    );
     assert!(e.contains("top-level SELECT item"), "unexpected: {e}");
-    let e = err_of(&db, "SELECT a, abs(stack(2, 'p', v1, 'q', v2)) AS (x, y) FROM t");
+    let e = err_of(
+        &db,
+        "SELECT a, abs(stack(2, 'p', v1, 'q', v2)) AS (x, y) FROM t",
+    );
     assert!(e.contains("top-level SELECT item"), "unexpected: {e}");
 }
 
@@ -278,7 +301,10 @@ fn 参数个数与_n_对不上就拒() {
     let e = err_of(&db, "SELECT stack(2, 'p', v1, 'q') AS (x, y) FROM t");
     assert!(e.contains("needs exactly 5 arguments"), "unexpected: {e}");
     // 说 3 对，给了 4 对
-    let e = err_of(&db, "SELECT stack(3, 'p', v1, 'q', v2, 'r', v3, 's', v1) AS (x, y) FROM t");
+    let e = err_of(
+        &db,
+        "SELECT stack(3, 'p', v1, 'q', v2, 'r', v3, 's', v1) AS (x, y) FROM t",
+    );
     assert!(e.contains("needs exactly 7 arguments"), "unexpected: {e}");
 }
 
@@ -305,11 +331,23 @@ fn 与聚合_group_by_混用就拒() {
     let (db, _r) = setup("agg");
     seed(&db);
     // 兄弟投影项里有聚合
-    let e = err_of(&db, "SELECT sum(a), stack(2, 'p', 1, 'q', 2) AS (dt, v) FROM t");
-    assert!(e.contains("aggregate / window functions"), "unexpected: {e}");
+    let e = err_of(
+        &db,
+        "SELECT sum(a), stack(2, 'p', 1, 'q', 2) AS (dt, v) FROM t",
+    );
+    assert!(
+        e.contains("aggregate / window functions"),
+        "unexpected: {e}"
+    );
     // stack 参数里有聚合
-    let e = err_of(&db, "SELECT a, stack(2, 'p', sum(v1), 'q', v2) AS (dt, v) FROM t");
-    assert!(e.contains("aggregate / window functions"), "unexpected: {e}");
+    let e = err_of(
+        &db,
+        "SELECT a, stack(2, 'p', sum(v1), 'q', v2) AS (dt, v) FROM t",
+    );
+    assert!(
+        e.contains("aggregate / window functions"),
+        "unexpected: {e}"
+    );
     // GROUP BY
     let e = err_of(
         &db,
@@ -322,5 +360,8 @@ fn 与聚合_group_by_混用就拒() {
         "SELECT row_number() OVER (ORDER BY a) AS rn, \
                 stack(2, 'p', v1, 'q', v2) AS (dt, v) FROM t",
     );
-    assert!(e.contains("aggregate / window functions"), "unexpected: {e}");
+    assert!(
+        e.contains("aggregate / window functions"),
+        "unexpected: {e}"
+    );
 }
