@@ -405,9 +405,14 @@ struct BuildState {
     index: HashIndex,
 }
 
-/// 键 → build 行号列表。单整数键（Int/Date/Boolean/Timestamp）用 i64 直查。
+/// 键 → build 行号列表。单整数键（Int/Date/Boolean/Timestamp）用 i64 直查；
+/// 单 UTF8 键用**零拷贝**字符串索引（`docs/join字符串键零拷贝设计.md`）。
 enum HashIndex {
-    I64(I64Map<Vec<u32>>),
+    /// 值用 [`SmallRows`]（首个行号内联）：一一 join（绝大多数）**零分配、
+    /// 一次指针追逐** —— 此前 `Vec<u32>` 每键一个堆分配，probe 每次 get
+    /// 追两级指针（桶 → Vec 头 → 数据），perf 里 8 字节数组访问占单函数 48%。
+    I64(I64Map<SmallRows>),
+    Str(StringIndex),
     Bytes(RowIndex),
 }
 
@@ -423,6 +428,12 @@ impl HashIndex {
                     | crate::types::LogicalType::Int64
                     | crate::types::LogicalType::Date
             )
+    }
+
+    /// 单 UTF8 键判定（`docs/join字符串键零拷贝设计.md`）。
+    fn str_ok(keys: &[PhysExpr]) -> bool {
+        keys.len() == 1
+            && matches!(keys[0].data_type(), crate::types::LogicalType::Varchar { .. })
     }
 }
 
@@ -653,6 +664,15 @@ impl HashJoinExec {
             );
         }
         self.build_res = Some(res);
+        if std::env::var("QSDB_JOIN_PROF").is_ok() {
+            // **可断言**（对照"静默不触发"）：键索引到底走了哪条路。
+            let kind = match &index {
+                HashIndex::I64(_) => "I64",
+                HashIndex::Str(_) => "Str",
+                HashIndex::Bytes(_) => "Bytes",
+            };
+            eprintln!("[join-build] key index: {kind}");
+        }
         self.build_state = Some(BuildState { table, index });
         self.probe.prefetch(); // 见 CrossJoinExec：build 侧已退出，预取 probe
         Ok(())
@@ -1229,7 +1249,7 @@ fn concat_batches(batches: &[RecordBatch], schema: &SchemaRef) -> Result<RecordB
 fn build_index(side: &BuildSide, build_keys: &[PhysExpr]) -> Result<HashIndex> {
     let int_ok = HashIndex::int_ok(build_keys);
     if int_ok {
-        let mut m: I64Map<Vec<u32>> = I64Map::default();
+        let mut m: I64Map<SmallRows> = I64Map::default();
         let mut ok = true;
         for (bi, b) in side.batches.iter().enumerate() {
             let mut key_cols: Vec<ArrayRef> = Vec::with_capacity(build_keys.len());
@@ -1241,7 +1261,21 @@ fn build_index(side: &BuildSide, build_keys: &[PhysExpr]) -> Result<HashIndex> {
                     let off = side.base[bi];
                     for row in 0..b.num_rows() {
                         if let Some(v) = vals(row) {
-                            m.entry(v).or_default().push((off + row) as u32);
+                            let r = (off + row) as u32;
+                            match m.entry(v) {
+                                std::collections::hash_map::Entry::Occupied(mut e) => {
+                                    match e.get_mut() {
+                                        SmallRows::One(f) => {
+                                            let f = *f;
+                                            *e.get_mut() = SmallRows::Many(vec![f, r]);
+                                        }
+                                        SmallRows::Many(list) => list.push(r),
+                                    }
+                                }
+                                std::collections::hash_map::Entry::Vacant(e) => {
+                                    e.insert(SmallRows::One(r));
+                                }
+                            }
                         }
                     }
                 }
@@ -1253,6 +1287,45 @@ fn build_index(side: &BuildSide, build_keys: &[PhysExpr]) -> Result<HashIndex> {
         }
         if ok {
             return Ok(HashIndex::I64(m));
+        }
+    }
+    // ── 单 UTF8 键：**零拷贝**字符串索引 ─────────────────────────────────
+    // 建侧不复制键字节（保住 build 批的 StringArray，索引只存「字节哈希 →
+    // 全局行号」）；probe 命中后与建侧箭头缓冲**原地比字节**。此前字符串键
+    // 走字节路：每行 encode 进 buf（拷贝+tag）→ 对 buf 哈希 → find（arena
+    // 随机访问 + memcmp）—— complex_three_way 的 perf 剖面里这三项合计 20%。
+    if HashIndex::str_ok(build_keys) {
+        let mut idx = StringIndex::default();
+        let mut ok = true;
+        'build: for (bi, b) in side.batches.iter().enumerate() {
+            let kc = eval::eval(&build_keys[0], b)?;
+            let Some(arr) = kc.as_any().downcast_ref::<StringArray>() else {
+                ok = false; // 运行期不是 Utf8 ⇒ 整体退字节路（已建部分丢弃）
+                break 'build;
+            };
+            let base = side.base[bi] as u32;
+            for row in 0..b.num_rows() {
+                if arr.is_null(row) {
+                    continue; // NULL 键不入索引（不匹配任何行，SQL 三值）
+                }
+                let h = hash_bytes(arr.value(row).as_bytes());
+                match idx.by_hash.get_mut(&h) {
+                    Some(slot) => slot.push(base + row as u32),
+                    None => {
+                        idx.by_hash.insert(
+                            h,
+                            KeySlot {
+                                first: base + row as u32,
+                                rest: Vec::new(),
+                            },
+                        );
+                    }
+                }
+            }
+            idx.cols.push((Arc::clone(&kc), base));
+        }
+        if ok {
+            return Ok(HashIndex::Str(idx));
         }
     }
     // 直接往**同一个** arena 索引里灌（旧实现是"每批各建一张 BytesMap 再逐键合并"
@@ -1335,6 +1408,35 @@ struct RowIndex {
     arena: Vec<u8>,
     keys: Vec<(u32, u32, SmallRows)>,
     by_hash: std::collections::HashMap<u64, KeySlot, BuildByteHasher>,
+}
+
+/// 单列 UTF8 join 键的**零拷贝**索引（`docs/join字符串键零拷贝设计.md`）。
+///
+/// 建侧**不复制键字节**：保住 build 批的 `StringArray`，索引只存
+/// 「字节哈希 → 建侧全局行号」。probe 命中后与建侧箭头缓冲**原地比字节**
+/// —— 哈希碰撞必须比真值（只信哈希 = 静默错值），但比较的是箭头缓冲
+/// 而非 arena 拷贝。
+#[derive(Default)]
+struct StringIndex {
+    by_hash: std::collections::HashMap<u64, KeySlot, BuildByteHasher>,
+    /// (键列的 ArrayRef, 该批首行的全局行号) —— 行号 → 键字节的落点。
+    /// 批数是个位数，行号找落点线性倒扫即可。
+    cols: Vec<(ArrayRef, u32)>,
+}
+
+impl StringIndex {
+    fn bytes_of(&self, id: u32) -> &[u8] {
+        for (a, base) in self.cols.iter().rev() {
+            if id >= *base {
+                let arr = a
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("str join key col is Utf8");
+                return arr.value((id - *base) as usize).as_bytes();
+            }
+        }
+        unreachable!("str join key row id {id} 越界");
+    }
 }
 
 impl RowIndex {
@@ -1535,9 +1637,11 @@ fn join_batch(
     for k in probe_keys {
         key_cols.push(eval::eval(k, probe_batch)?);
     }
-    // 每行：build 行号列表（NULL 键 → 空）
-    let mut probe_idx: Vec<u32> = Vec::new();
-    let mut build_idx: Vec<u32> = Vec::new();
+    // 每行：build 行号列表（NULL 键 → 空）。
+    // **预留给量**：一对多/一一 join 的匹配对 ≈ probe 行数量级，从 0 扩容
+    // 会在百万行上反复合并（perf 剖面里 memcpy 6.8% 的大头之一）。
+    let mut probe_idx: Vec<u32> = Vec::with_capacity(n);
+    let mut build_idx: Vec<u32> = Vec::with_capacity(n);
     let mut unmatched: Vec<u32> = Vec::new();
     match &state.index {
         // i64 快路径：免编码免字节哈希
@@ -1547,9 +1651,40 @@ fn join_batch(
                 let hit = vals.as_ref().and_then(|f| f(row));
                 match hit.and_then(|v| map.get(&v)) {
                     Some(rows) => {
-                        for &b in rows {
+                        for &b in rows.as_slice() {
                             probe_idx.push(row as u32);
                             build_idx.push(b);
+                        }
+                    }
+                    None => unmatched.push(row as u32),
+                }
+            }
+        }
+        // 单 UTF8 键零拷贝：probe 字节切片直接哈希、命中后与建侧原地比字节
+        HashIndex::Str(idx) => {
+            let arr = key_cols[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| QsdbError::invalid("join str key: probe col is not Utf8"))?;
+            for row in 0..n {
+                if arr.is_null(row) {
+                    unmatched.push(row as u32);
+                    continue;
+                }
+                let bytes = arr.value(row).as_bytes();
+                match idx.by_hash.get(&hash_bytes(bytes)) {
+                    Some(slot) => {
+                        let mut any = false;
+                        for &id in slot.ids() {
+                            if idx.bytes_of(id) == bytes {
+                                probe_idx.push(row as u32);
+                                build_idx.push(id);
+                                any = true;
+                            }
+                        }
+                        if !any {
+                            // 哈希撞了但真值都不等 ⇒ 未匹配
+                            unmatched.push(row as u32);
                         }
                     }
                     None => unmatched.push(row as u32),
@@ -1633,19 +1768,24 @@ fn join_batch(
     // 声明行数 = 实际输出行数：INNER 丢弃未匹配行（M6-2 修复——
     // 原先恒计入 unmatched，未匹配行存在时与列长不符触发 batch 校验失败）
     let total_rows = probe_idx.len() + usize::from(emit_unmatched) * unmatched.len();
-    // 左（probe）列索引 = 匹配行 ++ 未匹配行（保留左值）
-    let mut all_probe = probe_idx.clone();
-    if emit_unmatched {
+    let has_matches = !probe_idx.is_empty();
+    // 左（probe）列索引 = 匹配行 ++ 未匹配行（保留左值）。
+    // INNER（不补未匹配）直接 **move** probe_idx —— 此前无条件 clone，
+    // 百万匹配对就是一次白给的 20MB 级拷贝。
+    let indices = if emit_unmatched {
+        let mut all_probe = probe_idx.clone();
         all_probe.extend_from_slice(&unmatched);
-    }
-    let indices = UInt32Array::from(all_probe);
+        UInt32Array::from(all_probe)
+    } else {
+        UInt32Array::from(probe_idx)
+    };
     let mut cols: Vec<ArrayRef> = Vec::with_capacity(n_probe_cols + n_build_cols);
     // **只需这些输出位置**（`None` = 全部）：不在表里的列**填 NULL**，不 take。
     // 省的是"整列 × 全部输出行"的拷贝——实测 join 输出 10 列 → 5 列时间减半。
     // 判错的后果是静默错值，所以标注侧（`annotate_join_needs`）只在
     // "读取集合可枚举"时才动手；这里只负责照做。
     let want = |pos: usize| needed.is_none_or(|n| n.contains(&(pos as u32)));
-    if !probe_idx.is_empty() || emit_unmatched {
+    if has_matches || emit_unmatched {
         for c in 0..n_probe_cols {
             if !want(c) {
                 cols.push(new_null_like(probe_batch.column(c).as_ref(), total_rows));
