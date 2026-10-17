@@ -5,6 +5,7 @@
 
 pub mod agg;
 pub mod agg_spill;
+pub(crate) mod fused_dim_agg;
 pub mod join;
 pub mod par_scan;
 pub mod spill;

@@ -315,7 +315,7 @@ pub struct HashJoinExec {
 ///
 /// ⚠️ **行号口径**：整个 join 内部用的行号一律是**跨批全局行号**
 /// （索引、`join_batch`、`full_tail` 的匹配位图三处必须一致）。
-struct BuildSide {
+pub(crate) struct BuildSide {
     batches: Vec<RecordBatch>,
     /// `base[i]` = 第 i 批第一行的全局行号；末项 = 总行数（长度 = 批数 + 1）
     base: Vec<usize>,
@@ -326,7 +326,7 @@ struct BuildSide {
 }
 
 impl BuildSide {
-    fn new(batches: Vec<RecordBatch>, schema: SchemaRef) -> Self {
+    pub(crate) fn new(batches: Vec<RecordBatch>, schema: SchemaRef) -> Self {
         let mut base = Vec::with_capacity(batches.len() + 1);
         let mut acc = 0usize;
         base.push(0);
@@ -342,8 +342,14 @@ impl BuildSide {
         }
     }
 
-    fn num_rows(&self) -> usize {
+    pub(crate) fn num_rows(&self) -> usize {
         self.n_rows
+    }
+
+    /// 融合维表链聚合读原始批/行号基址用（`exec/fused_dim_agg.rs` 的预计算
+    /// 要逐 build 行取键值；`column()` 只给代表数组，跨批取不到）。
+    pub(crate) fn batches(&self) -> &[RecordBatch] {
+        &self.batches
     }
 
     fn num_columns(&self) -> usize {
@@ -364,7 +370,7 @@ impl BuildSide {
     }
 
     /// 全局行号 → `(批号, 批内行号)`。`base` 单调 ⇒ 二分。
-    fn row_of(&self, global: usize) -> (usize, usize) {
+    pub(crate) fn row_of(&self, global: usize) -> (usize, usize) {
         let upto = &self.base[..self.base.len() - 1];
         let b = match upto.binary_search(&global) {
             Ok(i) => i,
@@ -407,11 +413,24 @@ struct BuildState {
 
 /// 键 → build 行号列表。单整数键（Int/Date/Boolean/Timestamp）用 i64 直查；
 /// 单 UTF8 键用**零拷贝**字符串索引（`docs/join字符串键零拷贝设计.md`）。
-enum HashIndex {
+pub(crate) enum HashIndex {
     /// 值用 [`SmallRows`]（首个行号内联）：一一 join（绝大多数）**零分配、
     /// 一次指针追逐** —— 此前 `Vec<u32>` 每键一个堆分配，probe 每次 get
     /// 追两级指针（桶 → Vec 头 → 数据），perf 里 8 字节数组访问占单函数 48%。
     I64(I64Map<SmallRows>),
+    /// **密集直索引**（第十四批）：单整数键且域稠密（span ≤ 256k）时免哈希免桶
+    /// —— `rows[v-min]` **一次**随机访问拿到全部行号（`SmallRows` 首行内联，
+    /// 一对多也停在数组槽里）。剖面依据：i64 探测臂 57ns/行的大头就是 20 万
+    /// 条目哈希表的随机桶追逐。
+    /// ⚠️ 教训（2026-10-17 实测）：首版把"多命中"放 `HashMap<u32, Vec>` 旁表——
+    /// 一对多键（本基准恰好每键 2 行）每次探测变成"数组读 + 哈希 + 解引用"，
+    /// 比纯哈希还慢 ~5×。旁表形态**已废弃**，多命中必须留在数组槽内。
+    /// 域稀疏 ⇒ 照旧 `I64`，双路并存。
+    Direct {
+        min: i64,
+        /// dense 槽：`One(u32::MAX)` = 该键无行；其余 = 行号列表
+        rows: Vec<SmallRows>,
+    },
     Str(StringIndex),
     Bytes(RowIndex),
 }
@@ -434,6 +453,118 @@ impl HashIndex {
     fn str_ok(keys: &[PhysExpr]) -> bool {
         keys.len() == 1
             && matches!(keys[0].data_type(), crate::types::LogicalType::Varchar { .. })
+    }
+
+    /// **探测预备态**：每批构造一次（downcast / 类型化视图 / 缓冲复用都在这一步），
+    /// 之后 [`RowProbe::match_row`] 逐行零预备——融合维表链聚合的 probe 循环
+    /// 靠它做到每行只有查找本身。
+    pub(crate) fn prepare_probe<'a>(&'a self, key_cols: &'a [ArrayRef]) -> RowProbe<'a> {
+        let (vals, arr) = match self {
+            HashIndex::I64(_) | HashIndex::Direct { .. } => (int_col(&key_cols[0]), None),
+            HashIndex::Str(_) => (
+                None,
+                key_cols[0].as_any().downcast_ref::<StringArray>(),
+            ),
+            HashIndex::Bytes(_) => (None, None),
+        };
+        RowProbe {
+            index: self,
+            key_cols,
+            vals,
+            arr,
+            buf: Vec::with_capacity(32),
+        }
+    }
+}
+
+/// [`HashIndex::prepare_probe`] 的产物：**单行探测**该 probe 行匹配的每个
+/// 建侧行号各调一次 `f`。
+///
+/// 融合维表链聚合（`exec/fused_dim_agg.rs`）的 join 语义唯一定义点——
+/// NULL 键不匹配、哈希碰撞必比真字节，与 `join_batch` 各臂**逐位一致**
+/// （那三个臂各有"成对发射"的快速布局，这里不重复实现它们，只保证
+/// 语义同源；对撞测试钉在 `tests/fused_dim_agg.rs`）。
+/// 返回 false = 该行未匹配（NULL / 查无 / 碰撞全否）。
+pub(crate) struct RowProbe<'a> {
+    index: &'a HashIndex,
+    key_cols: &'a [ArrayRef],
+    vals: Option<IntCol<'a>>,
+    arr: Option<&'a StringArray>,
+    buf: Vec<u8>,
+}
+
+impl RowProbe<'_> {
+    #[inline]
+    pub(crate) fn match_row<F: FnMut(u32)>(&mut self, row: usize, f: &mut F) -> bool {
+        match self.index {
+            HashIndex::I64(map) => {
+                let Some(v) = self.vals.as_ref().and_then(|c| c.get(row)) else {
+                    return false;
+                };
+                match map.get(&v) {
+                    Some(rows) => {
+                        rows.as_slice().iter().copied().for_each(f);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            HashIndex::Direct { min, rows } => {
+                let Some(v) = self.vals.as_ref().and_then(|c| c.get(row)) else {
+                    return false;
+                };
+                let i = v.wrapping_sub(*min);
+                if i < 0 {
+                    return false;
+                }
+                let iu = i as usize;
+                if iu >= rows.len() {
+                    return false;
+                }
+                match &rows[iu] {
+                    SmallRows::One(fst) if *fst == u32::MAX => false, // 该键无行
+                    small => {
+                        small.as_slice().iter().copied().for_each(f);
+                        true
+                    }
+                }
+            }
+            HashIndex::Str(idx) => {
+                let Some(arr) = self.arr else {
+                    return false;
+                };
+                if arr.is_null(row) {
+                    return false;
+                }
+                let bytes = arr.value(row).as_bytes();
+                match idx.by_hash.get(&hash_bytes(bytes)) {
+                    Some(slot) => {
+                        let mut any = false;
+                        for &id in slot.ids() {
+                            if idx.bytes_of(id) == bytes {
+                                f(id);
+                                any = true;
+                            }
+                        }
+                        any
+                    }
+                    None => false,
+                }
+            }
+            HashIndex::Bytes(map) => {
+                encode_join_key(self.key_cols, row, &mut self.buf);
+                if self.buf.first() == Some(&0) {
+                    return false;
+                }
+                match map.get(self.buf.as_slice()) {
+                    Some(rows) => {
+                        rows.iter().copied().for_each(f);
+                        true
+                    }
+                    None => false,
+                }
+            }
+        }
     }
 }
 
@@ -668,6 +799,7 @@ impl HashJoinExec {
             // **可断言**（对照"静默不触发"）：键索引到底走了哪条路。
             let kind = match &index {
                 HashIndex::I64(_) => "I64",
+                HashIndex::Direct { .. } => "Direct",
                 HashIndex::Str(_) => "Str",
                 HashIndex::Bytes(_) => "Bytes",
             };
@@ -1097,7 +1229,12 @@ impl ExecNode for HashJoinExec {
             }
             let batch = match self.probe.next() {
                 // probe 跑完 → FULL 还要补一轮"没匹配上的 build 行"（其余类型就此结束）
-                None => return self.full_tail(),
+                None => {
+                    if std::env::var("QSDB_JOIN_PROF").is_ok() {
+                        emit_prof_snapshot();
+                    }
+                    return self.full_tail();
+                }
                 Some(Ok(b)) => b,
                 Some(Err(e)) => return Some(Err(e)),
             };
@@ -1220,7 +1357,7 @@ fn unmatched_build_batch(
 }
 
 /// 把若干批拼成一张表（**只在峰值额度付得起时**调用，见 `build_phase` 的说明）。
-fn concat_batches(batches: &[RecordBatch], schema: &SchemaRef) -> Result<RecordBatch> {
+pub(crate) fn concat_batches(batches: &[RecordBatch], schema: &SchemaRef) -> Result<RecordBatch> {
     if batches.is_empty() {
         return Ok(RecordBatch::new_empty(Arc::clone(schema)));
     }
@@ -1246,36 +1383,24 @@ fn concat_batches(batches: &[RecordBatch], schema: &SchemaRef) -> Result<RecordB
 ///
 /// 逐批复用 `build_bytes_index` / i64 快路径，再把每批的结果按 `base` 偏移
 /// 并进总表 —— 不重写编码与"NULL 键不入索引"的规则，那两处一旦分叉就是静默错值。
-fn build_index(side: &BuildSide, build_keys: &[PhysExpr]) -> Result<HashIndex> {
+pub(crate) fn build_index(side: &BuildSide, build_keys: &[PhysExpr]) -> Result<HashIndex> {
     let int_ok = HashIndex::int_ok(build_keys);
     if int_ok {
-        let mut m: I64Map<SmallRows> = I64Map::default();
+        // 一趟收（键值, 全局行号），再按 span 定形态：稠密走直索引（免哈希免桶），
+        // 稀疏走哈希表。两形态对 probe 语义一致：都是"键 → 建侧行号列表"。
+        let mut kv: Vec<(i64, u32)> = Vec::with_capacity(side.num_rows());
         let mut ok = true;
         for (bi, b) in side.batches.iter().enumerate() {
             let mut key_cols: Vec<ArrayRef> = Vec::with_capacity(build_keys.len());
             for k in build_keys {
                 key_cols.push(eval::eval(k, b)?);
             }
-            match int_key_column(&key_cols[0]) {
-                Some(vals) => {
+            match int_col(&key_cols[0]) {
+                Some(c) => {
                     let off = side.base[bi];
                     for row in 0..b.num_rows() {
-                        if let Some(v) = vals(row) {
-                            let r = (off + row) as u32;
-                            match m.entry(v) {
-                                std::collections::hash_map::Entry::Occupied(mut e) => {
-                                    match e.get_mut() {
-                                        SmallRows::One(f) => {
-                                            let f = *f;
-                                            *e.get_mut() = SmallRows::Many(vec![f, r]);
-                                        }
-                                        SmallRows::Many(list) => list.push(r),
-                                    }
-                                }
-                                std::collections::hash_map::Entry::Vacant(e) => {
-                                    e.insert(SmallRows::One(r));
-                                }
-                            }
+                        if let Some(v) = c.get(row) {
+                            kv.push((v, (off + row) as u32));
                         }
                     }
                 }
@@ -1286,6 +1411,47 @@ fn build_index(side: &BuildSide, build_keys: &[PhysExpr]) -> Result<HashIndex> {
             }
         }
         if ok {
+            if let (Some(mn), Some(mx)) =
+                (kv.iter().map(|k| k.0).min(), kv.iter().map(|k| k.0).max())
+            {
+                let span = (mx as i128 - mn as i128 + 1) as u128;
+                // 直索引上界：span ≤ 256k 槽 × 32B（SmallRows）= 8MB。多命中**必须
+                // 留在数组槽内**（首版 HashMap 旁表实测慢 5×，见枚举注释）。
+                // `QSDB_NO_JOIN_DENSE=1` 回哈希路（A/B 对照与回归锚点）。
+                if span <= 262_144 && std::env::var("QSDB_NO_JOIN_DENSE").is_err() {
+                    let mut rows = vec![SmallRows::One(u32::MAX); span as usize];
+                    for (v, r) in kv {
+                        let i = (v - mn) as usize;
+                        let slot = &mut rows[i];
+                        match slot {
+                            SmallRows::One(s) if *s == u32::MAX => *s = r,
+                            SmallRows::One(f) => {
+                                let f = *f;
+                                *slot = SmallRows::Many(vec![f, r]);
+                            }
+                            SmallRows::Many(list) => list.push(r),
+                        }
+                    }
+                    return Ok(HashIndex::Direct { min: mn, rows });
+                }
+            }
+            let mut m: I64Map<SmallRows> = I64Map::default();
+            for (v, r) in kv {
+                match m.entry(v) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        match e.get_mut() {
+                            SmallRows::One(f) => {
+                                let f = *f;
+                                *e.get_mut() = SmallRows::Many(vec![f, r]);
+                            }
+                            SmallRows::Many(list) => list.push(r),
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(SmallRows::One(r));
+                    }
+                }
+            }
             return Ok(HashIndex::I64(m));
         }
     }
@@ -1377,13 +1543,15 @@ impl KeySlot {
 }
 
 /// 同一键的建侧行号：`One` 内联（绝大多数键只有一行），第二次出现才升级成 `Vec`。
-enum SmallRows {
+/// 融合维表链聚合的预计算 matches 也用它（`pub(crate)` 仅为跨模块复用这个形状）。
+#[derive(Clone)]
+pub(crate) enum SmallRows {
     One(u32),
     Many(Vec<u32>),
 }
 
 impl SmallRows {
-    fn as_slice(&self) -> &[u32] {
+    pub(crate) fn as_slice(&self) -> &[u32] {
         match self {
             Self::One(r) => std::slice::from_ref(r),
             Self::Many(v) => v,
@@ -1404,7 +1572,7 @@ impl SmallRows {
 /// 键字节进**单一 arena**，索引里只留 `(起始, 长度)`；**首个行号内联** ⇒
 /// **1:1 的数据（真实 join 的绝大多数）全程零分配**。
 #[derive(Default)]
-struct RowIndex {
+pub(crate) struct RowIndex {
     arena: Vec<u8>,
     keys: Vec<(u32, u32, SmallRows)>,
     by_hash: std::collections::HashMap<u64, KeySlot, BuildByteHasher>,
@@ -1417,7 +1585,7 @@ struct RowIndex {
 /// —— 哈希碰撞必须比真值（只信哈希 = 静默错值），但比较的是箭头缓冲
 /// 而非 arena 拷贝。
 #[derive(Default)]
-struct StringIndex {
+pub(crate) struct StringIndex {
     by_hash: std::collections::HashMap<u64, KeySlot, BuildByteHasher>,
     /// (键列的 ArrayRef, 该批首行的全局行号) —— 行号 → 键字节的落点。
     /// 批数是个位数，行号找落点线性倒扫即可。
@@ -1621,6 +1789,77 @@ fn residual_keep_mask(
 /// 发射**存活**的匹配对时置位，probe 跑完后据此补发没匹配上的 build 行。
 /// 其它 join 类型传 `None`。
 #[allow(clippy::too_many_arguments)] // 多两个语义参数，比把 9 个参数包成结构体更好读
+/// 发射路径**内部归因**（`QSDB_JOIN_PROF`，2026-10-17 第十四批准备）。
+///
+/// 函数级 perf 采样切不开发射内部——arrow `take`/`interleave` 内联后
+/// 采样点归不回名字。所以按**段**累加（求值/探测/残留/probe take/
+/// build take/批构造），进程级静态：多 join、多分片全叠一份，
+/// 每个 HashJoinExec probe 收尾打一份**全局快照**（看最后一份）。
+struct EmitProf {
+    eval_ns: std::sync::atomic::AtomicU64,
+    probe_ns: std::sync::atomic::AtomicU64,
+    residual_ns: std::sync::atomic::AtomicU64,
+    probe_take_ns: std::sync::atomic::AtomicU64,
+    build_take_ns: std::sync::atomic::AtomicU64,
+    construct_ns: std::sync::atomic::AtomicU64,
+    probe_i64_ns: std::sync::atomic::AtomicU64,
+    probe_str_ns: std::sync::atomic::AtomicU64,
+    probe_bytes_ns: std::sync::atomic::AtomicU64,
+    calls: std::sync::atomic::AtomicU64,
+    rows_in: std::sync::atomic::AtomicU64,
+    rows_out: std::sync::atomic::AtomicU64,
+    needed_calls: std::sync::atomic::AtomicU64,
+}
+
+static EMIT_PROF: EmitProf = EmitProf {
+    eval_ns: std::sync::atomic::AtomicU64::new(0),
+    probe_ns: std::sync::atomic::AtomicU64::new(0),
+    residual_ns: std::sync::atomic::AtomicU64::new(0),
+    probe_take_ns: std::sync::atomic::AtomicU64::new(0),
+    build_take_ns: std::sync::atomic::AtomicU64::new(0),
+    construct_ns: std::sync::atomic::AtomicU64::new(0),
+    probe_i64_ns: std::sync::atomic::AtomicU64::new(0),
+    probe_str_ns: std::sync::atomic::AtomicU64::new(0),
+    probe_bytes_ns: std::sync::atomic::AtomicU64::new(0),
+    calls: std::sync::atomic::AtomicU64::new(0),
+    rows_in: std::sync::atomic::AtomicU64::new(0),
+    rows_out: std::sync::atomic::AtomicU64::new(0),
+    needed_calls: std::sync::atomic::AtomicU64::new(0),
+};
+
+fn emit_prof_snapshot() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let g = |c: &std::sync::atomic::AtomicU64| c.load(Relaxed);
+    let ms = |ns: u64| ns as f64 / 1e6;
+    let (ev, pr, rs, pt, bt, cs) = (
+        g(&EMIT_PROF.eval_ns),
+        g(&EMIT_PROF.probe_ns),
+        g(&EMIT_PROF.residual_ns),
+        g(&EMIT_PROF.probe_take_ns),
+        g(&EMIT_PROF.build_take_ns),
+        g(&EMIT_PROF.construct_ns),
+    );
+    let total = (ev + pr + rs + pt + bt + cs).max(1);
+    let pct = |ns: u64| 100.0 * ns as f64 / total as f64;
+    eprintln!(
+        "[join-emit] 全局快照：批 {}（probe 行 {}，出 {} 行，列收窄批 {}）｜\
+         求值 {:.1}ms({:.0}%) 探测 {:.1}ms({:.0}%)[i64 {:.0}/str {:.0}/bytes {:.0}] \
+         残留 {:.1}ms probe-take {:.1}ms({:.0}%) build-take {:.1}ms({:.0}%) 构造 {:.1}ms({:.0}%)｜段计 {:.1}ms",
+        g(&EMIT_PROF.calls),
+        g(&EMIT_PROF.rows_in),
+        g(&EMIT_PROF.rows_out),
+        g(&EMIT_PROF.needed_calls),
+        ms(ev), pct(ev),
+        ms(pr), pct(pr),
+        ms(g(&EMIT_PROF.probe_i64_ns)), ms(g(&EMIT_PROF.probe_str_ns)), ms(g(&EMIT_PROF.probe_bytes_ns)),
+        ms(rs),
+        ms(pt), pct(pt),
+        ms(bt), pct(bt),
+        ms(cs), pct(cs),
+        ms(total),
+    );
+}
+
 fn join_batch(
     probe_batch: &RecordBatch,
     state: &BuildState,
@@ -1631,11 +1870,19 @@ fn join_batch(
     residual: Option<&PhysExpr>,
     matched: Option<&mut [bool]>,
 ) -> Result<Option<RecordBatch>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let prof = std::env::var("QSDB_JOIN_PROF").is_ok();
+    let t_eval = prof.then(std::time::Instant::now);
     let n = probe_batch.num_rows();
     // probe 键求值
     let mut key_cols: Vec<ArrayRef> = Vec::with_capacity(probe_keys.len());
     for k in probe_keys {
         key_cols.push(eval::eval(k, probe_batch)?);
+    }
+    if prof {
+        EMIT_PROF
+            .eval_ns
+            .fetch_add(t_eval.unwrap().elapsed().as_nanos() as u64, Relaxed);
     }
     // 每行：build 行号列表（NULL 键 → 空）。
     // **预留给量**：一对多/一一 join 的匹配对 ≈ probe 行数量级，从 0 扩容
@@ -1643,6 +1890,7 @@ fn join_batch(
     let mut probe_idx: Vec<u32> = Vec::with_capacity(n);
     let mut build_idx: Vec<u32> = Vec::with_capacity(n);
     let mut unmatched: Vec<u32> = Vec::new();
+    let t_probe = prof.then(std::time::Instant::now);
     match &state.index {
         // i64 快路径：免编码免字节哈希
         HashIndex::I64(map) => {
@@ -1710,6 +1958,39 @@ fn join_batch(
                 }
             }
         }
+        HashIndex::Direct { min, rows } => {
+            // 密集直索引：免哈希免桶，`rows[(v-min)]` 一次直取全部行号
+            let vals = int_col(&key_cols[0]);
+            for row in 0..n {
+                let hit = vals.as_ref().and_then(|c| c.get(row));
+                let Some(v) = hit else {
+                    unmatched.push(row as u32); // NULL / 类型不符 ⇒ 未匹配（同 I64 臂口径）
+                    continue;
+                };
+                let i = v.wrapping_sub(*min);
+                if i >= 0 && (i as usize) < rows.len() {
+                    let small = &rows[i as usize];
+                    if !matches!(small, SmallRows::One(f) if *f == u32::MAX) {
+                        for &b in small.as_slice() {
+                            probe_idx.push(row as u32);
+                            build_idx.push(b);
+                        }
+                        continue;
+                    }
+                }
+                unmatched.push(row as u32);
+            }
+        }
+    }
+    if prof {
+        let d = t_probe.unwrap().elapsed().as_nanos() as u64;
+        EMIT_PROF.probe_ns.fetch_add(d, Relaxed);
+        let kind = match &state.index {
+            HashIndex::I64(_) | HashIndex::Direct { .. } => &EMIT_PROF.probe_i64_ns,
+            HashIndex::Str(_) => &EMIT_PROF.probe_str_ns,
+            HashIndex::Bytes(_) => &EMIT_PROF.probe_bytes_ns,
+        };
+        kind.fetch_add(d, Relaxed);
     }
     // ── 残留谓词：对**匹配对**求值（键之外的条件）──────────────────────────
     //
@@ -1717,6 +1998,7 @@ fn join_batch(
     // 若一个左行的所有匹配对都被否掉，它就该**算未匹配、补 NULL 保留**。
     // 反过来（先定案再判残留，或把残留提到 WHERE）会**整体丢掉那些行** ——
     // 那是一次静默少行（实测口径：3 行变 1 行）。
+    let t_res = prof.then(std::time::Instant::now);
     if let Some(r) = residual {
         if !probe_idx.is_empty() {
             let keep = residual_keep_mask(probe_batch, &state.table, &probe_idx, &build_idx, r)?;
@@ -1756,6 +2038,16 @@ fn join_batch(
             mask[b as usize] = true;
         }
     }
+    if prof {
+        EMIT_PROF
+            .residual_ns
+            .fetch_add(t_res.unwrap().elapsed().as_nanos() as u64, Relaxed);
+        EMIT_PROF.calls.fetch_add(1, Relaxed);
+        EMIT_PROF.rows_in.fetch_add(n as u64, Relaxed);
+        if needed.is_some() {
+            EMIT_PROF.needed_calls.fetch_add(1, Relaxed);
+        }
+    }
 
     // LEFT / FULL：未匹配行补 NULL build 侧
     let emit_unmatched =
@@ -1780,6 +2072,7 @@ fn join_batch(
         UInt32Array::from(probe_idx)
     };
     let mut cols: Vec<ArrayRef> = Vec::with_capacity(n_probe_cols + n_build_cols);
+    let t_ptake = prof.then(std::time::Instant::now);
     // **只需这些输出位置**（`None` = 全部）：不在表里的列**填 NULL**，不 take。
     // 省的是"整列 × 全部输出行"的拷贝——实测 join 输出 10 列 → 5 列时间减半。
     // 判错的后果是静默错值，所以标注侧（`annotate_join_needs`）只在
@@ -1801,6 +2094,12 @@ fn join_batch(
         }
     }
     // 右（build）列
+    if prof {
+        EMIT_PROF
+            .probe_take_ns
+            .fetch_add(t_ptake.unwrap().elapsed().as_nanos() as u64, Relaxed);
+    }
+    let t_btake = prof.then(std::time::Instant::now);
     if total_rows > 0 {
         let build_indices = UInt32Array::from(build_idx);
         for c in 0..n_build_cols {
@@ -1826,13 +2125,25 @@ fn join_batch(
         }
     }
     let _ = n_probe_cols;
-    RecordBatch::try_new_with_options(
+    if prof {
+        EMIT_PROF
+            .build_take_ns
+            .fetch_add(t_btake.unwrap().elapsed().as_nanos() as u64, Relaxed);
+        EMIT_PROF.rows_out.fetch_add(total_rows as u64, Relaxed);
+    }
+    let t_cons = prof.then(std::time::Instant::now);
+    let out = RecordBatch::try_new_with_options(
         Arc::clone(out_schema),
         cols,
         &RecordBatchOptions::new().with_row_count(Some(total_rows)),
     )
-    .map(Some)
-    .map_err(|e| QsdbError::invalid(format!("join output: {e}")))
+    .map_err(|e| QsdbError::invalid(format!("join output: {e}")))?;
+    if prof {
+        EMIT_PROF
+            .construct_ns
+            .fetch_add(t_cons.unwrap().elapsed().as_nanos() as u64, Relaxed);
+    }
+    Ok(Some(out))
 }
 
 /// semi/anti 族单 probe 批：存在集探测 → 选中左行 take（仅左列，
@@ -2274,6 +2585,51 @@ fn int_key_column(col: &ArrayRef) -> Option<Box<dyn Fn(usize) -> Option<i64> + '
         DataType::Int16 => prim!(arrow::array::Int16Array),
         DataType::Int32 => prim!(arrow::array::Int32Array),
         DataType::Int64 => prim!(arrow::array::Int64Array),
+        _ => None,
+    }
+}
+
+/// 单整数列的**类型化只读视图**：探测臂逐行直读用，免 `Box<dyn Fn>` 每行
+/// 一次虚调用（剖面：i64 探测臂 57ns/行里这是一项）。覆盖面与
+/// [`int_key_column`] 严格一致（Int8/16/32/64）——多认一个类型就会让
+/// build/probe 两侧行集分叉。
+enum IntCol<'a> {
+    I8(&'a Int8Array),
+    I16(&'a Int16Array),
+    I32(&'a Int32Array),
+    I64(&'a Int64Array),
+}
+
+impl IntCol<'_> {
+    #[inline]
+    fn get(&self, i: usize) -> Option<i64> {
+        match self {
+            Self::I8(a) => (!a.is_null(i)).then(|| a.value(i) as i64),
+            Self::I16(a) => (!a.is_null(i)).then(|| a.value(i) as i64),
+            Self::I32(a) => (!a.is_null(i)).then(|| a.value(i) as i64),
+            Self::I64(a) => (!a.is_null(i)).then(|| a.value(i)),
+        }
+    }
+}
+
+fn int_col(col: &ArrayRef) -> Option<IntCol<'_>> {
+    match col.data_type() {
+        DataType::Int8 => col
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .map(IntCol::I8),
+        DataType::Int16 => col
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .map(IntCol::I16),
+        DataType::Int32 => col
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .map(IntCol::I32),
+        DataType::Int64 => col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .map(IntCol::I64),
         _ => None,
     }
 }

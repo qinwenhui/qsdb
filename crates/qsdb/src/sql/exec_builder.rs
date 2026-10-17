@@ -1502,9 +1502,12 @@ fn annotate_join_needs(
             f.collect_columns(&mut needed);
         }
     }
-    // 一列都不读（如 `count(*)` + 纯过滤）：**不标**。空掩码会把所有列填 NULL，
-    // 虽然按定义也没人读，但"整行都是 NULL"这种状态没有实测支撑，不值得为它冒险。
-    if needed.is_empty() || std::env::var("QSDB_JOIN_NO_PROJ").is_ok() {
+    // 空 needed（count(*) 过 join）**照样标**：join 键列由 `annotate_walk` 的
+    // Join 臂强制补进（键必须真值才能匹配），所以实际效果 = 只物化键列、其余
+    // 填 NULL ——而行数是 count 唯一读的东西。（2026-10-17 实测：count(*) 过
+    // 三表 join 因这里整体放弃 ⇒ 子 join 整宽物化 1000 万行，0.65s；标注后
+    // 只物化键列。）"整行 NULL"不是没实测支撑的状态，是显式支持的对象。
+    if std::env::var("QSDB_JOIN_NO_PROJ").is_ok() {
         return plan.clone();
     }
     let needed: Vec<u32> = needed.into_iter().map(|i| i as u32).collect();
@@ -1536,6 +1539,27 @@ fn annotate_walk(plan: &LogicalPlan, needed: &[u32], allow_scan_read: bool) -> L
             LogicalPlan::Filter {
                 input: Box::new(annotate_walk(input, &n, allow_scan_read)),
                 predicate: predicate.clone(),
+            }
+        }
+        // Project：**schema 变形**的透传。消费者要的本子树输出位置 p，由
+        // `exprs[p]` 产出 ⇒ 换算成"exprs[p] 引用的输入位置集合"往下传。
+        // ⚠️ 空间换算只经 `exprs`（本子树输出空间 ≠ 输入空间，`allow_scan_read`
+        // 同款教训）；位置越界说明空间对不上 ⇒ 停手（宁可不优化）。
+        // 实测（2026-10-17）：此前在此停手 ⇒ `count(*) FROM (SELECT 列 FROM join)`
+        // 整宽物化 2000 万行，1.5s；学会下钻后只物化键列。
+        LogicalPlan::Project { input, exprs, names } => {
+            let mut cols: Vec<usize> = Vec::new();
+            for &p in needed {
+                let Some(e) = exprs.get(p as usize) else {
+                    return plan.clone();
+                };
+                e.collect_columns(&mut cols);
+            }
+            let n: Vec<u32> = cols.into_iter().map(|c| c as u32).collect();
+            LogicalPlan::Project {
+                input: Box::new(annotate_walk(input, &n, allow_scan_read)),
+                exprs: exprs.clone(),
+                names: names.clone(),
             }
         }
         LogicalPlan::Join {
@@ -1743,6 +1767,265 @@ pub fn distinct_fuse_applies(group: &[PhysExpr], aggs: &[AggExpr], input: &Logic
         // （`SELECT count(*) FILTER (WHERE …) FROM (SELECT DISTINCT …)`）
         && aggs[0].filter.is_none()
         && matches!(input, LogicalPlan::Distinct { .. })
+}
+
+/// 维表链聚合融合的形状（`exec/fused_dim_agg.rs` 执行；第十四批刀 C）。
+struct FusedShape {
+    idx: crate::exec::fused_dim_agg::FusedIdx,
+    bot_build: Option<LogicalPlan>,
+    top_build: LogicalPlan,
+    /// probe 流输入（深度 1 = top.left；深度 2 = bot.left）
+    probe_plan: LogicalPlan,
+}
+
+/// 维表链聚合融合的**形状判定**（`docs/join发射与维表链聚合融合设计.md` §二刀 C）。
+///
+/// 门（全部满足，任何一条不满足 = `None` 走现有路径，零改动——这是性能计划
+/// 选择，不是语义回退）：
+/// ① `Aggregate` 直接盖 INNER Join(TOP)；TOP 的 probe 侧要么直接是可流式子计划
+///    （深度 1），要么是 INNER Join(BOT)（深度 2）；之间无 Filter/Project/Sort。
+/// ② 两个 join 都无残留谓词（残留会否掉一部分对，融合路的预计算/直累计没有
+///    这一步——判错就是静默多计数）。
+/// ③ aggs ⊆ {`count(*)`, `count(裸列)`, `sum(整型族|Float64 裸列)`}，无 DISTINCT、
+///    无 FILTER；取数列全在事实表（probe）侧——build 侧取数要逐对随机读，
+///    收益未证，门拒。
+/// ④ group = TOP build 侧裸列（非空）；TOP 的 probe 键 = BOT build 侧裸列；
+///    两个 join 的键全裸列。
+/// ⑤ build 侧都可剥出单表且元数据行数 ≤ `JOIN_SHARD_MAX_BUILD_ROWS`（与分片闸
+///    同款：组表上界 = TOP build 行数，超了没有溢出通道）。
+/// ⑥ `base_table` 给出时（分片路），build 侧表名 ≠ 基表名——自连在 `ShardScope`
+///    下两侧都认领同一分片 = 静默错配。
+fn fused_dim_shape(
+    input: &LogicalPlan,
+    group: &[PhysExpr],
+    aggs: &[AggExpr],
+) -> Option<FusedShape> {
+    use crate::expr::AggFunc;
+    use crate::types::LogicalType;
+    let LogicalPlan::Join {
+        left: top_probe,
+        right: top_build,
+        left_keys: tlk,
+        right_keys: trk,
+        join_type: tj,
+        residual: tres,
+        ..
+    } = input
+    else {
+        return None;
+    };
+    if *tj != crate::exec::join::JoinType::Inner || tres.is_some() {
+        return None;
+    }
+    if group.is_empty() {
+        return None; // 无分组 = T3 计数下推 / JoinCountExec 的领地
+    }
+    if aggs
+        .iter()
+        .any(|a| a.distinct || a.filter.is_some())
+    {
+        return None;
+    }
+    // 键全裸列 → 列号列表
+    let bare = |ks: &[PhysExpr]| -> Option<Vec<(usize, String, LogicalType)>> {
+        ks.iter()
+            .map(|k| match k {
+                PhysExpr::Column { idx, name, ty } => Some((*idx, name.clone(), ty.clone())),
+                _ => None,
+            })
+            .collect()
+    };
+    let tlk_cols = bare(tlk)?;
+    let trk_cols = bare(trk)?;
+    let top_lw = super::translate::plan_output_columns(top_probe).ok()?.len();
+    // ③ 聚合形状
+    let mut agg_cols: Vec<Option<usize>> = Vec::with_capacity(aggs.len());
+    for a in aggs {
+        match (&a.arg, a.func) {
+            (None, AggFunc::Count) => agg_cols.push(None),
+            (Some(e), AggFunc::Count | AggFunc::Sum) => match e {
+                PhysExpr::Column { idx, .. } if *idx < top_lw => agg_cols.push(Some(*idx)),
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    // sum 类型门：整型族 / Float64（Decimal/Float32 留给现有路）
+    for a in aggs.iter().filter(|a| a.func == AggFunc::Sum) {
+        match a.arg.as_ref().map(|e| e.data_type()) {
+            Some(
+                LogicalType::Int8
+                | LogicalType::Int16
+                | LogicalType::Int32
+                | LogicalType::Int64
+                | LogicalType::Float64,
+            ) => {}
+            _ => return None,
+        }
+    }
+    // ④ group = TOP build 侧裸列
+    let group_cols: Vec<usize> = group
+        .iter()
+        .map(|g| match g {
+            PhysExpr::Column { idx, .. } if *idx >= top_lw => Some(idx - top_lw),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    // TOP build 键（输出空间 → build 局部）
+    let top_build_keys: Vec<PhysExpr> = trk_cols
+        .iter()
+        .map(|(i, n, t)| {
+            if *i >= top_lw {
+                Some(PhysExpr::Column {
+                    idx: i - top_lw,
+                    name: n.clone(),
+                    ty: t.clone(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    // ── TOP probe 侧：深度 1（直接可流式）或 BOT join ──
+    let (bot_build, top_key_in_bot_build, probe_keys, probe_plan) =
+        if let LogicalPlan::Join {
+            left: bp,
+            right: bb,
+            left_keys: blk,
+            right_keys: brk,
+            join_type: bj,
+            residual: bres,
+            ..
+        } = &**top_probe
+        {
+            if *bj != crate::exec::join::JoinType::Inner || bres.is_some() {
+                return None;
+            }
+            let brk_cols = bare(brk)?;
+            let bot_lw = super::translate::plan_output_columns(bp).ok()?.len();
+            // TOP probe 键必须全在 BOT build 侧
+            let tkeys: Vec<usize> = tlk_cols
+                .iter()
+                .map(|(i, _, _)| if *i >= bot_lw { Some(i - bot_lw) } else { None })
+                .collect::<Option<Vec<_>>>()?;
+            if tkeys.is_empty() {
+                return None;
+            }
+            // ③ 取数列必须全在事实表（BOT probe 侧）
+            if agg_cols
+                .iter()
+                .any(|c| c.map_or(false, |p| p >= bot_lw))
+            {
+                return None;
+            }
+            let bot_build_keys: Vec<PhysExpr> = brk_cols
+                .iter()
+                .map(|(i, n, t)| {
+                    if *i >= bot_lw {
+                        Some(PhysExpr::Column {
+                            idx: i - bot_lw,
+                            name: n.clone(),
+                            ty: t.clone(),
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Option<Vec<_>>>()?;
+            (
+                Some(((**bb).clone(), bot_build_keys)),
+                tkeys,
+                blk.iter()
+                    .map(|k| match k {
+                        PhysExpr::Column { idx, name, ty } => PhysExpr::Column {
+                            idx: *idx,
+                            name: name.clone(),
+                            ty: ty.clone(),
+                        },
+                        other => other.clone(),
+                    })
+                    .collect::<Vec<_>>(),
+                (**bp).clone(),
+            )
+        } else {
+            // 深度 1：TOP probe 键就是 probe 批上的键
+            if tlk_cols.is_empty() {
+                return None;
+            }
+            (
+                None,
+                Vec::new(),
+                tlk.iter()
+                    .map(|k| match k {
+                        PhysExpr::Column { idx, name, ty } => PhysExpr::Column {
+                            idx: *idx,
+                            name: name.clone(),
+                            ty: ty.clone(),
+                        },
+                        other => other.clone(),
+                    })
+                    .collect::<Vec<_>>(),
+                (**top_probe).clone(),
+            )
+        };
+
+    let (bot_build_plan, bot_build_keys) = match bot_build {
+        Some((p, k)) => (Some(p), k),
+        None => (None, Vec::new()),
+    };
+    Some(FusedShape {
+        idx: crate::exec::fused_dim_agg::FusedIdx {
+            top_build_keys,
+            bot_build_keys,
+            probe_keys,
+            top_key_in_bot_build,
+            group_cols,
+            agg_cols,
+        },
+        bot_build: bot_build_plan,
+        top_build: (**top_build).clone(),
+        probe_plan,
+    })
+}
+
+/// 融合的**预算/自连判定**（分片路必须；非分片路 `base_table=None` 跳过自连闸）：
+/// build 侧可剥出单表、元数据行数 ≤ `JOIN_SHARD_MAX_BUILD_ROWS`（组表上界 =
+/// TOP build 行数，融合路没有组溢出通道）、表名 ≠ 被分片的基表名（自连在
+/// `ShardScope` 下两侧都认领同一分片 = 静默错配）。
+fn fused_budget_ok(
+    db: &Qsdb,
+    shape: &FusedShape,
+    base_table: Option<&str>,
+) -> bool {
+    let mut build_plans: Vec<&LogicalPlan> = vec![&shape.top_build];
+    if let Some(b) = &shape.bot_build {
+        build_plans.push(b);
+    }
+    for bp in build_plans {
+        let Some(def) = plan_scan_def(bp) else {
+            return false;
+        };
+        if let Some(bt) = base_table {
+            if def.name.eq_ignore_ascii_case(bt) {
+                return false;
+            }
+        }
+        let Some(Some(rows)) = db.scan_metadata_count(&def.name, None).ok() else {
+            return false;
+        };
+        if rows > JOIN_SHARD_MAX_BUILD_ROWS {
+            return false;
+        }
+    }
+    true
+}
+
+/// 融合是否命中该形状（**可断言**，`distinct_fuse_applies` 同款纪律：融合静默
+/// 不触发只会让数字变难看，正确性测试一条都不会红——回归钉在
+/// `tests/fused_dim_agg.rs`）。
+pub fn fused_dim_applies(input: &LogicalPlan, group: &[PhysExpr], aggs: &[AggExpr]) -> bool {
+    fused_dim_shape(input, group, aggs).is_some()
 }
 
 /// 聚合构建：含 UDAF → 串行物化路径；可分片源 → 并行 partial/merge；否则串行。
@@ -1987,6 +2270,27 @@ fn build_aggregate(
                     };
                 let (lp, lkeys2, lproj) = project(left, left_keys);
                 let (rp, rkeys2, rproj) = project(right, &r_local);
+                // ★ probe 子树若还是个 join（`count(*) FROM t⋈d ⋈ d2` 的形态），
+                //   给它也标"只需键列"——JoinCountExec 只数行、逐批求 probe 键，
+                //   中间 join 整宽物化全是白给（实测 0.65s 里 take 占 185ms 累计）。
+                //   ⚠️ needed 必须含**外层 probe 键位**：那些键是父层（JoinCountExec）
+                //   从子 join 的**输出**里读的；`annotate_walk` 的 Join 臂只把键下传
+                //   给孩子（匹配用），不保证出现在输出里——传空集会把 probe 键位
+                //   填 NULL ⇒ 静默 0 行（`三表链式等值_join` 抓的就是这个）。
+                //   `false` = lp 已在 project() 的投影空间（Scan 臂必须停手，别碰它）。
+                let lp = if matches!(lp, LogicalPlan::Join { .. }) {
+                    let mut need: Vec<u32> = Vec::new();
+                    for k in &lkeys2 {
+                        if let PhysExpr::Column { idx, .. } = k {
+                            if !need.contains(&(*idx as u32)) {
+                                need.push(*idx as u32);
+                            }
+                        }
+                    }
+                    annotate_walk(&lp, &need, false)
+                } else {
+                    lp
+                };
                 let probe = build_inner(db, &lp, lproj, ctx)?;
                 let build = build_inner(db, &rp, rproj, ctx)?;
                 let left_width = probe.schema().fields().len();
@@ -2021,6 +2325,43 @@ fn build_aggregate(
         table,
     }) = try_shard_source(db, input, scan_proj, ctx)
     else {
+        // 维表链聚合融合（非分片路，第十四批刀 C）：形状命中就在计划期
+        // 一口气跑完 build+probe，finalize 成一批吐出。
+        if std::env::var("QSDB_NO_FUSED_JOIN").is_err() {
+            if let Some(shape) = fused_dim_shape(input, group, aggs).filter(|s| fused_budget_ok(db, s, None)) {
+                let mut fields: Vec<arrow::datatypes::Field> = group
+                    .iter()
+                    .map(|g| arrow::datatypes::Field::new(g.display(), g.data_type().arrow_type(), true))
+                    .collect();
+                for a in aggs {
+                    fields.push(arrow::datatypes::Field::new(
+                        &a.out_name,
+                        a.out_ty.arrow_type(),
+                        true,
+                    ));
+                }
+                let schema = Arc::new(arrow::datatypes::Schema::new(fields));
+                let bot_build = match &shape.bot_build {
+                    Some(p) => Some(build_inner(db, p, scan_proj.clone(), ctx)?),
+                    None => None,
+                };
+                let top_build = build_inner(db, &shape.top_build, scan_proj.clone(), ctx)?;
+                let probe = build_inner(db, &shape.probe_plan, scan_proj.clone(), ctx)?;
+                let batch = crate::exec::fused_dim_agg::run_fused_dim_agg_final(
+                    crate::exec::fused_dim_agg::FusedParts {
+                        bot_build,
+                        top_build,
+                        probe,
+                    },
+                    &shape.idx,
+                    group,
+                    aggs,
+                    &schema,
+                    ctx,
+                )?;
+                return Ok(Box::new(OneShotExec { batch, schema }));
+            }
+        }
         return Ok(Box::new(HashAggExec::new(
             build_inner(db, input, scan_proj.clone(), ctx)?,
             group.to_vec(),
@@ -2080,6 +2421,52 @@ fn build_aggregate(
         crate::memory::Reservation,
         Option<crate::exec::agg_spill::AggSpill>,
     );
+    // ── 维表链聚合融合（分片路，第十四批刀 C）：每片在 ShardScope 下建两侧
+    //    build + probe 流，融合核心直累计出 GroupTable partial——零发射物化。
+    //    merge/finalize 机制零改动（finish_partitioned_merge 原样吃）。
+    //    `filters`/`semis` 非空就门拒（它们的列可能来自 join 结果，融合路的
+    //    probe 流没有那些列）；`QSDB_NO_FUSED_JOIN=1` A/B 对照。
+    if joins > 0 && filters.is_empty() && semis.is_empty()
+        && std::env::var("QSDB_NO_FUSED_JOIN").is_err()
+    {
+        if let Some(shape) = fused_dim_shape(input, &group, &aggs).filter(|s| fused_budget_ok(db, s, Some(&table))) {
+            let partials: Vec<(GroupTable, crate::memory::Reservation)> = shards
+                .into_par_iter()
+                .map(|s| {
+                    let scope = ShardScope::set(&table, s);
+                    let bot_build = match &shape.bot_build {
+                        Some(p) => Some(build_inner(db, p, scan_proj.clone(), ctx)?),
+                        None => None,
+                    };
+                    let top_build = build_inner(db, &shape.top_build, scan_proj.clone(), ctx)?;
+                    let probe = build_inner(db, &shape.probe_plan, scan_proj.clone(), ctx)?;
+                    let r = crate::exec::fused_dim_agg::run_fused_dim_agg(
+                        crate::exec::fused_dim_agg::FusedParts {
+                            bot_build,
+                            top_build,
+                            probe,
+                        },
+                        &shape.idx,
+                        &group,
+                        &aggs,
+                        ctx,
+                    );
+                    if !scope.taken() {
+                        // 分片没被取走 ⇒ 剥出来的路径与 build_inner 建的树对不上。
+                        // 继续跑会**静默变成全表扫**，故显式失败（与既有 join
+                        // 分片路同一口径）。
+                        return Err(crate::error::QsdbError::invalid(format!(
+                            "join 分片未生效：{} 的 Scan 未出现在重建的计划里（计划形状与分片剥离不一致）",
+                            table
+                        )));
+                    }
+                    r
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let (tables, hold): (Vec<_>, Vec<_>) = partials.into_iter().unzip();
+            return finish_partitioned_merge(tables, group, aggs, schema, hold);
+        }
+    }
     // 诊断（与 `QSDB_JOIN_PROF` 同风格）：证明**分片路径真被走到**——
     // 否则"测了并行"与"测了串行"从外面看不出来，回归会变成空转。
     if joins > 0 && std::env::var("QSDB_JOIN_SHARD_PROF").is_ok() {

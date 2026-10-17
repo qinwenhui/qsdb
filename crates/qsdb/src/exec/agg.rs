@@ -1596,6 +1596,91 @@ impl GroupTable {
         gid
     }
 
+    // ── 融合维表链聚合的种子/直写口（第十四批刀 C，
+    //    `docs/join发射与维表链聚合融合设计.md`）──────────────────────────
+
+    /// 手工种子建组：键 = **canonical 编码**（`encode_key_row` 口径），返回 gid
+    /// （键已存在 ⇒ 返回既有 gid）。与 [`Self::group_id`] 的"新组"臂走同一条
+    /// `push_group` + `bucket_push`；首次调用按 `kinds`/`sum_types` 初始化列
+    /// 结构（`init_cols` 同款——但不依赖实批：融合路的聚合参数不在种子里）。
+    /// ⚠️ 键编码与 `ingest` 建出来的表必须逐位一致，否则 merge/finalize 分叉
+    /// ——回归钉在 `tests/fused_dim_agg.rs`（种子路 vs ingest 路 finalize 同值）。
+    pub fn seed_group(
+        &mut self,
+        key: &[u8],
+        lits: Vec<Literal>,
+        group_width: usize,
+        kinds: &[crate::expr::AggFunc],
+        sum_types: &[arrow::datatypes::DataType],
+    ) -> u32 {
+        if self.kinds.is_empty() {
+            if self.group_lits.is_empty() && !self.count_only {
+                self.group_lits = vec![Vec::new(); group_width];
+            }
+            self.kinds = kinds.to_vec();
+            for (ai, k) in kinds.iter().enumerate() {
+                use crate::expr::AggFunc::*;
+                match k {
+                    Count | Udaf | Min | Max => {
+                        self.counts.push(Vec::new());
+                        self.sums.push(SumCol::None);
+                        self.minmax.push(Vec::new());
+                    }
+                    Sum | Avg => {
+                        self.counts.push(Vec::new());
+                        self.sums.push(match &sum_types[ai] {
+                            DataType::Int8
+                            | DataType::Int16
+                            | DataType::Int32
+                            | DataType::Int64 => SumCol::Int(Vec::new()),
+                            DataType::Float32 | DataType::Float64 => SumCol::Flt(Vec::new()),
+                            DataType::Decimal128(_, _) => SumCol::Dec(Vec::new()),
+                            _ => SumCol::None,
+                        });
+                        self.minmax.push(Vec::new());
+                    }
+                }
+            }
+        }
+        let h = fxhash_bytes(key);
+        if let Some(b) = self.by_hash.get(&h) {
+            if let Some(gid) = b.find(|gid| self.key_of(gid as usize) == key) {
+                return gid;
+            }
+        }
+        let gid = self.push_group(key, &lits);
+        self.bucket_push(h, gid);
+        gid
+    }
+
+    /// 融合探测的计数直写（口径同 `update_aggs`：count(*) 全行、count(col) 非空）。
+    #[inline]
+    pub fn fused_add_count(&mut self, ai: usize, gid: usize, by: u64) {
+        self.counts[ai][gid] += by;
+    }
+
+    /// 融合探测的整型 sum 直写（i128 累加 + 非空计数，口径同 `update_sum`）。
+    #[inline]
+    pub fn fused_add_sum_int(&mut self, ai: usize, gid: usize, v: i128) {
+        if let SumCol::Int(acc) = &mut self.sums[ai] {
+            acc[gid] += v;
+        }
+        self.counts[ai][gid] += 1;
+    }
+
+    /// 融合探测的 float sum 直写（Kahan 补偿公式逐位同 `update_sum`）。
+    #[inline]
+    pub fn fused_add_sum_f64(&mut self, ai: usize, gid: usize, v: f64) {
+        if let SumCol::Flt(acc) = &mut self.sums[ai] {
+            let s = &mut acc[gid];
+            let y = v - s.1;
+            let t = s.0 + y;
+            s.1 = (t - s.0) - y;
+            s.0 = t;
+        }
+        self.counts[ai][gid] += 1;
+    }
+
     /// merge 另一张 partial 表（两表结构一致：同 group/aggs 语义）。
     /// merge 后 fast 索引置空（下次 fast ingest 时按 groups 惰性回填）。
     /// 空表首并直接整体接管（move，零拷贝）。
