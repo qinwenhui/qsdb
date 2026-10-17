@@ -74,15 +74,26 @@
 | compaction 触发 | CompactOptions（代码默认 ≥4 段且均值 <64MB） | ❌ | 见 `qsdb admin compact` |
 | Flight 监听口 | `--flight-bind` / 关 | ❌ | Arrow Flight 数据面（h2c，独立于 HTTP）；需 `--features flight` 编译（默认关闭守二进制红线）。鉴权复用 `--token`（Bearer metadata）。do_get ticket=SQL；do_put 首帧 descriptor cmd=`table:<名>` |
 
-## 五·五、用户体系（M7-A）
+## 五·五、用户体系（M7-A）与库级授权（M-C）
 
-三角色（`admin | writer | reader`）：
+三角色（`admin | writer | reader`），**库级生效**（M-C 起同一用户在不同库可以不同角色）：
 | 能力 | reader | writer | admin |
 |---|---|---|---|
 | SELECT / SHOW / DESCRIBE | ✓ | ✓ | ✓ |
 | INSERT / POST /write | ✗ | ✓ | ✓ |
 | DDL（CREATE/DROP/ALTER/TRUNCATE/DELETE） | ✗ | ✗ | ✓ |
 | compact / gc / refresh-index / 用户管理 / PUT /config | ✗ | ✗ | ✓ |
+
+**库级 grants（M-C，白名单制）**：
+```jsonc
+// _catalog/users.json 的用户条目（grants 字段存在时即取代 role 成为判定唯一依据）
+{ "name": "op_settle", "salt": "…", "hash": "…",
+  "grants": { "settle": "Reader", "sales": null, "*": "Writer" } }
+```
+- 键 = 库名或 `"*"`（通配）；值 `null` = **显式无权**；**键缺失 = 无权**（白名单制）
+- 库级精确项优先于 `"*"`；无 `grants` 字段的旧条目 = `role` 管所有库（**逐位兼容**）
+- 判定**每请求现查**（角色不缓存进会话）——`PUT grants` 返回即生效，用户无需重登
+- 无授权（凭证有效但该库无 grant）→ **403 `FORBIDDEN`**，文案区分"未认证"（401）
 
 **认证方式**（server）：
 | 方式 | 形态 | 说明 |
@@ -110,9 +121,13 @@
 
 **用户存储**：`_catalog/users.json`（进程外可直接读不可改——密码哈希 + catalog 锁内原子写）。
 
-**SQL 管理**（Admin 专属）：`CREATE USER name WITH PASSWORD 'pw' [ROLE r]`、`DROP USER name [IF EXISTS]`、`ALTER USER name SET PASSWORD 'pw' / SET ROLE r`、`SHOW USERS`。默认角色 = writer。
+**SQL 管理**（Admin 专属）：`CREATE USER name WITH PASSWORD 'pw' [ROLE r]`、`DROP USER name [IF EXISTS]`、`ALTER USER name SET PASSWORD 'pw' / SET ROLE r`（= 写 `"*"` 槽位，库级精确项保留）、`SHOW USERS`（M-C 起第三列 `grants` 摘要，如 `settle=reader,*=-`）。默认角色 = writer。
 
-**CLI**：`qsdb admin user add <名> <角色> [--password <密码>]`（未传则交互输入）、`user drop <名>`、`user passwd <名>`、`user list`。
+**grants 管理**（M-C，不做 SQL DDL）：
+- `PUT /api/v1/users/{name}/grants`（admin 热改）：body `{"grants": {"settle": "reader", "*": null}}`，**PUT = 全量替换**；角色名大小写不敏感，`null` = 显式无权；想全拒给 `{"*": null}`（空表 400）
+- `qsdb admin user-add <名> [--password <密码>] [角色] [--grant 库=角色 …]`（可重复；`db=` = 显式无权；给了 `--grant` 不给角色 = 白名单制）
+- `user export/import` 原样（**grants 随 JSON 走**，failover 无缝延伸）
+- 登录响应回显 `grants` 摘要 + 默认库的当前角色（`null` = 无权）——客户端自查，不用撞 403 试探
 
 **零配置零变化**：不建用户 + 不设 `--token` = 完全开放（现状兼容）；建了用户即要求认证。嵌入模式不受影响（宿主自控，`sql_with_role()` 可选）。
 

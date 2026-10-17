@@ -21,7 +21,7 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -58,10 +58,9 @@ pub struct SessionStats {
 pub struct Session {
     /// 服务端生成，与 token 1:1
     pub id: String,
-    /// 登录用户名（审计与展示；`__token__` = 超级凭证，`anonymous` = 开放模式）
+    /// 登录用户名（审计与展示；`__token__` = 超级凭证，`anonymous` = 开放模式）。
+    /// **角色不存会话**（M-C）：判定与展示都现查 grants——管理员改了立即生效。
     pub user: String,
-    /// 登录时角色快照（展示用）
-    pub role_at_login: qsdb::users::Role,
     /// ip:port + User-Agent（登录时定格）
     pub client: String,
     /// 创建时刻（epoch ms，展示用）
@@ -94,12 +93,13 @@ impl Session {
             .unwrap_or_default()
     }
 
-    /// 会话条目的 JSON 形态（列表与详情共用；`running` 由注册表反查注入）。
-    fn to_json(&self, running: Vec<String>) -> serde_json::Value {
+    /// 会话条目的 JSON 形态（列表与详情共用）。`running` 由注册表反查注入；
+    /// `role` 由调用方**现查 grants** 注入（None = 当前无授权，回 null）。
+    fn to_json(&self, running: Vec<String>, role: Option<qsdb::users::Role>) -> serde_json::Value {
         serde_json::json!({
             "id": self.id,
             "user": self.user,
-            "role": self.role_at_login.name(),
+            "role": role.map(|r| serde_json::json!(r.name())).unwrap_or(serde_json::Value::Null),
             "client": self.client,
             "createdAtMs": self.created_at_ms,
             "lastActiveMs": self.last_active_ms.load(Ordering::Relaxed),
@@ -402,6 +402,7 @@ pub async fn serve(
         .route("/api/v1/error-codes", get(error_codes))
         .route("/api/v1/files", get(download_file))
         .route("/api/v1/users/export", get(export_users))
+        .route("/api/v1/users/{name}/grants", put(put_user_grants))
         .route("/api/v1/query", post(query))
         .route("/api/v1/write", post(write))
         .route("/api/v1/tables", get(tables))
@@ -553,11 +554,13 @@ pub async fn serve(
 // handlers
 // ---------------------------------------------------------------------------
 
-/// 认证结果（十六批 M-A 起**三态**）：
+/// 认证结果（十六批 **四态**）：
 /// - `Pass`：通过。`session` = 登录签发的会话（Basic / 超级 token / 开放模式为 None）；
-/// - `Deny`：未认证（缺凭证 / 凭证无效）→ 401 `UNAUTHORIZED`；
+/// - `Deny`：未认证（缺凭证 / 凭证无效 / 用户已被删）→ 401 `UNAUTHORIZED`；
 /// - `Revoked`：**会话形 token**（`sess-` 前缀）已不在会话表（被踢 / 空闲回收 /
-///   服务重启）→ 401 `SESSION_REVOKED`——客户端该重新登录，别再重试这把 token。
+///   服务重启）→ 401 `SESSION_REVOKED`——客户端该重新登录，别再重试这把 token；
+/// - `NoGrant`：凭证有效但对该库无授权（M-C 白名单制）→ 403 `FORBIDDEN`——
+///   与"未认证"分开：重试和重登都没用，得找管理员授权。
 enum Authed {
     Pass {
         role: qsdb::users::Role,
@@ -565,10 +568,56 @@ enum Authed {
     },
     Deny,
     Revoked,
+    NoGrant {
+        user: String,
+        db: String,
+    },
+}
+
+/// 库级授权判定（设计稿 §二 四行规则的落点；**每请求现查**——管理员改了
+/// grants 立即生效，角色不缓存进会话）。
+fn resolve_def(def: qsdb::users::UserDef, db: &str, session: Option<Arc<Session>>) -> Authed {
+    match def.role_for(db) {
+        Some(role) => Authed::Pass { role, session },
+        None => Authed::NoGrant {
+            user: def.name,
+            db: db.to_string(),
+        },
+    }
+}
+
+/// 按用户名现查（会话请求走这里；`__token__`/`anonymous` 是隐式 Admin）。
+fn resolve_user(state: &AppState, user: &str, db: &str, session: Option<Arc<Session>>) -> Authed {
+    if user == "__token__" || user == "anonymous" {
+        return Authed::Pass {
+            role: qsdb::users::Role::Admin,
+            session,
+        };
+    }
+    match qsdb::users::UserStore::read_all(state.db.store())
+        .ok()
+        .and_then(|m| m.get(user).cloned())
+    {
+        Some(def) => resolve_def(def, db, session),
+        // 登录后用户被删 → 凭证已无效（重登也没用，除非重建同名用户）
+        None => Authed::Deny,
+    }
+}
+
+/// 展示用现查（`/sessions` 列表；不做身份判定，只回答"现在是什么角色"）。
+fn resolved_role_for(state: &AppState, user: &str, db: &str) -> Option<qsdb::users::Role> {
+    if user == "__token__" || user == "anonymous" {
+        return Some(qsdb::users::Role::Admin);
+    }
+    qsdb::users::UserStore::read_all(state.db.store())
+        .ok()
+        .and_then(|m| m.get(user).cloned())
+        .and_then(|def| def.role_for(db))
 }
 
 /// 认证入口。优先级：Bearer 会话 token > Basic 用户名密码 > Bearer 超级 token > 开放。
 /// 命中会话时**顺带 touch `last_active_at`**（一次 `store(Relaxed)`，无锁竞争面）。
+/// 请求目标库 = 会话默认库（M-A 的 USE 落点）；无会话 = `default`。
 fn authenticate(state: &AppState, headers: &HeaderMap) -> Authed {
     let auth_header = headers
         .get("authorization")
@@ -586,10 +635,9 @@ fn authenticate(state: &AppState, headers: &HeaderMap) -> Authed {
             if let Some(s) = hit {
                 s.last_active_ms
                     .store(Session::epoch_ms(), Ordering::Relaxed);
-                return Authed::Pass {
-                    role: s.role_at_login,
-                    session: Some(s),
-                };
+                let user = s.user.clone();
+                let db = s.default_db();
+                return resolve_user(state, &user, &db, Some(s));
             }
             // 会话形 token 却不在表里 = 已吊销（专属码，别落进笼统 401）
             if token.starts_with(SESSION_TOKEN_PREFIX) {
@@ -597,16 +645,17 @@ fn authenticate(state: &AppState, headers: &HeaderMap) -> Authed {
             }
         }
     }
-    // Basic 用户名密码（无会话：每请求现校验，~5ms 哈希）。
+    // Basic 用户名密码（无会话：每请求现校验，~5ms 哈希 + 现查 grants）。
     // 校验失败**落穿**到超级 token / 开放检查（与既有行为一致：完全开放的服务器
     // 忽略凭证形态；有用户的服务器会在开放检查里 Deny）。
     if let Some(h) = &auth_header {
         if let Some(b64) = h.strip_prefix("Basic ") {
-            if let Some(role) = auth_basic(state, b64) {
-                return Authed::Pass {
-                    role,
-                    session: None,
-                };
+            if let Some((user, pass)) = basic_credentials(b64) {
+                if let Some(def) =
+                    qsdb::users::UserStore::verify_def(state.db.store(), &user, &pass)
+                {
+                    return resolve_def(def, "default", None);
+                }
             }
         }
     }
@@ -643,18 +692,20 @@ fn authenticate(state: &AppState, headers: &HeaderMap) -> Authed {
     }
 }
 
-/// 兼容旧调用（只关心角色；`Deny`/`Revoked` 都归 None → 401）。
-fn auth_role(state: &AppState, headers: &HeaderMap) -> Option<qsdb::users::Role> {
+/// 认证并解析角色；失败直接给出契约错误响应（401/403）——各端点
+/// `let role = match require_role(…) { Ok(r) => r, Err(resp) => return resp };`
+fn require_role(state: &AppState, headers: &HeaderMap) -> Result<qsdb::users::Role, Box<Response>> {
     match authenticate(state, headers) {
-        Authed::Pass { role, .. } => Some(role),
-        _ => None,
+        Authed::Pass { role, .. } => Ok(role),
+        Authed::NoGrant { user, db } => Err(Box::new(ErrorCode::Forbidden.response(format!(
+            "user '{user}' has no grant on database '{db}' (mounted: {})",
+            state.mounts.join(", ")
+        )))),
+        Authed::Revoked => Err(Box::new(
+            ErrorCode::SessionRevoked.response("session revoked or expired; re-login"),
+        )),
+        Authed::Deny => Err(Box::new(ErrorCode::Unauthorized.response("unauthorized"))),
     }
-}
-
-/// Basic 解码 + 校验（返回角色；用户名由登录端点另行解析）。
-fn auth_basic(state: &AppState, b64: &str) -> Option<qsdb::users::Role> {
-    basic_credentials(b64)
-        .and_then(|(user, pass)| qsdb::users::UserStore::verify(state.db.store(), &user, &pass))
 }
 
 /// Basic 头 → (用户名, 密码)。
@@ -666,12 +717,12 @@ fn basic_credentials(b64: &str) -> Option<(String, String)> {
     Some((user.to_string(), pass.to_string()))
 }
 
-/// 兼容旧调用（仅查 401）。
-fn auth(state: &AppState, headers: &HeaderMap) -> StatusCode {
-    match auth_role(state, headers) {
-        Some(_) => StatusCode::OK,
-        None => StatusCode::UNAUTHORIZED,
-    }
+/// 资源端点闸（`/tables`、`/schema`、`/partitions`、`/stats`、`/config`、
+/// `/queries`、`/queries/{id}/cancel`）：失败把 401/403 **响应体**原样带回去
+/// （M-C 起无授权用户在这些端点上是 403——旧的"只查 401 状态码"写法会把
+/// 403 丢掉然后继续执行 handler，M-C 契约测试抓出来的）。
+fn auth(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>> {
+    require_role(state, headers).map(|_| ())
 }
 
 /// 生成随机 token（hex 32 字节）。
@@ -792,26 +843,41 @@ async fn auth_login(
             }
         }
     }
-    // 凭证解析：(用户名, 角色)。失败 → 各自的 401。
+    // 凭证解析：(用户名, grants 摘要, 默认库角色)。失败 → 各自的 401。
+    // **登录只验凭证，不做授权判定**——白名单制用户（M-C，可能对 default 无权）
+    // 也要能登录，403 留给每请求的现查。
     let cred = (|| {
         let h = auth_header.as_deref()?;
         if let Some(b64) = h.strip_prefix("Basic ") {
             let (user, pass) = basic_credentials(b64)?;
-            let role = qsdb::users::UserStore::verify(s.db.store(), &user, &pass)?;
-            return Some((user, role));
+            let def = qsdb::users::UserStore::verify_def(s.db.store(), &user, &pass)?;
+            return Some((def.name.clone(), def.grants_json(), def.role_for("default")));
         }
         if let Some(token) = h.strip_prefix("Bearer ") {
-            // 旧会话重登：沿用其身份
-            if let Some(old) = s.sessions.lock().ok().and_then(|m| m.get(token).cloned()) {
-                return Some((old.user.clone(), old.role_at_login));
+            // 旧会话重登：沿用其身份；用户被删 → 401（凭证已无效）
+            if let Some(name) = s
+                .sessions
+                .lock()
+                .ok()
+                .and_then(|m| m.get(token).cloned())
+                .map(|old| old.user.clone())
+            {
+                let def = qsdb::users::UserStore::read_all(s.db.store())
+                    .ok()
+                    .and_then(|m| m.get(&name).cloned())?;
+                return Some((def.name.clone(), def.grants_json(), def.role_for("default")));
             }
             if s.token.as_deref() == Some(token) {
-                return Some(("__token__".to_string(), qsdb::users::Role::Admin));
+                return Some((
+                    "__token__".to_string(),
+                    serde_json::json!({ "*": "admin" }),
+                    Some(qsdb::users::Role::Admin),
+                ));
             }
         }
         None
     })();
-    let (user, role) = match cred {
+    let (user, grants, role) = match cred {
         Some(c) => c,
         None => {
             // 完全开放（无用户 + 无超级 token）：照常可登（anonymous 会话）；
@@ -820,7 +886,11 @@ async fn auth_login(
                 .map(|u| !u.is_empty())
                 .unwrap_or(false);
             if s.token.is_none() && !has_users {
-                ("anonymous".to_string(), qsdb::users::Role::Admin)
+                (
+                    "anonymous".to_string(),
+                    serde_json::json!({ "*": "admin" }),
+                    Some(qsdb::users::Role::Admin),
+                )
             } else {
                 return ErrorCode::Unauthorized.response("invalid credentials");
             }
@@ -830,7 +900,6 @@ async fn auth_login(
     let session = Arc::new(Session {
         id: new_session_id(),
         user: user.clone(),
-        role_at_login: role,
         client: format!(
             "{}; {}",
             addr,
@@ -851,7 +920,8 @@ async fn auth_login(
     Json(serde_json::json!({
         "token": token,
         "sessionId": session_id,
-        "role": role.name(),
+        "role": role.map(|r| serde_json::json!(r.name())).unwrap_or(serde_json::Value::Null),
+        "grants": grants,
         "defaultDb": "default",
         "note": "process-lifetime token + session; restart requires re-login"
     }))
@@ -866,8 +936,9 @@ async fn auth_login(
 ///
 /// 在跑查询由**查询注册表反查**（唯一真源，不冗余存进 Session）。
 async fn list_sessions(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let Some(role) = auth_role(&s, &headers) else {
-        return ErrorCode::Unauthorized.response("unauthorized");
+    let role = match require_role(&s, &headers) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
     };
     if !role.is_admin() {
         return ErrorCode::Forbidden.response("session list requires admin");
@@ -892,7 +963,11 @@ async fn list_sessions(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Re
     entries.sort_by(|a, b| (a.created_at_ms, &a.id).cmp(&(b.created_at_ms, &b.id)));
     let list: Vec<serde_json::Value> = entries
         .iter()
-        .map(|sess| sess.to_json(running.get(&sess.id).cloned().unwrap_or_default()))
+        .map(|sess| {
+            let db = sess.default_db();
+            let now_role = resolved_role_for(&s, &sess.user, &db);
+            sess.to_json(running.get(&sess.id).cloned().unwrap_or_default(), now_role)
+        })
         .collect();
     let count = list.len();
     Json(serde_json::json!({ "sessions": list, "count": count })).into_response()
@@ -906,6 +981,12 @@ async fn get_session(
 ) -> Response {
     let (role, own) = match authenticate(&s, &headers) {
         Authed::Pass { role, session } => (role, session.is_some_and(|x| x.id == id)),
+        Authed::NoGrant { user, db } => {
+            return ErrorCode::Forbidden.response(format!(
+                "user '{user}' has no grant on database '{db}' (mounted: {})",
+                s.mounts.join(", ")
+            ));
+        }
         Authed::Revoked => return ErrorCode::SessionRevoked.response("session revoked; re-login"),
         Authed::Deny => return ErrorCode::Unauthorized.response("unauthorized"),
     };
@@ -927,7 +1008,11 @@ async fn get_session(
         .ok()
         .and_then(|m| m.values().find(|x| x.id == id).cloned());
     match found {
-        Some(sess) => Json(sess.to_json(running)).into_response(),
+        Some(sess) => {
+            let db = sess.default_db();
+            let now_role = resolved_role_for(&s, &sess.user, &db);
+            Json(sess.to_json(running, now_role)).into_response()
+        }
         None => ErrorCode::NotFound.response(format!("session {id} not found")),
     }
 }
@@ -940,8 +1025,9 @@ async fn kick_session(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let Some(role) = auth_role(&s, &headers) else {
-        return ErrorCode::Unauthorized.response("unauthorized");
+    let role = match require_role(&s, &headers) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
     };
     if !role.is_admin() {
         return ErrorCode::Forbidden.response("kicking sessions requires admin");
@@ -973,6 +1059,12 @@ async fn set_session_database(
 ) -> Response {
     let session = match authenticate(&s, &headers) {
         Authed::Pass { session, .. } => session,
+        Authed::NoGrant { user, db } => {
+            return ErrorCode::Forbidden.response(format!(
+                "user '{user}' has no grant on database '{db}' (mounted: {})",
+                s.mounts.join(", ")
+            ));
+        }
         Authed::Revoked => return ErrorCode::SessionRevoked.response("session revoked; re-login"),
         Authed::Deny => return ErrorCode::Unauthorized.response("unauthorized"),
     };
@@ -1016,8 +1108,9 @@ async fn download_file(
     headers: HeaderMap,
     StructuredQuery(p): StructuredQuery<FileParams>,
 ) -> Response {
-    let Some(role) = auth_role(&s, &headers) else {
-        return ErrorCode::Unauthorized.response("unauthorized");
+    let role = match require_role(&s, &headers) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
     };
     if !role.is_admin() {
         return ErrorCode::Forbidden.response("file download requires admin");
@@ -1067,8 +1160,9 @@ async fn download_file(
 /// - **含口令哈希、不含明文密码**（与 CLI 一致）。
 /// - **admin 专属**：体里有哈希，拖走等于拖走全部凭证。
 async fn export_users(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let Some(role) = auth_role(&s, &headers) else {
-        return ErrorCode::Unauthorized.response("unauthorized");
+    let role = match require_role(&s, &headers) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
     };
     if !role.is_admin() {
         return ErrorCode::Forbidden.response("user export requires admin");
@@ -1083,6 +1177,71 @@ async fn export_users(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Res
             resp
         }
         Err(e) => ErrorCode::Internal.response(e.to_string()),
+    }
+}
+
+/// `PUT /api/v1/users/{name}/grants` —— **库级授权热改**（M-C；admin 专属）。
+///
+/// body `{"grants": {"settle": "reader", "sales": null, "*": "writer"}}`：
+/// 键 = 库名或 `"*"`，值 = 角色名（大小写不敏感）或 `null`（**显式无权**）。
+/// **PUT = 全量替换**；想全拒给 `{"*": null}`，空表 400。
+/// 判定侧**每请求现查**（角色不缓存进会话）——本调用返回即生效，被改用户
+/// 无需重登。写 `_catalog/users.json` 走既有锁内原子写路径。
+async fn put_user_grants(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    StructuredJson(body): StructuredJson<serde_json::Value>,
+) -> Response {
+    let role = match require_role(&s, &headers) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    if !role.is_admin() {
+        return ErrorCode::Forbidden.response("changing grants requires admin");
+    }
+    // 严格 shape：顶层只认 {"grants": {db: 角色名|null}}
+    let Some(obj) = body.as_object() else {
+        return ErrorCode::InvalidArgument.response(r#"body must be an object {"grants": {...}}"#);
+    };
+    if obj.len() != 1 || !obj.contains_key("grants") {
+        return ErrorCode::InvalidArgument
+            .response(r#"body must be exactly {"grants": {...}} (unknown or missing keys)"#);
+    }
+    let Some(g) = obj["grants"].as_object() else {
+        return ErrorCode::InvalidArgument
+            .response(r#""grants" must be an object {db: role|null}"#);
+    };
+    let mut map = std::collections::BTreeMap::new();
+    for (db, v) in g {
+        let db = db.trim();
+        if db.is_empty() {
+            return ErrorCode::InvalidArgument.response("grant key (database) must not be empty");
+        }
+        let r = match v {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(role) => match qsdb::users::Role::from_name(role) {
+                Ok(r) => Some(r),
+                Err(e) => return ErrorCode::InvalidArgument.response(e.to_string()),
+            },
+            _ => {
+                return ErrorCode::InvalidArgument
+                    .response(format!("grant for {db:?} must be a role name or null"));
+            }
+        };
+        map.insert(db.to_string(), r);
+    }
+    match qsdb::users::UserStore::set_grants(s.db.store(), &name, map) {
+        Ok(()) => {
+            // 回显**落盘后**的实际形态（read_all 再取一次，别信内存里的猜测）
+            let grants = qsdb::users::UserStore::read_all(s.db.store())
+                .ok()
+                .and_then(|m| m.get(&name).cloned())
+                .map(|d| d.grants_json())
+                .unwrap_or(serde_json::json!({}));
+            Json(serde_json::json!({ "user": name, "grants": grants })).into_response()
+        }
+        Err(e) => status_of(&e, e.to_string()),
     }
 }
 
@@ -1169,9 +1328,9 @@ async fn watch(
     Query(p): Query<WatchParams>,
 ) -> Response {
     // 与 /query 同一套鉴权；**reader 角色即可**（订阅只是读事件）
-    let Some(_role) = auth_role(&s, &headers) else {
-        return ErrorCode::Unauthorized.response("unauthorized");
-    };
+    if let Err(resp) = require_role(&s, &headers) {
+        return *resp;
+    }
     let wait = std::time::Duration::from_secs(
         p.wait
             .unwrap_or(crate::commit_log::DEFAULT_WAIT_SECS)
@@ -1221,6 +1380,12 @@ async fn query(
 ) -> Response {
     let (role, session) = match authenticate(&s, &headers) {
         Authed::Pass { role, session } => (role, session),
+        Authed::NoGrant { user, db } => {
+            return ErrorCode::Forbidden.response(format!(
+                "user '{user}' has no grant on database '{db}' (mounted: {})",
+                s.mounts.join(", ")
+            ));
+        }
         Authed::Revoked => {
             return ErrorCode::SessionRevoked.response("session revoked or expired; re-login");
         }
@@ -1460,13 +1625,24 @@ async fn write(
     StructuredQuery(p): StructuredQuery<WriteParams>,
     body: axum::body::Bytes,
 ) -> Response {
-    let session = match authenticate(&s, &headers) {
-        Authed::Pass { session, .. } => session,
+    let (role, session) = match authenticate(&s, &headers) {
+        Authed::Pass { role, session } => (role, session),
+        Authed::NoGrant { user, db } => {
+            return ErrorCode::Forbidden.response(format!(
+                "user '{user}' has no grant on database '{db}' (mounted: {})",
+                s.mounts.join(", ")
+            ));
+        }
         Authed::Revoked => {
             return ErrorCode::SessionRevoked.response("session revoked or expired; re-login");
         }
         Authed::Deny => return ErrorCode::Unauthorized.response("unauthorized"),
     };
+    // **写入闸**（M-C 补漏）：此前 /write 只查"登录没登录"，reader 也能写——
+    // 与 SQL 面的 `role.can_write()` 闸不对齐（配置矩阵承诺 reader 拒写）。
+    if !role.can_write() {
+        return ErrorCode::Forbidden.response("write requires writer or admin role");
+    }
     if s.db.read_only() {
         return ErrorCode::ReadOnly.response("database is read-only");
     }
@@ -1660,8 +1836,8 @@ async fn tables(
     headers: HeaderMap,
     StructuredQuery(q): StructuredQuery<TablesQuery>,
 ) -> Response {
-    if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
-        return ErrorCode::Unauthorized.response("unauthorized");
+    if let Err(resp) = auth(&s, &headers) {
+        return *resp;
     }
     let want_schema = match parse_bool_param("withSchema", q.with_schema.as_deref()) {
         Ok(v) => v,
@@ -1701,8 +1877,8 @@ async fn schema(
     headers: HeaderMap,
     Path(table): Path<String>,
 ) -> Response {
-    if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
-        return ErrorCode::Unauthorized.response("unauthorized");
+    if let Err(resp) = auth(&s, &headers) {
+        return *resp;
     }
     let table_out = table.clone();
     let st = Arc::clone(&s);
@@ -1721,8 +1897,8 @@ async fn partitions(
     headers: HeaderMap,
     Path(table): Path<String>,
 ) -> Response {
-    if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
-        return ErrorCode::Unauthorized.response("unauthorized");
+    if let Err(resp) = auth(&s, &headers) {
+        return *resp;
     }
     let st = Arc::clone(&s);
     let res = tokio::task::spawn_blocking(move || st.db.partition_stats(&table)).await;
@@ -1751,8 +1927,8 @@ async fn partitions(
 }
 
 async fn stats(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
-        return ErrorCode::Unauthorized.response("unauthorized");
+    if let Err(resp) = auth(&s, &headers) {
+        return *resp;
     }
     let st = Arc::clone(&s);
     let res = tokio::task::spawn_blocking(move || {
@@ -1778,8 +1954,8 @@ async fn stats(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
 }
 
 async fn get_config(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
-        return ErrorCode::Unauthorized.response("unauthorized");
+    if let Err(resp) = auth(&s, &headers) {
+        return *resp;
     }
     let rt = s.db.runtime();
     let opts = s.db.options();
@@ -1829,8 +2005,8 @@ async fn put_config(
     headers: HeaderMap,
     StructuredJson(body): StructuredJson<ConfigUpdate>,
 ) -> Response {
-    if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
-        return ErrorCode::Unauthorized.response("unauthorized");
+    if let Err(resp) = auth(&s, &headers) {
+        return *resp;
     }
     let rt = s.db.runtime();
     if let Some(ms) = body.query_timeout_ms {
@@ -1851,8 +2027,8 @@ async fn put_config(
 }
 
 async fn list_queries(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
-        return ErrorCode::Unauthorized.response("unauthorized");
+    if let Err(resp) = auth(&s, &headers) {
+        return *resp;
     }
     let entries: Vec<serde_json::Value> = match s.queries.lock() {
         Ok(q) => q
@@ -1880,8 +2056,8 @@ async fn cancel_query(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let StatusCode::UNAUTHORIZED = auth(&s, &headers) {
-        return ErrorCode::Unauthorized.response("unauthorized");
+    if let Err(resp) = auth(&s, &headers) {
+        return *resp;
     }
     match s.queries.lock() {
         Ok(q) => match q.get(&id) {
@@ -2318,7 +2494,6 @@ mod tests {
         let s = Arc::new(Session {
             id: id.to_string(),
             user: "bob".to_string(),
-            role_at_login: qsdb::users::Role::Reader,
             client: "127.0.0.1:1; ut".to_string(),
             created_at_ms: now,
             last_active_ms: AtomicU64::new(now - idle_ms_ago),

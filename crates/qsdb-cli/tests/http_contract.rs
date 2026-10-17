@@ -1831,6 +1831,217 @@ fn session_lifecycle_kick_revocation_and_attribution() {
     assert_eq!(r.code(), "UNAUTHORIZED");
 }
 
+/// **库级 grants（十六批 M-C）**：白名单判定、每请求现查、/write 写入闸、
+/// 登录回显 grants、CLI `--grant`。
+///
+/// 契约核心：**改 grants 立即生效**（同一把 token 不用重登）——管理员收权后
+/// 在跑的会话下一个请求就是 403，这是"角色不缓存进会话"的纪律。
+#[test]
+fn grants_whitelist_per_request_effect_and_write_gate() {
+    let srv = Server::start(&["--token", "s3cret"]);
+    let p = srv.port;
+    let admin = [("Authorization", "Bearer s3cret")];
+
+    // ① 建 reader（旧格式全局角色）+ 登录：grants 回显 {"*":"reader"}
+    let r = query_auth(
+        p,
+        "CREATE USER dave WITH PASSWORD 'pass123' ROLE reader",
+        None,
+        &admin,
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let r = login(p, "dave", "pass123");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["grants"], serde_json::json!({ "*": "reader" }));
+    assert_eq!(r.json()["role"], "reader");
+    let tok = r.json()["token"].as_str().unwrap().to_string();
+    let bearer = format!("Bearer {tok}");
+    let dave = [("Authorization", bearer.as_str())];
+
+    // ② reader 能读；**不能经 /write 写**（M-C 补上的写入闸——此前 reader 可写）
+    let r = query_auth(p, "SELECT 1", None, &dave);
+    assert_eq!(r.status, 200);
+    let r = query_auth(p, "CREATE TABLE t (a BIGINT, b BIGINT)", None, &admin);
+    assert_eq!(r.status, 200);
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/write?table=t&mode=append",
+        &[("Content-Type", "application/octet-stream"), dave[0]],
+        &ipc_two_int_cols(1),
+    );
+    assert_eq!(r.status, 403, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.code(), "FORBIDDEN");
+    assert!(
+        String::from_utf8_lossy(&r.body).contains("writer or admin"),
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+
+    // ③ 收权到全拒（{"*": null}）→ **同一把 token** 下一请求即 403（现查）
+    let r = http(
+        p,
+        "PUT",
+        "/api/v1/users/dave/grants",
+        &[("Content-Type", "application/json"), admin[0]],
+        br#"{"grants": {"*": null}}"#,
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["grants"], serde_json::json!({ "*": null }));
+    let r = query_auth(p, "SELECT 1", None, &dave);
+    assert_eq!(
+        r.status,
+        403,
+        "收权后同 token 应立即 403: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(r.code(), "FORBIDDEN");
+    assert!(
+        String::from_utf8_lossy(&r.body).contains("no grant on database 'default'"),
+        "文案要区分'无权限': {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    // 资源端点同样 403（不是 401——凭证是好的，只是没授权）
+    let r = http(p, "GET", "/api/v1/tables", &dave, b"");
+    assert_eq!(r.status, 403);
+    assert_eq!(r.code(), "FORBIDDEN");
+
+    // ④ 授回精确库 → 立刻恢复（不需要重登）
+    let r = http(
+        p,
+        "PUT",
+        "/api/v1/users/dave/grants",
+        &[("Content-Type", "application/json"), admin[0]],
+        br#"{"grants": {"default": "reader"}}"#,
+    );
+    assert_eq!(r.status, 200);
+    let r = query_auth(p, "SELECT 1", None, &dave);
+    assert_eq!(
+        r.status,
+        200,
+        "授回后应立即恢复: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    // 重登的 grants 回显是新形态
+    let r = login(p, "dave", "pass123");
+    assert_eq!(
+        r.json()["grants"],
+        serde_json::json!({ "default": "reader" })
+    );
+    assert_eq!(r.json()["role"], "reader");
+
+    // ⑤ 非法 body / 非法角色名 → 400；不存在的用户 → 404
+    let r = http(
+        p,
+        "PUT",
+        "/api/v1/users/dave/grants",
+        &[("Content-Type", "application/json"), admin[0]],
+        br#"{"grantz": {}}"#,
+    );
+    assert_eq!(r.status, 400);
+    assert_eq!(r.code(), "INVALID_ARGUMENT");
+    let r = http(
+        p,
+        "PUT",
+        "/api/v1/users/ghost/grants",
+        &[("Content-Type", "application/json"), admin[0]],
+        br#"{"grants": {"*": "reader"}}"#,
+    );
+    assert_eq!(r.status, 404);
+    let r = http(
+        p,
+        "PUT",
+        "/api/v1/users/dave/grants",
+        &[("Content-Type", "application/json"), admin[0]],
+        br#"{"grants": {"*": "root"}}"#,
+    );
+    assert_eq!(r.status, 400, "非法角色名 → 400");
+
+    // ⑥ CLI `user add --grant`（白名单制：只授 default=writer，无 "*"）——
+    //    server 运行中同库跑 admin 子命令（写走 catalog 锁，安全）
+    let out = Command::new(env!("CARGO_BIN_EXE_qsdb"))
+        .args(["admin", "--path"])
+        .arg(&srv.root)
+        .args([
+            "user-add",
+            "erin",
+            "--password",
+            "pw123",
+            "--grant",
+            "default=writer",
+        ])
+        .output()
+        .expect("run admin user add");
+    assert!(
+        out.status.success(),
+        "user add 失败: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = login(p, "erin", "pw123");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.json()["grants"],
+        serde_json::json!({ "default": "writer" })
+    );
+    assert_eq!(r.json()["role"], "writer", "默认库角色现查回显");
+    let etok = r.json()["token"].as_str().unwrap().to_string();
+    let ebearer = format!("Bearer {etok}");
+    // writer 真能写（写入闸放行）
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/write?table=t&mode=append",
+        &[
+            ("Content-Type", "application/octet-stream"),
+            ("Authorization", ebearer.as_str()),
+        ],
+        &ipc_two_int_cols(2),
+    );
+    assert_eq!(
+        r.status,
+        200,
+        "writer 应能写: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+
+    // ⑦ 白名单制用户对未授库的语义：只授 settle → 登录成功但 default 无权
+    let out = Command::new(env!("CARGO_BIN_EXE_qsdb"))
+        .args(["admin", "--path"])
+        .arg(&srv.root)
+        .args([
+            "user-add",
+            "finn",
+            "--password",
+            "pw123",
+            "--grant",
+            "settle=reader",
+        ])
+        .output()
+        .expect("run admin user add");
+    assert!(out.status.success());
+    let r = login(p, "finn", "pw123");
+    assert_eq!(
+        r.status,
+        200,
+        "白名单制用户登录不该被拒: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(
+        r.json()["grants"],
+        serde_json::json!({ "settle": "reader" })
+    );
+    assert!(r.json()["role"].is_null(), "对 default 无权 → role 回 null");
+    let ftok = r.json()["token"].as_str().unwrap().to_string();
+    let fbearer = format!("Bearer {ftok}");
+    let r = query_auth(p, "SELECT 1", None, &[("Authorization", fbearer.as_str())]);
+    assert_eq!(r.status, 403);
+    assert!(
+        String::from_utf8_lossy(&r.body).contains("no grant"),
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+}
+
 /// `PUT /api/v1/sessions/current/database`：设会话默认库（`USE` 的 REST 落点）。
 /// M-A 单库：唯一挂载是 `default`；未挂载的库名显式 404，拼错键 400，
 /// 无会话的请求（超级 token / Basic）403。

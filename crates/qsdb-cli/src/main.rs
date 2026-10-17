@@ -245,7 +245,13 @@ enum AdminCmd {
     /// 添加用户（角色 admin|writer|reader；密码可经 --password 或交互输入）
     UserAdd {
         name: String,
-        role: String,
+        /// 全局角色（= `"*"` 槽位）。给了 `--grant` 后可省略（省略 = 白名单制，
+        /// 未列出的库一律无权）。
+        role: Option<String>,
+        /// 库级授权（M-C）：`--grant 库名=角色`，可重复；角色省写（`db=`）=
+        /// **显式无权**；库名可为 `*`（通配）。判定每请求现查，立即生效。
+        #[arg(long = "grant")]
+        grants: Vec<String>,
         #[arg(long)]
         password: Option<String>,
     },
@@ -337,12 +343,43 @@ fn main() {
                 AdminCmd::UserAdd {
                     name,
                     role,
+                    grants,
                     password,
                 } => {
-                    let r = qsdb::users::Role::from_name(&role).unwrap_or_else(|e| {
-                        eprintln!("error: {e}");
+                    // --grant 解析（M-C）：`db=role`；`db=` = 显式无权；`*=role` = 通配
+                    let mut map = std::collections::BTreeMap::new();
+                    for g in &grants {
+                        let Some((db, r)) = g.split_once('=') else {
+                            eprintln!("error: --grant 需要 库名=角色 形态（got {g:?}）");
+                            std::process::exit(1);
+                        };
+                        let db = db.trim();
+                        if db.is_empty() {
+                            eprintln!("error: --grant 的库名不能为空（got {g:?}）");
+                            std::process::exit(1);
+                        }
+                        let rr = if r.trim().is_empty() {
+                            None // `db=` = 显式无权
+                        } else {
+                            Some(qsdb::users::Role::from_name(r.trim()).unwrap_or_else(|e| {
+                                eprintln!("error: {e}");
+                                std::process::exit(1);
+                            }))
+                        };
+                        map.insert(db.to_string(), rr);
+                    }
+                    let global = role
+                        .as_deref()
+                        .map(qsdb::users::Role::from_name)
+                        .transpose()
+                        .unwrap_or_else(|e| {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        });
+                    if global.is_none() && map.is_empty() {
+                        eprintln!("error: 需要全局角色（admin|writer|reader）或至少一个 --grant");
                         std::process::exit(1);
-                    });
+                    }
                     let pw = match password {
                         Some(p) => p,
                         None => {
@@ -353,16 +390,43 @@ fn main() {
                             line.trim().to_string()
                         }
                     };
-                    match qsdb::users::UserStore::add(db.store(), &name, &pw, r) {
-                        Ok(()) => {
-                            println!("user '{name}' added ({})", r.name());
-                            return;
+                    match (global, map.is_empty()) {
+                        // 旧形态：只有全局角色 → 旧格式（逐位兼容）
+                        (Some(r), true) => {
+                            match qsdb::users::UserStore::add(db.store(), &name, &pw, r) {
+                                Ok(()) => {
+                                    println!("user '{name}' added ({})", r.name());
+                                    return;
+                                }
+                                Err(e) => {
+                                    eprintln!("error: {e}");
+                                    std::process::exit(1);
+                                }
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("error: {e}");
-                            std::process::exit(1);
+                        // grants 形态：全局角色（若有）落 "*" 槽位
+                        (r, false) => {
+                            if let Some(r) = r {
+                                map.insert("*".to_string(), Some(r));
+                            }
+                            match qsdb::users::UserStore::add_with_grants(
+                                db.store(),
+                                &name,
+                                &pw,
+                                map,
+                            ) {
+                                Ok(()) => {
+                                    println!("user '{name}' added (grants 模式)");
+                                    return;
+                                }
+                                Err(e) => {
+                                    eprintln!("error: {e}");
+                                    std::process::exit(1);
+                                }
+                            }
                         }
-                    }
+                        (None, true) => unreachable!("上面已挡"),
+                    };
                 }
                 AdminCmd::UserDrop { name } => {
                     match qsdb::users::UserStore::drop_user(db.store(), &name) {
@@ -440,8 +504,26 @@ fn main() {
                         if users.is_empty() {
                             println!("(no users)");
                         } else {
-                            for (n, r) in users {
-                                println!("{n:<20} {}", r.name());
+                            for u in users {
+                                let role = u
+                                    .role
+                                    .as_ref()
+                                    .map(|r| r.name().to_string())
+                                    .unwrap_or_else(|| "-".to_string());
+                                match &u.grants {
+                                    None => println!("{:<20} {}", u.name, role),
+                                    Some(g) => {
+                                        let gs = g
+                                            .iter()
+                                            .map(|(k, v)| match v {
+                                                Some(r) => format!("{k}={}", r.name()),
+                                                None => format!("{k}=-"),
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(",");
+                                        println!("{:<20} {}  [{}]", u.name, role, gs);
+                                    }
+                                }
                             }
                         }
                         return;

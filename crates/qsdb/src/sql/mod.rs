@@ -320,18 +320,42 @@ fn execute_stmt(
             let schema = Arc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new("user", arrow::datatypes::DataType::Utf8, true),
                 arrow::datatypes::Field::new("role", arrow::datatypes::DataType::Utf8, true),
+                // M-C 第三列（只增）：grants 摘要，如 `settle=reader,*=-`；
+                // 旧格式用户为空串
+                arrow::datatypes::Field::new("grants", arrow::datatypes::DataType::Utf8, true),
             ]));
             use arrow::array::StringArray;
             let batch = RecordBatch::try_new(
                 Arc::clone(&schema),
                 vec![
                     Arc::new(StringArray::from(
-                        users.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                        users.iter().map(|u| u.name.clone()).collect::<Vec<_>>(),
                     )),
                     Arc::new(StringArray::from(
                         users
                             .iter()
-                            .map(|(_, r)| r.name().to_string())
+                            .map(|u| {
+                                u.role
+                                    .as_ref()
+                                    .map(|r| r.name().to_string())
+                                    .unwrap_or_default()
+                            })
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        users
+                            .iter()
+                            .map(|u| match &u.grants {
+                                None => String::new(),
+                                Some(g) => g
+                                    .iter()
+                                    .map(|(k, v)| match v {
+                                        Some(r) => format!("{k}={}", r.name()),
+                                        None => format!("{k}=-"),
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                            })
                             .collect::<Vec<_>>(),
                     )),
                 ],
