@@ -22,6 +22,9 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
+## 多库限定名路由（M-B）：与内核**同一版本**的 sqlparser 做表引用的 AST 级
+## 重写（剥挂载限定符）——版本不同会重序列化出内核解析不了的 SQL
+sqlparser = { workspace = true }
 arrow-flight = { version = "60", optional = true }
 tonic = { version = "0.14", optional = true }
 futures = { version = "0.3", optional = true }

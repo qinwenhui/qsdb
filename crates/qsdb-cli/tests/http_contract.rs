@@ -2042,6 +2042,132 @@ fn grants_whitelist_per_request_effect_and_write_gate() {
     );
 }
 
+/// **多库挂载（十六批 M-B）**：限定名路由、同名表隔离、跨库显式拒、
+/// `USE` / `SHOW DATABASES` / `GET /databases`、写入路由。
+///
+/// 验收基准（设计稿 §八）：**双挂载各库同表名不串**；单库零改动回归由
+/// 本文件其余全部用例（单挂载）承担。
+#[test]
+fn multi_mount_routing_isolation_and_rejects() {
+    // 第二个挂载目录（Server::start 只建 root；Drop 只清 root）
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let settle_dir =
+        std::env::temp_dir().join(format!("qsdb_mm_settle_{}_{}", std::process::id(), uniq));
+    let _ = std::fs::remove_dir_all(&settle_dir);
+    std::fs::create_dir_all(&settle_dir).unwrap();
+
+    let settle_s = settle_dir.to_string_lossy().replace('\\', "/");
+    let srv = Server::start(&["--mount", &format!("settle={settle_s}")]);
+    let p = srv.port;
+    let q = |sql: &str| query(p, sql, None);
+
+    // ① 同名表各建各的，互不串（验收核心）
+    assert_eq!(q("CREATE TABLE t (a BIGINT)").status, 200);
+    assert_eq!(q("CREATE TABLE settle.t (a BIGINT)").status, 200);
+    assert_eq!(q("INSERT INTO t VALUES (1),(2)").status, 200);
+    assert_eq!(q("INSERT INTO settle.t VALUES (10),(20),(30)").status, 200);
+    let r = q("SELECT count(*) FROM t");
+    assert_eq!(r.json()["rows"][0][0], 2, "default.t");
+    let r = q("SELECT count(*) FROM settle.t");
+    assert_eq!(r.json()["rows"][0][0], 3, "settle.t——同名表不串");
+    // 参数化 + 限定名
+    let r = query_params(
+        p,
+        "SELECT count(*) FROM settle.t WHERE a = $1",
+        serde_json::json!([20]),
+    );
+    assert_eq!(r.json()["rows"][0][0], 1);
+
+    // ② 跨库显式拒（501 UNSUPPORTED，不是静默连错库）
+    let r = q("SELECT count(*) FROM t JOIN settle.t ON true");
+    assert_eq!(r.status, 501, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.code(), "UNSUPPORTED");
+    // 未挂载的库名 → 404
+    let r = q("SELECT * FROM nope.t");
+    assert_eq!(r.status, 404);
+    assert_eq!(r.code(), "NOT_FOUND");
+
+    // ③ REST database 字段（优先级最高）
+    let body =
+        serde_json::json!({"sql": "SELECT count(*) FROM t", "database": "settle"}).to_string();
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/query",
+        &[("Content-Type", "application/json")],
+        body.as_bytes(),
+    );
+    assert_eq!(r.json()["rows"][0][0], 3, "database=settle 定向");
+    // 未挂载的 database → 404
+    let body = serde_json::json!({"sql": "SELECT 1", "database": "nope"}).to_string();
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/query",
+        &[("Content-Type", "application/json")],
+        body.as_bytes(),
+    );
+    assert_eq!(r.status, 404);
+
+    // ④ 写入路由：?table=settle.t
+    let r = http(
+        p,
+        "POST",
+        "/api/v1/write?table=settle.t&mode=append&format=csv",
+        &[("Content-Type", "text/csv")],
+        b"a
+40
+",
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let r = q("SELECT count(*) FROM settle.t");
+    assert_eq!(r.json()["rows"][0][0], 4);
+
+    // ⑤ 元数据端点带限定名
+    let r = http(p, "GET", "/api/v1/tables", &[], &[]);
+    let txt = String::from_utf8_lossy(&r.body).to_string();
+    assert!(
+        txt.contains("default.t") && txt.contains("settle.t"),
+        "多挂载 /tables 应给限定名: {txt}"
+    );
+    let r = http(p, "GET", "/api/v1/tables/settle.t/schema", &[], &[]);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["table"], "settle.t");
+    let r = http(p, "GET", "/api/v1/databases", &[], &[]);
+    let v = r.json();
+    let dbs = v["databases"].as_array().unwrap();
+    assert_eq!(dbs.len(), 2);
+    assert_eq!(dbs[0]["name"], "default");
+    assert_eq!(dbs[0]["readOnly"], false);
+
+    // ⑥ USE 流程（要登录会话；开放模式登录 = anonymous 会话）
+    let r = login(p, "x", "y");
+    assert_eq!(
+        r.status,
+        200,
+        "开放模式可登: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let tok = r.json()["token"].as_str().unwrap().to_string();
+    let bearer = format!("Bearer {tok}");
+    let auth = [("Authorization", bearer.as_str())];
+    let qa = |sql: &str| query_auth(p, sql, None, &auth);
+    let r = qa("USE settle");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["defaultDb"], "settle");
+    let r = qa("SELECT count(*) FROM t");
+    assert_eq!(r.json()["rows"][0][0], 4, "USE 后单段名落 settle");
+    let r = qa("USE nope");
+    assert_eq!(r.status, 404);
+    // SHOW DATABASES
+    let r = qa("SHOW DATABASES");
+    assert_eq!(r.status, 200);
+    assert_eq!(r.json()["rowCount"], 2);
+
+    let _ = std::fs::remove_dir_all(&settle_dir);
+}
+
 /// `PUT /api/v1/sessions/current/database`：设会话默认库（`USE` 的 REST 落点）。
 /// M-A 单库：唯一挂载是 `default`；未挂载的库名显式 404，拼错键 400，
 /// 无会话的请求（超级 token / Basic）403。

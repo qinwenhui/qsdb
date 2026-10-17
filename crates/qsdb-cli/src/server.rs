@@ -120,11 +120,11 @@ pub struct AppState {
     /// 会话表（token → session；登录签发，进程内存态）。
     /// 十六批 M-A：由 `token → Role` 升级而来，同一把锁、同一处签发/吊销。
     pub sessions: std::sync::Mutex<HashMap<String, Arc<Session>>>,
-    /// 挂载库名（M-A 单库恒 `["default"]`；M-B 多库由 `--mount` 填充——
-    /// 会话默认库 / 之后的库名解析都按这份白名单校验）。
-    pub mounts: Vec<String>,
+    /// 挂载表（十六批 M-B）：库名（小写）→ 挂载。恒含 `"default"`（来自 `--path`）。
+    /// 会话默认库 / 限定名路由 / grants 键都按这份白名单校验。
+    pub mounts: HashMap<String, Mount>,
+    /// 默认挂载句柄（= `mounts["default"].db`；用户存储 / `/files` / Flight 面）。
     pub db: Arc<Qsdb>,
-    pub writer: WriteBuffer,
     pub token: Option<String>,
     pub metrics: Metrics,
     /// 运行中查询（query_id → entry）
@@ -133,26 +133,45 @@ pub struct AppState {
     pub max_concurrent_queries: usize,
 }
 
+/// 一个挂载库（M-B）：句柄 + 该句柄**自己的写缓冲**（预算/缓存/锁随句柄天然隔离）。
+pub struct Mount {
+    pub db: Arc<Qsdb>,
+    pub writer: WriteBuffer,
+}
+
 impl AppState {
     /// 组装共享状态（HTTP 与 Flight 两面共用同一份；Flight 的单测也走这里）。
-    pub(crate) fn new(
-        db: Arc<Qsdb>,
+    /// 多挂载形态（M-B）：`("名字", 句柄)` 列表；**必须含** `"default"`
+    /// （单库场景传一项 `("default", 句柄)`——与历史行为逐位一致）。
+    pub(crate) fn with_mounts(
+        mount_list: Vec<(String, Arc<Qsdb>)>,
         token: Option<String>,
         commits: Arc<crate::commit_log::CommitLog>,
         max_concurrent_queries: usize,
     ) -> Self {
-        let writer = db.writer(WriteBufferOptions::default());
+        let mut mounts = HashMap::new();
+        for (name, db) in mount_list {
+            let writer = db.writer(WriteBufferOptions::default());
+            mounts.insert(name, Mount { db, writer });
+        }
+        let db = Arc::clone(&mounts.get("default").expect("default mount is required").db);
         Self {
             commits,
             sessions: std::sync::Mutex::new(HashMap::new()),
-            mounts: vec!["default".to_string()],
+            mounts,
             db,
-            writer,
             token,
             metrics: Metrics::default(),
             queries: std::sync::Mutex::new(HashMap::new()),
             max_concurrent_queries,
         }
+    }
+
+    /// 挂载名清单（排序，展示/文案用）。
+    pub(crate) fn mount_names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.mounts.keys().cloned().collect();
+        v.sort();
+        v
     }
 
     /// 建查询上下文并注册为"运行中"——**并发限额与 id 归属都在同一把锁内定**。
@@ -165,6 +184,7 @@ impl AppState {
     /// `session` = 归属会话（注册时计一次 `queriesTotal`；踢人靠注册表反查）。
     pub(crate) fn register_query(
         &self,
+        db: &Arc<Qsdb>,
         want_id: Option<String>,
         timeout_ms: Option<u64>,
         sql: String,
@@ -181,11 +201,10 @@ impl AppState {
                 self.max_concurrent_queries
             ));
         }
+        // 上下文建在**目标挂载**上（M-B）：内存池 / 超时 / 单查询配额随句柄走
         let ctx = match want_id {
-            Some(id) if !q.contains_key(&id) => {
-                self.db.new_query_context_with_id(Some(id), timeout_ms)
-            }
-            _ => self.db.new_query_context(timeout_ms),
+            Some(id) if !q.contains_key(&id) => db.new_query_context_with_id(Some(id), timeout_ms),
+            _ => db.new_query_context(timeout_ms),
         };
         if let Some(s) = session {
             s.stats.queries_total.fetch_add(1, Ordering::Relaxed);
@@ -351,7 +370,7 @@ const DEFAULT_QUERY_MEMORY_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
-    db: Arc<Qsdb>,
+    mounts: Vec<(String, Arc<Qsdb>)>,
     addr: &str,
     token: Option<String>,
     // 提交事件缓冲（T2；`GET /api/v1/watch` 的后端）
@@ -374,6 +393,15 @@ pub async fn serve(
             .map_err(|e| format!("parse config {}: {e}", path.display()))?;
         eprintln!("config file applied: {}", path.display());
     }
+    let state = Arc::new(AppState::with_mounts(
+        mounts,
+        token,
+        commits,
+        max_concurrent_queries.unwrap_or(0),
+    ));
+    // 运行期配置（超时/单查询配额）落**默认挂载**的 runtime；M-B 各挂载独立
+    // runtime，运行期热更按同一值刷全部（见 put_config 的说明）。
+    let db = Arc::clone(&state.db);
     let rt = db.runtime();
     if let Some(ms) = cfg.query_timeout_ms {
         rt.set_query_timeout_ms(ms);
@@ -386,12 +414,6 @@ pub async fn serve(
             .or(cfg.query_memory_limit_bytes)
             .unwrap_or(DEFAULT_QUERY_MEMORY_LIMIT_BYTES),
     );
-    let state = Arc::new(AppState::new(
-        db,
-        token,
-        commits,
-        max_concurrent_queries.unwrap_or(0),
-    ));
 
     // 写入走大 body（Arrow IPC 批）；默认 2MB 限制放大到 1GB
     let write_layer = axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024);
@@ -413,6 +435,7 @@ pub async fn serve(
         .route("/api/v1/watch", get(watch))
         .route("/api/v1/queries/{id}/cancel", post(cancel_query))
         // 会话（十六批 M-A）：静态段先于 `{id}` 匹配，`current` 不会被参数路由吞掉
+        .route("/api/v1/databases", get(list_databases))
         .route("/api/v1/sessions", get(list_sessions))
         .route(
             "/api/v1/sessions/current/database",
@@ -429,12 +452,17 @@ pub async fn serve(
     // staging 后台上传（M6-4，可选）：定时 flush_staged——启动即跑一轮
     // （崩溃恢复补传），错误记日志不中断
     let staging_task = staging_upload_secs.map(|secs| {
-        let db = Arc::clone(&state.db);
+        let st0 = Arc::clone(&state);
         tokio::spawn(async move {
-            let d0 = Arc::clone(&db);
-            let _ = tokio::task::spawn_blocking(move || {
-                if let Err(e) = d0.flush_staged() {
-                    eprintln!("staging recovery flush error: {e}");
+            // 多挂载（M-B）：每个挂载自己的 staging；启动先补传一轮（崩溃恢复）
+            let _ = tokio::task::spawn_blocking({
+                let st0 = Arc::clone(&st0);
+                move || {
+                    for m in st0.mounts.values() {
+                        if let Err(e) = m.db.flush_staged() {
+                            eprintln!("staging recovery flush error: {e}");
+                        }
+                    }
                 }
             })
             .await;
@@ -442,10 +470,12 @@ pub async fn serve(
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                let d = Arc::clone(&db);
+                let st = Arc::clone(&st0);
                 let _ = tokio::task::spawn_blocking(move || {
-                    if let Err(e) = d.flush_staged() {
-                        eprintln!("staging flush error: {e}");
+                    for m in st.mounts.values() {
+                        if let Err(e) = m.db.flush_staged() {
+                            eprintln!("staging flush error: {e}");
+                        }
                     }
                 })
                 .await;
@@ -463,9 +493,11 @@ pub async fn serve(
                 tick.tick().await;
                 let st = Arc::clone(&st);
                 let _ = tokio::task::spawn_blocking(move || {
-                    if let Ok(names) = st.db.tables() {
-                        for t in names {
-                            let _ = st.db.compact_table(&t);
+                    for m in st.mounts.values() {
+                        if let Ok(names) = m.db.tables() {
+                            for t in names {
+                                let _ = m.db.compact_table(&t);
+                            }
                         }
                     }
                 })
@@ -544,9 +576,14 @@ pub async fn serve(
     if let Some(t) = flight_task {
         t.abort();
     }
-    // 退出前 flush 写缓冲
+    // 退出前 flush 写缓冲（多挂载：全部）
     let st = Arc::clone(&state);
-    let _ = tokio::task::spawn_blocking(move || st.writer.flush_all()).await;
+    let _ = tokio::task::spawn_blocking(move || {
+        for m in st.mounts.values() {
+            let _ = m.writer.flush_all();
+        }
+    })
+    .await;
     result.map_err(Into::into)
 }
 
@@ -699,13 +736,323 @@ fn require_role(state: &AppState, headers: &HeaderMap) -> Result<qsdb::users::Ro
         Authed::Pass { role, .. } => Ok(role),
         Authed::NoGrant { user, db } => Err(Box::new(ErrorCode::Forbidden.response(format!(
             "user '{user}' has no grant on database '{db}' (mounted: {})",
-            state.mounts.join(", ")
+            state.mount_names().join(", ")
         )))),
         Authed::Revoked => Err(Box::new(
             ErrorCode::SessionRevoked.response("session revoked or expired; re-login"),
         )),
         Authed::Deny => Err(Box::new(ErrorCode::Unauthorized.response("unauthorized"))),
     }
+}
+
+/// 库名必须已挂载；否则 404（文案带挂载清单——"库不存在"与"无权限"在这里
+/// 就是同一条，因为挂载表是全量的）。
+fn ensure_mounted(state: &AppState, db: &str) -> std::result::Result<(), Box<Response>> {
+    if state.mounts.contains_key(db) {
+        Ok(())
+    } else {
+        Err(Box::new(ErrorCode::NotFound.response(format!(
+            "database {db:?} is not mounted (mounted: {})",
+            state.mount_names().join(", ")
+        ))))
+    }
+}
+
+/// 身份抽取（不判授权）：谁 + 会话。M-B 起 `/query`、`/write` 走这里——
+/// 它们的目标库要等解析完 SQL / 表名才知道，授权判定必须**延后到目标库确定**：
+/// 先按会话默认库判会把"只授了 settle、查询里写 settle.t"的用户误杀成 403。
+/// 401/吊销判定与 [`authenticate`] 完全同源（Revoked → 401 `SESSION_REVOKED`）。
+struct Identity {
+    user: String,
+    session: Option<Arc<Session>>,
+}
+
+fn authenticate_identity(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> std::result::Result<Identity, Box<Response>> {
+    let auth_header = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    if let Some(h) = &auth_header {
+        if let Some(token) = h.strip_prefix("Bearer ") {
+            let hit = state
+                .sessions
+                .lock()
+                .ok()
+                .and_then(|m| m.get(token).cloned());
+            if let Some(s) = hit {
+                s.last_active_ms
+                    .store(Session::epoch_ms(), Ordering::Relaxed);
+                return Ok(Identity {
+                    user: s.user.clone(),
+                    session: Some(s),
+                });
+            }
+            if token.starts_with(SESSION_TOKEN_PREFIX) {
+                return Err(Box::new(
+                    ErrorCode::SessionRevoked.response("session revoked or expired; re-login"),
+                ));
+            }
+        }
+    }
+    if let Some(h) = &auth_header {
+        if let Some(b64) = h.strip_prefix("Basic ") {
+            if let Some((user, pass)) = basic_credentials(b64) {
+                if let Some(def) =
+                    qsdb::users::UserStore::verify_def(state.db.store(), &user, &pass)
+                {
+                    return Ok(Identity {
+                        user: def.name,
+                        session: None,
+                    });
+                }
+            }
+        }
+    }
+    match (&state.token, &auth_header) {
+        (Some(expect), Some(h)) => {
+            if h.strip_prefix("Bearer ")
+                .map(|t| t == expect.as_str())
+                .unwrap_or(false)
+            {
+                Ok(Identity {
+                    user: "__token__".to_string(),
+                    session: None,
+                })
+            } else {
+                Err(Box::new(ErrorCode::Unauthorized.response("unauthorized")))
+            }
+        }
+        (Some(_), None) => Err(Box::new(ErrorCode::Unauthorized.response("unauthorized"))),
+        (None, _) => {
+            let has_users = qsdb::users::UserStore::read_all(state.db.store())
+                .map(|u| !u.is_empty())
+                .unwrap_or(false);
+            if has_users {
+                Err(Box::new(ErrorCode::Unauthorized.response("unauthorized")))
+            } else {
+                Ok(Identity {
+                    user: "anonymous".to_string(),
+                    session: None,
+                })
+            }
+        }
+    }
+}
+
+/// 元数据语句（`SHOW PARTITIONS t` / `SHOW CREATE TABLE t` / `DESCRIBE t` /
+/// `DESC t`）的**文本级路由**：这些语句由内核手解析（不走 sqlparser 绑定），
+/// route_sql 的关系遍历看不见里面的表名——这里按"最后一个空白分隔 token 是表名"
+/// 处理（这四种形态没有别的参数排在表名后面）。`db.t` → 剥成 `t` 并路由到 db。
+/// `None` = 不是元数据语句（交给 route_sql 正常走）。
+fn route_metadata_statement(
+    state: &AppState,
+    sql: &str,
+) -> Option<std::result::Result<(String, String), Box<Response>>> {
+    let t = sql.trim();
+    let t = t.strip_suffix(';').map(str::trim).unwrap_or(t);
+    const PREFIXES: [&str; 4] = [
+        "SHOW PARTITIONS ",
+        "SHOW CREATE TABLE ",
+        "DESCRIBE ",
+        "DESC ",
+    ];
+    let mut matched = None;
+    for p in PREFIXES {
+        if t.len() > p.len() && t.get(..p.len()).is_some_and(|x| x.eq_ignore_ascii_case(p)) {
+            matched = Some(p);
+            break;
+        }
+    }
+    let prefix = matched?;
+    let rest = t[prefix.len()..].trim();
+    // "DESCRIBE TABLE t" 的中间 TABLE 也吃掉——最后一个 token 恒是表名
+    let name = rest.rsplit(' ').next()?.trim();
+    if name.is_empty() {
+        return Some(Err(Box::new(
+            ErrorCode::InvalidArgument.response(format!("missing table name after {prefix:?}")),
+        )));
+    }
+    let (qdb, plain) = split_qualified(name);
+    let Some(db) = qdb else {
+        return None; // 单段名：照常交给 route_sql（落会话默认库）
+    };
+    if let Err(resp) = ensure_mounted(state, &db) {
+        return Some(Err(resp));
+    }
+    let head = &t[..t.len() - name.len()];
+    Some(Ok((format!("{head}{plain}"), db)))
+}
+
+/// `USE db` 语句识别（server 面拦截；嵌入面不认这个——单句柄单库，
+/// `db.sql("USE x")` 照旧走内核报它的错）。匹配整个语句（剥尾分号）。
+fn parse_use_statement(sql: &str) -> Option<String> {
+    let t = sql.trim().trim_end_matches(';').trim();
+    let rest = t.strip_prefix("USE").or_else(|| t.strip_prefix("use"))?;
+    let db = rest.trim();
+    if db.is_empty()
+        || !db.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        || db.as_bytes()[0].is_ascii_digit()
+    {
+        return None;
+    }
+    Some(db.to_ascii_lowercase())
+}
+
+fn is_show_databases(sql: &str) -> bool {
+    sql.trim()
+        .trim_end_matches(';')
+        .trim()
+        .eq_ignore_ascii_case("SHOW DATABASES")
+}
+
+/// `db.table` 拆分（首点分段；无点 = None）。表名里的点本仓不允许（列名都不许），
+/// 所以首点即库名分隔——这跟 SQL 限定名的语义一致。
+fn split_qualified(name: &str) -> (Option<String>, String) {
+    match name.split_once('.') {
+        Some((db, t)) => (Some(db.to_ascii_lowercase()), t.to_string()),
+        None => (None, name.to_string()),
+    }
+}
+
+/// SQL 限定名路由（M-B，设计稿 §4.2）：解析语句里的**表引用**，剥挂载限定符，
+/// 定出目标库。语义：
+/// - `db.t`：`db` 必须是挂载名（否则 404），路由到该库；
+/// - `t`（单段）：落目标库；
+/// - 目标库 = 显式指定（REST body `database`）?? 语句里唯一出现过的限定库
+///   ?? 会话默认库 ?? `"default"`；
+/// - 触及的库多于一个 → **显式拒**（501 `UNSUPPORTED`：跨库 JOIN/事务是另一个
+///   项目，"逐个查询再拼"必然是错的半吊子语义——设计稿 §4.2 定案）。
+///
+/// 解析失败（内核预处理语法如 `COPY … (FORMAT …)` sqlparser 裸解析不了）→
+/// **原样透传**给目标句柄：内核给它的错误，显式失败不静默。
+/// 返回（改写后的 SQL, 目标库名）。
+fn route_sql(
+    state: &AppState,
+    sql: &str,
+    explicit_db: Option<&str>,
+    session_default: &str,
+) -> std::result::Result<(String, String), Box<Response>> {
+    use sqlparser::ast::visit_relations_mut;
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+    use std::ops::ControlFlow;
+
+    let mut stmts = match Parser::parse_sql(&GenericDialect {}, sql) {
+        Ok(s) => s,
+        Err(_) => {
+            let db = explicit_db.unwrap_or(session_default);
+            ensure_mounted(state, db)?;
+            return Ok((sql.to_string(), db.to_string()));
+        }
+    };
+    // 第一遍：库归属收集（限定首段 = 库名；单段 = 待定）。
+    // ⚠️ visit_relations 覆盖不到 `DROP TABLE` 的 names 与 `CREATE TABLE` 的 name
+    // （sqlparser 0.63 的 visit_relation 标注没打在这两处）——补收，漏了会把
+    // DDL 目标静默留给会话默认库。
+    let mut qualified: Vec<String> = Vec::new();
+    let mut unqualified = false;
+    let mut collect = |name: &sqlparser::ast::ObjectName| {
+        if name.0.len() >= 2 {
+            if let Some(sqlparser::ast::ObjectNamePart::Identifier(id)) = name.0.first() {
+                let db = id.value.to_ascii_lowercase();
+                if !qualified.contains(&db) {
+                    qualified.push(db);
+                }
+                return;
+            }
+        }
+        unqualified = true;
+    };
+    for st in stmts.iter() {
+        let _ = sqlparser::ast::visit_relations(st, |name| {
+            collect(name);
+            ControlFlow::<()>::Continue(())
+        });
+        match st {
+            sqlparser::ast::Statement::Drop { names, .. } => {
+                for n in names {
+                    collect(n);
+                }
+            }
+            sqlparser::ast::Statement::CreateTable(ct) => collect(&ct.name),
+            _ => {}
+        }
+    }
+    for db in &qualified {
+        ensure_mounted(state, db)?;
+    }
+    // 目标库判定（设计稿 §二 + §4.2）：
+    // - **单段名锚定**在 显式库 ?? 会话默认库——绝不浮动到限定库里去
+    //   （否则 `t JOIN settle.t` 会静默连到 settle 的同名表，错数据级别的事故）；
+    // - 带限定名的语句（且无单段名）落那个唯一的限定库——授权也按它判，
+    //   白名单用户写 `settle.t` 即可直达，不必先 USE。
+    let (target, touched) = match explicit_db {
+        Some(exp) => {
+            ensure_mounted(state, exp)?;
+            let mut touched = qualified.clone();
+            if unqualified && !touched.iter().any(|d| d == exp) {
+                touched.push(exp.to_string());
+            }
+            (exp.to_string(), touched)
+        }
+        None => {
+            ensure_mounted(state, session_default)?;
+            let base = session_default.to_string();
+            match qualified.as_slice() {
+                [] => (base.clone(), vec![base]),
+                [one] => {
+                    let mut touched = vec![one.clone()];
+                    if unqualified && one != &base {
+                        touched.push(base.clone());
+                    }
+                    (one.clone(), touched)
+                }
+                _ => (base.clone(), qualified.clone()),
+            }
+        }
+    };
+    if touched.len() > 1 {
+        return Err(Box::new(ErrorCode::Unsupported.response(format!(
+            "cross-database query is not supported: statement touches databases [{}], \
+             target {:?} — 跨库查询未实现，请分别查询或同库",
+            touched.join(", "),
+            target
+        ))));
+    }
+    // 第二遍：剥挂载限定符（首段 == 目标库的多段名 → 去掉首段）+ DDL 补刀
+    fn strip(name: &mut sqlparser::ast::ObjectName, target: &str) {
+        if name.0.len() >= 2 {
+            if let Some(sqlparser::ast::ObjectNamePart::Identifier(id)) = name.0.first() {
+                if id.value.to_ascii_lowercase() == target {
+                    name.0.remove(0);
+                }
+            }
+        }
+    }
+    for st in &mut stmts {
+        let _ = visit_relations_mut(st, |name| {
+            strip(name, &target);
+            ControlFlow::<()>::Continue(())
+        });
+        match st {
+            sqlparser::ast::Statement::Drop { names, .. } => {
+                for n in names {
+                    strip(n, &target);
+                }
+            }
+            sqlparser::ast::Statement::CreateTable(ct) => strip(&mut ct.name, &target),
+            _ => {}
+        }
+    }
+    let out = stmts
+        .iter()
+        .map(|st| st.to_string())
+        .collect::<Vec<_>>()
+        .join(";\n");
+    Ok((out, target))
 }
 
 /// Basic 头 → (用户名, 密码)。
@@ -984,7 +1331,7 @@ async fn get_session(
         Authed::NoGrant { user, db } => {
             return ErrorCode::Forbidden.response(format!(
                 "user '{user}' has no grant on database '{db}' (mounted: {})",
-                s.mounts.join(", ")
+                s.mount_names().join(", ")
             ));
         }
         Authed::Revoked => return ErrorCode::SessionRevoked.response("session revoked; re-login"),
@@ -1040,6 +1387,133 @@ async fn kick_session(
     }
 }
 
+/// 403 无授权响应（统一文案；提示怎么定向到自己的库）。
+fn no_grant_response(state: &AppState, user: &str, db: &str) -> Response {
+    ErrorCode::Forbidden.response(format!(
+        "user '{user}' has no grant on database '{db}' (mounted: {});          target it via the \"database\" field or USE",
+        state.mount_names().join(", ")
+    ))
+}
+
+/// X-QSDB-Query-Id 头抽取（非法 → 400，与 /query 主路径同一纪律）。
+fn want_id_from(headers: &HeaderMap) -> std::result::Result<Option<String>, Box<Response>> {
+    match headers.get("x-qsdb-query-id") {
+        None => Ok(None),
+        Some(v) => match v.to_str().ok().filter(|s| valid_client_query_id(s)) {
+            Some(id) => Ok(Some(id.to_string())),
+            None => Err(Box::new(ErrorCode::InvalidArgument.response(
+                "invalid X-QSDB-Query-Id: expect 1..=64 chars of [A-Za-z0-9._:-]",
+            ))),
+        },
+    }
+}
+
+/// `USE db`（server 面语句拦截；语义同 `PUT /sessions/current/database`）：
+/// 需要**会话**（Basic / 超级 token 无会话可切 → 403）；库名按挂载表校验。
+fn use_database(s: &Arc<AppState>, ident: &Identity, db: &str, headers: &HeaderMap) -> Response {
+    let Some(sess) = ident.session.as_ref() else {
+        return ErrorCode::Forbidden.response(
+            "USE requires a login session (POST /api/v1/auth/login) — Basic / super-token requests have no session to switch",
+        );
+    };
+    if let Err(resp) = ensure_mounted(s, db) {
+        return *resp;
+    }
+    if let Err(resp) = want_id_from(headers) {
+        return *resp;
+    }
+    if let Ok(mut d) = sess.default_db.lock() {
+        *d = db.to_string();
+    }
+    let (qid, echo) = match want_id_from(headers) {
+        Ok(Some(id)) => (id.clone(), Some(id)),
+        _ => (format!("q{}", new_token()), None),
+    };
+    let mut resp = Json(serde_json::json!({
+        "queryId": qid,
+        "message": format!("database changed to '{db}'"),
+        "defaultDb": db,
+        "elapsedMs": 0.0,
+    }))
+    .into_response();
+    if let Some(id) = echo {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&id) {
+            resp.headers_mut()
+                .insert(axum::http::HeaderName::from_static("x-qsdb-query-id"), v);
+        }
+    }
+    resp
+}
+
+/// `SHOW DATABASES`（server 面语句拦截）：admin 全列；非 admin 只列**有 grant**
+/// 的库（白名单制不泄露库名）。
+fn show_databases(s: &Arc<AppState>, ident: &Identity, headers: &HeaderMap) -> Response {
+    if let Err(resp) = want_id_from(headers) {
+        return *resp;
+    }
+    let session_default = ident
+        .session
+        .as_ref()
+        .map(|x| x.default_db())
+        .unwrap_or_else(|| "default".to_string());
+    let is_admin =
+        resolved_role_for(s, &ident.user, &session_default).is_some_and(|r| r.is_admin());
+    let rows: Vec<Vec<serde_json::Value>> = s
+        .mount_names()
+        .into_iter()
+        .filter(|name| is_admin || resolved_role_for(s, &ident.user, name).is_some())
+        .map(|name| vec![serde_json::json!(name)])
+        .collect();
+    let n = rows.len();
+    let (qid, echo) = match want_id_from(headers) {
+        Ok(Some(id)) => (id.clone(), Some(id)),
+        _ => (format!("q{}", new_token()), None),
+    };
+    let mut resp = Json(serde_json::json!({
+        "queryId": qid,
+        "schema": [{ "name": "database", "type": "Utf8" }],
+        "rows": rows,
+        "rowCount": n,
+        "elapsedMs": 0.0,
+    }))
+    .into_response();
+    if let Some(id) = echo {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&id) {
+            resp.headers_mut()
+                .insert(axum::http::HeaderName::from_static("x-qsdb-query-id"), v);
+        }
+    }
+    resp
+}
+
+/// GET /api/v1/databases：挂载清单与各自只读态（M-B；授权过滤同 SHOW DATABASES）。
+async fn list_databases(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let ident = match authenticate_identity(&s, &headers) {
+        Ok(i) => i,
+        Err(resp) => return *resp,
+    };
+    let session_default = ident
+        .session
+        .as_ref()
+        .map(|x| x.default_db())
+        .unwrap_or_else(|| "default".to_string());
+    let is_admin =
+        resolved_role_for(&s, &ident.user, &session_default).is_some_and(|r| r.is_admin());
+    let list: Vec<serde_json::Value> = s
+        .mount_names()
+        .into_iter()
+        .filter(|name| is_admin || resolved_role_for(&s, &ident.user, name).is_some())
+        .map(|name| {
+            serde_json::json!({
+                "name": name,
+                "readOnly": s.mounts[&name].db.read_only(),
+            })
+        })
+        .collect();
+    let count = list.len();
+    Json(serde_json::json!({ "databases": list, "count": count })).into_response()
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SessionDatabaseBody {
@@ -1062,7 +1536,7 @@ async fn set_session_database(
         Authed::NoGrant { user, db } => {
             return ErrorCode::Forbidden.response(format!(
                 "user '{user}' has no grant on database '{db}' (mounted: {})",
-                s.mounts.join(", ")
+                s.mount_names().join(", ")
             ));
         }
         Authed::Revoked => return ErrorCode::SessionRevoked.response("session revoked; re-login"),
@@ -1073,11 +1547,11 @@ async fn set_session_database(
             "setting a default database requires a login session (POST /api/v1/auth/login)",
         );
     };
-    if !s.mounts.iter().any(|m| m == &body.database) {
+    if !s.mounts.contains_key(&body.database) {
         return ErrorCode::NotFound.response(format!(
             "database {:?} is not mounted (mounted: {})",
             body.database,
-            s.mounts.join(", ")
+            s.mount_names().join(", ")
         ));
     }
     if let Ok(mut d) = sess.default_db.lock() {
@@ -1246,15 +1720,21 @@ async fn put_user_grants(
 }
 
 /// 把内存池的实时占用刷进指标原子（渲染前调一次；池本身在 `Qsdb` 上）。
+/// 多挂载（M-B）：每个挂载有自己的池——指标给**总和**（分挂载口径走 /stats 的
+/// `mounts` 数组）。
 fn refresh_mem_gauges(s: &AppState) {
-    let pool = s.db.memory_pool();
-    s.metrics.mem_budget.store(pool.budget(), Ordering::Relaxed);
-    s.metrics
-        .mem_exec
-        .store(pool.exec_used(), Ordering::Relaxed);
-    s.metrics
-        .mem_cache
-        .store(pool.cache_used(), Ordering::Relaxed);
+    let mut budget = 0u64;
+    let mut exec = 0u64;
+    let mut cache = 0u64;
+    for m in s.mounts.values() {
+        let pool = m.db.memory_pool();
+        budget += pool.budget();
+        exec += pool.exec_used();
+        cache += pool.cache_used();
+    }
+    s.metrics.mem_budget.store(budget, Ordering::Relaxed);
+    s.metrics.mem_exec.store(exec, Ordering::Relaxed);
+    s.metrics.mem_cache.store(cache, Ordering::Relaxed);
 }
 
 /// GET /api/v1/error-codes：错误码目录（机器可读，由 [`ErrorCode`] 直接产出）。
@@ -1281,12 +1761,22 @@ async fn metrics(State(s): State<Arc<AppState>>) -> Response {
     refresh_mem_gauges(&s);
     let sessions = s.sessions.lock().map(|m| m.len()).unwrap_or(0);
     let (tables, bytes) = match tokio::task::spawn_blocking({
-        let db = Arc::clone(&s.db);
-        move || db.stats()
+        let st = Arc::clone(&s);
+        move || {
+            let mut t = 0usize;
+            let mut b = 0u64;
+            for m in st.mounts.values() {
+                if let Ok((x, y)) = m.db.stats() {
+                    t += x;
+                    b += y;
+                }
+            }
+            (t, b)
+        }
     })
     .await
     {
-        Ok(Ok((t, b))) => (t, b),
+        Ok((t, b)) => (t, b),
         _ => (0, 0),
     };
     (
@@ -1355,6 +1845,10 @@ struct QueryBody {
     sql: String,
     #[serde(default)]
     format: Option<String>,
+    /// 请求目标库（M-B，**优先级最高**）：未给 = 语句里唯一出现的限定库
+    /// ?? 会话默认库 ?? "default"。授权按它判，单段表名落在这里。
+    #[serde(default)]
+    database: Option<String>,
     /// 参数化查询（`docs/参数化查询设计.md`）：**位置数组**，`$n` 取第 n 个。
     /// 元素可以是裸 JSON 值（推类型）或 `{"type": …, "value": …}`（显式）。
     /// 缺省 = 没有参数（行为与从前一字不差）。
@@ -1378,12 +1872,56 @@ async fn query(
     headers: HeaderMap,
     StructuredJson(body): StructuredJson<QueryBody>,
 ) -> Response {
-    let (role, session) = match authenticate(&s, &headers) {
+    let ident = match authenticate_identity(&s, &headers) {
+        Ok(i) => i,
+        Err(resp) => return *resp,
+    };
+    s.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+    let session_default = ident
+        .session
+        .as_ref()
+        .map(|x| x.default_db())
+        .unwrap_or_else(|| "default".to_string());
+
+    // ---- server 面语句拦截（M-B）：USE / SHOW DATABASES ----
+    if let Some(db) = parse_use_statement(&body.sql) {
+        return use_database(&s, &ident, &db, &headers);
+    }
+    if is_show_databases(&body.sql) {
+        return show_databases(&s, &ident, &headers);
+    }
+    // 元数据语句（SHOW PARTITIONS / DESCRIBE …）文本级路由
+    let routed_pre = match route_metadata_statement(&s, &body.sql) {
+        Some(r) => match r {
+            Ok((sql2, db)) => (sql2, Some(db)),
+            Err(resp) => {
+                s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                return *resp;
+            }
+        },
+        None => (body.sql.clone(), None),
+    };
+
+    // ---- 限定名路由：先定目标库，**再**按目标库判权（设计稿 §二 + §4.2）。
+    // 权限判定若抢在路由前（按会话默认库），会把"只授了 settle、查询里写
+    // settle.t"的用户误杀成 403——顺序就是语义。
+    let explicit_db = routed_pre.1.or(body.database.clone());
+    let (sql_routed, target_db) =
+        match route_sql(&s, &routed_pre.0, explicit_db.as_deref(), &session_default) {
+            Ok(r) => r,
+            Err(resp) => {
+                s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                return *resp;
+            }
+        };
+    let session = ident.session.clone();
+    let (role, session) = match resolve_user(&s, &ident.user, &target_db, session) {
         Authed::Pass { role, session } => (role, session),
         Authed::NoGrant { user, db } => {
+            s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
             return ErrorCode::Forbidden.response(format!(
-                "user '{user}' has no grant on database '{db}' (mounted: {})",
-                s.mounts.join(", ")
+                "user '{user}' has no grant on database '{db}' (mounted: {});                  target it via the \"database\" field or USE",
+                s.mount_names().join(", ")
             ));
         }
         Authed::Revoked => {
@@ -1391,7 +1929,6 @@ async fn query(
         }
         Authed::Deny => return ErrorCode::Unauthorized.response("unauthorized"),
     };
-    s.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
     // format 值校验（拼错如 "arrow" 此前静默回 JSON——静默失败在协议面危险）
     let fmt = match body.format.as_deref() {
         None => "json".to_string(),
@@ -1428,7 +1965,14 @@ async fn query(
             }
         },
     };
-    let ctx = match s.register_query(want_id, timeout_ms, body.sql.clone(), session.as_ref()) {
+    let target = Arc::clone(&s.mounts[&target_db].db);
+    let ctx = match s.register_query(
+        &target,
+        want_id,
+        timeout_ms,
+        sql_routed.clone(),
+        session.as_ref(),
+    ) {
         Ok(ctx) => ctx,
         Err(msg) => {
             s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
@@ -1443,8 +1987,7 @@ async fn query(
     let query_id = ctx.query_id.clone();
     let reg = Arc::clone(&s);
     let t = Instant::now();
-    let st = Arc::clone(&s);
-    let sql = body.sql;
+    let sql = sql_routed;
     // 参数在**请求线程**上先转好（类型/格式错立刻 400，不进 spawn_blocking）
     let params = match qsdb::sql::params::params_from_json(body.params.as_ref()) {
         Ok(p) => p,
@@ -1456,8 +1999,7 @@ async fn query(
     };
     let ctx_exec = Arc::clone(&ctx);
     let result = tokio::task::spawn_blocking(move || {
-        st.db
-            .sql_with_role_and_params_context(&sql, params, role, &ctx_exec)
+        target.sql_with_role_and_params_context(&sql, params, role, &ctx_exec)
     })
     .await;
     reg.unregister_query(&query_id);
@@ -1604,6 +2146,9 @@ struct WriteParams {
     table: String,
     #[serde(default)]
     mode: Option<String>,
+    /// 请求目标库（M-B）：`table=db.t` 的限定符优先于本字段；都缺 = 会话默认库。
+    #[serde(default)]
+    database: Option<String>,
     #[serde(default)]
     flush: Option<bool>,
     /// `mode=overwrite` 的 **CAS 期望分区 generation**（F24）。
@@ -1625,14 +2170,24 @@ async fn write(
     StructuredQuery(p): StructuredQuery<WriteParams>,
     body: axum::body::Bytes,
 ) -> Response {
-    let (role, session) = match authenticate(&s, &headers) {
+    let ident = match authenticate_identity(&s, &headers) {
+        Ok(i) => i,
+        Err(resp) => return *resp,
+    };
+    // 目标库：table 限定符（db.t）> ?database= > 会话默认库 > "default"
+    let (qdb, table_only) = split_qualified(&p.table);
+    let session_default = ident
+        .session
+        .as_ref()
+        .map(|x| x.default_db())
+        .unwrap_or_else(|| "default".to_string());
+    let target_db = qdb.unwrap_or_else(|| p.database.clone().unwrap_or(session_default));
+    if let Err(resp) = ensure_mounted(&s, &target_db) {
+        return *resp;
+    }
+    let (role, session) = match resolve_user(&s, &ident.user, &target_db, ident.session.clone()) {
         Authed::Pass { role, session } => (role, session),
-        Authed::NoGrant { user, db } => {
-            return ErrorCode::Forbidden.response(format!(
-                "user '{user}' has no grant on database '{db}' (mounted: {})",
-                s.mounts.join(", ")
-            ));
-        }
+        Authed::NoGrant { user, db } => return no_grant_response(&s, &user, &db),
         Authed::Revoked => {
             return ErrorCode::SessionRevoked.response("session revoked or expired; re-login");
         }
@@ -1643,10 +2198,12 @@ async fn write(
     if !role.can_write() {
         return ErrorCode::Forbidden.response("write requires writer or admin role");
     }
-    if s.db.read_only() {
+    if s.mounts[&target_db].db.read_only() {
         return ErrorCode::ReadOnly.response("database is read-only");
     }
     s.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+    let mount_db = Arc::clone(&s.mounts[&target_db].db);
+    let table = table_only;
     let t = Instant::now();
     // mode 值校验（在解码 body 之前——拼错的值此前静默按 append 处理）
     let mode = match p.mode.as_deref() {
@@ -1686,7 +2243,7 @@ async fn write(
         "rows" => {
             // 行式（驱动向）：**schema 由表定义给**（payload 只带值，`flags=0`）——
             // 见 docs/rows-format.md §四。列序 = 表列序（与 /write 全列批约定一致）。
-            let def = match s.db.table_def(&p.table) {
+            let def = match mount_db.table_def(&table) {
                 Ok(d) => d,
                 Err(e) => {
                     s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
@@ -1705,7 +2262,7 @@ async fn write(
         "csv" => {
             // CSV body：列序 = **表列序**（与 `/write` 的既有约定一致：全列批）。
             // 首行若是表头（与表列名一致）则跳过。
-            let def = match s.db.table_def(&p.table) {
+            let def = match mount_db.table_def(&table) {
                 Ok(d) => d,
                 Err(e) => {
                     s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
@@ -1729,13 +2286,14 @@ async fn write(
     };
     let mode_out = mode.clone();
     let st = Arc::clone(&s);
-    let table = p.table.clone();
     let flush = p.flush.unwrap_or(true);
     let expected_generation = p.expected_generation;
     let result = tokio::task::spawn_blocking(move || -> Result<u64, QsdbError> {
+        let mount = &st.mounts[&target_db];
+        let mount_db = Arc::clone(&mount.db);
         match mode.as_str() {
             "overwrite" => {
-                let def = st.db.table_def(&table)?;
+                let def = mount_db.table_def(&table)?;
                 let batch = concat_batches(&batches)?;
                 let groups = qsdb::partition::split_by_partition(&batch, &def)?;
                 // CAS 是**单分区**语义：一次请求命中多个分区时，"期望 generation"
@@ -1764,18 +2322,18 @@ async fn write(
                     let full = qsdb::partition::attach_partition_columns(&def, &names, &data)?;
                     let r = match expected_generation {
                         Some(exp) => {
-                            st.db.overwrite_partition_cas(&table, &names, &[full], exp)?
+                            mount_db.overwrite_partition_cas(&table, &names, &[full], exp)?
                         }
-                        None => st.db.overwrite_partition(&table, &names, &[full])?,
+                        None => mount_db.overwrite_partition(&table, &names, &[full])?,
                     };
                     rows += r.rows;
                 }
                 Ok(rows)
             }
             "append" => {
-                st.writer.push(&table, &batches)?;
+                mount.writer.push(&table, &batches)?;
                 if flush {
-                    let r = st.writer.flush(&table)?;
+                    let r = mount.writer.flush(&table)?;
                     Ok(r.rows)
                 } else {
                     Ok(batches.iter().map(|b| b.num_rows() as u64).sum())
@@ -1847,20 +2405,42 @@ async fn tables(
         }
     };
     let st = Arc::clone(&s);
+    // 多挂载：跨库列出，名字给限定形态 `db.table`（可直接当表名查）；单挂载照旧裸名
+    let multi = st.mounts.len() > 1;
+    let mounts: Vec<(String, Arc<Qsdb>)> = st
+        .mount_names()
+        .into_iter()
+        .map(|n| {
+            let db = Arc::clone(&st.mounts[&n].db);
+            (n, db)
+        })
+        .collect();
     match tokio::task::spawn_blocking(move || {
-        let list = st.db.tables()?;
-        if !want_schema {
-            return Ok(serde_json::json!({ "tables": list }));
+        let mut names = Vec::new();
+        let mut out = Vec::new();
+        for (dbname, db) in &mounts {
+            let list = db.tables()?;
+            for t in &list {
+                let shown = if multi {
+                    format!("{dbname}.{t}")
+                } else {
+                    t.clone()
+                };
+                if !want_schema {
+                    names.push(shown);
+                    continue;
+                }
+                // J6：JDBC getColumns 原先要 N+1 次请求（列表 + 逐表 schema）。
+                // 万级表名下首次连接翻库表明显慢，一次返回列集即可。
+                let cols = match db.table_def(t) {
+                    Ok(def) => columns_json(&def),
+                    Err(_) => Vec::new(), // 并发 DROP 等：跳过而非整体失败
+                };
+                out.push(serde_json::json!({ "name": shown, "columns": cols }));
+            }
         }
-        // J6：JDBC getColumns 原先要 N+1 次请求（列表 + 逐表 schema）。
-        // 万级表名下首次连接翻库表明显慢，一次返回列集即可。
-        let mut out = Vec::with_capacity(list.len());
-        for t in &list {
-            let cols = match st.db.table_def(t) {
-                Ok(def) => columns_json(&def),
-                Err(_) => Vec::new(), // 并发 DROP 等：跳过而非整体失败
-            };
-            out.push(serde_json::json!({ "name": t, "columns": cols }));
+        if !want_schema {
+            return Ok(serde_json::json!({ "tables": names }));
         }
         Ok(serde_json::json!({ "tables": out }))
     })
@@ -1872,17 +2452,45 @@ async fn tables(
     }
 }
 
+/// 路径参数表的 (目标库, 纯表名) + 该库授权判定（401/403 响应直通）。
+/// `db.t` 限定符优先；单段名 = 会话默认库。
+fn target_from_path(
+    state: &AppState,
+    headers: &HeaderMap,
+    raw: &str,
+) -> std::result::Result<(String, String), Box<Response>> {
+    let ident = authenticate_identity(state, headers)?;
+    let (qdb, t) = split_qualified(raw);
+    let session_default = ident
+        .session
+        .as_ref()
+        .map(|x| x.default_db())
+        .unwrap_or_else(|| "default".to_string());
+    let target = qdb.unwrap_or(session_default);
+    ensure_mounted(state, &target)?;
+    match resolve_user(state, &ident.user, &target, ident.session) {
+        Authed::Pass { .. } => Ok((target, t)),
+        Authed::NoGrant { user, db } => Err(Box::new(no_grant_response(state, &user, &db))),
+        Authed::Revoked => Err(Box::new(
+            ErrorCode::SessionRevoked.response("session revoked or expired; re-login"),
+        )),
+        Authed::Deny => Err(Box::new(ErrorCode::Unauthorized.response("unauthorized"))),
+    }
+}
+
 async fn schema(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(table): Path<String>,
 ) -> Response {
-    if let Err(resp) = auth(&s, &headers) {
-        return *resp;
-    }
+    let (target_db, table_name) = match target_from_path(&s, &headers, &table) {
+        Ok(x) => x,
+        Err(resp) => return *resp,
+    };
     let table_out = table.clone();
     let st = Arc::clone(&s);
-    match tokio::task::spawn_blocking(move || st.db.table_def(&table)).await {
+    match tokio::task::spawn_blocking(move || st.mounts[&target_db].db.table_def(&table_name)).await
+    {
         Ok(Ok(def)) => {
             let cols = columns_json(&def);
             Json(serde_json::json!({ "table": table_out, "columns": cols })).into_response()
@@ -1897,11 +2505,14 @@ async fn partitions(
     headers: HeaderMap,
     Path(table): Path<String>,
 ) -> Response {
-    if let Err(resp) = auth(&s, &headers) {
-        return *resp;
-    }
+    let (target_db, table_name) = match target_from_path(&s, &headers, &table) {
+        Ok(x) => x,
+        Err(resp) => return *resp,
+    };
     let st = Arc::clone(&s);
-    let res = tokio::task::spawn_blocking(move || st.db.partition_stats(&table)).await;
+    let res =
+        tokio::task::spawn_blocking(move || st.mounts[&target_db].db.partition_stats(&table_name))
+            .await;
     match res {
         Ok(Ok(stats)) => {
             // 契约形态：partitions = 名单（兼容旧消费方）；detail = 每分区
@@ -1932,17 +2543,30 @@ async fn stats(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     }
     let st = Arc::clone(&s);
     let res = tokio::task::spawn_blocking(move || {
-        let (tables, bytes) = st.db.stats()?;
-        let buffered: Vec<_> = st
-            .writer
-            .buffered()
-            .into_iter()
-            .map(|(t, b, by)| serde_json::json!({"table": t, "batches": b, "bytes": by}))
-            .collect();
+        // 多挂载：聚合 + 分库明细（M-B）；单挂载形态不变（mounts 数组只增）
+        let mut tables = 0usize;
+        let mut bytes = 0u64;
+        let mut mounts_out = Vec::new();
+        let mut buffered: Vec<_> = Vec::new();
+        for name in st.mount_names() {
+            let mount = &st.mounts[&name];
+            let (t, b) = mount.db.stats()?;
+            tables += t;
+            bytes += b;
+            mounts_out.push(
+                serde_json::json!({"database": name, "tables": t, "storeBytes": b}),
+            );
+            for (tb, batches, by) in mount.writer.buffered() {
+                buffered.push(
+                    serde_json::json!({"database": name, "table": tb, "batches": batches, "bytes": by}),
+                );
+            }
+        }
         qsdb::Result::Ok(serde_json::json!({
             "tables": tables,
             "storeBytes": bytes,
             "writeBuffer": buffered,
+            "mounts": mounts_out,
         }))
     })
     .await;
@@ -1973,15 +2597,17 @@ async fn get_config(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         },
         // 全局内存账本（实时）
         "memory": {
-            "budgetBytes": s.db.memory_pool().budget(),
-            "execUsedBytes": s.db.memory_pool().exec_used(),
-            "cacheUsedBytes": s.db.memory_pool().cache_used(),
+            // 多挂载（M-B）：各库独立预算，这里给总和
+            "budgetBytes": s.mounts.values().map(|m| m.db.memory_pool().budget()).sum::<u64>(),
+            "execUsedBytes": s.mounts.values().map(|m| m.db.memory_pool().exec_used()).sum::<u64>(),
+            "cacheUsedBytes": s.mounts.values().map(|m| m.db.memory_pool().cache_used()).sum::<u64>(),
             "cacheEvictedBytes": s.db.cache_evicted_bytes(),
             "note": "budget=0 表示不限；压力下先挤兑 cache（纯缓存），再拒查询（503 MEMORY_PRESSURE）",
         },
         // 服务器级
         "server": {
             "maxConcurrentQueries": s.max_concurrent_queries,
+            "mounts": s.mount_names(),
         },
         "_hint": "PUT /api/v1/config 可热更 runtime 节；startup/server 节需重启",
     }))
@@ -2478,8 +3104,8 @@ mod tests {
             std::env::temp_dir().join(format!("qsdb_session_ut_{}_{}", std::process::id(), uniq));
         let _ = std::fs::remove_dir_all(&root);
         let db = Arc::new(Qsdb::open(&root, qsdb::QsdbOptions::default()).expect("open temp db"));
-        let state = Arc::new(AppState::new(
-            db,
+        let state = Arc::new(AppState::with_mounts(
+            vec![("default".to_string(), db)],
             None,
             crate::commit_log::CommitLog::new(),
             0,
@@ -2521,14 +3147,21 @@ mod tests {
             .insert(tok_b.clone(), Arc::clone(&sb));
 
         // a 跑两条（其中一条带客户端 id）、b 跑一条
+        let db = Arc::clone(&state.db);
         let q1 = state
-            .register_query(None, None, "SELECT 1".into(), Some(&sa))
+            .register_query(&db, None, None, "SELECT 1".into(), Some(&sa))
             .unwrap();
         let q2 = state
-            .register_query(Some("drv-x".into()), None, "SELECT 2".into(), Some(&sa))
+            .register_query(
+                &db,
+                Some("drv-x".into()),
+                None,
+                "SELECT 2".into(),
+                Some(&sa),
+            )
             .unwrap();
         let q3 = state
-            .register_query(None, None, "SELECT 3".into(), Some(&sb))
+            .register_query(&db, None, None, "SELECT 3".into(), Some(&sb))
             .unwrap();
         assert_eq!(state.queries.lock().unwrap().len(), 3);
         assert_eq!(
@@ -2581,5 +3214,132 @@ mod tests {
         let (tok, _) = make_session("s-x", 0);
         assert!(tok.starts_with(SESSION_TOKEN_PREFIX));
         assert!(new_session_id().starts_with("s-"));
+    }
+
+    /// 双挂载 AppState（M-B 测试底座）。
+    fn two_mount_state() -> (Arc<AppState>, std::path::PathBuf, std::path::PathBuf) {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let mk = |tag: &str| {
+            let d = std::env::temp_dir()
+                .join(format!("qsdb_mb_ut_{}_{uniq}_{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            d
+        };
+        let (d1, d2) = (mk("a"), mk("b"));
+        let db1 = Arc::new(Qsdb::open(&d1, qsdb::QsdbOptions::default()).expect("open a"));
+        let db2 = Arc::new(Qsdb::open(&d2, qsdb::QsdbOptions::default()).expect("open b"));
+        let state = Arc::new(AppState::with_mounts(
+            vec![("default".to_string(), db1), ("settle".to_string(), db2)],
+            None,
+            crate::commit_log::CommitLog::new(),
+            0,
+        ));
+        (state, d1, d2)
+    }
+
+    /// 限定名路由（M-B 核心）：剥限定符、单段名锚定、显式库、跨库拒、
+    /// 未挂载拒、DDL 目标（Drop/CreateTable 是 sqlparser visitor 的盲区）。
+    #[test]
+    fn route_sql_qualified_anchor_and_rejects() {
+        let (state, d1, d2) = two_mount_state();
+
+        // 限定名 → 剥掉并路由
+        let (sql, db) = route_sql(&state, "SELECT * FROM settle.t", None, "default").unwrap();
+        assert_eq!(db, "settle");
+        assert!(!sql.contains("settle"), "{sql}");
+        // 单段名锚定会话默认库（**不浮动**到限定库——那是错数据级事故）
+        let (_, db) = route_sql(&state, "SELECT * FROM t", None, "default").unwrap();
+        assert_eq!(db, "default");
+        // 显式库最高
+        let (_, db) = route_sql(&state, "SELECT * FROM t", Some("settle"), "default").unwrap();
+        assert_eq!(db, "settle");
+        // 无限定名 + 无显式 → 会话默认库
+        let (_, db) = route_sql(&state, "SELECT 1", None, "default").unwrap();
+        assert_eq!(db, "default");
+
+        // 跨库：单段名锚 default + 限定 settle → 显式拒（501 UNSUPPORTED）
+        let e = route_sql(
+            &state,
+            "SELECT count(*) FROM t JOIN settle.t ON true",
+            None,
+            "default",
+        )
+        .unwrap_err();
+        assert_eq!(e.status().as_u16(), 501, "{e:?}");
+        // 同库双限定是合法的（都落 settle），不拒
+        let (_, db) =
+            route_sql(&state, "SELECT * FROM settle.a, settle.b", None, "default").unwrap();
+        assert_eq!(db, "settle");
+
+        // 未挂载 → 404
+        let e = route_sql(&state, "SELECT * FROM nope.t", None, "default").unwrap_err();
+        assert_eq!(e.status().as_u16(), 404);
+
+        // DDL 目标（visitor 盲区，补刀覆盖）
+        let (sql, db) = route_sql(&state, "DROP TABLE settle.x", None, "default").unwrap();
+        assert_eq!(db, "settle");
+        assert!(!sql.contains("settle"), "{sql}");
+        let (sql, db) =
+            route_sql(&state, "CREATE TABLE settle.x (a BIGINT)", None, "default").unwrap();
+        assert_eq!(db, "settle");
+        assert!(!sql.contains("settle"), "{sql}");
+        // INSERT 目标
+        let (sql, db) =
+            route_sql(&state, "INSERT INTO settle.t VALUES (1)", None, "default").unwrap();
+        assert_eq!(db, "settle");
+        assert!(!sql.contains("settle"), "{sql}");
+        // 子查询里的限定名
+        let (sql, db) = route_sql(
+            &state,
+            "SELECT count(*) FROM (SELECT a FROM settle.t WHERE a > 0) x",
+            None,
+            "default",
+        )
+        .unwrap();
+        assert_eq!(db, "settle");
+        assert!(!sql.contains("settle"), "{sql}");
+
+        let _ = std::fs::remove_dir_all(&d1);
+        let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    /// USE / 元数据语句识别。
+    #[test]
+    fn use_and_metadata_statement_parsing() {
+        assert_eq!(parse_use_statement("USE settle"), Some("settle".into()));
+        assert_eq!(parse_use_statement("  use SETTLE ;"), Some("settle".into()));
+        assert_eq!(parse_use_statement("SELECT 1"), None);
+        assert_eq!(parse_use_statement("USE 9bad"), None);
+        assert_eq!(parse_use_statement("USE"), None);
+        assert_eq!(
+            parse_use_statement("UPDATE t SET a = 1"),
+            None,
+            "USE 前缀匹配必须整语句"
+        );
+        assert!(is_show_databases(" show databases "));
+        assert!(!is_show_databases("SHOW TABLES"));
+
+        let (state, d1, d2) = two_mount_state();
+        // SHOW PARTITIONS settle.t → 剥 + 路由
+        let (sql, db) = route_metadata_statement(&state, "SHOW PARTITIONS settle.t")
+            .expect("metadata")
+            .unwrap();
+        assert_eq!(db, "settle");
+        assert_eq!(sql, "SHOW PARTITIONS t");
+        // DESCRIBE 同理
+        let (_, db) = route_metadata_statement(&state, "DESCRIBE settle.t")
+            .expect("metadata")
+            .unwrap();
+        assert_eq!(db, "settle");
+        // 单段名 → 不拦（交 route_sql 落会话默认库）
+        assert!(route_metadata_statement(&state, "DESCRIBE t").is_none());
+        // 未挂载 → 404
+        let e = route_metadata_statement(&state, "SHOW PARTITIONS nope.t")
+            .expect("metadata")
+            .unwrap_err();
+        assert_eq!(e.status().as_u16(), 404);
+        let _ = std::fs::remove_dir_all(&d1);
+        let _ = std::fs::remove_dir_all(&d2);
     }
 }

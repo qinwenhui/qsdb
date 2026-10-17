@@ -29,7 +29,8 @@ uuid = { version = "1", features = ["v7"] }
 windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
 
 # 前端/门面
-sqlparser = "0.63"
+# "visitor" = 多库限定名路由（M-B）用的 AST 遍历器；对内核本身无行为影响
+sqlparser = { version = "0.63", features = ["visitor"] }
 clap = { version = "4", features = ["derive"] }
 rustyline = "18"
 axum = "0.8"

@@ -171,6 +171,15 @@ enum Cmd {
         /// （读完全不受影响；客户端**永不重试**该码，换可写实例才对）
         #[arg(long, default_value_t = false)]
         read_only: bool,
+        /// **多库挂载**（M-B，可重复）：`--mount 名=路径` 或带选项
+        /// `--mount 名=路径,budget-mb=2048,read-only`。
+        ///
+        /// `default` 库固定来自 `--path`（`--mount default=…` 显式拒绝）。
+        /// 名字进 SQL 限定符（`settle.t`）、`USE`、`SHOW DATABASES` 与
+        /// grants 键——必须是小写 `[a-z_][a-z0-9_]*`。各挂载独立预算/缓存/
+        /// 写缓冲（并发闸是实例级的——过载保护管整个进程）。
+        #[arg(long = "mount")]
+        mounts: Vec<String>,
     },
     /// **导出库结构**（DDL；打印到 stdout）—— 备份/迁移/交付。
     ///
@@ -630,6 +639,7 @@ fn main() {
             staging_upload_secs,
             durability,
             read_only,
+            mounts,
             config,
         } => {
             // 存储后端解析（cli 层校验，错误走统一 exit 风格）
@@ -700,36 +710,122 @@ fn main() {
             // **提交事件缓冲 + 钩子（T2）**：缓冲要在开库**之前**建好，
             // 因为钩子得在 `Qsdb::open` 时一起装上去。
             let commits = crate::commit_log::CommitLog::new();
-            let opts = QsdbOptions {
-                storage,
-                durability: dur,
-                read_only,
-                on_commit: read_only
-                    .then_some(None)
-                    .flatten()
-                    .or_else(|| Some(commits.hook())),
-                writer_epoch,
-                // MB → 字节；0 = 不限（嵌入方/部署方自控）
-                memory_budget_bytes: (memory_budget_mb > 0)
-                    .then(|| memory_budget_mb.saturating_mul(1024 * 1024)),
-                // 溢出目录：默认与数据同盘；只读句柄回落系统 temp
-                spill_dir: if read_only {
-                    None
-                } else {
-                    Some(spill_dir.clone().unwrap_or_else(|| path.join("_spill")))
-                },
-                scan_cache_bytes: cache_mb * 1024 * 1024,
-                file_cache_bytes: file_cache_mb * 1024 * 1024,
-                staging_dir: staging_dir.clone(),
-                ..Default::default()
-            };
-            let db = match Qsdb::open(&path, opts) {
-                Ok(db) => Arc::new(db),
-                Err(e) => {
-                    eprintln!("open {} failed: {e}", path.display());
+            // ---- 多挂载解析（M-B）----
+            // 名字小写标识符；选项 = 逗号尾注（budget-mb=N / read-only）。
+            let mut extra_mounts: Vec<(String, PathBuf, Option<u64>, bool)> = Vec::new();
+            for m in &mounts {
+                let Some((name, rest)) = m.split_once('=') else {
+                    eprintln!("error: --mount 需要 名字=路径 形态（got {m:?}）");
+                    std::process::exit(1);
+                };
+                let name = name.trim().to_string();
+                let ok = !name.is_empty()
+                    && name
+                        .bytes()
+                        .next()
+                        .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b == b'_' || b.is_ascii_digit());
+                if !ok {
+                    eprintln!(
+                        "error: --mount 名字必须是小写 [a-z_][a-z0-9_]*（got {name:?}）——\\
+                         它要进 SQL 限定符与 grants 键"
+                    );
                     std::process::exit(1);
                 }
+                if name == "default" {
+                    eprintln!("error: default 库固定来自 --path，不许 --mount default=…");
+                    std::process::exit(1);
+                }
+                if extra_mounts.iter().any(|(n, _, _, _)| *n == name) {
+                    eprintln!("error: --mount 名字重复：{name}");
+                    std::process::exit(1);
+                }
+                let mut parts = rest.split(',');
+                let dir = PathBuf::from(parts.next().unwrap_or_default().trim());
+                if dir.as_os_str().is_empty() {
+                    eprintln!("error: --mount {name} 缺路径");
+                    std::process::exit(1);
+                }
+                let mut budget: Option<u64> = None;
+                let mut ro = false;
+                for opt in parts {
+                    let opt = opt.trim();
+                    if opt.is_empty() {
+                        continue;
+                    }
+                    if opt == "read-only" {
+                        ro = true;
+                    } else if let Some(v) = opt.strip_prefix("budget-mb=") {
+                        budget = Some(v.parse().unwrap_or_else(|_| {
+                            eprintln!("error: --mount {name} 的 budget-mb 不是数字：{v}");
+                            std::process::exit(1);
+                        }));
+                    } else {
+                        eprintln!(
+                            "error: --mount {name} 未知选项 {opt:?}（支持 budget-mb=N、read-only）"
+                        );
+                        std::process::exit(1);
+                    }
+                }
+                extra_mounts.push((name, dir, budget, ro));
+            }
+            // 同路径双挂载 = 两套缓存/预算对着同一目录，显式拒绝
+            {
+                let mut seen = vec![path.clone()];
+                for (n, d, _, _) in &extra_mounts {
+                    if seen.contains(d) {
+                        eprintln!("error: --mount {n} 的路径 {} 已被别的挂载使用", d.display());
+                        std::process::exit(1);
+                    }
+                    seen.push(d.clone());
+                }
+            }
+            let open_mount = |name: &str,
+                              p: &std::path::Path,
+                              ro: bool,
+                              budget_override: Option<u64>|
+             -> Arc<Qsdb> {
+                let budget = budget_override.unwrap_or(memory_budget_mb);
+                let opts = QsdbOptions {
+                    storage: storage.clone(),
+                    durability: dur,
+                    read_only: ro,
+                    on_commit: ro
+                        .then_some(None)
+                        .flatten()
+                        .or_else(|| Some(commits.hook_for(name))),
+                    writer_epoch,
+                    // MB → 字节；0 = 不限（嵌入方/部署方自控）
+                    memory_budget_bytes: (budget > 0).then(|| budget.saturating_mul(1024 * 1024)),
+                    // 溢出目录：默认与数据同盘；只读句柄回落系统 temp
+                    spill_dir: if ro {
+                        None
+                    } else {
+                        Some(spill_dir.clone().unwrap_or_else(|| p.join("_spill")))
+                    },
+                    scan_cache_bytes: cache_mb * 1024 * 1024,
+                    file_cache_bytes: file_cache_mb * 1024 * 1024,
+                    staging_dir: staging_dir.clone(),
+                    ..Default::default()
+                };
+                match Qsdb::open(p, opts) {
+                    Ok(db) => Arc::new(db),
+                    Err(e) => {
+                        eprintln!("open {} (mount {name}) failed: {e}", p.display());
+                        std::process::exit(1);
+                    }
+                }
             };
+            let mut mount_list: Vec<(String, Arc<Qsdb>)> = vec![(
+                "default".to_string(),
+                open_mount("default", &path, read_only, None),
+            )];
+            for (name, dir, budget, ro) in &extra_mounts {
+                let db = open_mount(name, dir, *ro, *budget);
+                mount_list.push((name.clone(), db));
+            }
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -740,7 +836,7 @@ fn main() {
                 None
             };
             if let Err(e) = rt.block_on(crate::server::serve(
-                db,
+                mount_list,
                 &addr,
                 token,
                 commits,

@@ -77,18 +77,18 @@ impl CommitLog {
         })
     }
 
-    /// 装上内核钩子：把事件按协议形态写进缓冲。
-    ///
-    /// 序列化**在钩子里做一次**（而不是每次取件重做）—— 回调要快，但 `to_value`
-    /// 是纯内存操作，比让每个订阅方各转一遍划算。
-    pub fn hook(self: &Arc<Self>) -> CommitHook {
+    /// 同上，但事件带上**挂载库名**（M-B 多库：同一个 CommitLog 收所有挂载的
+    /// 事件，消费方靠 `database` 字段区分）。字段只增——旧消费方多收一个键。
+    pub fn hook_for(self: &Arc<Self>, database: &str) -> CommitHook {
         let me = Arc::clone(self);
-        CommitHook::new(move |ev: &CommitEvent| me.push(ev))
+        let db = database.to_string();
+        CommitHook::new(move |ev: &CommitEvent| me.push(&db, ev))
     }
 
     /// 写一条（由内核钩子调用；**任意线程**，可能是阻塞线程池）。
-    pub fn push(&self, ev: &CommitEvent) {
+    pub fn push(&self, database: &str, ev: &CommitEvent) {
         let json = serde_json::json!({
+            "database": database,
             "table": ev.table,
             "partition": ev
                 .partition_values

@@ -70,6 +70,7 @@
 | 单查询内存上限 | `--query-memory-limit-mb` / **4096** | ✅（`PUT /api/v1/config`） | 单查询自己的配额；0 = 不限。超限 → 400 `QUERY_MEMORY_LIMIT`（改查询才有用） |
 | 并发查询上限 | `--max-concurrent-queries` / **0（不限）** | ❌（当前版） | 0 = 不限；超限直接 503 `TOO_MANY_QUERIES`（不排队，可退避重试）。**只管条数、不承担内存职责**（内存归预算管）——先前默认 16 是因为"它是唯一的系统级内存上界"，预算落地后该理由不成立，且按条数限流会误伤轻查询 |
 | 会话空闲回收 | `--session-idle-timeout-mins` / **0（关）** | ❌ | 超时会话按"踢人"路径清理（取消在跑查询 + 吊销 token，之后 401 `SESSION_REVOKED`）。默认关的理由：踢错活跃会话的代价大于泄漏代价（会话对象 ~百字节级，泄漏是审计噪音不是内存问题） |
+| **多库挂载** | `--mount 名=路径`（可重复；带选项 `名=路径,budget-mb=2048,read-only`） | ❌ | **`default` 库固定来自 `--path`**（`--mount default=…` 显式拒绝）。名字（小写 `[a-z_][a-z0-9_]*`）进 SQL 限定符（`settle.t`）、`USE`、`SHOW DATABASES` 与 grants 键。**各挂载独立**内存预算/解码缓存/写缓冲（缓存 `--cache-mb` 每挂载一份）；**并发闸是实例级的**（过载保护管整个进程）。跨库 JOIN/事务显式拒（501）。`--mount` 同路径双挂载拒绝 |
 | 写缓冲阈值 | WriteBufferOptions（代码默认 64 批/128MB） | ❌ | 攒批自动 flush |
 | compaction 触发 | CompactOptions（代码默认 ≥4 段且均值 <64MB） | ❌ | 见 `qsdb admin compact` |
 | Flight 监听口 | `--flight-bind` / 关 | ❌ | Arrow Flight 数据面（h2c，独立于 HTTP）；需 `--features flight` 编译（默认关闭守二进制红线）。鉴权复用 `--token`（Bearer metadata）。do_get ticket=SQL；do_put 首帧 descriptor cmd=`table:<名>` |
