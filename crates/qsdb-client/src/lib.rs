@@ -760,7 +760,8 @@ impl Client {
     /// **读路径**的 REVOKED 恢复包装：撞 401 `SESSION_REVOKED` 且有会话态 →
     /// 单飞重登 → **原样重发一次**。安全依据（契约 §3.1）：服务端认证闸在
     /// 执行**前**，401 = 语句从未运行——读请求重发无副作用。
-    fn read_with_relogin<T>(&self, f: impl Fn(&Client) -> Result<T>) -> Result<T> {
+    /// `f` 是 `FnMut`：下载类的调用方要在闭包里重复写 `out`（重发路径）。
+    fn read_with_relogin<T>(&self, mut f: impl FnMut(&Client) -> Result<T>) -> Result<T> {
         let stale_auth = self.http.auth_snapshot();
         match f(self) {
             Err(e @ Error::Api { status: 401, .. }) if e.code() == Some("SESSION_REVOKED") => {
@@ -1200,6 +1201,48 @@ impl Client {
             }
             Ok(resp.body)
         })
+    }
+
+    /// 下载服务端文件（`GET /api/v1/files`，**admin 专属**）。
+    ///
+    /// `COPY (SELECT …) TO '<dir>'` 的取回闭环：服务端 COPY 写盘，本方法把
+    /// 文件**流式**拉回——逐块写进 `out`，两端内存恒定（服务端 `ReaderStream`，
+    /// 客户端 64KB 块）。`path` = **库根目录内的相对路径**（`default/t/part-0000.parquet`
+    /// 这种形态；`..`/绝对路径/`_trash`/`_spill`/`_filecache` 内部路径服务端显式拒）。
+    ///
+    /// 完整性：响应带 `Content-Length`，连接中断 ⇒ 显式报错——**不回静默的
+    /// 半截文件**（与本仓"绝不静默部分数据"同源）。返回写入字节数。
+    /// 非授权（403）/不存在（404）/路径非法（400）→ [`Error::Api`] 原样上抛。
+    pub fn download_file(&self, path: &str, out: &mut dyn std::io::Write) -> Result<u64> {
+        // 下载是幂等读：REVOKED 自动重登+重发。重发只会发生在"401、一字节
+        // 文件内容都没收到"时 ⇒ out 不可能被写两份。
+        self.read_with_relogin(|c| c.download_file_once(path, out))
+    }
+
+    fn download_file_once(&self, path: &str, out: &mut dyn std::io::Write) -> Result<u64> {
+        use std::io::Read;
+        // '/' 在 query 值里合法，整段编码会破坏路径——按段编码，段内 & = ? % 照挡
+        let q = path
+            .split('/')
+            .map(http::percent_encode)
+            .collect::<Vec<_>>()
+            .join("/");
+        let (head, mut body) = self.http.get_stream(&format!("/api/v1/files?path={q}"))?;
+        if !(200..300).contains(&head.status) {
+            let b = body.read_all()?;
+            return Err(json::api_error(head.status, &b));
+        }
+        let mut n = 0u64;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let k = body.read(&mut buf)?;
+            if k == 0 {
+                break;
+            }
+            out.write_all(&buf[..k])?;
+            n += k as u64;
+        }
+        Ok(n)
     }
 }
 

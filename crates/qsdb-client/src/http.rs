@@ -596,6 +596,25 @@ impl Http {
         extra: &[(&str, &str)],
         body: &[u8],
     ) -> Result<(Head, Body)> {
+        self.stream_exchange("POST", Some(content_type), path, extra, body)
+    }
+
+    /// `GET` + **流式**响应体（十八批Ⅳ：`GET /api/v1/files` 文件下载——
+    /// 大文件边收边写盘，两端内存恒定）。语义与 [`Self::post_stream`] 同款：
+    /// `Connection: close`、Body 独占连接。
+    pub(crate) fn get_stream(&self, path: &str) -> Result<(Head, Body)> {
+        self.stream_exchange("GET", None, path, &[], b"")
+    }
+
+    /// 流式请求的公共路径（`post_stream` / `get_stream` 共用）。
+    fn stream_exchange(
+        &self,
+        method: &str,
+        content_type: Option<&str>,
+        path: &str,
+        extra: &[(&str, &str)],
+        body: &[u8],
+    ) -> Result<(Head, Body)> {
         let mut slot = self.lock();
         // 池里那条拿走（活着就用，失效就丢）
         let mut conn = match slot.take() {
@@ -611,9 +630,9 @@ impl Http {
         conn.set_io_timeout(self.io_timeout)?;
         let auth_snap = self.auth_snapshot();
         let (head, conn) = match conn.send(
-            "POST",
+            method,
             path,
-            Some(content_type),
+            content_type,
             extra,
             body,
             auth_snap.as_deref(),
@@ -625,9 +644,9 @@ impl Http {
                 let mut fresh = BufConn::connect(&self.host, self.port, self.connect_timeout)?;
                 fresh.set_io_timeout(self.io_timeout)?;
                 let h = fresh.send(
-                    "POST",
+                    method,
                     path,
-                    Some(content_type),
+                    content_type,
                     extra,
                     body,
                     auth_snap.as_deref(),

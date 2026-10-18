@@ -1137,3 +1137,69 @@ fn 管理面一等方法_config_watch_sessions_grants() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// 文件下载（十八批Ⅳ）：流式 + 逐字节一致 + 路径守卫
+// ---------------------------------------------------------------------------
+
+#[test]
+fn 文件下载_逐字节一致与路径守卫() {
+    let s = Server::start();
+    let c = s.client();
+    setup(&c);
+    c.append("t", &sample()).expect("append");
+
+    // 在库根目录里找一个真实文件（测试进程与 server 同机同目录）
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(&s.root, &mut files);
+    // 挑**最大**的文件（lock/manifest 之类可能是空的；段文件才是真数据）
+    files.sort_by_key(|p| std::cmp::Reverse(std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)));
+    let (abs, rel) = files
+        .first()
+        .and_then(|p| {
+            let rel = p
+                .strip_prefix(&s.root)
+                .ok()?
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            Some((p.clone(), rel))
+        })
+        .expect("库里应有至少一个文件");
+
+    // 流式下载：逐字节与本地一致
+    let mut got = Vec::new();
+    let n = c.download_file(&rel, &mut got).expect("download");
+    assert_eq!(n as usize, got.len());
+    let want = std::fs::read(&abs).expect("本地读源文件");
+    assert!(!want.is_empty(), "测试前提：库里得有非空文件");
+    assert_eq!(got, want, "逐字节一致（{rel}）");
+
+    // 路径穿越 → 400 显式拒
+    match c.download_file("../etc/passwd", &mut Vec::new()) {
+        Err(Error::Api { status: 400, .. }) => {}
+        other => panic!("路径穿越应 400，实为 {other:?}"),
+    }
+    // 不存在的文件 → 404
+    match c.download_file("nope/none.bin", &mut Vec::new()) {
+        Err(Error::Api { status: 404, .. }) => {}
+        other => panic!("不存在的文件应 404，实为 {other:?}"),
+    }
+    // 内部路径 → 403
+    match c.download_file("_trash/x", &mut Vec::new()) {
+        Err(Error::Api { status: 403, .. }) => {}
+        other => panic!("内部路径应 403，实为 {other:?}"),
+    }
+}
