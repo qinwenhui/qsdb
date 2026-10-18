@@ -474,12 +474,13 @@ fn 同_spec_不同帧不许去重() {
 #[test]
 fn 该拒的都拒且指路() {
     let (db, root) = setup("reject");
-    // RANGE 仍拒（按值分帧是另一件事；当 ROWS 跑会换个数字）
+    // RANGE 的**值偏移**仍拒（按值偏移要排序键的值算术）；无偏移三形态已实现
+    // （值级验收 `tests/window_range.rs`——键重复时 RANGE 与 ROWS 数字必须不同）
     let e = err_of(
         &db,
-        "SELECT sum(x) OVER (ORDER BY i RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM s",
+        "SELECT sum(x) OVER (ORDER BY i RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM s",
     );
-    assert!(e.contains("RANGE"), "{e}");
+    assert!(e.contains("value offset"), "{e}");
     // 起点在终点之后 ⇒ 帧恒空，必是笔误
     let e = err_of(
         &db,

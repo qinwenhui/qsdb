@@ -115,6 +115,13 @@ pub enum FrameBound {
 pub struct RowFrame {
     pub start: FrameBound,
     pub end: FrameBound,
+    /// **RANGE 语义标志**（十九批 S3）：起点 `CURRENT ROW` 指**并列组**起点
+    /// （按值分帧，键相等的一组整组进帧），不是当前行。绑定层只把
+    /// `RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING` 映射成
+    /// `range_peer_start = true`；另两个 RANGE 形态在绑定层就改写掉了
+    /// （`UP..CR` ≡ 默认帧 → `None`；`UP..UF` ≡ 整分区 → 普通行帧）。
+    /// 空帧语义（帧内无值 ⇒ NULL/0）与 ROWS 路径同一套。
+    pub range_peer_start: bool,
 }
 
 /// 窗口函数定义（binder 产出）。
@@ -608,7 +615,15 @@ fn compute_window_fn(
             // **显式帧走另一条路**（滑窗）；默认帧（None）**不进这里**，
             // 下面原代码一字不改 —— 这是"零回归"的落点。
             if let Some(frame) = *fr {
-                return framed_agg(f, &arg_arr, arg.data_type(), frame, &partition_start, n);
+                return framed_agg(
+                    f,
+                    &arg_arr,
+                    arg.data_type(),
+                    frame,
+                    &partition_start,
+                    Some(&seg_start),
+                    n,
+                );
             }
             let out = match arg.data_type() {
                 t if t.is_integer() => {
@@ -762,7 +777,13 @@ fn compute_window_fn(
             };
             let counted = |i: usize| arg_arr.as_ref().is_none_or(|a| !a.is_null(i));
             if let Some(frame) = *fr {
-                return Ok(framed_count(arg_arr.as_deref(), frame, &partition_start, n));
+                return Ok(framed_count(
+                    arg_arr.as_deref(),
+                    frame,
+                    &partition_start,
+                    Some(&seg_start),
+                    n,
+                ));
             }
             let mut out = vec![0i64; n];
             let mut cnt = 0i64;
@@ -911,12 +932,14 @@ fn framed_agg(
     arg_type: crate::types::LogicalType,
     frame: RowFrame,
     partition_start: &[bool],
+    seg_start: Option<&[bool]>,
     n: usize,
 ) -> Result<ArrayRef> {
     let fname = agg_name(f);
     let is_avg = matches!(f, WindowFn::Avg(..));
     let is_extreme = matches!(f, WindowFn::Min(..) | WindowFn::Max(..));
     let want_min = matches!(f, WindowFn::Min(..));
+    let peer = peer_starts(n, seg_start);
 
     let arr: ArrayRef = match arg_type {
         t if t.is_integer() => {
@@ -926,11 +949,12 @@ fn framed_agg(
                     &vals,
                     frame,
                     partition_start,
+                    &peer,
                     n,
                     want_min,
                 )))
             } else {
-                let (sums, cnts) = framed_prefix(n, partition_start, frame, &vals);
+                let (sums, cnts) = framed_prefix(n, partition_start, frame, &peer, &vals);
                 if is_avg {
                     Arc::new(Float64Array::from(avg_of(&sums, &cnts, |v| v as f64)))
                 } else {
@@ -945,11 +969,12 @@ fn framed_agg(
                     &vals,
                     frame,
                     partition_start,
+                    &peer,
                     n,
                     want_min,
                 )))
             } else {
-                let (sums, cnts) = framed_prefix(n, partition_start, frame, &vals);
+                let (sums, cnts) = framed_prefix(n, partition_start, frame, &peer, &vals);
                 if is_avg {
                     Arc::new(Float64Array::from(avg_of(&sums, &cnts, |v| v)))
                 } else {
@@ -962,14 +987,14 @@ fn framed_agg(
                 return Err(QsdbError::type_err("decimal window arg downcast failed"));
             };
             if is_extreme {
-                let out = framed_extreme(&vals, frame, partition_start, n, want_min);
+                let out = framed_extreme(&vals, frame, partition_start, &peer, n, want_min);
                 Arc::new(Decimal128Array::from(out).with_data_type({
                     let m = dec_meta(&arg_type)?;
                     DataType::Decimal128(m.precision, m.scale)
                 }))
             } else {
                 let big: Vec<Option<i256>> = vals.iter().map(|v| v.map(i256::from_i128)).collect();
-                let (sums, cnts) = framed_prefix(n, partition_start, frame, &big);
+                let (sums, cnts) = framed_prefix(n, partition_start, frame, &peer, &big);
                 let in_scale = dec_meta(&arg_type)?.scale;
                 let out_sc = out_meta(f, &arg_type)?.scale;
                 let out: Vec<Option<i128>> = if is_avg {
@@ -1126,6 +1151,7 @@ fn framed_count(
     has_arg: Option<&dyn Array>,
     frame: RowFrame,
     partition_start: &[bool],
+    seg_start: Option<&[bool]>,
     n: usize,
 ) -> ArrayRef {
     // 非 NULL 记 1、NULL 记 0，前缀和即区间计数（`count(*)` 全是 1）
@@ -1136,7 +1162,8 @@ fn framed_count(
             Some(_) => Some(1i64),
         })
         .collect();
-    let (_, cnts) = framed_prefix(n, partition_start, frame, &marks);
+    let peer = peer_starts(n, seg_start);
+    let (_, cnts) = framed_prefix(n, partition_start, frame, &peer, &marks);
     Arc::new(Int64Array::from(cnts))
 }
 
@@ -1173,10 +1200,17 @@ fn partition_ranges(n: usize, partition_start: &[bool]) -> Vec<(usize, usize)> {
 /// **只夹"该在分区内"的那一侧**：越出分区的那一侧**不**回夹到分区边 ——
 /// 回夹会把不该进帧的行算进来。`ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING` 在
 /// 分区首行是**空帧**（PG / DuckDB 都给 NULL），回夹成 `[ps, ps]` 就成"取首行"了。
-fn frame_bounds(frame: RowFrame, i: usize, ps: usize, pe: usize) -> (i64, i64) {
+fn frame_bounds(frame: RowFrame, i: usize, ps: usize, pe: usize, peer: &[usize]) -> (i64, i64) {
     let i = i as i64;
     let a = match frame.start {
         FrameBound::Unbounded => ps as i64,
+        // RANGE `CURRENT ROW` 起点 = **并列组**起点（十九批 S3：按值分帧，
+        // 键相等的一组整组进帧）。组号随 i 单调不减 —— 滑窗前缀与单调队列的
+        // "左界单调"前提不破。`peer` 为空 = 该形态不该出现（绑定层只在有
+        // ORDER BY 时放行），防御性回退当前行。
+        FrameBound::Current if frame.range_peer_start => {
+            peer.get(i as usize).copied().unwrap_or(i as usize) as i64
+        }
         FrameBound::Current => i,
         FrameBound::Preceding(k) => (i - k as i64).max(ps as i64),
         FrameBound::Following(k) => i + k as i64,
@@ -1190,6 +1224,23 @@ fn frame_bounds(frame: RowFrame, i: usize, ps: usize, pe: usize) -> (i64, i64) {
     (a, b)
 }
 
+/// 并列组起点数组：`peer[i]` = 行 i 所在并列组的首行号（`seg_start` 缺省 → 空，
+/// 调用方保证此帧不用它）。
+fn peer_starts(n: usize, seg_start: Option<&[bool]>) -> Vec<usize> {
+    let Some(ss) = seg_start else {
+        return Vec::new();
+    };
+    let mut peer = vec![0usize; n];
+    let mut s = 0usize;
+    for (i, is_start) in ss.iter().enumerate().take(n) {
+        if *is_start {
+            s = i;
+        }
+        peer[i] = s;
+    }
+    peer
+}
+
 /// 滑窗求和/计数：分区内一次前缀和 ⇒ 每行 O(1)。
 ///
 /// 返回 `(sums, counts)`。`counts[i] == 0`（空帧 **或** 帧内全 NULL）时
@@ -1199,6 +1250,7 @@ fn framed_prefix<T>(
     n: usize,
     partition_start: &[bool],
     frame: RowFrame,
+    peer: &[usize],
     vals: &[Option<T>],
 ) -> (Vec<Option<T>>, Vec<i64>)
 where
@@ -1216,7 +1268,7 @@ where
             pcnt[k + 1] = pcnt[k] + i64::from(v.is_some());
         }
         for i in ps..pe {
-            let (a, b) = frame_bounds(frame, i, ps, pe);
+            let (a, b) = frame_bounds(frame, i, ps, pe, peer);
             if a > b {
                 continue; // 空帧 ⇒ sums 保持 None、cnts 保持 0
             }
@@ -1243,6 +1295,7 @@ fn framed_extreme<T: PartialOrd + Copy>(
     vals: &[Option<T>],
     frame: RowFrame,
     partition_start: &[bool],
+    peer: &[usize],
     n: usize,
     want_min: bool,
 ) -> Vec<Option<T>> {
@@ -1251,7 +1304,7 @@ fn framed_extreme<T: PartialOrd + Copy>(
         let mut dq: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
         let mut last = ps as i64 - 1; // 已入过队的最大行号
         for (i, slot) in out.iter_mut().enumerate().take(pe).skip(ps) {
-            let (a, b) = frame_bounds(frame, i, ps, pe);
+            let (a, b) = frame_bounds(frame, i, ps, pe, peer);
             while last < b {
                 last += 1;
                 let j = last as usize;

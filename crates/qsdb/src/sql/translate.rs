@@ -406,8 +406,9 @@ fn audit_function(f: &sqlparser::ast::Function) -> Result<()> {
 /// 窗口说明上的子句：**帧边界**（`ROWS/RANGE BETWEEN …`）与窗口内 `ORDER BY` 选项。
 ///
 /// 帧静默忽略最阴：`ROWS BETWEEN 1 PRECEDING AND CURRENT ROW` 被当成默认帧
-/// （累计），结果**换个数字、不报错**。现在 `ROWS` 已实现（走滑窗路径），
-/// `RANGE`/`GROUPS` 仍**显式拒**。
+/// （累计），结果**换个数字、不报错**。`ROWS` 已实现（走滑窗路径）；
+/// `RANGE` 的三个**无值偏移**形态已实现（十九批 S3，形态映射见
+/// `parse_window_fn_frame`）；`GROUPS` 仍**显式拒**。
 fn audit_window_spec(spec: &sqlparser::ast::WindowSpec) -> Result<()> {
     if let Some(fr) = &spec.window_frame {
         audit_window_frame(fr)?;
@@ -417,21 +418,15 @@ fn audit_window_spec(spec: &sqlparser::ast::WindowSpec) -> Result<()> {
     ))
 }
 
-/// 帧闸门（**单位**这一层）：`ROWS` 放行（`parse_window_fn_frame` 会把边界解析成
-/// [`crate::exec::window::RowFrame`] 交给执行器），其余单位**显式拒**。
-///
-/// `RANGE` / `GROUPS` 必须拒：按**值**分帧要 `ORDER BY` 恰好一列 + 值域语义，
-/// 与 ROWS 是两回事 —— 当 ROWS 跑会**换个数字**（本批只实现 ROWS）。
+/// 帧闸门（**单位**这一层）：`ROWS` 与 `RANGE` 放行（形态收敛在
+/// `parse_window_fn_frame`——RANGE 在那里按语义改写或拒绝），`GROUPS` **显式拒**。
 fn audit_window_frame(fr: &sqlparser::ast::WindowFrame) -> Result<()> {
     use sqlparser::ast::WindowFrameUnits as U;
     match fr.units {
-        U::Rows => Ok(()),
-        U::Range => Err(QsdbError::unsupported(
-            "window frame RANGE BETWEEN … (only ROWS is implemented) — RANGE 按「值」\
-             分帧（要 ORDER BY 恰好一列 + 值域语义），按 ROWS 跑会给出不同数字",
-        )),
+        U::Rows | U::Range => Ok(()),
         U::Groups => Err(QsdbError::unsupported(
-            "window frame GROUPS BETWEEN … (only ROWS is implemented)",
+            "window frame GROUPS BETWEEN … (not implemented) — 按「组数」分帧是\
+             另一套语义；滑动窗口请用 ROWS，按值分帧请用 RANGE（无偏移形态）",
         )),
     }
 }
@@ -574,6 +569,52 @@ fn parse_window_fn_frame(
              ranking/lag/lead 按定义只吃分区与排序，帧是给聚合函数用的"
         )));
     }
+    // ── RANGE（十九批 S3）：只收**无值偏移**的三形态，按语义改写 ──
+    //
+    // 关键判定（也是它当初必须显式拒、不能拿 ROWS 冒充的原因）：RANGE 按
+    // **值**分帧 —— ORDER BY 键相等的行为**并列组（peers）**，整组一起进帧。
+    // 键有重复时与 ROWS 同形态**数字不同**（`tests/window_range.rs` 锁定）。
+    if fr.units == sqlparser::ast::WindowFrameUnits::Range {
+        use crate::exec::window::{FrameBound as B, RowFrame};
+        let has_offset = |b: B| matches!(b, B::Preceding(_) | B::Following(_));
+        if has_offset(start) || has_offset(end) {
+            return Err(QsdbError::unsupported(
+                "window frame RANGE with a value offset (n PRECEDING / n FOLLOWING) — \
+                 按「值」偏移需要排序键的值算术（数值加减/时间区间），未实现。已支持的\
+                 三个无偏移形态：UNBOUNDED PRECEDING AND CURRENT ROW / \
+                 CURRENT ROW AND UNBOUNDED FOLLOWING / UNBOUNDED … AND UNBOUNDED …",
+            ));
+        }
+        // RANGE 带 CURRENT ROW 界 ⇒ 标准要求 ORDER BY **恰一列**（按值分帧要
+        // 有唯一的"值"轴）；整分区形态与行序无关，不需要。
+        let whole = matches!(start, B::Unbounded) && matches!(end, B::Unbounded);
+        if !whole && spec.order_by.len() != 1 {
+            return Err(QsdbError::unsupported(
+                "window frame RANGE … CURRENT ROW requires exactly one ORDER BY column — \
+                 RANGE 按值分帧，值轴必须是唯一一列\
+                 （整分区形态 UNBOUNDED … AND UNBOUNDED … 不需要）",
+            ));
+        }
+        return Ok(match (start, end) {
+            // ① ≡ **默认帧**：标准的默认帧就是 RANGE UNBOUNDED PRECEDING AND
+            //    CURRENT ROW ⇒ 改写为 None 走原快路径（并列组共享段尾值由它
+            //    保证，零执行器改动、逐位同语义）
+            (B::Unbounded, B::Current) => None,
+            // ② 整分区：帧与行序/单位都无关 ⇒ 普通行帧
+            (B::Unbounded, B::Unbounded) => Some(RowFrame {
+                start,
+                end,
+                range_peer_start: false,
+            }),
+            // ③ 当前列 → 分区尾：起点是**并列组** ⇒ 执行器按 peer 组起点走
+            (B::Current, B::Unbounded) => Some(RowFrame {
+                start,
+                end,
+                range_peer_start: true,
+            }),
+            _ => unreachable!("值偏移与非法组合已在上方拦下"),
+        });
+    }
     // 无 ORDER BY 时行序由扫描决定（可能随并行度变化）⇒ 按行号分帧会给出
     // **不确定**的值。整分区那一种（前后都无界）与行序无关，放行。
     let whole_partition = matches!(start, crate::exec::window::FrameBound::Unbounded)
@@ -585,7 +626,11 @@ fn parse_window_fn_frame(
              或改用 `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`（整分区）",
         ));
     }
-    Ok(Some(crate::exec::window::RowFrame { start, end }))
+    Ok(Some(crate::exec::window::RowFrame {
+        start,
+        end,
+        range_peer_start: false,
+    }))
 }
 
 /// INSERT 的源：字面量行集（VALUES）或一条完整 SELECT（含 CTE/集合操作）。

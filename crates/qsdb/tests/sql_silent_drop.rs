@@ -108,9 +108,11 @@ fn aggregate_filter_and_null_treatment_are_rejected() {
 
 /// ② 窗口帧：静默忽略会**换一个数字**（用默认累计帧）而不报错。
 ///
-/// 2026-10-15 起 `ROWS` **已实现**（本闸门的正例从"没有帧"扩到"ROWS 帧"），
-/// `RANGE`/`GROUPS` 仍拒。**正例必须断言值**：只断言"不报错"的话，将来谁把
-/// ROWS 又退化成默认帧，这条闸门会静静地放过（正是它当初要防的事）。
+/// 2026-10-15 起 `ROWS` **已实现**；2026-10-18（十九批 S3）`RANGE` 三个
+/// 无偏移形态**已实现**（`RANGE UP..CR` ≡ 默认帧——本例键唯一，值与默认帧
+/// 逐位相同；**键重复的判别器在 `tests/window_range.rs`**：RANGE 与 ROWS
+/// 数字必须不同，谁把 RANGE 悄悄当 ROWS/默认帧跑，那条会当场红）。
+/// `GROUPS` 与 RANGE 值偏移仍拒。
 #[test]
 fn window_frame_is_rejected() {
     let (db, root) = setup("frame");
@@ -125,11 +127,21 @@ fn window_frame_is_rejected() {
         .map(|i| arrow::util::display::array_value_to_string(bs[0].column(0).as_ref(), i).unwrap())
         .collect();
     assert_eq!(vals, vec!["10", "10", "40", "70"], "ROWS 帧 = 滑动一行");
-    // RANGE / GROUPS 仍拒（按值分帧 / 按组计数是另一件事，当 ROWS 跑会换数字）
+    // RANGE①（≡ 默认帧）：键唯一 ⇒ 累计 10 / 10 / 50 / 80
+    let bs = db
+        .sql_collect(
+            "SELECT sum(b) OVER (ORDER BY a RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t",
+        )
+        .unwrap();
+    let vals: Vec<String> = (0..bs[0].num_rows())
+        .map(|i| arrow::util::display::array_value_to_string(bs[0].column(0).as_ref(), i).unwrap())
+        .collect();
+    assert_eq!(vals, vec!["10", "10", "50", "80"], "RANGE① = 组尾累计");
+    // RANGE 值偏移仍拒（要排序键的值算术）
     rejected(
         &db,
-        "SELECT sum(b) OVER (ORDER BY a RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t",
-        "RANGE",
+        "SELECT sum(b) OVER (ORDER BY a RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+        "value offset",
     );
     rejected(
         &db,

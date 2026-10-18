@@ -70,7 +70,7 @@
 | `TABLESAMPLE` | ✋ | 此前**静默当全表** ⇒ 多返回 |
 | `LATERAL VIEW` / `CONNECT BY` | ✋ | |
 | `WINDOW w AS (…)`（命名窗口） | ✋ | |
-| CTE 列别名 `WITH w(q) AS …` | ✋ | 此前**别名被丢掉**，之后报"列不存在"（误导） |
+| CTE 列别名 `WITH w(a,b) AS …` | ✅ | 2026-10-18 实现（十九批 S2）。**按位置重命名**（第 i 个别名接管第 i 个输出列，值/类型不变），CTE / 派生表 / 实表 / JOIN 右侧四形态同治。数不符 / 重名 / 带类型显式拒。值级验收 `tests/cte_alias.rs` |
 | `WITH w AS MATERIALIZED/NOT MATERIALIZED` | ⛔ | sqlparser 不认这个写法 |
 
 ## 二、`FROM` / JOIN
@@ -104,7 +104,7 @@
 | `RIGHT [OUTER] JOIN` | ✅ | 换边实现（`a RIGHT JOIN b` ≡ `b LEFT JOIN a`，输出列序换回 `a.* ++ b.*`）。仅支持等值 `ON`。值级验收 `tests/join_right_cross.rs` |
 | `FULL [OUTER] JOIN` | ✅ | 值级验收 `tests/join_full.rs`。⚠️ 两条限制：**不参与并行分片**、**不支持落盘溢出**（内存不足时明确报 `MEMORY_PRESSURE`，不假装能跑）。实用判据：`2 × 右表大小 + 索引` 装得进内存配额 —— 细节见 `docs/内存预算与溢出设计.md` §4.4 |
 | ↑ 这两种的**替代写法**（实测通过，见 `join_surface.rs`） | ✅ | `A RIGHT JOIN B` ≡ `B LEFT JOIN A`（列序自己重排）。`FULL OUTER` 拼出来是：<br>`SELECT a.k FROM a LEFT JOIN b ON a.k = b.k`<br>`UNION ALL`<br>`SELECT b.k FROM b WHERE NOT EXISTS (SELECT 1 FROM a WHERE a.k = b.k)`<br>（左全 + 右未匹配；**列数/类型要对齐**，右侧补的列写 `CAST(NULL AS <类型>)`） |
-| `JOIN … USING (cols)` | ✅ | 键 = 两侧同名列**且输出把那一列合并成一份**（`SELECT *` 只出一份；取值 `COALESCE(l.c, r.c)`，四种 join 一套覆盖）。值级验收 `tests/join_using.rs`。<br>⚠️ **偏差**：合并之后 `l.c` / `r.c` 这类**限定名会回退到裸名**、指到合并列上（PostgreSQL 是两者并存）；这是本仓限定名解析的既有行为，已记队列 |
+| `JOIN … USING (cols)` | ✅ | 键 = 两侧同名列**且输出把那一列合并成一份**（`SELECT *` 只出一份；取值 `COALESCE(l.c, r.c)`，四种 join 一套覆盖）。值级验收 `tests/join_using.rs`。<br>**限定名并存**（2026-10-18 锁定）：合并之后 `l.c` / `r.c` 都指合并列（PG 同款；孤儿行取非空侧），裸名解析见下行 |
 | `NATURAL JOIN` | ✋ | **明确不做**：按"同名同类型列"隐式匹配，两侧加一列就可能**静默改语义** —— 与"拼错就报错"的纪律相反。写 `ON`/`USING` |
 | 非等值 `ON` + `INNER` | ✅ | 走 `CrossJoinFilter`（叉积 + 过滤）。代价 = **左行数 × 右行数**，只适合小表 |
 | 非等值 `ON` + `LEFT` | ✋ | `non-equi LEFT JOIN not supported (only non-equi INNER is)`（**绝不能按 INNER 跑**——那会静默丢掉未匹配行） |
@@ -115,7 +115,7 @@
 | 表因子列别名 `FROM t AS x(a,b)` | ✋ | 同样被静默丢掉。⚠️ 真实踩坑：`SELECT * FROM t EXCLUDE (b)` 会被解析成「别名 `exclude` + 列清单」⇒ 拿到**全列**（Snowflake 用户会中招） |
 | `TABLESAMPLE` | ✋ | |
 | 表 PARTITION 选择器 / `AT VERSION`（时间旅行） | ⛔ | 本方言不解析；**静默忽略会读到别的数据**，故一旦能解析必须拦 |
-| **裸列的解析范围** | ⚠️ | **裸名 = 左侧输入**；JOIN 右表的列**必须限定**（`u.c`）。与标准 SQL 不同（标准是"全输入搜索 + 歧义报错"），但本仓规则**确定性**且报错会指路（提示写成 `u.c`）。歧义不会静默二选一 |
+| **裸列的解析范围** | ✅ | 2026-10-18（十九批 S1）：精确名优先；**落空后做限定列尾名回退**——`SELECT v FROM t JOIN u …` 里 `u.v` 被裸名 `v` 解析到（PG/MySQL 同判；此前右表列必须限定）。多命中（`r.v`/`r2.v`）⇒ 歧义错；两侧同名取左（精确命中优先，本仓刻意比 PG 宽容，既有查询零变化）。值级验收 `tests/join_namespace.rs` |
 
 ## 三、表达式与函数
 
@@ -151,7 +151,8 @@
 | `PARTITION BY` / `ORDER BY`（多列、混合方向） | ✅ | |
 | **行帧** `ROWS BETWEEN a AND b` | ✅ | 2026-10-15 实现。边界 `UNBOUNDED PRECEDING/FOLLOWING`、`n PRECEDING/FOLLOWING`、`CURRENT ROW`；简写 `ROWS n PRECEDING` ≡ `… AND CURRENT ROW`。**帧不会跨分区**。<br>⚠️ **帧可能为空**（边界全落在当前行之外，如 `3 PRECEDING AND 1 PRECEDING` 在分区首行）⇒ `sum/avg/min/max` 给 **NULL**、`count` 给 **0**（与 PG/DuckDB 一致；**不是**夹到分区边）。<br>⚠️ 帧内一个非 NULL 都没有时 `sum/avg/min/max` 也是 **NULL**（此前是 0 / NaN，2026-10-15 一并修）。<br>值级验收 `tests/window_frame.rs` |
 | 帧 + **无 `ORDER BY`** | ✋ | 显式拒：没有 `ORDER BY` 就没有确定行序（并行扫描下会变），按行分帧的值不可复现。**例外**：`ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`（整分区，与行序无关）放行 |
-| **`RANGE` / `GROUPS BETWEEN …`** | ✋ | 按**值**分帧 / 按组计数，是另一件事；当 `ROWS` 跑会换个数字，故显式拒 |
+| **`RANGE` BETWEEN …（无值偏移三形态）** | ✅ | 2026-10-18 实现（十九批 S3）。按**值**分帧：`ORDER BY` 键相等的行是并列组，整组一起进帧——**键重复时与 ROWS 数字不同**（不能拿 ROWS 冒充）。三形态：`UP..CURRENT ROW` ≡ 默认帧 / `CURRENT ROW..UNBOUNDED FOLLOWING`（起点=并列组）/ 整分区。要求 ORDER BY 恰一列（整分区形态除外）。值级验收 `tests/window_range.rs`（RANGE 与 ROWS 成对断言） |
+| `RANGE` **值偏移**（`n PRECEDING`/`n FOLLOWING`）/ **`GROUPS BETWEEN …`** | ✋ | 值偏移要排序键的值算术（数值加减/时间区间）；GROUPS 是按组计数——都显式拒并指路 |
 | 起点在终点之后（`3 PRECEDING AND 5 PRECEDING`）、起点 `UNBOUNDED FOLLOWING`、终点 `UNBOUNDED PRECEDING` | ✋ | 帧恒空 / 标准不允许 —— 必是笔误，报错比回一列 NULL 好 |
 | **排名 / lag / lead 带帧** | ✋ | 按标准它们**忽略**帧；本仓不静默忽略 ⇒ 显式拒并指路 |
 | 窗口内 `ORDER BY … NULLS FIRST/LAST` | ✅ | 与外部 `ORDER BY` **同一套**规则（共用 `SortKey`）|
