@@ -559,6 +559,12 @@ impl Http {
         )
     }
 
+    /// `DELETE`（十八批Ⅲ：`DELETE /sessions/{id}` 踢会话等管理动作）。
+    pub fn delete(&self, path: &str) -> Result<Response> {
+        let auth_snap = self.auth_snapshot();
+        self.exchange_auth("DELETE", path, None, &[], b"", auth_snap.as_deref())
+    }
+
     /// `POST` + **显式** Authorization（login 专用：要带 Basic 凭证，
     /// 不吃当前态的 token——那正是要被换掉的东西）。
     pub(crate) fn post_with_auth(

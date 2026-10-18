@@ -433,3 +433,336 @@ pub(crate) fn parse_databases(bytes: &[u8]) -> Result<Vec<DbInfo>> {
         })
         .collect())
 }
+
+// ---------------------------------------------------------------------------
+// 管理面一等类型（十八批Ⅲ：/config /watch /sessions /queries /grants）
+// ---------------------------------------------------------------------------
+
+/// 运行期配置节（`GET /api/v1/config` 的 `runtime`；四个键全部热更）。
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    /// 默认查询超时（毫秒；0 = 不超时）。
+    pub query_timeout_ms: u64,
+    /// 单查询执行内存配额（字节；0 = 不限——server 默认 4GB）。
+    pub query_memory_limit_bytes: u64,
+    /// 结果护栏·行数（0 = 关）。
+    pub max_result_rows: u64,
+    /// 结果护栏·体量（字节，估算口径；0 = 关）。
+    pub max_result_bytes: u64,
+    /// 整个响应体（`startup`/`memory`/`server` 节给需要的人原样读）。
+    pub raw: serde_json::Value,
+}
+
+pub(crate) fn parse_runtime_config(bytes: &[u8]) -> Result<RuntimeConfig> {
+    #[derive(serde::Deserialize, Default)]
+    struct RawRuntime {
+        #[serde(default, rename = "queryTimeoutMs")]
+        query_timeout_ms: u64,
+        #[serde(default, rename = "queryMemoryLimitBytes")]
+        query_memory_limit_bytes: u64,
+        #[serde(default, rename = "maxResultRows")]
+        max_result_rows: u64,
+        #[serde(default, rename = "maxResultBytes")]
+        max_result_bytes: u64,
+    }
+    #[derive(serde::Deserialize)]
+    struct RawBody {
+        #[serde(default)]
+        runtime: RawRuntime,
+    }
+    let v: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|e| Error::Decode(format!("json: /config 响应不合法: {e}")))?;
+    let rt: RawBody = serde_json::from_value(v.clone())
+        .map_err(|e| Error::Decode(format!("json: /config runtime 节不合法: {e}")))?;
+    Ok(RuntimeConfig {
+        query_timeout_ms: rt.runtime.query_timeout_ms,
+        query_memory_limit_bytes: rt.runtime.query_memory_limit_bytes,
+        max_result_rows: rt.runtime.max_result_rows,
+        max_result_bytes: rt.runtime.max_result_bytes,
+        raw: v,
+    })
+}
+
+/// 热更补丁（`PUT /api/v1/config` 的 body）。`None` = 不动该项。
+/// 服务端校验 `applied` 诚实性；**客户端在空补丁上直接报用法错**
+/// （发出去注定 `applied:false`，没有意义）。
+#[derive(Debug, Clone, Default)]
+pub struct ConfigPatch {
+    /// 默认查询超时（毫秒）。
+    pub query_timeout_ms: Option<u64>,
+    /// 单查询执行内存配额（字节）。
+    pub query_memory_limit_bytes: Option<u64>,
+    /// 结果护栏·行数（0 = 关）。
+    pub max_result_rows: Option<u64>,
+    /// 结果护栏·体量（字节）。
+    pub max_result_bytes: Option<u64>,
+}
+
+impl ConfigPatch {
+    /// 是否一个键都没给（[`crate::Client::config_put`] 会拒绝空补丁）。
+    pub fn is_empty(&self) -> bool {
+        self.query_timeout_ms.is_none()
+            && self.query_memory_limit_bytes.is_none()
+            && self.max_result_rows.is_none()
+            && self.max_result_bytes.is_none()
+    }
+
+    pub(crate) fn to_body(&self) -> String {
+        // camelCase 规范名（与 GET 回显同形——读-改-写整轮可行）
+        let mut v = serde_json::Map::new();
+        if let Some(n) = self.query_timeout_ms {
+            v.insert("queryTimeoutMs".into(), serde_json::json!(n));
+        }
+        if let Some(n) = self.query_memory_limit_bytes {
+            v.insert("queryMemoryLimitBytes".into(), serde_json::json!(n));
+        }
+        if let Some(n) = self.max_result_rows {
+            v.insert("maxResultRows".into(), serde_json::json!(n));
+        }
+        if let Some(n) = self.max_result_bytes {
+            v.insert("maxResultBytes".into(), serde_json::json!(n));
+        }
+        serde_json::Value::Object(v).to_string()
+    }
+}
+
+/// `PUT /config` 的回执（回显**生效后**的值，客户端可直接比对）。
+#[derive(Debug, Clone)]
+pub struct ConfigPutAck {
+    /// 生效后的默认查询超时（毫秒）。
+    pub query_timeout_ms: u64,
+    /// 生效后的单查询内存配额（字节）。
+    pub query_memory_limit_bytes: u64,
+    /// 生效后的结果护栏·行数。
+    pub max_result_rows: u64,
+    /// 生效后的结果护栏·体量（字节）。
+    pub max_result_bytes: u64,
+    /// **确实落了至少一个已知字段**（键名拼错 = false——不许假成功）。
+    pub applied: bool,
+}
+
+pub(crate) fn parse_config_put_ack(bytes: &[u8]) -> Result<ConfigPutAck> {
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        #[serde(default, rename = "queryTimeoutMs")]
+        query_timeout_ms: u64,
+        #[serde(default, rename = "queryMemoryLimitBytes")]
+        query_memory_limit_bytes: u64,
+        #[serde(default, rename = "maxResultRows")]
+        max_result_rows: u64,
+        #[serde(default, rename = "maxResultBytes")]
+        max_result_bytes: u64,
+        #[serde(default)]
+        applied: bool,
+    }
+    let r: Raw = serde_json::from_slice(bytes)
+        .map_err(|e| Error::Decode(format!("json: PUT /config 回执不合法: {e}")))?;
+    Ok(ConfigPutAck {
+        query_timeout_ms: r.query_timeout_ms,
+        query_memory_limit_bytes: r.query_memory_limit_bytes,
+        max_result_rows: r.max_result_rows,
+        max_result_bytes: r.max_result_bytes,
+        applied: r.applied,
+    })
+}
+
+/// 一条提交事件（`GET /api/v1/watch`；reader 角色即可订阅）。
+#[derive(Debug, Clone)]
+pub struct CommitEvent {
+    /// 事件所属库（多挂载后同缓冲收所有库的事件）。
+    pub database: String,
+    /// 事件所属表。
+    pub table: String,
+    /// 分区值（已解码为目录值；无分区表 = 空）。
+    pub partition: Vec<String>,
+    /// 该分区提交后的 generation（同步增量判据）。
+    pub generation: u64,
+    /// `Append` / `Overwrite` / `Clear`；**未知值原样透出**（服务端只增不改，
+    /// 老客户端按字符串比较别穷举）。
+    pub kind: String,
+}
+
+/// 一次 watch 长轮询的页。
+#[derive(Debug, Clone)]
+pub struct WatchPage {
+    /// 本页事件（可能为空 = wait 到期无新事件）。
+    pub events: Vec<CommitEvent>,
+    /// 下次请求带的游标（**唯一真源**；缓冲滚过/服务端重启 ⇒ 409
+    /// `CURSOR_TOO_OLD` ⇒ 必须全量对账一次再续订，原游标永远不会好）。
+    pub next: u64,
+    /// true = 还有积压，**立刻**用 `next` 再拉。
+    pub more: bool,
+}
+
+pub(crate) fn parse_watch(bytes: &[u8]) -> Result<WatchPage> {
+    #[derive(serde::Deserialize)]
+    struct RawEvent {
+        #[serde(default)]
+        database: String,
+        #[serde(default)]
+        table: String,
+        #[serde(default)]
+        partition: Vec<String>,
+        #[serde(default)]
+        generation: u64,
+        #[serde(default)]
+        kind: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        #[serde(default)]
+        events: Vec<RawEvent>,
+        #[serde(default)]
+        next: u64,
+        #[serde(default)]
+        more: bool,
+    }
+    let r: Raw = serde_json::from_slice(bytes)
+        .map_err(|e| Error::Decode(format!("json: /watch 响应不合法: {e}")))?;
+    Ok(WatchPage {
+        next: r.next,
+        more: r.more,
+        events: r
+            .events
+            .into_iter()
+            .map(|e| CommitEvent {
+                database: e.database,
+                table: e.table,
+                partition: e.partition,
+                generation: e.generation,
+                kind: e.kind,
+            })
+            .collect(),
+    })
+}
+
+/// 一个登录会话（`GET /api/v1/sessions`，admin 专属）。
+/// 与登录返回的 [`SessionInfo`] 分工：这是**管理视角的全量清单**（含活跃度
+/// 与在跑查询），那个是**本连接的身份**。
+#[derive(Debug, Clone)]
+pub struct AdminSession {
+    /// 会话 id（`session_kick` 的键）。
+    pub id: String,
+    /// 登录用户（`anonymous` = 开放模式）。
+    pub user: String,
+    /// 角色快照（每请求现查的展示值；白名单制用户可为 `None`）。
+    pub role: Option<String>,
+    /// `ip:port; User-Agent`（登录时定格）。
+    pub client: String,
+    /// 创建时刻（epoch 毫秒）。
+    pub created_at_ms: u64,
+    /// 最近活跃（epoch 毫秒）。
+    pub last_active_ms: u64,
+    /// 空闲毫秒数。
+    pub idle_ms: u64,
+    /// 会话默认库（`USE` 的落点）。
+    pub default_db: String,
+    /// 在跑查询的 id 列表。
+    pub running_queries: Vec<String>,
+    /// 累计发起查询数。
+    pub queries_total: u64,
+    /// 累计写入行数。
+    pub rows_written: u64,
+}
+
+pub(crate) fn parse_sessions(bytes: &[u8]) -> Result<Vec<AdminSession>> {
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        #[serde(default)]
+        sessions: Vec<RawSession>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RawSession {
+        id: String,
+        #[serde(default)]
+        user: String,
+        #[serde(default)]
+        role: Option<String>,
+        #[serde(default)]
+        client: String,
+        #[serde(default, rename = "createdAtMs")]
+        created_at_ms: u64,
+        #[serde(default, rename = "lastActiveMs")]
+        last_active_ms: u64,
+        #[serde(default, rename = "idleMs")]
+        idle_ms: u64,
+        #[serde(default, rename = "defaultDb")]
+        default_db: String,
+        #[serde(default, rename = "runningQueries")]
+        running_queries: Vec<String>,
+        #[serde(default, rename = "queriesTotal")]
+        queries_total: u64,
+        #[serde(default, rename = "rowsWritten")]
+        rows_written: u64,
+    }
+    let r: Raw = serde_json::from_slice(bytes)
+        .map_err(|e| Error::Decode(format!("json: /sessions 响应不合法: {e}")))?;
+    Ok(r.sessions
+        .into_iter()
+        .map(|s| AdminSession {
+            id: s.id,
+            user: s.user,
+            role: s.role,
+            client: s.client,
+            created_at_ms: s.created_at_ms,
+            last_active_ms: s.last_active_ms,
+            idle_ms: s.idle_ms,
+            default_db: s.default_db,
+            running_queries: s.running_queries,
+            queries_total: s.queries_total,
+            rows_written: s.rows_written,
+        })
+        .collect())
+}
+
+/// 一条运行中的查询（`GET /api/v1/queries`）。
+#[derive(Debug, Clone)]
+pub struct QueryInfo {
+    /// 服务端 query id（cancel 的键；客户端透传的 id 冲突回退后以此为准）。
+    pub id: String,
+    /// SQL 文本（注册时的原句）。
+    pub sql: String,
+    /// 已运行毫秒数。
+    pub elapsed_ms: u64,
+    /// 执行内存记账（字节；只含物化算子）。
+    pub memory_bytes: u64,
+    /// 是否已被取消（取消是协作式，标志置位到真正停下有毫秒级延迟）。
+    pub cancelled: bool,
+    /// 归属会话（Basic/超级 token/开放模式 = `None`）。
+    pub session_id: Option<String>,
+}
+
+pub(crate) fn parse_queries(bytes: &[u8]) -> Result<Vec<QueryInfo>> {
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        #[serde(default)]
+        queries: Vec<RawQuery>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RawQuery {
+        id: String,
+        #[serde(default)]
+        sql: String,
+        #[serde(default, rename = "elapsedMs")]
+        elapsed_ms: u64,
+        #[serde(default, rename = "memoryBytes")]
+        memory_bytes: u64,
+        #[serde(default)]
+        cancelled: bool,
+        #[serde(default, rename = "sessionId")]
+        session_id: Option<String>,
+    }
+    let r: Raw = serde_json::from_slice(bytes)
+        .map_err(|e| Error::Decode(format!("json: /queries 响应不合法: {e}")))?;
+    Ok(r.queries
+        .into_iter()
+        .map(|q| QueryInfo {
+            id: q.id,
+            sql: q.sql,
+            elapsed_ms: q.elapsed_ms,
+            memory_bytes: q.memory_bytes,
+            cancelled: q.cancelled,
+            session_id: q.session_id,
+        })
+        .collect())
+}

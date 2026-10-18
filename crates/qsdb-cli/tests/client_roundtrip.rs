@@ -14,7 +14,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use qsdb_client::{
-    Auth, Client, Column, Error, Format, Mode, Param, QueryOptions, Value, WriteOptions,
+    Auth, Client, Column, ConfigPatch, Error, Format, Mode, Param, QueryOptions, Value,
+    WriteOptions,
 };
 
 // ---------------------------------------------------------------------------
@@ -512,8 +513,8 @@ fn 取消运行中的查询() {
     let mut ok = false;
     for _ in 0..100 {
         std::thread::sleep(Duration::from_millis(50));
-        let q = c.running_queries().unwrap();
-        if q.to_string().contains(qid) {
+        let q = c.queries_list().unwrap();
+        if q.iter().any(|x| x.id == qid) {
             ok = true;
             break;
         }
@@ -984,4 +985,155 @@ fn 结果护栏覆盖与多库清单() {
         Err(Error::Api { status: 404, .. }) => {}
         other => panic!("未挂载库应 404，实为 {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// 管理面一等方法（十八批Ⅲ）：config / watch / sessions / grants
+// ---------------------------------------------------------------------------
+
+#[test]
+fn 管理面一等方法_config_watch_sessions_grants() {
+    // 带 token 起 server（后面要 CREATE USER——建了用户即要求认证，开放模式
+    // 会失效，所以全程走超级 token 当 admin）
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root =
+        std::env::temp_dir().join(format!("qsdb_client_admin_{}_{}", std::process::id(), uniq));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_qsdb"))
+        .args(["server", "--path"])
+        .arg(&root)
+        .args(["--addr", "127.0.0.1:0", "--token", "t0k"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let mut buf = Vec::new();
+    let port = loop {
+        let mut chunk = [0u8; 512];
+        match stderr.read(&mut chunk) {
+            Ok(0) | Err(_) => panic!("server 提前退出"),
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(p) = parse_port(&String::from_utf8_lossy(&buf)) {
+                    break p;
+                }
+            }
+        }
+    };
+    let c = Client::connect(
+        &format!("http://127.0.0.1:{port}"),
+        Auth::Bearer("t0k".into()),
+    )
+    .expect("connect");
+    setup(&c);
+    c.execute(
+        "INSERT INTO t VALUES (1,'x',10.5,true,DATE '2026-01-01',TIMESTAMP '2026-01-01 00:00:00')",
+    )
+    .unwrap();
+
+    // ---- config：get/put 往返 + applied 诚实 + 空补丁 Usage ----
+    let cfg = c.config_get().expect("config_get");
+    assert_eq!(cfg.max_result_rows, 0, "默认护栏关");
+    let ack = c
+        .config_put(&ConfigPatch {
+            max_result_rows: Some(7),
+            ..Default::default()
+        })
+        .expect("config_put");
+    assert!(ack.applied);
+    assert_eq!(ack.max_result_rows, 7, "回显生效值");
+    assert_eq!(c.config_get().unwrap().max_result_rows, 7);
+    c.config_put(&ConfigPatch {
+        max_result_rows: Some(0),
+        ..Default::default()
+    })
+    .expect("还原");
+    match c.config_put(&ConfigPatch::default()) {
+        Err(Error::Usage(_)) => {}
+        other => panic!("空补丁应 Usage，实为 {other:?}"),
+    }
+
+    // ---- watch：since=0 拉历史事件；追订阅空页；新写入立即可见 ----
+    let page = c.watch(Some(0), Duration::from_secs(1)).expect("watch");
+    assert!(
+        page.events
+            .iter()
+            .any(|e| e.kind == "Append" && e.table == "t"),
+        "since=0 应有 setup 的 Append 事件: {:?}",
+        page.events
+    );
+    assert!(page.more || !page.events.is_empty());
+    let page2 = c
+        .watch(Some(page.next), Duration::from_secs(1))
+        .expect("watch 追");
+    assert!(page2.events.is_empty(), "无新写入 ⇒ 空页");
+    c.execute(
+        "INSERT INTO t VALUES (2,'y',20.5,false,DATE '2026-01-02',TIMESTAMP '2026-01-02 00:00:00')",
+    )
+    .unwrap();
+    let page3 = c
+        .watch(Some(page.next), Duration::from_secs(5))
+        .expect("watch 追2");
+    assert!(
+        page3
+            .events
+            .iter()
+            .any(|e| e.kind == "Append" && e.table == "t"),
+        "新 INSERT 应出现在追订阅里"
+    );
+
+    // ---- sessions/kick + grants：建真用户（--token 下任意 Basic 不能匿名登录）----
+    c.execute("CREATE USER gu WITH PASSWORD 'gpass' ROLE admin")
+        .unwrap();
+    let c3 = Client::connect(
+        &format!("http://127.0.0.1:{port}"),
+        Auth::Bearer("t0k".into()),
+    )
+    .unwrap();
+    let si = c3.login("gu", "gpass").expect("gu 登录");
+    let ss = c.sessions_list().expect("sessions_list");
+    let target = ss.iter().find(|x| x.id == si.session_id).expect("会话在列");
+    assert_eq!(target.user, "gu");
+    let (kicked_id, cancelled) = c.session_kick(&si.session_id).expect("kick");
+    assert_eq!(kicked_id, si.session_id, "kicked 是会话 id 回显");
+    assert_eq!(cancelled, 0);
+    c3.query_with("SELECT 1", &QueryOptions::json())
+        .expect("被踢后读应自动重登恢复");
+
+    // ---- grants：整表替换 + 每请求现查（不重登即生效） ----
+    let mut g = std::collections::BTreeMap::new();
+    g.insert("default".to_string(), Some("reader".to_string()));
+    c.set_grants("gu", &g).expect("set_grants reader");
+    c3.query("SELECT 1").expect("reader 可查");
+    // reader 的 DDL 拒绝 = 403 FORBIDDEN（十九批Ⅲ归码修正：此前 SQL 面误归
+    // 400 INVALID_ARGUMENT，与 /write 面同动作的 403 自相矛盾）
+    match c3.execute("CREATE TABLE nope (a BIGINT)") {
+        Err(Error::Api {
+            status: 403, code, ..
+        }) => assert_eq!(code, "FORBIDDEN"),
+        other => panic!("reader 建表应 403 FORBIDDEN，实为 {other:?}"),
+    }
+    // 全拒（"*": null）——不重登即生效（每请求现查）
+    let mut g2 = std::collections::BTreeMap::new();
+    g2.insert("*".to_string(), None);
+    c.set_grants("gu", &g2).expect("set_grants 全拒");
+    match c3.query("SELECT 1") {
+        Err(Error::Api {
+            status: 403, code, ..
+        }) => assert_eq!(code, "FORBIDDEN"),
+        other => panic!("无权应 403 FORBIDDEN，实为 {other:?}"),
+    }
+    // 空表 → Usage（服务端对空表 400，客户端提前拦）
+    match c.set_grants("gu", &std::collections::BTreeMap::new()) {
+        Err(Error::Usage(_)) => {}
+        other => panic!("空 grants 应 Usage，实为 {other:?}"),
+    }
+    c.execute("DROP USER gu").unwrap();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&root);
 }

@@ -122,7 +122,10 @@ use std::time::Duration;
 
 pub use crate::bulk::{BulkTable, Column, ColumnIter, ColumnView, Row, Rows};
 pub use crate::error::{Error, Result};
-pub use crate::json::{DbInfo, JsonResult, PartitionInfo, SessionInfo, Stats, TableInfo, WriteAck};
+pub use crate::json::{
+    AdminSession, CommitEvent, ConfigPatch, ConfigPutAck, DbInfo, JsonResult, PartitionInfo,
+    QueryInfo, RuntimeConfig, SessionInfo, Stats, TableInfo, WatchPage, WriteAck,
+};
 pub use crate::rows::{Chunk, ChunkRow, RowStream, RowsData};
 pub use crate::value::{ColumnDesc, ColumnInfo, Tag, Value, ValueRef};
 
@@ -1041,11 +1044,9 @@ impl Client {
             .map_err(|e| Error::Decode(format!("json: /error-codes 响应不合法: {e}")))
     }
 
-    /// 运行中的查询（诊断）。
-    pub fn running_queries(&self) -> Result<serde_json::Value> {
-        let b = self.get_json("/api/v1/queries")?;
-        serde_json::from_slice(&b)
-            .map_err(|e| Error::Decode(format!("json: /queries 响应不合法: {e}")))
+    /// 运行中的查询（诊断面板用）。
+    pub fn queries_list(&self) -> Result<Vec<QueryInfo>> {
+        json::parse_queries(&self.get_json("/api/v1/queries")?)
     }
 
     /// 取消一条查询（配合 [`QueryOptions::query_id`] 用；**用响应回显的 id**）。
@@ -1066,6 +1067,128 @@ impl Client {
             return Err(json::api_error(resp.head.status, &resp.body));
         }
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // 管理面一等方法（十八批Ⅲ）——此前只能裸 HTTP 的端点全部收编
+    // -----------------------------------------------------------------------
+
+    /// 运行期配置快照（`GET /api/v1/config` 的 `runtime` 节；完整响应体在
+    /// [`RuntimeConfig::raw`]）。reader 无法访问（admin 专属 ⇒ 403 原样上抛）。
+    pub fn config_get(&self) -> Result<RuntimeConfig> {
+        json::parse_runtime_config(&self.get_json("/api/v1/config")?)
+    }
+
+    /// 热更运行期配置（`PUT /api/v1/config`）：超时 / 单查询内存 / 结果护栏
+    /// 行数与体量，四个键全部即时生效。回执 [`ConfigPutAck`] 回显**生效后**
+    /// 的值——建议比对（不一致 = 别的客户端在同时改）。
+    ///
+    /// # 报错
+    /// 空补丁 → [`Error::Usage`]（发出去注定 `applied:false`）；
+    /// 键名拼错不会发生（方法拼好的），但 `applied:false` 原样透传供调用方断言。
+    pub fn config_put(&self, patch: &ConfigPatch) -> Result<ConfigPutAck> {
+        if patch.is_empty() {
+            return Err(Error::Usage(
+                "config_put 收到空补丁——至少给一个要改的键（否则服务端 applied:false）".into(),
+            ));
+        }
+        let resp = self.http.put(
+            "/api/v1/config",
+            "application/json",
+            patch.to_body().as_bytes(),
+        );
+        let r = match resp {
+            Ok(r) if !(200..300).contains(&r.head.status) => {
+                Err(json::api_error(r.head.status, &r.body))
+            }
+            Ok(r) => json::parse_config_put_ack(&r.body),
+            Err(e) => Err(e),
+        };
+        self.write_handle_revoked(r)
+    }
+
+    /// 提交事件长轮询（`GET /api/v1/watch`）：有事件立刻返回；没有就挂到
+    /// `wait` 到期。`since = None` 表示**从现在开始**订阅；之后永远传上一次
+    /// 响应的 [`WatchPage::next`]。
+    ///
+    /// # ⚠️ 两条契约级纪律
+    /// 1. `more == true` ⇒ 还有积压，**立刻**用 `next` 再拉（别等 wait）；
+    /// 2. 撞 409 `CURSOR_TOO_OLD`（缓冲滚过 / 服务端重启）⇒ 原游标**永远不会
+    ///    好**——做一次全量对账（`tables` + `partitions`），再从响应头新的
+    ///    `next` 续订。事件是加速器不是真相来源，请保留慢轮询兜底。
+    ///
+    /// # ⚠️ 超时
+    /// 长轮询会**阻塞读到** `wait` 到期——若设了 [`ConnectOptions::io_timeout`]，
+    /// 它必须 ≥ `wait`（默认 io_timeout = 不设，直接可用）。
+    pub fn watch(&self, since: Option<u64>, wait: std::time::Duration) -> Result<WatchPage> {
+        let mut path = format!("/api/v1/watch?wait={}", wait.as_secs().max(1));
+        if let Some(s) = since {
+            path.push_str(&format!("&since={s}"));
+        }
+        json::parse_watch(&self.get_json(&path)?)
+    }
+
+    /// 登录会话清单（`GET /api/v1/sessions`，admin 专属）：谁连着、在跑什么、
+    /// 多久没动。会话不持久化——服务端重启即清空。
+    pub fn sessions_list(&self) -> Result<Vec<AdminSession>> {
+        json::parse_sessions(&self.get_json("/api/v1/sessions")?)
+    }
+
+    /// **踢会话**（admin）：取消它全部在跑查询 + 吊销 token。被踢方的下一条
+    /// 请求收到 401 `SESSION_REVOKED`（若对方也是本 crate，会自动重登恢复）。
+    /// 返回 `(被踢的会话 id, 取消的查询数)`——`kicked` 是服务端对**会话 id 的
+    /// 回显**（不是计数；不存在的 id 是 404 `NOT_FOUND`）。
+    pub fn session_kick(&self, session_id: &str) -> Result<(String, u64)> {
+        let p = format!("/api/v1/sessions/{}", http::percent_encode(session_id));
+        let resp = self.http.delete(&p);
+        let r = match resp {
+            Ok(r) if !(200..300).contains(&r.head.status) => {
+                Err(json::api_error(r.head.status, &r.body))
+            }
+            Ok(r) => {
+                #[derive(serde::Deserialize)]
+                struct Ack {
+                    #[serde(default)]
+                    kicked: String,
+                    #[serde(default, rename = "cancelledQueries")]
+                    cancelled_queries: u64,
+                }
+                let a: Ack = serde_json::from_slice(&r.body)
+                    .map_err(|e| Error::Decode(format!("json: 踢会话回执不合法: {e}")))?;
+                Ok((a.kicked, a.cancelled_queries))
+            }
+            Err(e) => Err(e),
+        };
+        self.write_handle_revoked(r)
+    }
+
+    /// **库级授权整表替换**（`PUT /api/v1/users/{name}/grants`，admin 专属）。
+    ///
+    /// 键 = 库名或 `"*"`；值 = `Some("reader"/"writer"/"admin")` 或 `None`
+    /// （显式无权）。**PUT = 全量替换**（想全拒给 `{"*": None}`；空 map 是
+    /// 400——服务端不给"清空但保留条目"的歧义语义）。判定每请求现查 ⇒
+    /// 返回即生效，被改用户无需重登。
+    pub fn set_grants(
+        &self,
+        user: &str,
+        grants: &std::collections::BTreeMap<String, Option<String>>,
+    ) -> Result<()> {
+        if grants.is_empty() {
+            return Err(Error::Usage(
+                "set_grants 收到空表——全拒请给 {\"*\": None}（服务端对空表 400）".into(),
+            ));
+        }
+        let body = serde_json::json!({ "grants": grants }).to_string();
+        let p = format!("/api/v1/users/{}/grants", http::percent_encode(user));
+        let resp = self.http.put(&p, "application/json", body.as_bytes());
+        let r = match resp {
+            Ok(r) if !(200..300).contains(&r.head.status) => {
+                Err(json::api_error(r.head.status, &r.body))
+            }
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        };
+        self.write_handle_revoked(r)
     }
 
     fn get_json(&self, path: &str) -> Result<Vec<u8>> {
