@@ -1308,7 +1308,7 @@ fn error_catalog_endpoint_and_no_off_catalog_codes() {
     // 条数与代码侧枚举一致（docs/error-codes.md ↔ enum 的逐字对账在单测里）
     // 条数（集成测试看不到 crate 内部枚举，故这里写死；**逐字对账在 `error_code.rs`
     // 的单测里**，那条才是防漂移的权威）
-    assert_eq!(codes.len(), 25, "目录应列出全部码（数错说明漏挂在 ALL 上）");
+    assert_eq!(codes.len(), 26, "目录应列出全部码（数错说明漏挂在 ALL 上）");
     for c in &codes {
         for k in ["code", "http", "retry", "category", "sqlState"] {
             assert!(c.get(k).is_some(), "目录条目缺字段 {k}: {c}");
@@ -2251,4 +2251,164 @@ fn session_default_db_endpoint() {
         String::from_utf8_lossy(&r.body).contains("qsdb_sessions 1"),
         "metrics 应有会话 gauge"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 22. 结果护栏（十七批 R1）：超限恒 400 不回部分数据 + 覆盖优先级 + 热更 +
+//     体量闸 + DML 不受限 + metrics 计数
+// ---------------------------------------------------------------------------
+
+#[test]
+fn result_guardrail_limit_override_hot_update_and_dml_exempt() {
+    // 行数护栏 3，表 5 行 —— 起步即超限
+    let srv = Server::start(&["--max-result-rows", "3"]);
+    let p = srv.port;
+    let post = |body: serde_json::Value, extra: &[(&str, &str)]| {
+        let mut h = vec![("Content-Type", "application/json")];
+        h.extend_from_slice(extra);
+        http(p, "POST", "/api/v1/query", &h, body.to_string().as_bytes())
+    };
+
+    assert_eq!(
+        query(p, "CREATE TABLE gt (a BIGINT)", None).status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&query(p, "CREATE TABLE gt (a BIGINT)", None).body)
+    );
+    let r = query(p, "INSERT INTO gt VALUES (1),(2),(3),(4),(5)", None);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+
+    // 超限 → 400 RESULT_TOO_LARGE；错误体只有 {error, code}，**没有 rows**
+    let r = query(p, "SELECT * FROM gt", None);
+    assert_eq!(r.status, 400, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.code(), "RESULT_TOO_LARGE");
+    assert!(
+        r.json().get("rows").is_none(),
+        "拒绝响应不得携带部分数据: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let err = r.json()["error"].as_str().unwrap_or_default().to_string();
+    assert!(err.contains("5 rows"), "文案应带实际行数: {err}");
+    assert!(err.contains("max-result-rows"), "文案应带上限名: {err}");
+
+    // **全格式一致**：护栏在执行后、序列化前——ipc/bulk/rows/csv 同样恒 400
+    for f in ["ipc", "bulk", "rows", "csv"] {
+        let r = post(
+            serde_json::json!({"sql": "SELECT * FROM gt", "format": f}),
+            &[],
+        );
+        assert_eq!(r.status, 400, "format={f} 也应被护栏拦下");
+        assert_eq!(r.code(), "RESULT_TOO_LARGE", "format={f}");
+    }
+
+    // 每请求覆盖：body `maxRows: 0` = 本次不限（5 行全回）
+    let r = post(
+        serde_json::json!({"sql": "SELECT * FROM gt", "maxRows": 0}),
+        &[],
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["rowCount"], 5);
+    // snake_case 别名同样可用
+    let r = post(
+        serde_json::json!({"sql": "SELECT * FROM gt", "max_rows": 0}),
+        &[],
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    // 头覆盖（body 缺省时生效）
+    let r = query_auth(p, "SELECT * FROM gt", None, &[("X-QSDB-Max-Rows", "0")]);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    // **body 优先于头**：头 0（不限）+ body 2（收紧）→ 仍拦
+    let r = post(
+        serde_json::json!({"sql": "SELECT * FROM gt", "maxRows": 2}),
+        &[("X-QSDB-Max-Rows", "0")],
+    );
+    assert_eq!(r.status, 400);
+    assert_eq!(r.code(), "RESULT_TOO_LARGE");
+    // 覆盖可**收紧**：服务器 3、头给 4 仍是 5 行超 4 → 拦（覆盖双向，不是只许放宽）
+    let r = query_auth(p, "SELECT * FROM gt", None, &[("X-QSDB-Max-Rows", "4")]);
+    assert_eq!(r.status, 400);
+    // LIMIT 后结果变小 → 自然通过（护栏管结果，不管语句）
+    assert_eq!(query(p, "SELECT * FROM gt LIMIT 2", None).status, 200);
+    // 非法头值 → 显式 400（不静默忽略）
+    let r = query_auth(p, "SELECT 1", None, &[("X-QSDB-Max-Rows", "abc")]);
+    assert_eq!(r.status, 400);
+    assert_eq!(r.code(), "INVALID_ARGUMENT");
+
+    // DML 不受限：CTAS 的源结果集超护栏，但**回执**很小 → 照常成功（护栏只管结果集）
+    let r = query(p, "CREATE TABLE gt2 AS SELECT * FROM gt", None);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    // 读回 gt2 的 5 行是结果集 → 照样被拦（不是只有 gt 被特殊对待）
+    assert_eq!(query(p, "SELECT * FROM gt2", None).status, 400);
+
+    // 热更：PUT /config（camelCase）→ 立即生效；GET /config 回显
+    let r = http(
+        p,
+        "PUT",
+        "/api/v1/config",
+        &[("Content-Type", "application/json")],
+        br#"{"maxResultRows":10}"#,
+    );
+    assert_eq!(r.status, 200);
+    assert_eq!(r.json()["applied"], true, "camelCase 键应生效");
+    assert_eq!(r.json()["maxResultRows"], 10);
+    assert_eq!(query(p, "SELECT * FROM gt", None).status, 200);
+    let r = http(p, "GET", "/api/v1/config", &[], &[]);
+    assert_eq!(r.json()["runtime"]["maxResultRows"], 10);
+    // 关闭（0）→ 放行
+    let r = http(
+        p,
+        "PUT",
+        "/api/v1/config",
+        &[("Content-Type", "application/json")],
+        br#"{"maxResultRows":0}"#,
+    );
+    assert_eq!(r.json()["applied"], true);
+    assert_eq!(query(p, "SELECT * FROM gt", None).status, 200);
+
+    // 体量闸（估算护栏）：1 字节上限 → 任何非空结果都拦；**覆盖接管护栏整体**
+    // ——maxRows=0 连体量闸一并豁免（护栏只有一个豁免口径，客户端显式担责）
+    let r = http(
+        p,
+        "PUT",
+        "/api/v1/config",
+        &[("Content-Type", "application/json")],
+        br#"{"maxResultBytes":1}"#,
+    );
+    assert_eq!(r.json()["applied"], true);
+    let r = query(p, "SELECT * FROM gt LIMIT 1", None);
+    assert_eq!(r.status, 400, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.code(), "RESULT_TOO_LARGE");
+    let err = r.json()["error"].as_str().unwrap_or_default().to_string();
+    assert!(
+        err.contains("arrow estimate"),
+        "体量文案应注明是估算: {err}"
+    );
+    let r = post(
+        serde_json::json!({"sql": "SELECT * FROM gt LIMIT 1", "maxRows": 0}),
+        &[],
+    );
+    assert_eq!(
+        r.status,
+        200,
+        "覆盖应连体量闸一并接管: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let r = http(
+        p,
+        "PUT",
+        "/api/v1/config",
+        &[("Content-Type", "application/json")],
+        br#"{"maxResultBytes":0}"#,
+    );
+    assert_eq!(r.json()["applied"], true);
+
+    // metrics：reason="result_size" 计数 > 0（本测试已拦 ≥8 次）
+    let r = http(p, "GET", "/metrics", &[], &[]);
+    let text = String::from_utf8_lossy(&r.body);
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("qsdb_queries_rejected_total{reason=\"result_size\"}"))
+        .expect("metrics 应有 result_size 拒绝计数");
+    let v: f64 = line.rsplit(' ').next().unwrap().parse().unwrap();
+    assert!(v >= 8.0, "护栏拒绝应已计数: {line}");
 }

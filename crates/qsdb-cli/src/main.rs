@@ -130,6 +130,18 @@ enum Cmd {
         /// 显式给定时优先于 `--config` 里的同名项。
         #[arg(long)]
         query_memory_limit_mb: Option<u64>,
+        /// **结果护栏·行数**（十七批 R1；默认 0 = 关，升级零行为变更）。
+        /// 单次查询结果行数超过它 → 400 `RESULT_TOO_LARGE`，**绝不返回部分
+        /// 数据**。检查点在执行后、序列化前（不省计算，纯传输护栏，全格式
+        /// 一致）；可被每请求 `maxRows`/`X-QSDB-Max-Rows` 覆盖，
+        /// 可经 `PUT /api/v1/config` 热更。显式给定时优先于 `--config`。
+        #[arg(long)]
+        max_result_rows: Option<u64>,
+        /// **结果护栏·体量**（MB，按 Arrow 内存估算；默认 0 = 关）。
+        /// JSON 序列化后实际体积可达估算的 1.5~3×（转义/数字展开）——
+        /// 要精确护栏用 `--max-result-rows`。热更键 `maxResultBytes`。
+        #[arg(long)]
+        max_result_mb: Option<u64>,
         /// 配置文件（JSON：query_timeout_ms / query_memory_limit_bytes）
         #[arg(long)]
         config: Option<PathBuf>,
@@ -627,6 +639,8 @@ fn main() {
             spill_dir,
             memory_budget_mb,
             query_memory_limit_mb,
+            max_result_rows,
+            max_result_mb,
             flight_bind,
             file_cache_mb,
             storage_type,
@@ -845,6 +859,8 @@ fn main() {
                 Some(session_idle_timeout_mins),
                 // MB → 字节；未显式给则 None（让配置文件优先，再由 serve 兜 4GB）
                 query_memory_limit_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
+                max_result_rows,
+                max_result_mb,
                 config.as_deref(),
                 flight_bind,
                 staging_secs,

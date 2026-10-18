@@ -46,6 +46,7 @@
 | 超时 | HTTP 头 `X-QSDB-Timeout: <ms>`；嵌入 API `Qsdb::new_query_context(Some(ms))` | 显式传值优先于运行期默认 |
 | 取消 | `POST /api/v1/queries/{id}/cancel`；嵌入 API `ctx.cancel()` | 协作式：算子批边界生效（并行分片即刻可见） |
 | 内存上限 | 嵌入 API `QueryContext::new(id, None, Some(bytes))` | 单查询独立限额 |
+| **结果护栏** | HTTP body `"maxRows": N`（规范名；别名 `max_rows`）或头 `X-QSDB-Max-Rows: <n>` | **给出即接管本请求的护栏整体**（行数 = 此值，体量闸一并放开；`0` = 本请求不限）。body 优先于头，头优先于服务器值——**双向覆盖**（可放宽也可收紧）。仅可信客户端可用（查询面本就有 grants） |
 
 ## 四、表级配置（建表时写入 `table.json` 的 `properties`，随表持久化）
 
@@ -69,6 +70,8 @@
 | 全局内存预算 | `--memory-budget-mb` / **4096** | ❌（open 期定死） | 全库执行内存 + 缓存总上界；0 = 不限。超预算 → 503 `MEMORY_PRESSURE`（**可退避重试**）。**这是「进程内存上界」的承诺落点** |
 | 单查询内存上限 | `--query-memory-limit-mb` / **4096** | ✅（`PUT /api/v1/config`） | 单查询自己的配额；0 = 不限。超限 → 400 `QUERY_MEMORY_LIMIT`（改查询才有用） |
 | 并发查询上限 | `--max-concurrent-queries` / **0（不限）** | ❌（当前版） | 0 = 不限；超限直接 503 `TOO_MANY_QUERIES`（不排队，可退避重试）。**只管条数、不承担内存职责**（内存归预算管）——先前默认 16 是因为"它是唯一的系统级内存上界"，预算落地后该理由不成立，且按条数限流会误伤轻查询 |
+| **结果护栏·行数** | `--max-result-rows` / **0（关）** | ✅（`PUT /api/v1/config`，键 `maxResultRows`） | 单次查询结果行数超限 → 400 `RESULT_TOO_LARGE`，**绝不返回部分数据**。检查点在执行后、序列化前（不省计算，纯传输护栏；json/ipc/bulk/rows/csv 全格式一致）。默认关 ⇒ 升级零行为变更 |
+| **结果护栏·体量** | `--max-result-mb` / **0（关）** | ✅（同上，键 `maxResultBytes`） | 结果体量上限，按 **Arrow 数组内存估算**——JSON 序列化后实际体积可达估算的 1.5~3×（转义/数字展开），要精确护栏用行数档。热更值单位是**字节**（CLI 是 MB） |
 | 会话空闲回收 | `--session-idle-timeout-mins` / **0（关）** | ❌ | 超时会话按"踢人"路径清理（取消在跑查询 + 吊销 token，之后 401 `SESSION_REVOKED`）。默认关的理由：踢错活跃会话的代价大于泄漏代价（会话对象 ~百字节级，泄漏是审计噪音不是内存问题） |
 | **多库挂载** | `--mount 名=路径`（可重复；带选项 `名=路径,budget-mb=2048,read-only`） | ❌ | **`default` 库固定来自 `--path`**（`--mount default=…` 显式拒绝）。名字（小写 `[a-z_][a-z0-9_]*`）进 SQL 限定符（`settle.t`）、`USE`、`SHOW DATABASES` 与 grants 键。**各挂载独立**内存预算/解码缓存/写缓冲（缓存 `--cache-mb` 每挂载一份）；**并发闸是实例级的**（过载保护管整个进程）。跨库 JOIN/事务显式拒（501）。`--mount` 同路径双挂载拒绝 |
 | 写缓冲阈值 | WriteBufferOptions（代码默认 64 批/128MB） | ❌ | 攒批自动 flush |
@@ -163,13 +166,14 @@ drift 时显式报错转人工 ALTER（最小权限原则）。此矩阵不改�
 **流式路径不记账**：扫描/过滤/聚合是拉式迭代（一批 8192 行用完即弃），不驻留——
 故空闲进程 RSS 只有几 MB。只有「必须物化」的算子才吃账本。
 
-### 三道闸（仅 server；嵌入模式由宿主自控）
+### 四道闸（仅 server；嵌入模式由宿主自控）
 
 | 闸 | 默认 | 超限行为 |
 |---|------|---------|
 | `--memory-budget-mb` | **4096**（4GB；0 = 不限） | **全库**执行内存 + 缓存的总上界。要不到额度 → 503 **`MEMORY_PRESSURE`**（**可退避重试**——多为他人占用）。这才是「进程内存上界」的落点 |
 | `--query-memory-limit-mb` | **4096**（4GB；0 = 不限） | 单查询**自己的配额**超限 → 400 `QUERY_MEMORY_LIMIT`（**改查询才有用**，重试无用） |
 | `--max-concurrent-queries` | **0**（不限） | 并发**条数**上限 → 503 `TOO_MANY_QUERIES`（可退避重试）。**它不再承担内存职责**（内存归预算管）；真需要过载保护/公平性时才显式给 |
+| `--max-result-rows` / `--max-result-mb` | **0（关）** | **结果传输体量**上限（十七批 R1）→ 400 `RESULT_TOO_LARGE`（**绝不返回部分数据**；重试无用，加 LIMIT / 换流式格式 / `COPY` 导出）。与前三者正交：超时管计算时长、内存管执行、护栏管传输——一条查询可以算得快、省内存、但结果太大 |
 
 **"内存不够"的两种码别混**（客户端动作相反）：`QUERY_MEMORY_LIMIT`（你的查询太大 →
 改查询）/ `MEMORY_PRESSURE`（全库此刻吃紧 → 退避重试）。**三种 503 也别按状态码一刀切**。
@@ -204,10 +208,13 @@ GET  /api/v1/error-codes            # 错误码目录（静态、免鉴权）
 snake_case 都接受**——`queryTimeoutMs` / `queryMemoryLimitBytes`（与 GET 回显
 同形，故「读-改-写」整轮可行）或 `query_timeout_ms` / `query_memory_limit_bytes`
 （与 `--config` 文件同形）。两个键名同时出现 → **422**（重复字段，不猜）。
+结果护栏两键同款（十七批 R1）：`maxResultRows` / `maxResultBytes` 或
+`max_result_rows` / `max_result_bytes`。
 
 - 应答 `applied` = **确实落了至少一个已知字段**：空 body 或键名拼错时为 `false`
   （此前恒返回 `true`，键名拼错会拿到"成功"的假信号——已修）
-- 应答回显**生效后**的 `queryTimeoutMs` / `queryMemoryLimitBytes`，客户端可直接比对
+- 应答回显**生效后**的 `queryTimeoutMs` / `queryMemoryLimitBytes` /
+  `maxResultRows` / `maxResultBytes`，客户端可直接比对
 
 CLI 等价：`qsdb admin tables|partitions|compact|refresh-index|gc`。
 
@@ -323,6 +330,10 @@ qsdb server --path /data/qsdb   --addr 0.0.0.0:9430   --memory-budget-mb 4096   
 # --query-memory-limit-mb 4096   单查询配额；大聚合单条超限时才调大
 # --max-concurrent-queries 0     默认不限；过载保护需要时显式给（见 B.3）
 # --cache-mb 256                 热数据缓存；宽投影快查显式调大（代价见启动期表）
+# --max-result-rows 1000000      可选：结果护栏（默认关）。面向 BI/看板的部署
+#                                建议开（手滑 SELECT * 的闸）；批量取数客户端
+#                                走 ipc/rows/bulk 流式格式或本请求 maxRows 覆盖，
+#                                全量导出走 COPY（护栏不适用）
 ```
 
 安全基线二选一：`--token <运维密钥>`（运维后门 + 最简）**或**建用户

@@ -16,7 +16,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use qsdb::{NotFoundKind, QsdbError};
 
-/// 目录里的全部错误码（25 个）。
+/// 目录里的全部错误码（26 个）。
 ///
 /// 顺序 = 文档 §三 表格顺序 = 目录端点输出顺序，便于对账。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +25,11 @@ pub enum ErrorCode {
     QueryTimeout,
     QueryCancelled,
     QueryMemoryLimit,
+    /// 结果护栏超限（十七批 R1）：单次查询的结果行数/体量超过部署护栏。
+    /// 检查点在**执行后、序列化前**——恒定拒绝、绝不返回部分数据
+    /// （throw 不 break；静默部分数据是本仓红线）。与 QUERY_MEMORY_LIMIT
+    /// 同构："改查询/换流式格式才有用，重试无用"。
+    ResultTooLarge,
     QueryPanic,
     TableNotFound,
     ColumnNotFound,
@@ -60,10 +65,11 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// 全量清单（目录端点与漂移测试的唯一来源）。
-    pub const ALL: [ErrorCode; 25] = [
+    pub const ALL: [ErrorCode; 26] = [
         Self::QueryTimeout,
         Self::QueryCancelled,
         Self::QueryMemoryLimit,
+        Self::ResultTooLarge,
         Self::QueryPanic,
         Self::TableNotFound,
         Self::ColumnNotFound,
@@ -94,6 +100,7 @@ impl ErrorCode {
             Self::QueryTimeout => "QUERY_TIMEOUT",
             Self::QueryCancelled => "QUERY_CANCELLED",
             Self::QueryMemoryLimit => "QUERY_MEMORY_LIMIT",
+            Self::ResultTooLarge => "RESULT_TOO_LARGE",
             Self::QueryPanic => "QUERY_PANIC",
             Self::TableNotFound => "TABLE_NOT_FOUND",
             Self::ColumnNotFound => "COLUMN_NOT_FOUND",
@@ -125,6 +132,7 @@ impl ErrorCode {
             Self::QueryTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::QueryCancelled
             | Self::QueryMemoryLimit
+            | Self::ResultTooLarge
             | Self::TableNotFound
             | Self::ColumnNotFound
             | Self::ParseError
@@ -164,6 +172,7 @@ impl ErrorCode {
             Self::QueryTimeout
             | Self::QueryCancelled
             | Self::QueryMemoryLimit
+            | Self::ResultTooLarge
             | Self::QueryPanic
             | Self::TableNotFound
             | Self::ColumnNotFound
@@ -192,6 +201,10 @@ impl ErrorCode {
             Self::QueryTimeout => "57014",
             Self::QueryCancelled => "HY008",
             Self::QueryMemoryLimit => "53200",
+            // 54000 = program_limit_exceeded：结果超部署护栏与"程序性上限"同族
+            // （PG 把磁盘满/超出上限都归此类），与 QUERY_MEMORY_LIMIT 的 53200
+            // （out_of_memory 类）刻意区分——护栏管的是**传输体量**不是内存
+            Self::ResultTooLarge => "54000",
             Self::QueryPanic | Self::MetadataError | Self::Internal => "XX000",
             Self::TableNotFound => "42P01",
             Self::ColumnNotFound => "42703",
@@ -305,6 +318,7 @@ impl ErrorCode {
             Self::WriteConflict | Self::StaleWriter | Self::CursorTooOld => Code::Aborted,
             Self::IoError => Code::Unavailable,
             Self::QueryMemoryLimit
+            | Self::ResultTooLarge
             | Self::QueryPanic
             | Self::TableNotFound
             | Self::ColumnNotFound
@@ -476,6 +490,20 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         assert!(!ErrorCode::QueryMemoryLimit.retryable());
+    }
+
+    /// 三闸正交（十七批 R1）：超时管**计算时长**、QUERY_MEMORY_LIMIT 管**执行
+    /// 内存**、RESULT_TOO_LARGE 管**结果传输体量**。护栏与内存配额同为 400
+    /// no-retry，但 SQLState 刻意不同（54000 程序性上限 vs 53200 内存类）——
+    /// 混用一个码，驱动就无法提示"改 LIMIT/换流式格式"这个正确动作。
+    #[test]
+    fn result_guard_is_its_own_gate() {
+        let c = ErrorCode::ResultTooLarge;
+        assert_eq!(c.status(), StatusCode::BAD_REQUEST);
+        assert!(!c.retryable());
+        assert_eq!(c.category(), "query");
+        assert_eq!(c.sqlstate(), "54000");
+        assert_ne!(c.sqlstate(), ErrorCode::QueryMemoryLimit.sqlstate());
     }
 
     /// NotFound 的类别决定查询端点的码——不再嗅探文案。

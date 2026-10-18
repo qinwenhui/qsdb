@@ -131,6 +131,15 @@ pub struct AppState {
     pub queries: std::sync::Mutex<HashMap<String, QueryEntry>>,
     /// 并发查询上限（0 = 不限）
     pub max_concurrent_queries: usize,
+    /// 结果护栏·行数上限（十七批 R1；0 = 不限）。检查点在**执行后、序列化前**，
+    /// 超限恒定 400 `RESULT_TOO_LARGE`（绝不返回部分数据）。落 AppState 而非
+    /// 各挂载 runtime——护栏管的是**传输体量**（server 面），不是某个库的执行；
+    /// 原子 = `PUT /api/v1/config` 热更（与并发闸同族）。
+    pub max_result_rows: AtomicU64,
+    /// 结果护栏·体量上限（字节，按 Arrow 数组内存估算；0 = 不限）。估算口径：
+    /// JSON 序列化后实际体积可达估算的 1.5~3×（字符串转义/数字展开）——要精确
+    /// 护栏用行数上限。
+    pub max_result_bytes: AtomicU64,
 }
 
 /// 一个挂载库（M-B）：句柄 + 该句柄**自己的写缓冲**（预算/缓存/锁随句柄天然隔离）。
@@ -164,6 +173,8 @@ impl AppState {
             metrics: Metrics::default(),
             queries: std::sync::Mutex::new(HashMap::new()),
             max_concurrent_queries,
+            max_result_rows: AtomicU64::new(0),
+            max_result_bytes: AtomicU64::new(0),
         }
     }
 
@@ -295,6 +306,8 @@ pub struct Metrics {
     pub rejected_concurrency: AtomicU64,
     /// 被全局内存预算拒绝（`MEMORY_PRESSURE`）次数
     pub rejected_memory: AtomicU64,
+    /// 被结果护栏拒绝（`RESULT_TOO_LARGE`）次数（十七批 R1）
+    pub rejected_result_size: AtomicU64,
 }
 
 impl Metrics {
@@ -322,7 +335,7 @@ impl Metrics {
              # HELP qsdb_sessions current login sessions\n# TYPE qsdb_sessions gauge\nqsdb_sessions {}\n\
              # HELP qsdb_memory_used_bytes memory in use (exec = materializing operators, cache = decoded LRU)\n# TYPE qsdb_memory_used_bytes gauge\nqsdb_memory_used_bytes{{pool=\"exec\"}} {}\nqsdb_memory_used_bytes{{pool=\"cache\"}} {}\n\
              # HELP qsdb_memory_budget_bytes global memory budget (0 = unlimited)\n# TYPE qsdb_memory_budget_bytes gauge\nqsdb_memory_budget_bytes {}\n\
-             # HELP qsdb_queries_rejected_total queries rejected by admission control\n# TYPE qsdb_queries_rejected_total counter\nqsdb_queries_rejected_total{{reason=\"concurrency\"}} {}\nqsdb_queries_rejected_total{{reason=\"memory\"}} {}\n",
+             # HELP qsdb_queries_rejected_total queries rejected by admission control\n# TYPE qsdb_queries_rejected_total counter\nqsdb_queries_rejected_total{{reason=\"concurrency\"}} {}\nqsdb_queries_rejected_total{{reason=\"memory\"}} {}\nqsdb_queries_rejected_total{{reason=\"result_size\"}} {}\n",
             self.requests_total.load(Ordering::Relaxed),
             self.errors_total.load(Ordering::Relaxed),
             if qc > 0 {
@@ -345,6 +358,7 @@ impl Metrics {
             self.mem_budget.load(Ordering::Relaxed),
             self.rejected_concurrency.load(Ordering::Relaxed),
             self.rejected_memory.load(Ordering::Relaxed),
+            self.rejected_result_size.load(Ordering::Relaxed),
         )
     }
 }
@@ -358,6 +372,12 @@ pub struct ServerConfigFile {
     pub query_timeout_ms: Option<u64>,
     #[serde(default)]
     pub query_memory_limit_bytes: Option<u64>,
+    /// 结果护栏（十七批 R1）：行数 / 体量（字节）。与 CLI 同名项同族——
+    /// CLI 显式值优先。
+    #[serde(default)]
+    pub max_result_rows: Option<u64>,
+    #[serde(default)]
+    pub max_result_bytes: Option<u64>,
 }
 
 /// 单查询执行内存的兜底默认闸门（4GB）。
@@ -382,6 +402,10 @@ pub async fn serve(
     // 单查询执行内存闸门（字节；`Some(0)` = 显式不限，`None` = 未指定，交由
     // 配置文件 / 兜底默认决定）。
     query_memory_limit_bytes: Option<u64>,
+    // 结果护栏（十七批 R1）：行数 / 体量（MB；`None` = 未指定，交由配置文件 /
+    // 默认 0 = 关）。默认关 ⇒ 升级零行为变更。
+    max_result_rows: Option<u64>,
+    max_result_mb: Option<u64>,
     config_file: Option<&std::path::Path>,
     #[cfg_attr(not(feature = "flight"), allow(unused_variables))] flight_bind: Option<String>,
     #[cfg_attr(not(feature = "s3"), allow(unused_variables))] staging_upload_secs: Option<u64>,
@@ -413,6 +437,20 @@ pub async fn serve(
         query_memory_limit_bytes
             .or(cfg.query_memory_limit_bytes)
             .unwrap_or(DEFAULT_QUERY_MEMORY_LIMIT_BYTES),
+    );
+    // 结果护栏（十七批 R1）：**默认关**（0 = 不限）——升级零行为变更；部署方
+    // 显式给了才守。CLI 显式值 > 配置文件 > 0。落 AppState 原子（热更入口见
+    // put_config），查询端点在执行后、序列化前检查。
+    state.max_result_rows.store(
+        max_result_rows.or(cfg.max_result_rows).unwrap_or(0),
+        Ordering::Relaxed,
+    );
+    state.max_result_bytes.store(
+        max_result_mb
+            .map(|mb| mb.saturating_mul(1024 * 1024))
+            .or(cfg.max_result_bytes)
+            .unwrap_or(0),
+        Ordering::Relaxed,
     );
 
     // 写入走大 body（Arrow IPC 批）；默认 2MB 限制放大到 1GB
@@ -1854,6 +1892,14 @@ struct QueryBody {
     /// 缺省 = 没有参数（行为与从前一字不差）。
     #[serde(default)]
     params: Option<serde_json::Value>,
+    /// 结果护栏的**本请求覆盖**（十七批 R1）：给出即接管本请求的护栏整体
+    /// （行数 = 此值，体量闸一并放开——护栏只有一个豁免口径，客户端显式担责；
+    /// 要在护栏内自限请在 SQL 里加 LIMIT）。`0` = 本请求不限。
+    /// 优先级：body `maxRows` > 头 `X-QSDB-Max-Rows` > 服务器值。
+    /// 规范名 camelCase（契约文档以此为准）；`alias` 是**追加**名，规范名
+    /// 须 `rename` —— `deny_unknown_fields` 下写反了 camelCase 会被当未知键 400。
+    #[serde(default, rename = "maxRows", alias = "max_rows")]
+    max_rows: Option<u64>,
 }
 
 /// J11：客户端透传 query id 的合法性。放行 `[A-Za-z0-9._:-]`、长度 `1..=64`
@@ -1865,6 +1911,36 @@ pub(crate) fn valid_client_query_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+}
+
+/// R1 覆盖优先级收敛（纯函数，供单测）：body > 头 > 服务器值。
+/// 覆盖**给出即接管护栏整体**——行数取覆盖值、体量闸随行覆盖一并放开；
+/// `0` = 本请求不限。两侧都没给 → 服务器值原样（默认 0 = 关）。
+fn effective_result_guard(
+    body: Option<u64>,
+    header: Option<u64>,
+    server_rows: u64,
+    server_bytes: u64,
+) -> (u64, u64) {
+    match body.or(header) {
+        Some(n) => (n, 0),
+        None => (server_rows, server_bytes),
+    }
+}
+
+/// 结果护栏的字节估算口径：Arrow 数组内存量（含缓冲区与偏移）。**估算而非
+/// 精确**——JSON 序列化后实际体积可达此值的 1.5~3×（转义/数字展开），
+/// 契约文档如实标注。
+pub(crate) fn batches_arrow_bytes(batches: &[RecordBatch]) -> u64 {
+    batches
+        .iter()
+        .map(|b| {
+            b.columns()
+                .iter()
+                .map(|c| c.get_array_memory_size() as u64)
+                .sum::<u64>()
+        })
+        .sum()
 }
 
 async fn query(
@@ -1952,6 +2028,26 @@ async fn query(
         .get("x-qsdb-timeout-ms")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok());
+    // R1 每请求覆盖：头 `X-QSDB-Max-Rows`（body maxRows 优先，见检查点处收敛）。
+    // 非法值显式 400——静默忽略正是 J6/J11 的教训。
+    let max_rows_header = match headers.get("x-qsdb-max-rows") {
+        None => None,
+        Some(v) => match v.to_str().ok().and_then(|s| s.parse::<u64>().ok()) {
+            Some(n) => Some(n),
+            None => {
+                s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                return ErrorCode::InvalidArgument.response(
+                    "invalid X-QSDB-Max-Rows: expect an unsigned integer (0 = unlimited)",
+                );
+            }
+        },
+    };
+    let (guard_rows, guard_bytes) = effective_result_guard(
+        body.max_rows,
+        max_rows_header,
+        s.max_result_rows.load(Ordering::Relaxed),
+        s.max_result_bytes.load(Ordering::Relaxed),
+    );
     // J11：客户端可在执行前指定 query id，从而零扫描、零误伤地取消自己的查询。
     // 非法值**显式 400**——静默忽略正是 J6 那条 serde alias 坑的教训。
     let want_id = match headers.get("x-qsdb-query-id") {
@@ -2013,84 +2109,122 @@ async fn query(
                 schema, batches, ..
             } => {
                 let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-                if fmt.eq_ignore_ascii_case("ipc") {
-                    match batches_to_ipc(&schema, &batches) {
-                        Ok(bytes) => (
-                            [(
-                                axum::http::header::CONTENT_TYPE,
-                                axum::http::HeaderValue::from_static(
-                                    "application/vnd.apache.arrow.stream",
-                                ),
-                            )],
-                            bytes,
-                        )
-                            .into_response(),
-                        Err(e) => {
-                            s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-                            ErrorCode::Internal.response(e.to_string())
-                        }
-                    }
-                } else if fmt.eq_ignore_ascii_case("bulk") {
-                    // **无依赖二进制**（读侧；与写侧同一格式）
-                    match qsdb::bulk::encode(&schema, &batches) {
-                        Ok(bytes) => (
-                            [(
-                                axum::http::header::CONTENT_TYPE,
-                                axum::http::HeaderValue::from_static("application/vnd.qsdb.bulk"),
-                            )],
-                            bytes,
-                        )
-                            .into_response(),
-                        Err(e) => {
-                            s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-                            ErrorCode::Unsupported.response(e.to_string())
-                        }
-                    }
-                } else if fmt.eq_ignore_ascii_case("rows") {
-                    // **无依赖行式**（读侧；列名/类型随头一起发，客户端逐块消费）
-                    match qsdb::rows::encode(&schema, &batches) {
-                        Ok(bytes) => (
-                            [(
-                                axum::http::header::CONTENT_TYPE,
-                                axum::http::HeaderValue::from_static("application/vnd.qsdb.rows"),
-                            )],
-                            bytes,
-                        )
-                            .into_response(),
-                        Err(e) => {
-                            s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-                            ErrorCode::Unsupported.response(e.to_string())
-                        }
-                    }
-                } else if fmt.eq_ignore_ascii_case("csv") {
-                    // 文本 CSV（读侧；列序 = schema，首行表头）
-                    match batches_to_csv(&schema, &batches) {
-                        Ok(bytes) => (
-                            [(
-                                axum::http::header::CONTENT_TYPE,
-                                axum::http::HeaderValue::from_static("text/csv"),
-                            )],
-                            bytes,
-                        )
-                            .into_response(),
-                        Err(e) => {
-                            s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-                            ErrorCode::Internal.response(e.to_string())
-                        }
-                    }
+                // ---- R1 结果护栏检查点：**执行后、序列化前**，全格式一致 ----
+                // 行数精确（执行完即知）；字节按 Arrow 内存估算。超限恒定拒绝
+                // 且**绝不返回部分数据**（throw 不 break——静默部分数据是本仓
+                // 红线）。只作用于结果集：DML 回执恒小、COPY TO 是服务端写盘
+                // 不是结果集，都不经过这里。
+                if guard_rows > 0 && rows as u64 > guard_rows {
+                    s.metrics
+                        .rejected_result_size
+                        .fetch_add(1, Ordering::Relaxed);
+                    s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    ErrorCode::ResultTooLarge.response(format!(
+                        "result has {rows} rows, exceeds max-result-rows {guard_rows}; \
+                         add LIMIT, use a streaming format (ipc/rows/bulk), or override \
+                         this request with body maxRows / header X-QSDB-Max-Rows \
+                         (full export: COPY (SELECT …) TO …)"
+                    ))
                 } else {
-                    match batches_to_json(&schema, &batches) {
-                        Ok(v) => Json(serde_json::json!({
-                            "queryId": query_id,
-                            "schema": schema_fields(&schema),
-                            "rows": v,
-                            "rowCount": rows,
-                            "elapsedMs": elapsed as f64 / 1e6,
-                        }))
-                        .into_response(),
-                        Err(e) => {
-                            s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-                            ErrorCode::Internal.response(e.to_string())
+                    let est_bytes = (guard_bytes > 0).then(|| batches_arrow_bytes(&batches));
+                    if est_bytes.is_some_and(|est| est > guard_bytes) {
+                        let est = est_bytes.unwrap_or(0);
+                        s.metrics
+                            .rejected_result_size
+                            .fetch_add(1, Ordering::Relaxed);
+                        s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                        ErrorCode::ResultTooLarge.response(format!(
+                            "result is ~{} MiB (arrow estimate), exceeds max-result-mb {} ({} bytes); \
+                             add LIMIT, use a streaming format (ipc/rows/bulk), or override \
+                             this request with body maxRows / header X-QSDB-Max-Rows \
+                             (full export: COPY (SELECT …) TO …)",
+                            est / (1024 * 1024),
+                            guard_bytes / (1024 * 1024),
+                            guard_bytes
+                        ))
+                    } else if fmt.eq_ignore_ascii_case("ipc") {
+                        match batches_to_ipc(&schema, &batches) {
+                            Ok(bytes) => (
+                                [(
+                                    axum::http::header::CONTENT_TYPE,
+                                    axum::http::HeaderValue::from_static(
+                                        "application/vnd.apache.arrow.stream",
+                                    ),
+                                )],
+                                bytes,
+                            )
+                                .into_response(),
+                            Err(e) => {
+                                s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                                ErrorCode::Internal.response(e.to_string())
+                            }
+                        }
+                    } else if fmt.eq_ignore_ascii_case("bulk") {
+                        // **无依赖二进制**（读侧；与写侧同一格式）
+                        match qsdb::bulk::encode(&schema, &batches) {
+                            Ok(bytes) => (
+                                [(
+                                    axum::http::header::CONTENT_TYPE,
+                                    axum::http::HeaderValue::from_static(
+                                        "application/vnd.qsdb.bulk",
+                                    ),
+                                )],
+                                bytes,
+                            )
+                                .into_response(),
+                            Err(e) => {
+                                s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                                ErrorCode::Unsupported.response(e.to_string())
+                            }
+                        }
+                    } else if fmt.eq_ignore_ascii_case("rows") {
+                        // **无依赖行式**（读侧；列名/类型随头一起发，客户端逐块消费）
+                        match qsdb::rows::encode(&schema, &batches) {
+                            Ok(bytes) => (
+                                [(
+                                    axum::http::header::CONTENT_TYPE,
+                                    axum::http::HeaderValue::from_static(
+                                        "application/vnd.qsdb.rows",
+                                    ),
+                                )],
+                                bytes,
+                            )
+                                .into_response(),
+                            Err(e) => {
+                                s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                                ErrorCode::Unsupported.response(e.to_string())
+                            }
+                        }
+                    } else if fmt.eq_ignore_ascii_case("csv") {
+                        // 文本 CSV（读侧；列序 = schema，首行表头）
+                        match batches_to_csv(&schema, &batches) {
+                            Ok(bytes) => (
+                                [(
+                                    axum::http::header::CONTENT_TYPE,
+                                    axum::http::HeaderValue::from_static("text/csv"),
+                                )],
+                                bytes,
+                            )
+                                .into_response(),
+                            Err(e) => {
+                                s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                                ErrorCode::Internal.response(e.to_string())
+                            }
+                        }
+                    } else {
+                        match batches_to_json(&schema, &batches) {
+                            Ok(v) => Json(serde_json::json!({
+                                "queryId": query_id,
+                                "schema": schema_fields(&schema),
+                                "rows": v,
+                                "rowCount": rows,
+                                "elapsedMs": elapsed as f64 / 1e6,
+                            }))
+                            .into_response(),
+                            Err(e) => {
+                                s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                                ErrorCode::Internal.response(e.to_string())
+                            }
                         }
                     }
                 }
@@ -2588,6 +2722,9 @@ async fn get_config(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         "runtime": {
             "queryTimeoutMs": rt.query_timeout_ms().unwrap_or(0),
             "queryMemoryLimitBytes": rt.query_memory_limit_bytes().unwrap_or(0),
+            // 结果护栏（十七批 R1；0 = 不限）
+            "maxResultRows": s.max_result_rows.load(Ordering::Relaxed),
+            "maxResultBytes": s.max_result_bytes.load(Ordering::Relaxed),
         },
         // 启动期快照（只读，改动需重启）
         "startup": {
@@ -2624,6 +2761,12 @@ struct ConfigUpdate {
     query_timeout_ms: Option<u64>,
     #[serde(default, alias = "queryMemoryLimitBytes")]
     query_memory_limit_bytes: Option<u64>,
+    // 结果护栏（十七批 R1）—— camelCase 别名同样是**必需的**：GET 回的就是
+    // camelCase（同上实测教训，不别名则"读-改-写"整轮 PUT 静默失效）
+    #[serde(default, alias = "maxResultRows")]
+    max_result_rows: Option<u64>,
+    #[serde(default, alias = "maxResultBytes")]
+    max_result_bytes: Option<u64>,
 }
 
 async fn put_config(
@@ -2641,12 +2784,24 @@ async fn put_config(
     if let Some(bytes) = body.query_memory_limit_bytes {
         rt.set_query_memory_limit_bytes(bytes);
     }
+    // 结果护栏（十七批 R1）：落 AppState 原子，下一条查询立即可见
+    if let Some(n) = body.max_result_rows {
+        s.max_result_rows.store(n, Ordering::Relaxed);
+    }
+    if let Some(bytes) = body.max_result_bytes {
+        s.max_result_bytes.store(bytes, Ordering::Relaxed);
+    }
     // `applied` = **确实落了至少一个已知字段**（空 body 或全未知/拼错键 → false）。
     // 恒返回 true 会在客户端拼错键时给出"成功"的假信号。
-    let applied = body.query_timeout_ms.is_some() || body.query_memory_limit_bytes.is_some();
+    let applied = body.query_timeout_ms.is_some()
+        || body.query_memory_limit_bytes.is_some()
+        || body.max_result_rows.is_some()
+        || body.max_result_bytes.is_some();
     Json(serde_json::json!({
         "queryTimeoutMs": rt.query_timeout_ms().unwrap_or(0),
         "queryMemoryLimitBytes": rt.query_memory_limit_bytes().unwrap_or(0),
+        "maxResultRows": s.max_result_rows.load(Ordering::Relaxed),
+        "maxResultBytes": s.max_result_bytes.load(Ordering::Relaxed),
         "applied": applied,
     }))
     .into_response()
@@ -3341,5 +3496,43 @@ mod tests {
         assert_eq!(e.status().as_u16(), 404);
         let _ = std::fs::remove_dir_all(&d1);
         let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    /// R1 覆盖优先级：body > 头 > 服务器值；覆盖给出即**接管护栏整体**
+    /// （体量闸随行覆盖一并放开——护栏只有一个豁免口径）；0 = 本请求不限；
+    /// 两侧都没给 → 服务器值原样。
+    #[test]
+    fn effective_result_guard_precedence() {
+        // body 压过头
+        assert_eq!(effective_result_guard(Some(7), Some(3), 100, 200), (7, 0));
+        // 头压过服务器值
+        assert_eq!(effective_result_guard(None, Some(3), 100, 200), (3, 0));
+        // 都没给 → 服务器值（含"服务器也没设"= 双 0 = 关）
+        assert_eq!(effective_result_guard(None, None, 100, 200), (100, 200));
+        assert_eq!(effective_result_guard(None, None, 0, 0), (0, 0));
+        // 0 = 显式不限（本请求豁免），不是"回退服务器值"
+        assert_eq!(effective_result_guard(Some(0), None, 100, 200), (0, 0));
+        // 覆盖可以**收紧**（服务器关、本请求自限）——双向覆盖
+        assert_eq!(effective_result_guard(Some(50), None, 0, 0), (50, 0));
+    }
+
+    /// R1 字节估算口径：Arrow 数组内存量随行数增长（非零、单调不减）。
+    #[test]
+    fn batches_arrow_bytes_tracks_rows() {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("a", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let mk = |n: i64| {
+            let arr = arrow::array::Int64Array::from((0..n).collect::<Vec<i64>>());
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)]).unwrap()
+        };
+        let empty = mk(0);
+        let small = mk(10);
+        let big = mk(10_000);
+        let b_empty = batches_arrow_bytes(&[empty]);
+        let b_small = batches_arrow_bytes(&[small]);
+        let b_big = batches_arrow_bytes(&[big]);
+        assert!(b_small > b_empty, "行数增长 ⇒ 估算增长");
+        assert!(b_big > b_small, "行数增长 ⇒ 估算增长");
     }
 }

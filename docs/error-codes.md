@@ -55,6 +55,7 @@ retry, category, sqlState}` 全表——驱动冷启动即可自配置映射，�
 | `QUERY_TIMEOUT` | 408 | no | query | 查询超时（`X-QSDB-Timeout-Ms` 头或运行期默认） | 上报超时；长查询请显式调大 | `57014` |
 | `QUERY_CANCELLED` | 400 | no | query | 被 `/queries/{id}/cancel` 或客户端断连取消 | 视为用户主动取消，不重试 | `HY008` |
 | `QUERY_MEMORY_LIMIT` | 400 | no | query | 单查询执行内存超限（物化算子记账） | 报错；调大 `--query-memory-limit-mb` 或改查询 | `53200` |
+| `RESULT_TOO_LARGE` | 400 | no | query | 单次查询结果超**结果护栏**（`--max-result-rows`/`--max-result-mb`；执行后、序列化前检查，**绝不返回部分数据**） | 加 `LIMIT`、改用 `ipc`/`rows`/`bulk` 流式格式；全量导出走 `COPY`；可信客户端可本请求带 `maxRows`/`X-QSDB-Max-Rows` 覆盖 | `54000` |
 | `QUERY_PANIC` | 500 | no | query | 算子 panic，被隔离边界捕获（进程无恙） | **上报内核 bug**；该查询不可重试 | `XX000` |
 | `TABLE_NOT_FOUND` | 400 | no | query | 查询端点：表不存在（SQL 语义错，**非** HTTP 404） | 表名/DB 名写错？ | `42P01` |
 | `COLUMN_NOT_FOUND` | 400 | no | query | 查询端点：列不存在 | 列名写错？ | `42703` |
@@ -87,6 +88,11 @@ retry, category, sqlState}` 全表——驱动冷启动即可自配置映射，�
 - **"内存不够"有两种**：`QUERY_MEMORY_LIMIT`（400，**你的查询超了自己的配额**——
   改查询或调 `--query-memory-limit-mb`）与 `MEMORY_PRESSURE`（503 可重试，
   **全库预算此刻被占用**——退避重试即可）。混成一个码会让驱动错误地重试/不重试。
+- **三道闸各管一段，互不替代**：`QUERY_TIMEOUT` 管**计算时长**（执行中）；
+  `QUERY_MEMORY_LIMIT` 管**执行内存**（物化算子记账，执行中）；
+  `RESULT_TOO_LARGE` 管**结果传输体量**（执行后、序列化前）。三者正交——
+  一条查询可以算得快、省内存、但结果太大（护栏拦）；也可以结果小、算得久（超时拦）。
+  护栏检查点在执行后 ⇒ **不省计算**，纯护栏不是熔断。
 - **400 与 404 的分工**：**查询端点**的 SQL 语义错误（表/列不存在）→ **400**
   （`TABLE_NOT_FOUND`/`COLUMN_NOT_FOUND`），避免网关把 SQL 错判成路由错；
   **资源端点**的对象不存在 → **404**（`NOT_FOUND`），保住 HTTP 语义。
