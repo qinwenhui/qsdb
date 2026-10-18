@@ -2512,3 +2512,65 @@ fn config_endpoints_are_admin_only() {
     assert_eq!(rr.status, 403, "{}", String::from_utf8_lossy(&rr.body));
     assert_eq!(rr.code(), "FORBIDDEN");
 }
+
+// ---------------------------------------------------------------------------
+// 25. COPY / `/files` 多挂载 + COPY 相对目标 = 库根（studio e2e 实测的两处不一致）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn copy_and_files_are_mount_aware() {
+    // 第二个挂载目录（同 multi_mount 测试的模式）
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let settle_dir =
+        std::env::temp_dir().join(format!("qsdb_cm_files_{}_{}", std::process::id(), uniq));
+    let _ = std::fs::remove_dir_all(&settle_dir);
+    std::fs::create_dir_all(&settle_dir).unwrap();
+    let settle_s = settle_dir
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    let srv = Server::start(&["--mount", &format!("settle={settle_s}")]);
+    let p = srv.port;
+    let q = |sql: &str| query(p, sql, None);
+
+    // settle 库建表 + 写数据
+    assert_eq!(q("CREATE TABLE settle.st (a BIGINT, s STRING)").status, 200);
+    assert_eq!(
+        q("INSERT INTO settle.st VALUES (1,'x'),(2,'y'),(3,'z')").status,
+        200
+    );
+
+    // COPY：内层限定名路由到 settle + **相对目标按库根解析**（此前按进程 CWD）
+    let r = q("COPY (SELECT * FROM settle.st) TO 'exp_mount' (FORMAT CSV, HEADER true)");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["command"], "COPY");
+
+    // `/files`：`<库名>/相对路径` 前缀 → settle 库根——下载到刚导出的文件，
+    // 内容与 settle 库根下的本地文件逐字节一致
+    let exported = settle_dir.join("exp_mount");
+    assert!(
+        exported.is_file(),
+        "相对目标应落在 settle 库根: {}",
+        settle_dir.display()
+    );
+    let local = std::fs::read(&exported).unwrap();
+    let r = http(p, "GET", "/api/v1/files?path=settle/exp_mount", &[], &[]);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.body, local, "下载逐字节一致");
+    // 同一文件在 default 库根不存在 → 404（挂载前缀真的路由了）
+    let r = http(p, "GET", "/api/v1/files?path=exp_mount", &[], &[]);
+    assert_eq!(r.status, 404);
+
+    // default 库的文件照旧（`default/` 前缀与裸路径两形态）
+    assert_eq!(q("CREATE TABLE dft (a BIGINT)").status, 200);
+    assert_eq!(q("INSERT INTO dft VALUES (9)").status, 200);
+    assert_eq!(
+        q("COPY (SELECT * FROM dft) TO 'exp_dft' (FORMAT CSV, HEADER true)").status,
+        200
+    );
+    assert!(http(p, "GET", "/api/v1/files?path=exp_dft", &[], &[]).status == 200);
+    // ⚠️ 不对称（如实锁进契约）：COPY 目标 = **存储根**相对（`<根>/exp_dft`）；
+    // 表文件 = `<根>/<库名>/<表>/…`（历史形态，`default/…` 是库名目录不是
+    // 挂载前缀）。所以 `default/exp_dft` 是"default 库目录下的 exp_dft"⇒ 404。
+    assert!(http(p, "GET", "/api/v1/files?path=default/exp_dft", &[], &[]).status == 404);
+}

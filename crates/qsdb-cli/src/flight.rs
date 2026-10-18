@@ -63,13 +63,41 @@ impl QsdbFlightService {
         meta: &MetadataMap,
         sql: &str,
     ) -> Result<(String, qsdb::sql::SqlResult), Status> {
+        // 十八批Ⅵ：与 HTTP 面同一路由——限定名（`settle.t`）解析到对应挂载，
+        // 剥限定后落目标句柄；此前 Flight 恒跑 default 库（多库下限定名必炸）
+        let (sql_exec_routed, target_db) =
+            match crate::server::route_sql(&self.state, sql, None, "default") {
+                Ok(r) => r,
+                Err(resp) => {
+                    // 路由错误（未挂载 404 / 跨库 501 / 鉴权）→ 同一张码表
+                    let status = resp.status();
+                    let msg = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                        .await
+                        .map(|b| String::from_utf8_lossy(&b).into_owned())
+                        .unwrap_or_default();
+                    let code = match status.as_u16() {
+                        404 => tonic::Code::NotFound,
+                        501 => tonic::Code::Unimplemented,
+                        403 => tonic::Code::PermissionDenied,
+                        401 => tonic::Code::Unauthenticated,
+                        _ => tonic::Code::InvalidArgument,
+                    };
+                    return Err(Status::new(code, msg));
+                }
+            };
+        let db_handle = self
+            .state
+            .mounts
+            .get(&target_db)
+            .map(|m| Arc::clone(&m.db))
+            .unwrap_or_else(|| Arc::clone(&self.state.db));
         let ctx = self
             .state
             .register_query(
-                &self.state.db,
+                &db_handle,
                 Self::client_query_id(meta)?,
                 None,
-                sql.to_string(),
+                sql_exec_routed.to_string(),
                 None,
             )
             .map_err(|msg| {
@@ -80,8 +108,8 @@ impl QsdbFlightService {
                 )
             })?;
         let query_id = ctx.query_id.clone();
-        let db = Arc::clone(&self.state.db);
-        let sql_exec = sql.to_string();
+        let db = db_handle;
+        let sql_exec = sql_exec_routed;
         let ctx_exec = Arc::clone(&ctx);
         let res =
             tokio::task::spawn_blocking(move || db.sql_with_context(&sql_exec, &ctx_exec)).await;

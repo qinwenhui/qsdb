@@ -981,7 +981,72 @@ fn split_qualified(name: &str) -> (Option<String>, String) {
 /// 解析失败（内核预处理语法如 `COPY … (FORMAT …)` sqlparser 裸解析不了）→
 /// **原样透传**给目标句柄：内核给它的错误，显式失败不静默。
 /// 返回（改写后的 SQL, 目标库名）。
-fn route_sql(
+pub(crate) fn route_sql(
+    state: &AppState,
+    sql: &str,
+    explicit_db: Option<&str>,
+    session_default: &str,
+) -> std::result::Result<(String, String), Box<Response>> {
+    let t = sql.trim_start();
+    // `COPY (SELECT …) TO …` 的**文本级路由**（十八批Ⅵ）：sqlparser 0.63 解析
+    // 不了整条 COPY，M-B 起原样透传——多库下内层的 `settle.t` 无人路由，在
+    // default 句柄上必炸。摘出内层 SELECT 走同一套归属判定/剥限定，再拼回。
+    if t.len() >= 4
+        && t.as_bytes()[..4].eq_ignore_ascii_case(b"COPY")
+        && t[4..].starts_with(|c: char| c.is_whitespace() || c == '(')
+    {
+        return route_copy(state, t, explicit_db, session_default);
+    }
+    route_query_text(state, sql, explicit_db, session_default)
+}
+
+/// COPY 语句的摘取与拼回：引号感知的括号配对找内层 SELECT 的边界，
+/// 内层走 [`route_query_text`]（归属判定与剥限定和普通查询**完全同一套**），
+/// 外壳（`COPY (` … `) TO '…' (FORMAT …)`）原样保留。
+fn route_copy(
+    state: &AppState,
+    t: &str,
+    explicit_db: Option<&str>,
+    session_default: &str,
+) -> std::result::Result<(String, String), Box<Response>> {
+    // 没有 parens 形态：内核只支持 `(query) TO`，原样透传让它给错误
+    let Some(open) = t.find('(') else {
+        let db = explicit_db.unwrap_or(session_default);
+        ensure_mounted(state, db)?;
+        return Ok((t.to_string(), db.to_string()));
+    };
+    let mut depth = 0usize;
+    let (mut in_s, mut in_d) = (false, false);
+    let mut close = None;
+    for (i, ch) in t.char_indices().skip(open) {
+        match ch {
+            '\'' if !in_d => in_s = !in_s,
+            '"' if !in_s => in_d = !in_d,
+            '(' if !in_s && !in_d => depth += 1,
+            ')' if !in_s && !in_d => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(close) = close else {
+        let db = explicit_db.unwrap_or(session_default);
+        ensure_mounted(state, db)?;
+        return Ok((t.to_string(), db.to_string()));
+    };
+    let inner = &t[open + 1..close];
+    let (inner_routed, target) = route_query_text(state, inner, explicit_db, session_default)?;
+    Ok((
+        format!("{}({}){}", &t[..=open], inner_routed, &t[close..]),
+        target,
+    ))
+}
+
+fn route_query_text(
     state: &AppState,
     sql: &str,
     explicit_db: Option<&str>,
@@ -1652,7 +1717,28 @@ async fn download_file(
     if rel.starts_with("_trash/") || rel.starts_with("_filecache/") || rel.starts_with("_spill/") {
         return ErrorCode::Forbidden.response("internal paths not downloadable");
     }
-    let full = s.db.root().join(&rel);
+    // 十八批Ⅵ：`path` 支持 `<挂载名>/存储根相对路径` 前缀——多挂载下载任意
+    // 库的文件。⚠️ `default` **不剥**：存储布局是 `<根>/<库名>/<表>/…`，
+    // default 库的文件历史上就以 `default/…` 寻址（剥了 = 全部历史路径 404）；
+    // 非默认挂载（`settle/…`）剥挂载名落到该库存储根（其内层 `default/` 是
+    // 内核句柄的库目录，照旧保留）。
+    let (db_handle, rel) = {
+        let first = rel.split('/').next().unwrap_or("");
+        if first != "default" {
+            if let Some(m) = s.mounts.get(first) {
+                let rest = rel
+                    .split_once('/')
+                    .map(|(_, r)| r.to_string())
+                    .unwrap_or_default();
+                (Arc::clone(&m.db), rest)
+            } else {
+                (Arc::clone(&s.db), rel.clone())
+            }
+        } else {
+            (Arc::clone(&s.db), rel.clone())
+        }
+    };
+    let full = db_handle.root().join(&rel);
     // 目录要先挡掉：`File::open` 在 Linux 上能打开目录，读起来报 EISDIR，
     // 那时响应头已经发出去了 —— 只能变成"截断的 200"，很难排查。
     let md = match tokio::fs::metadata(&full).await {
@@ -3549,6 +3635,38 @@ mod tests {
         // 未挂载 → 404
         let e = route_sql(&state, "SELECT * FROM nope.t", None, "default").unwrap_err();
         assert_eq!(e.status().as_u16(), 404);
+
+        // COPY 文本级路由（十八批Ⅵ）：内层限定名被识别与剥除，外壳原样保留
+        let (sql, db) = route_sql(
+            &state,
+            "COPY (SELECT a FROM settle.t WHERE a > 0) TO 'out' (FORMAT PARQUET)",
+            None,
+            "default",
+        )
+        .unwrap();
+        assert_eq!(db, "settle", "内层限定名应路由到 settle");
+        assert!(!sql.contains("settle"), "{sql}");
+        assert!(sql.starts_with("COPY ("), "外壳保留: {sql}");
+        assert!(sql.contains("TO 'out'"), "尾段保留: {sql}");
+        // 内层单段名锚定仍在（不浮动到限定库）
+        let (_, db) = route_sql(
+            &state,
+            "COPY (SELECT * FROM t) TO 'out' (FORMAT PARQUET)",
+            None,
+            "default",
+        )
+        .unwrap();
+        assert_eq!(db, "default");
+        // 多行 SQL（括号配对要跨行）+ 子查询嵌套括号
+        let (sql, db) = route_sql(
+            &state,
+            "COPY (\n  SELECT a FROM settle.t\n  WHERE a IN (SELECT x FROM settle.u)\n) TO 'out' (FORMAT PARQUET)",
+            None,
+            "default",
+        )
+        .unwrap();
+        assert_eq!(db, "settle", "{sql}");
+        assert!(!sql.contains("settle"), "嵌套子查询里的限定名也要剥: {sql}");
 
         // DDL 目标（visitor 盲区，补刀覆盖）
         let (sql, db) = route_sql(&state, "DROP TABLE settle.x", None, "default").unwrap();

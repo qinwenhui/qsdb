@@ -1363,6 +1363,15 @@ fn copy_to(
     format: crate::export::ExportFormat,
     ctx: &Arc<crate::query::QueryContext>,
 ) -> Result<SqlResult> {
+    // 目标路径基准（十九批Ⅵ，studio e2e 实测）：**相对路径按所执行库的根**
+    // 解析——此前按进程 CWD，与 `/files` 下载根（库根）不一致，"COPY 出来的
+    // 文件下载 404"。绝对路径不变（照 PG 语义，写哪算哪）。
+    let t = std::path::PathBuf::from(target.replace('\\', "/"));
+    let target: String = if t.is_absolute() {
+        target.to_string()
+    } else {
+        db.root().join(t).to_string_lossy().into_owned()
+    };
     let resolver = translate::TableResolver {
         resolve: Box::new(|n: &str| db.table_def(n)),
         views: crate::views::ViewStore::read_all(db.store())?,
@@ -1375,7 +1384,7 @@ fn copy_to(
     let schema = exec.schema();
     let stats = crate::export::write_dataset(
         db.store(),
-        target,
+        &target,
         &schema,
         partition_by,
         format,

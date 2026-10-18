@@ -589,3 +589,37 @@ fn csv_目标已存在要拒() {
     assert!(m.contains("已存在"), "{m}");
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// **相对目标按库根解析**（十九批Ⅵ，studio e2e 实测）：此前按进程 CWD——
+/// 与 `/files` 下载根（库根）不一致，"COPY 出来的文件下载 404"。
+/// 顺带闭环：相对导出的 parquet 能被 `read_parquet` 以**同样的相对路径**读回。
+#[test]
+fn 相对目标按库根解析() {
+    let (db, root) = setup("relative");
+    db.sql("CREATE TABLE t (a BIGINT, s STRING)").unwrap();
+    db.sql("INSERT INTO t VALUES (1,'x'),(2,'y')").unwrap();
+    // 相对路径导出（不给绝对路径）
+    db.sql("COPY (SELECT * FROM t) TO 'rel_out' (FORMAT PARQUET)")
+        .unwrap_or_else(|e| panic!("相对导出应成功: {e}"));
+    // 落点 = 库根/rel_out（不是 CWD/rel_out）
+    let out = root.join("rel_out");
+    assert!(out.is_dir(), "相对目标应落在库根: {}", root.display());
+    // 闭环：读回逐值一致（read_parquet 的相对路径解析是它自己的语义，
+    // 这里用绝对路径验证**内容**——落点已由上面的目录断言锁定）
+    let pat = format!("{}/**/*.parquet", p(&out));
+    assert_eq!(
+        q(
+            &db,
+            &format!("SELECT * FROM read_parquet('{pat}') ORDER BY a")
+        ),
+        vec!["1|x".to_string(), "2|y".to_string()]
+    );
+    // 绝对路径不受影响（照 PG 语义）
+    let abs = root.join("abs_out");
+    db.sql(&format!(
+        "COPY (SELECT * FROM t) TO '{}' (FORMAT PARQUET)",
+        p(&abs)
+    ))
+    .unwrap();
+    assert!(abs.is_dir());
+}
