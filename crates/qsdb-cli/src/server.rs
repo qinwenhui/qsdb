@@ -783,6 +783,20 @@ fn require_role(state: &AppState, headers: &HeaderMap) -> Result<qsdb::users::Ro
     }
 }
 
+/// **admin 闸**（配置热改/用户面/文件下载这类实例级操作）。非 admin →
+/// 403 `FORBIDDEN`（与 configuration.md §五·五 的角色矩阵一致）。
+fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>> {
+    let role = require_role(state, headers)?;
+    if role.is_admin() {
+        Ok(())
+    } else {
+        Err(Box::new(ErrorCode::Forbidden.response(format!(
+            "this operation requires admin (current role: {})",
+            role.name()
+        ))))
+    }
+}
+
 /// 库名必须已挂载；否则 404（文案带挂载清单——"库不存在"与"无权限"在这里
 /// 就是同一条，因为挂载表是全量的）。
 fn ensure_mounted(state: &AppState, db: &str) -> std::result::Result<(), Box<Response>> {
@@ -2713,7 +2727,10 @@ async fn stats(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
 }
 
 async fn get_config(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if let Err(resp) = auth(&s, &headers) {
+    // **admin 专属**（十八批Ⅲ修正，studio 实测）：响应含挂载清单与启动期
+    // 路径（spillDir）——M-C 的"白名单制不泄露库名"同样适用这里；运行期
+    // 四键（超时/内存/护栏）非 admin 可从 RESULT_TOO_LARGE 等错误文案获得
+    if let Err(resp) = require_admin(&s, &headers) {
         return *resp;
     }
     let rt = s.db.runtime();
@@ -2775,7 +2792,9 @@ async fn put_config(
     headers: HeaderMap,
     StructuredJson(body): StructuredJson<ConfigUpdate>,
 ) -> Response {
-    if let Err(resp) = auth(&s, &headers) {
+    // **admin 专属**（configuration.md §五·五 角色矩阵本来就这么写的——
+    // 实测漏了闸：reader 能热改超时/内存/护栏，等于把三道闸的钥匙给了所有人）
+    if let Err(resp) = require_admin(&s, &headers) {
         return *resp;
     }
     let rt = s.db.runtime();

@@ -2475,3 +2475,40 @@ fn json_streaming_shape_unchanged_over_batch_boundaries() {
         "NULL 保持 null"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 24. /config 的 admin 闸（studio 实测：reader 曾能 GET/PUT 热更三道闸）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_endpoints_are_admin_only() {
+    let srv = Server::start(&[]);
+    let p = srv.port;
+    // 开放模式 = admin 等价：可用（基线不回归）
+    assert_eq!(http(p, "GET", "/api/v1/config", &[], &[]).status, 200);
+
+    // reader：GET/PUT 都 403 FORBIDDEN（三道闸的钥匙不能给所有人）
+    // ⚠️ CREATE USER 的状态要断言——口令太短会静默失败，后面拿到的就是
+    // 匿名 admin 会话（闸看起来失效，其实是测试自己没建出 reader）
+    assert_eq!(
+        query(p, "CREATE USER ru WITH PASSWORD 'rpass' ROLE reader", None).status,
+        200
+    );
+    let r = login(p, "ru", "rpass");
+    let tok = format!("Bearer {}", r.json()["token"].as_str().unwrap());
+    let rr = http(p, "GET", "/api/v1/config", &[("Authorization", &tok)], &[]);
+    assert_eq!(rr.status, 403, "{}", String::from_utf8_lossy(&rr.body));
+    assert_eq!(rr.code(), "FORBIDDEN");
+    let rr = http(
+        p,
+        "PUT",
+        "/api/v1/config",
+        &[
+            ("Authorization", &tok),
+            ("Content-Type", "application/json"),
+        ],
+        br#"{"maxResultRows":0}"#,
+    );
+    assert_eq!(rr.status, 403, "{}", String::from_utf8_lossy(&rr.body));
+    assert_eq!(rr.code(), "FORBIDDEN");
+}

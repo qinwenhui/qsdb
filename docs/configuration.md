@@ -86,7 +86,7 @@
 | SELECT / SHOW / DESCRIBE | ✓ | ✓ | ✓ |
 | INSERT / POST /write | ✗ | ✓ | ✓ |
 | DDL（CREATE/DROP/ALTER/TRUNCATE/DELETE） | ✗ | ✗ | ✓ |
-| compact / gc / refresh-index / 用户管理 / PUT /config | ✗ | ✗ | ✓ |
+| compact / gc / refresh-index / 用户管理 / `/config`（读与写都 admin——响应含挂载清单与启动期路径，非 admin 可从 `RESULT_TOO_LARGE` 等错误文案拿到运行期上限） | ✗ | ✗ | ✓ |
 
 **库级 grants（M-C，白名单制）**：
 ```jsonc
@@ -195,7 +195,7 @@ drift 时显式报错转人工 ALTER（最小权限原则）。此矩阵不改�
 ## 七、运行时查看 / 修改通道
 
 ```
-GET  /api/v1/config                 # 当前运行期配置 + 启动期快照（只读标注）
+GET  /api/v1/config                 # 当前运行期配置 + 启动期快照（**admin**）
 PUT  /api/v1/config                # 热更运行期项（body: {"queryTimeoutMs": 60000}）
 GET  /api/v1/queries                # 运行中查询（id/sql/elapsed/memory/cancelled）
 POST /api/v1/queries/{id}/cancel    # 取消
