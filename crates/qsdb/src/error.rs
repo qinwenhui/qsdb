@@ -126,6 +126,16 @@ pub enum QsdbError {
     /// 两者对客户端的动作完全不同，靠文案的 "read-only" 字样区分太脆。
     #[error("read-only: {0}")]
     ReadOnly(String),
+
+    /// **角色不足**（凭证有效但身份不够格：reader 写 / 非 admin 的 DDL 与运维）。
+    ///
+    /// 独立变体而非塞进 `InvalidArgument`：请求**本身合法**，是身份不够——
+    /// 上层要映射成 `FORBIDDEN`（403，"换角色或申请授权"，重试无用），参数错
+    /// 是"改请求就好"。混用一个码，驱动会把"没权限"提示成"参数写错了"。
+    /// （此前 SQL 角色闸落 `InvalidArgument`，与 `/write` 面同一动作的 403
+    /// 自相矛盾——qsdb-studio 2026-10-18 实测提出。）
+    #[error("forbidden: {0}")]
+    Forbidden(String),
 }
 
 impl QsdbError {
@@ -135,6 +145,11 @@ impl QsdbError {
 
     pub fn type_err(msg: impl Into<String>) -> Self {
         Self::Type(msg.into())
+    }
+
+    /// 角色不足（SQL 角色闸专用；见 [`Self::Forbidden`] 的文档）。
+    pub fn forbidden(msg: impl Into<String>) -> Self {
+        Self::Forbidden(msg.into())
     }
 
     pub fn parse_err(msg: impl Into<String>) -> Self {

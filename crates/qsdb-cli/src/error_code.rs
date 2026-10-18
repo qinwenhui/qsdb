@@ -255,6 +255,9 @@ impl ErrorCode {
             QsdbError::Meta(_) => Self::MetadataError,
             // 只读库拒绝变更：对客户端是"这台不行"，不是"请求写错了"
             QsdbError::ReadOnly(_) => Self::ReadOnly,
+            // 角色不足：身份不够格（403 FORBIDDEN）——不是参数错（400）。
+            // 与 /write 面的 can_write 闸对齐（同一动作两个面必须同码）
+            QsdbError::Forbidden(_) => Self::Forbidden,
             // 全库预算此刻耗尽（多为**他人占用**）→ 503 + 可退避重试
             QsdbError::MemoryPressure(_) => Self::MemoryPressure,
             QsdbError::NotFound { .. } => match (query_ctx, e.not_found_kind()) {
@@ -525,6 +528,25 @@ mod tests {
             ErrorCode::from_qsdb(&file, true),
             ErrorCode::InvalidArgument
         );
+    }
+
+    /// 角色不足 = FORBIDDEN（403），不是 INVALID_ARGUMENT（400）——身份不够格
+    /// 与参数错是两件事；与 /write 面的 can_write 闸同码（十九批Ⅲ修正）。
+    #[test]
+    fn role_denial_is_forbidden_not_invalid() {
+        let e = QsdbError::forbidden("role 'reader' cannot execute DDL");
+        assert_eq!(
+            ErrorCode::from_qsdb(&e, true),
+            ErrorCode::Forbidden,
+            "查询面的角色拒绝"
+        );
+        assert_eq!(
+            ErrorCode::from_qsdb(&e, false),
+            ErrorCode::Forbidden,
+            "资源面同理（角色问题不是'资源不存在'）"
+        );
+        assert_eq!(ErrorCode::Forbidden.status(), StatusCode::FORBIDDEN);
+        assert!(!ErrorCode::Forbidden.retryable());
     }
 
     #[test]

@@ -82,7 +82,10 @@ pub fn check_role_permission(
 ) -> Result<()> {
     use translate::ParsedStatement as PS;
     let deny = |what: &str| {
-        Err(QsdbError::invalid(format!(
+        // 十九批Ⅲ修正：角色不足是 **FORBIDDEN**（身份不够格，换角色/申请授权），
+        // 不是 INVALID_ARGUMENT（参数错，改请求）——此前与 /write 面同一动作的
+        // 403 自相矛盾（qsdb-studio 实测提出）
+        Err(QsdbError::forbidden(format!(
             "role '{}' cannot execute {} (requires {})",
             role.name(),
             what,
