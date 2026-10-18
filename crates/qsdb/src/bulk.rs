@@ -48,6 +48,9 @@ const MAGIC: &[u8; 8] = b"QSDBBULK";
 const VERSION: u16 = 1;
 
 /// 线上类型标签（**契约级稳定**：加类型只能追加编号）。
+///
+/// 8-13 与 `qsdb-rows` 的标签共用同一套编号（生态工具一套判断逻辑两格式通用）；
+/// `Interval`（rows=14）没有对应的内核列类型，bulk 不收。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ColType {
@@ -58,40 +61,75 @@ pub enum ColType {
     Utf8 = 5,
     Date32 = 6,
     TimestampNs = 7,
+    /// 十九批Ⅳ（格式扩展）：与 rows 共用编号——SMALLINT/TINYINT 等窄整型。
+    I8 = 8,
+    I16 = 9,
+    /// FLOAT（单精度）。
+    F32 = 10,
+    /// 变长字节串（布局同 Utf8：offsets + data，但值不验 UTF-8）。
+    Binary = 11,
+    /// **未缩放 i128**（16 字节小端）；precision/scale 在**列描述**里
+    /// （tag 后跟 `precision u8 + scale u8` 两个字节）——payload 不重复携带，
+    /// 表绑定场景两侧都从表定义校验。DECIMAL 表从此可 bulk 装载/查询。
+    Decimal128 = 12,
+    /// 自午夜的纳秒（TIME 列）。
+    Time64Ns = 13,
 }
 
+/// Decimal 列的 `(precision, scale)`（仅 Decimal128 有）。
+type DecimalParams = (u8, i8);
+
 impl ColType {
-    fn from_arrow(dt: &DataType) -> Option<Self> {
+    fn from_arrow(dt: &DataType) -> Option<(Self, Option<DecimalParams>)> {
         Some(match dt {
-            DataType::Boolean => Self::Bool,
-            DataType::Int32 => Self::I32,
-            DataType::Int64 => Self::I64,
-            DataType::Float64 => Self::F64,
-            DataType::Utf8 => Self::Utf8,
-            DataType::Date32 => Self::Date32,
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _) => Self::TimestampNs,
+            DataType::Boolean => (Self::Bool, None),
+            DataType::Int8 => (Self::I8, None),
+            DataType::Int16 => (Self::I16, None),
+            DataType::Int32 => (Self::I32, None),
+            DataType::Int64 => (Self::I64, None),
+            DataType::Float32 => (Self::F32, None),
+            DataType::Float64 => (Self::F64, None),
+            DataType::Utf8 => (Self::Utf8, None),
+            DataType::Binary => (Self::Binary, None),
+            DataType::Date32 => (Self::Date32, None),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _) => {
+                (Self::TimestampNs, None)
+            }
+            DataType::Time64(arrow::datatypes::TimeUnit::Nanosecond) => (Self::Time64Ns, None),
+            DataType::Decimal128(p, s) => (Self::Decimal128, Some((*p, *s))),
             _ => return None,
         })
     }
 
-    fn to_arrow(self) -> DataType {
+    fn to_arrow(self, dec: Option<DecimalParams>) -> DataType {
         match self {
             Self::Bool => DataType::Boolean,
+            Self::I8 => DataType::Int8,
+            Self::I16 => DataType::Int16,
             Self::I32 => DataType::Int32,
             Self::I64 => DataType::Int64,
+            Self::F32 => DataType::Float32,
             Self::F64 => DataType::Float64,
             Self::Utf8 => DataType::Utf8,
+            Self::Binary => DataType::Binary,
             Self::Date32 => DataType::Date32,
             Self::TimestampNs => DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            Self::Time64Ns => DataType::Time64(arrow::datatypes::TimeUnit::Nanosecond),
+            Self::Decimal128 => {
+                let (p, s) = dec.unwrap_or((38, 10));
+                DataType::Decimal128(p, s)
+            }
         }
     }
 
     fn width(self) -> Option<u64> {
         Some(match self {
-            Self::Bool => 1,
-            Self::I32 | Self::Date32 => 4,
-            Self::I64 | Self::F64 | Self::TimestampNs => 8,
-            Self::Utf8 => return None,
+            Self::Bool | Self::I8 => 1,
+            Self::I16 => 2,
+            Self::I32 | Self::F32 | Self::Date32 => 4,
+            Self::I64 | Self::F64 | Self::TimestampNs | Self::Time64Ns => 8,
+            Self::Decimal128 => 16,
+            Self::Utf8 | Self::Binary => return None,
         })
     }
 
@@ -104,6 +142,12 @@ impl ColType {
             5 => Self::Utf8,
             6 => Self::Date32,
             7 => Self::TimestampNs,
+            8 => Self::I8,
+            9 => Self::I16,
+            10 => Self::F32,
+            11 => Self::Binary,
+            12 => Self::Decimal128,
+            13 => Self::Time64Ns,
             other => {
                 return Err(QsdbError::invalid(format!(
                     "bulk: unknown column type {other}"
@@ -126,7 +170,7 @@ pub fn encode(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<Vec<u8>> {
     let n_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
     // 列类型（先全量校验，别写一半才发现不支持）
-    let types: Vec<ColType> = schema
+    let types: Vec<(ColType, Option<DecimalParams>)> = schema
         .fields()
         .iter()
         .map(|f| {
@@ -150,14 +194,20 @@ pub fn encode(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<Vec<u8>> {
     out.extend_from_slice(&VERSION.to_le_bytes());
     out.extend_from_slice(&(n_cols as u16).to_le_bytes());
     out.extend_from_slice(&(n_rows as u64).to_le_bytes());
-    for (f, t) in schema.fields().iter().zip(&types) {
+    for (f, (t, dec)) in schema.fields().iter().zip(&types) {
         let name = f.name().as_bytes();
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
         out.extend_from_slice(name);
         out.push(*t as u8);
+        // Decimal 的列描述携带 (precision, scale)——查询侧渲染与写入侧建数组
+        // 都靠它，payload 值本身只是未缩放 i128
+        if let Some((p, s)) = dec {
+            out.push(*p);
+            out.push(*s as u8);
+        }
     }
-    for (c, t) in (0..n_cols).zip(&types) {
-        encode_column(&mut out, batches, c, *t, n_rows)?;
+    for (c, (t, dec)) in (0..n_cols).zip(&types) {
+        encode_column(&mut out, batches, c, *t, *dec, n_rows)?;
     }
     Ok(out)
 }
@@ -167,6 +217,7 @@ fn encode_column(
     batches: &[RecordBatch],
     c: usize,
     ty: ColType,
+    dec: Option<DecimalParams>,
     n_rows: usize,
 ) -> Result<()> {
     // NULL 位图（任一批有 null 才写）
@@ -215,6 +266,30 @@ fn encode_column(
             }
             out.extend_from_slice(&data);
         }
+        ColType::Binary => {
+            // 与 Utf8 同布局（offsets + data），值是原始字节（不验 UTF-8）
+            let mut data: Vec<u8> = Vec::new();
+            let mut offsets: Vec<u32> = Vec::with_capacity(n_rows + 1);
+            offsets.push(0);
+            for b in batches {
+                let a = b
+                    .column(c)
+                    .as_any()
+                    .downcast_ref::<arrow::array::BinaryArray>()
+                    .ok_or_else(|| QsdbError::invalid("bulk: expected Binary"))?;
+                for i in 0..a.len() {
+                    if !a.is_null(i) {
+                        data.extend_from_slice(a.value(i));
+                    }
+                    offsets.push(data.len() as u32);
+                }
+            }
+            out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            for o in &offsets {
+                out.extend_from_slice(&o.to_le_bytes());
+            }
+            out.extend_from_slice(&data);
+        }
         _ => {
             let w = ty.width().expect("fixed width");
             out.extend_from_slice(&(n_rows as u64 * w).to_le_bytes());
@@ -230,6 +305,19 @@ fn encode_column(
                         ColType::Bool => out.push(u8::from(
                             a.as_any().downcast_ref::<BooleanArray>().unwrap().value(i),
                         )),
+                        ColType::I8 => out.push(
+                            a.as_any()
+                                .downcast_ref::<arrow::array::Int8Array>()
+                                .unwrap()
+                                .value(i) as u8,
+                        ),
+                        ColType::I16 => out.extend_from_slice(
+                            &a.as_any()
+                                .downcast_ref::<arrow::array::Int16Array>()
+                                .unwrap()
+                                .value(i)
+                                .to_le_bytes(),
+                        ),
                         ColType::I32 => out.extend_from_slice(
                             &a.as_any()
                                 .downcast_ref::<Int32Array>()
@@ -240,6 +328,13 @@ fn encode_column(
                         ColType::I64 => out.extend_from_slice(
                             &a.as_any()
                                 .downcast_ref::<Int64Array>()
+                                .unwrap()
+                                .value(i)
+                                .to_le_bytes(),
+                        ),
+                        ColType::F32 => out.extend_from_slice(
+                            &a.as_any()
+                                .downcast_ref::<arrow::array::Float32Array>()
                                 .unwrap()
                                 .value(i)
                                 .to_le_bytes(),
@@ -258,6 +353,13 @@ fn encode_column(
                                 .value(i)
                                 .to_le_bytes(),
                         ),
+                        ColType::Time64Ns => out.extend_from_slice(
+                            &a.as_any()
+                                .downcast_ref::<arrow::array::Time64NanosecondArray>()
+                                .unwrap()
+                                .value(i)
+                                .to_le_bytes(),
+                        ),
                         ColType::TimestampNs => out.extend_from_slice(
                             &a.as_any()
                                 .downcast_ref::<TimestampNanosecondArray>()
@@ -265,7 +367,18 @@ fn encode_column(
                                 .value(i)
                                 .to_le_bytes(),
                         ),
-                        ColType::Utf8 => unreachable!(),
+                        ColType::Decimal128 => {
+                            // 未缩放 i128（16 字节小端）；scale 在列描述里
+                            let _ = dec;
+                            out.extend_from_slice(
+                                &a.as_any()
+                                    .downcast_ref::<arrow::array::Decimal128Array>()
+                                    .unwrap()
+                                    .value(i)
+                                    .to_le_bytes(),
+                            );
+                        }
+                        ColType::Utf8 | ColType::Binary => unreachable!(),
                     }
                 }
             }
@@ -293,23 +406,32 @@ pub fn decode(bytes: &[u8]) -> Result<RecordBatch> {
     let n_cols = r.u16()? as usize;
     let n_rows = r.u64()? as usize;
     let mut names: Vec<String> = Vec::with_capacity(n_cols);
-    let mut types: Vec<ColType> = Vec::with_capacity(n_cols);
+    let mut types: Vec<(ColType, Option<DecimalParams>)> = Vec::with_capacity(n_cols);
     for _ in 0..n_cols {
         let l = r.u16()? as usize;
         names.push(
             String::from_utf8(r.take(l)?.to_vec())
                 .map_err(|_| QsdbError::invalid("bulk: column name not valid UTF-8"))?,
         );
-        types.push(ColType::from_u8(r.u8()?)?);
+        let ty = ColType::from_u8(r.u8()?)?;
+        // Decimal 的列描述多两个字节（precision/scale）——值只是未缩放 i128
+        let dec = if ty == ColType::Decimal128 {
+            let p = r.u8()?;
+            let s = r.u8()?;
+            Some((p, s as i8))
+        } else {
+            None
+        };
+        types.push((ty, dec));
     }
     let mut cols: Vec<ArrayRef> = Vec::with_capacity(n_cols);
-    for (name, ty) in names.iter().zip(&types) {
-        cols.push(decode_column(&mut r, *ty, n_rows, name)?);
+    for (name, (ty, dec)) in names.iter().zip(&types) {
+        cols.push(decode_column(&mut r, *ty, *dec, n_rows, name)?);
     }
     let fields: Vec<Field> = names
         .iter()
         .zip(&types)
-        .map(|(n, t)| Field::new(n, t.to_arrow(), true))
+        .map(|(n, (t, dec))| Field::new(n, t.to_arrow(*dec), true))
         .collect();
     let schema: SchemaRef = Arc::new(Schema::new(fields));
     RecordBatch::try_new_with_options(
@@ -320,7 +442,13 @@ pub fn decode(bytes: &[u8]) -> Result<RecordBatch> {
     .map_err(|e| QsdbError::invalid(format!("bulk: build batch failed: {e}")))
 }
 
-fn decode_column(r: &mut Reader<'_>, ty: ColType, n_rows: usize, name: &str) -> Result<ArrayRef> {
+fn decode_column(
+    r: &mut Reader<'_>,
+    ty: ColType,
+    dec: Option<DecimalParams>,
+    n_rows: usize,
+    name: &str,
+) -> Result<ArrayRef> {
     let null_len = r.u64()? as usize;
     let has_null = null_len > 0;
     let bits = if has_null {
@@ -366,6 +494,32 @@ fn decode_column(r: &mut Reader<'_>, ty: ColType, n_rows: usize, name: &str) -> 
                     })?;
                     b.append_value(std::str::from_utf8(slice).map_err(|_| {
                         QsdbError::invalid(format!("bulk: column '{name}' not valid UTF-8"))
+                    })?);
+                }
+            }
+            Arc::new(b.finish())
+        }
+        ColType::Binary => {
+            // 与 Utf8 同布局，值不验 UTF-8
+            let off_bytes = r.take((n_rows + 1) * 4)?;
+            let mut offsets: Vec<i32> = Vec::with_capacity(n_rows + 1);
+            for k in 0..=n_rows {
+                offsets.push(i32::from_le_bytes([
+                    off_bytes[k * 4],
+                    off_bytes[k * 4 + 1],
+                    off_bytes[k * 4 + 2],
+                    off_bytes[k * 4 + 3],
+                ]));
+            }
+            let data = r.take(data_len)?;
+            let mut b = arrow::array::BinaryBuilder::with_capacity(n_rows, data_len);
+            for i in 0..n_rows {
+                if is_null(i) {
+                    b.append_null();
+                } else {
+                    let (s, e) = (offsets[i] as usize, offsets[i + 1] as usize);
+                    b.append_value(data.get(s..e).ok_or_else(|| {
+                        QsdbError::invalid(format!("bulk: column '{name}' offsets out of range"))
                     })?);
                 }
             }
@@ -430,7 +584,40 @@ fn decode_column(r: &mut Reader<'_>, ty: ColType, n_rows: usize, name: &str) -> 
                         i64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
                     })
                 }
-                ColType::Utf8 => unreachable!(),
+                ColType::I8 => fixed!(arrow::array::Int8Builder, |s: &[u8]| s[0] as i8),
+                ColType::I16 => {
+                    fixed!(arrow::array::Int16Builder, |s: &[u8]| i16::from_le_bytes([
+                        s[0], s[1]
+                    ]))
+                }
+                ColType::F32 => fixed!(
+                    arrow::array::Float32Builder,
+                    |s: &[u8]| f32::from_le_bytes([s[0], s[1], s[2], s[3]])
+                ),
+                ColType::Time64Ns => {
+                    fixed!(arrow::array::Time64NanosecondBuilder, |s: &[u8]| {
+                        i64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
+                    })
+                }
+                ColType::Decimal128 => {
+                    let (p, s) = dec.unwrap_or((38, 10));
+                    let mut b = arrow::array::Decimal128Builder::with_capacity(n_rows)
+                        .with_precision_and_scale(p, s)
+                        .map_err(|e| {
+                            QsdbError::invalid(format!("bulk: column '{name}' decimal params: {e}"))
+                        })?;
+                    for i in 0..n_rows {
+                        if is_null(i) {
+                            b.append_null();
+                        } else {
+                            let mut raw = [0u8; 16];
+                            raw.copy_from_slice(&data[i * 16..(i + 1) * 16]);
+                            b.append_value(i128::from_le_bytes(raw));
+                        }
+                    }
+                    Arc::new(b.finish())
+                }
+                ColType::Utf8 | ColType::Binary => unreachable!(),
             }
         }
     })
@@ -470,6 +657,74 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
+    /// 十九批Ⅳ：扩展类型（I8/I16/F32/Binary/Decimal128/Time64Ns）的**编码→解码
+    /// 往返**，含 NULL 与 Decimal 的描述字节（precision/scale 丢了值就废）。
+    #[test]
+    fn 扩展类型往返_含null与decimal描述() {
+        use arrow::array::{
+            BinaryArray, Decimal128Array, Float32Array, Int8Array, Int16Array,
+            Time64NanosecondArray,
+        };
+        use arrow::datatypes::{DataType, Field};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int8, true),
+            Field::new("b", DataType::Int16, true),
+            Field::new("f", DataType::Float32, true),
+            Field::new("bin", DataType::Binary, true),
+            Field::new("d", DataType::Decimal128(10, 2), true),
+            Field::new(
+                "t",
+                DataType::Time64(arrow::datatypes::TimeUnit::Nanosecond),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int8Array::from(vec![Some(1i8), None, Some(-3)])),
+                Arc::new(Int16Array::from(vec![Some(300i16), Some(-4), None])),
+                Arc::new(Float32Array::from(vec![Some(1.5f32), Some(-2.25), None])),
+                Arc::new(BinaryArray::from_opt_vec(vec![
+                    Some(b"abc".as_slice()),
+                    None,
+                    Some(&[0x00u8, 0xff][..]),
+                ])),
+                Arc::new({
+                    let mut b = Decimal128Array::from(vec![3080i128, -5, 123456789012i128]);
+                    b = b.with_precision_and_scale(10, 2).unwrap();
+                    b
+                }),
+                Arc::new(Time64NanosecondArray::from(vec![
+                    Some(3_600_000_000_000i64),
+                    None,
+                    Some(1),
+                ])),
+            ],
+        )
+        .unwrap();
+        let payload = encode(&schema, &[batch]).unwrap();
+        let back = decode(&payload).unwrap();
+        assert_eq!(back.schema().as_ref(), schema.as_ref());
+        let d = back
+            .column(4)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(d.precision(), 10);
+        assert_eq!(d.scale(), 2);
+        assert_eq!(d.value(0), 3080);
+        let bin = back
+            .column(3)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(bin.value(0), b"abc");
+        assert_eq!(bin.value(2), &[0x00u8, 0xff][..]);
+        let a = back.column(0).as_any().downcast_ref::<Int8Array>().unwrap();
+        assert!(a.is_null(1));
+        assert_eq!(a.value(2), -3);
+    }
+
     use super::*;
     use arrow::array::{Int64Array, StringArray};
 
@@ -517,10 +772,17 @@ mod tests {
 
     #[test]
     fn unsupported_type_is_rejected_explicitly() {
-        let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float32, true)]));
+        // Float32 自十九批Ⅳ起已支持——改用仍然不支持的 Duration（无对应内核列类型）
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "f",
+            DataType::Duration(arrow::datatypes::TimeUnit::Nanosecond),
+            true,
+        )]));
         let b = RecordBatch::try_new(
             schema,
-            vec![Arc::new(arrow::array::Float32Array::from(vec![1.0f32]))],
+            vec![Arc::new(arrow::array::DurationNanosecondArray::from(vec![
+                1i64,
+            ]))],
         )
         .unwrap();
         let e = encode(&b.schema(), std::slice::from_ref(&b)).unwrap_err();

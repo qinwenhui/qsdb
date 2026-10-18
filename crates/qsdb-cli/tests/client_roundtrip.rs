@@ -1203,3 +1203,79 @@ fn 文件下载_逐字节一致与路径守卫() {
         other => panic!("内部路径应 403，实为 {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// bulk 类型扩展（十九批Ⅳ）：DECIMAL / BINARY 经 bulk 装载与查询
+// ---------------------------------------------------------------------------
+
+#[test]
+fn decimal与binary_bulk往返() {
+    let s = Server::start();
+    let c = s.client();
+    c.execute("CREATE TABLE dt (amt DECIMAL(10,2), b BINARY, k STRING)")
+        .expect("建表");
+
+    // 写：bulk 通道（Column::Decimal128 未缩放值 + Binary 字节）——含 NULL
+    let dec = qsdb_client::Column::Decimal128 {
+        unscaled: vec![Some(3080i128), None, Some(-123456)],
+        precision: 10,
+        scale: 2,
+    };
+    let bin =
+        qsdb_client::Column::Binary(vec![Some(b"abc".to_vec()), None, Some(vec![0x00, 0xff])]);
+    let k = qsdb_client::Column::utf8([Some("r1"), Some("r2"), Some("r3")]);
+    let ack = c
+        .append("dt", &[("amt", dec), ("b", bin), ("k", k)])
+        .expect("bulk append");
+    assert_eq!(ack.rows, 3);
+
+    // 查（bulk 通道）：DECIMAL/BINARY 列的值经编码→解码逐个对上
+    let t = c
+        .query("SELECT amt, b, k FROM dt ORDER BY k")
+        .expect("query")
+        .into_bulk()
+        .expect("bulk");
+    assert_eq!(t.num_rows(), 3);
+    // 列描述带 precision/scale（网格渲染的依据）
+    let desc = &t.schema()[0];
+    assert_eq!(desc.tag, qsdb_client::Tag::Decimal128);
+    assert_eq!(desc.decimal, Some((10, 2)));
+    let r0 = t.rows().next().unwrap();
+    match r0.get(0).unwrap().to_value() {
+        qsdb_client::Value::Decimal128(v) => assert_eq!(v, 3080, "30.80 @ scale 2"),
+        other => panic!("应当 Decimal128，实为 {other:?}"),
+    }
+    match r0.get(1).unwrap().to_value() {
+        qsdb_client::Value::Binary(b) => assert_eq!(b, b"abc"),
+        other => panic!("应当 Binary，实为 {other:?}"),
+    }
+    // NULL 行（k='r2'，ORDER BY 后是第二行）
+    let r2 = t.rows().nth(1).unwrap();
+    assert!(
+        r2.get(0).unwrap().to_value().is_null(),
+        "DECIMAL NULL 保持 null"
+    );
+    assert!(
+        r2.get(1).unwrap().to_value().is_null(),
+        "BINARY NULL 保持 null"
+    );
+}
+
+/// `decimals_from_str` 的精确转换（不经 f64——`0.1` 类小数经浮点带脏尾巴）。
+#[test]
+fn decimals_from_str_精确转换与拒绝() {
+    use qsdb_client::Column;
+    let col = Column::decimals_from_str([Some("30.8"), Some("-0.05"), None, Some("42")], 10, 2)
+        .expect("转换");
+    match col {
+        Column::Decimal128 { unscaled, .. } => {
+            assert_eq!(unscaled, vec![Some(3080), Some(-5), None, Some(4200)]);
+        }
+        other => panic!("应当 Decimal128，实为 {other:?}"),
+    }
+    // 小数位超出 scale → 拒（四舍五入是编造值）
+    assert!(Column::decimals_from_str([Some("1.005")], 10, 2).is_err());
+    // 脏值 → 拒并带行号
+    let e = Column::decimals_from_str([Some("1.0"), Some("abc")], 10, 2).unwrap_err();
+    assert!(e.contains("第 2 行"), "{e}");
+}

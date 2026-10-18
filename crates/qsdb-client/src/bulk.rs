@@ -18,7 +18,7 @@
 //! 静默截断在协议面 = 把半份数据当全份（写进库里更糟）。
 
 use crate::error::{Error, Result, decode_err};
-use crate::value::{ColumnDesc, Tag, ValueRef, decode_value};
+use crate::value::{ColumnDesc, Tag, ValueRef, decode_value, parse_decimal_unscaled};
 
 const MAGIC: &[u8; 8] = b"QSDBBULK";
 const VERSION: u16 = 1;
@@ -70,7 +70,15 @@ impl BulkTable {
                 .map_err(|e| decode_err(FMT, format!("列名不是合法 UTF-8: {e}")))?
                 .to_string();
             let tag = Tag::from_code(r.u8()?)?;
-            schema.push(ColumnDesc::new(name, tag));
+            let mut desc = ColumnDesc::new(name, tag);
+            // Decimal 的列描述多两个字节 (precision, scale)（格式文档 §类型表；
+            // 与内核 bulk 编码器对齐）——值本身只是未缩放 i128
+            if tag == Tag::Decimal128 {
+                let p = r.u8()?;
+                let s = r.u8()?;
+                desc.decimal = Some((p, s as i8));
+            }
+            schema.push(desc);
         }
         let mut cols = Vec::with_capacity(n_cols);
         for d in &schema {
@@ -453,6 +461,28 @@ pub enum Column {
     Date32(Vec<Option<i32>>),
     /// 时间戳列（自 epoch 的纳秒）。
     TimestampNs(Vec<Option<i64>>),
+    /// 8 位整数列（十九批Ⅳ：bulk 类型扩展，与 rows 同标签集）。
+    I8(Vec<Option<i8>>),
+    /// 16 位整数列。
+    I16(Vec<Option<i16>>),
+    /// 单精度列。
+    F32(Vec<Option<f32>>),
+    /// 二进制列（原始字节）。
+    Binary(Vec<Option<Vec<u8>>>),
+    /// **DECIMAL 列（未缩放 i128）**：`precision`/`scale` 必须与表定义一致
+    /// （`/schema` 的 `DECIMAL(p,s)`）——payload 的列描述会携带它们，值本身
+    /// 只是缩放后的整数。字符串 → 未缩放的精确转换见
+    /// [`Column::decimals_from_str`]（不经 f64）。
+    Decimal128 {
+        /// 未缩放值（`30.80` @ scale=2 ⇒ `3080`）。
+        unscaled: Vec<Option<i128>>,
+        /// 精度（总有效位数，≤38）。
+        precision: u8,
+        /// 小数位。
+        scale: i8,
+    },
+    /// 时间列（自午夜的纳秒）。
+    Time64Ns(Vec<Option<i64>>),
 }
 
 impl Column {
@@ -466,6 +496,12 @@ impl Column {
             Column::Utf8(v) => v.len(),
             Column::Date32(v) => v.len(),
             Column::TimestampNs(v) => v.len(),
+            Column::I8(v) => v.len(),
+            Column::I16(v) => v.len(),
+            Column::F32(v) => v.len(),
+            Column::Binary(v) => v.len(),
+            Column::Decimal128 { unscaled, .. } => unscaled.len(),
+            Column::Time64Ns(v) => v.len(),
         }
     }
 
@@ -484,6 +520,12 @@ impl Column {
             Column::Utf8(_) => Tag::Utf8,
             Column::Date32(_) => Tag::Date32,
             Column::TimestampNs(_) => Tag::TimestampNs,
+            Column::I8(_) => Tag::I8,
+            Column::I16(_) => Tag::I16,
+            Column::F32(_) => Tag::F32,
+            Column::Binary(_) => Tag::Binary,
+            Column::Decimal128 { .. } => Tag::Decimal128,
+            Column::Time64Ns(_) => Tag::Time64Ns,
         }
     }
 
@@ -495,6 +537,50 @@ impl Column {
     /// 时间戳列（纳秒）。
     pub fn timestamps<I: IntoIterator<Item = Option<i64>>>(it: I) -> Column {
         Column::TimestampNs(it.into_iter().collect())
+    }
+
+    /// **DECIMAL 列：从十进制字符串精确转未缩放 i128**（`"30.8"` @ scale=1 ⇒
+    /// `308`）——**不经 f64**（精度红线：`0.1` 类小数经浮点会带脏尾巴）。
+    ///
+    /// `precision`/`scale` 来自表定义（`/schema` 的 `DECIMAL(p,s)`）。规则：
+    /// 小数位**超过** `scale` ⇒ 报错（四舍五入是编造值）；总有效位数超过
+    /// `precision` ⇒ 报错（写进去也会被服务端拒，早fail带原值更好定位）。
+    /// 空串/`NULL` ⇒ None。
+    pub fn decimals_from_str<I, S>(
+        it: I,
+        precision: u8,
+        scale: i8,
+    ) -> std::result::Result<Column, String>
+    where
+        I: IntoIterator<Item = Option<S>>,
+        S: AsRef<str>,
+    {
+        let scale = scale.max(0);
+        let mut unscaled = Vec::new();
+        for (i, x) in it.into_iter().enumerate() {
+            match x {
+                None => unscaled.push(None),
+                Some(raw) => {
+                    let t = raw.as_ref().trim();
+                    let v = parse_decimal_unscaled(t, scale)
+                        .map_err(|e| format!("DECIMAL 列第 {} 行值 {t:?} 不合法: {e}", i + 1))?;
+                    // 位数 ≤ precision（负号不算位）
+                    let digits = v.unsigned_abs().to_string().len() as u32;
+                    if digits > precision as u32 {
+                        return Err(format!(
+                            "DECIMAL 列第 {} 行值 {t:?} 超出精度 {precision}（缩放后 {v} 有 {digits} 位）",
+                            i + 1
+                        ));
+                    }
+                    unscaled.push(Some(v));
+                }
+            }
+        }
+        Ok(Column::Decimal128 {
+            unscaled,
+            precision,
+            scale,
+        })
     }
 
     /// 字符串列（从任意迭代器建，省得先攒 `Vec<Option<String>>`）。
@@ -546,6 +632,36 @@ impl Column {
                     mark(i, x.is_none())
                 }
             }
+            Column::I8(v) => {
+                for (i, x) in v.iter().enumerate() {
+                    mark(i, x.is_none())
+                }
+            }
+            Column::I16(v) => {
+                for (i, x) in v.iter().enumerate() {
+                    mark(i, x.is_none())
+                }
+            }
+            Column::F32(v) => {
+                for (i, x) in v.iter().enumerate() {
+                    mark(i, x.is_none())
+                }
+            }
+            Column::Time64Ns(v) => {
+                for (i, x) in v.iter().enumerate() {
+                    mark(i, x.is_none())
+                }
+            }
+            Column::Binary(v) => {
+                for (i, x) in v.iter().enumerate() {
+                    mark(i, x.is_none())
+                }
+            }
+            Column::Decimal128 { unscaled, .. } => {
+                for (i, x) in unscaled.iter().enumerate() {
+                    mark(i, x.is_none())
+                }
+            }
         }
         if any { Some(bits) } else { None }
     }
@@ -586,6 +702,59 @@ impl Column {
                 out.extend_from_slice(&((n * 8) as u64).to_le_bytes());
                 for x in v {
                     out.extend_from_slice(&x.unwrap_or(0.0).to_le_bytes());
+                }
+            }
+            Column::I8(v) => {
+                out.extend_from_slice(&(n as u64).to_le_bytes());
+                for x in v {
+                    out.push(x.unwrap_or(0) as u8);
+                }
+            }
+            Column::I16(v) => {
+                out.extend_from_slice(&((n * 2) as u64).to_le_bytes());
+                for x in v {
+                    out.extend_from_slice(&x.unwrap_or(0).to_le_bytes());
+                }
+            }
+            Column::F32(v) => {
+                out.extend_from_slice(&((n * 4) as u64).to_le_bytes());
+                for x in v {
+                    out.extend_from_slice(&x.unwrap_or(0.0).to_le_bytes());
+                }
+            }
+            Column::Time64Ns(v) => {
+                out.extend_from_slice(&((n * 8) as u64).to_le_bytes());
+                for x in v {
+                    out.extend_from_slice(&x.unwrap_or(0).to_le_bytes());
+                }
+            }
+            Column::Binary(v) => {
+                let mut data = Vec::new();
+                let mut offs = Vec::with_capacity(n + 1);
+                offs.push(0u32);
+                for x in v {
+                    if let Some(b) = x {
+                        data.extend_from_slice(b);
+                    }
+                    offs.push(data.len() as u32);
+                }
+                out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+                for o in &offs {
+                    out.extend_from_slice(&o.to_le_bytes());
+                }
+                out.extend_from_slice(&data);
+            }
+            Column::Decimal128 {
+                unscaled,
+                precision,
+                scale,
+            } => {
+                // 值 = 未缩放 i128（16 字节小端）；precision/scale 由**列描述**
+                // 携带（encode 的描述符写入处按 tag 写）——这里只管值
+                let _ = (precision, scale);
+                out.extend_from_slice(&((n * 16) as u64).to_le_bytes());
+                for x in unscaled {
+                    out.extend_from_slice(&x.unwrap_or(0).to_le_bytes());
                 }
             }
             Column::Utf8(v) => {
@@ -664,6 +833,14 @@ pub fn encode(cols: &[(&str, Column)]) -> Result<Vec<u8>> {
         out.extend_from_slice(&(b.len() as u16).to_le_bytes());
         out.extend_from_slice(b);
         out.push(c.tag().code());
+        // Decimal 的列描述多两个字节 (precision, scale)——与内核解码器对齐
+        if let Column::Decimal128 {
+            precision, scale, ..
+        } = c
+        {
+            out.push(*precision);
+            out.push(*scale as u8);
+        }
     }
     for (_, c) in cols {
         c.encode(&mut out);

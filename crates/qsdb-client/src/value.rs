@@ -31,19 +31,19 @@ pub enum Tag {
     Date32 = 6,
     /// 7：自 epoch 的**纳秒**（i64）。
     TimestampNs = 7,
-    /// 8：8 位有符号整数（`rows` 专有）。
+    /// 8：8 位有符号整数（bulk/rows 共用编号）。
     I8 = 8,
-    /// 9：16 位有符号整数（`rows` 专有）。
+    /// 9：16 位有符号整数（bulk/rows 共用编号）。
     I16 = 9,
-    /// 10：IEEE754 单精度（`rows` 专有）。
+    /// 10：IEEE754 单精度（bulk/rows 共用编号）。
     F32 = 10,
-    /// 11：二进制（`rows` 专有）。
+    /// 11：二进制（bulk/rows 共用编号）。
     Binary = 11,
-    /// 12：十进制（`rows` 专有；未缩放 i128 + 列级 precision/scale）。
+    /// 12：十进制（未缩放 i128 + 列级 precision/scale；bulk/rows 共用编号）。
     Decimal128 = 12,
-    /// 13：自午夜的纳秒（`rows` 专有）。
+    /// 13：自午夜的纳秒（bulk/rows 共用编号）。
     Time64Ns = 13,
-    /// 14：`months i32 + days i32 + nanos i64`（`rows` 专有）。
+    /// 14：`months i32 + days i32 + nanos i64`（rows；bulk 无对应内核列类型）。
     Interval = 14,
 }
 
@@ -520,4 +520,37 @@ pub(crate) fn decode_value<'a>(tag: Tag, bytes: &'a [u8], fmt_name: &str) -> Res
         ),
         Tag::Binary => ValueRef::Binary(bytes),
     })
+}
+
+/// 十进制字符串 → 未缩放 i128（**精确，不经 f64**）。小数位超过 `scale` 报错
+/// （四舍五入是编造值）；不足右补零。`"+12.5"`/`"-0.05"`/`"42"` 均可。
+pub(crate) fn parse_decimal_unscaled(t: &str, scale: i8) -> std::result::Result<i128, String> {
+    let (neg, body) = match t.strip_prefix('-') {
+        Some(b) => (true, b),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let (int_part, frac_part) = match body.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (body, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return Err("没有数字".into());
+    }
+    if !int_part.chars().all(|c| c.is_ascii_digit())
+        || !frac_part.chars().all(|c| c.is_ascii_digit())
+    {
+        return Err("含非数字字符".into());
+    }
+    if frac_part.len() as i8 > scale {
+        return Err(format!(
+            "小数位 {} 超出 scale {scale}（多出的位拒绝——四舍五入是编造值）",
+            frac_part.len()
+        ));
+    }
+    let digits = format!(
+        "{int_part}{frac_part}{}",
+        "0".repeat((scale as usize) - frac_part.len())
+    );
+    let v: i128 = digits.parse().map_err(|_| "超出 i128".to_string())?;
+    Ok(if neg { -v } else { v })
 }
