@@ -344,3 +344,94 @@ pub(crate) fn api_error(status: u16, body: &[u8]) -> Error {
         },
     }
 }
+
+// ---------------------------------------------------------------------------
+// 会话（十八批 C1：POST /api/v1/auth/login）
+// ---------------------------------------------------------------------------
+
+/// 一次登录会话（`Client::login` 的产物；也经 `Client::session()` 可查）。
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    /// 会话 id（服务端日志/审计里对应它；`Client` 自己用它没用——凭证是 token）。
+    pub session_id: String,
+    /// 登录用户（开放模式 = `anonymous`；超级 token 面不建会话、走不到这里）。
+    pub user: String,
+    /// 登录时**默认库**的角色快照（`None` = 白名单制用户当前无默认库授权）。
+    /// 判定以服务端**每请求现查**为准，这里只是登录那一刻的展示值。
+    pub role: Option<String>,
+    /// 授权摘要（键 = 库名或 `"*"`，值 = 角色名或 `null`）——供调用方**自查**，
+    /// 不用撞 403 试探。
+    pub grants: serde_json::Value,
+    /// 会话默认库（`USE` 的落点；`QueryOptions::database` 缺省时的锚点）。
+    pub default_db: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RawLogin {
+    token: String,
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    #[serde(default)]
+    user: String,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    grants: serde_json::Value,
+    #[serde(rename = "defaultDb", default)]
+    default_db: String,
+}
+
+/// 解析 login 响应；token 单独交还（进 `Http` 的 auth 头，**不进**公开结构——
+/// 凭证不该被调用方随手 `Debug` 出去）。
+pub(crate) fn parse_login(bytes: &[u8]) -> Result<(String, SessionInfo)> {
+    let r: RawLogin = serde_json::from_slice(bytes)
+        .map_err(|e| Error::Decode(format!("json: /auth/login 响应不合法: {e}")))?;
+    Ok((
+        r.token,
+        SessionInfo {
+            session_id: r.session_id,
+            user: r.user,
+            role: r.role,
+            grants: r.grants,
+            default_db: r.default_db,
+        },
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// 多库（十八批 C3：GET /api/v1/databases）
+// ---------------------------------------------------------------------------
+
+/// 一个挂载库。
+#[derive(Debug, Clone)]
+pub struct DbInfo {
+    /// 库名（进 `QueryOptions::database` / `Client::use_database`）。
+    pub name: String,
+    /// 只读挂载（写 → 503 `READ_ONLY`，客户端**永不重试**，换可写实例）。
+    pub read_only: bool,
+}
+
+/// 十八批Ⅱ期（`Client::databases`）接线；Ⅰ期先行落了解析器故暂挂 dead_code。
+#[allow(dead_code)]
+pub(crate) fn parse_databases(bytes: &[u8]) -> Result<Vec<DbInfo>> {
+    #[derive(serde::Deserialize)]
+    struct RawDb {
+        name: String,
+        #[serde(rename = "readOnly", default)]
+        read_only: bool,
+    }
+    #[derive(serde::Deserialize)]
+    struct RawBody {
+        #[serde(default)]
+        databases: Vec<RawDb>,
+    }
+    let b: RawBody = serde_json::from_slice(bytes)
+        .map_err(|e| Error::Decode(format!("json: /databases 响应不合法: {e}")))?;
+    Ok(b.databases
+        .into_iter()
+        .map(|d| DbInfo {
+            name: d.name,
+            read_only: d.read_only,
+        })
+        .collect())
+}

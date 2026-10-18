@@ -107,7 +107,7 @@ use std::time::Duration;
 
 pub use crate::bulk::{BulkTable, Column, ColumnIter, ColumnView, Row, Rows};
 pub use crate::error::{Error, Result};
-pub use crate::json::{JsonResult, PartitionInfo, Stats, TableInfo, WriteAck};
+pub use crate::json::{DbInfo, JsonResult, PartitionInfo, SessionInfo, Stats, TableInfo, WriteAck};
 pub use crate::rows::{Chunk, ChunkRow, RowStream, RowsData};
 pub use crate::value::{ColumnDesc, ColumnInfo, Tag, Value, ValueRef};
 
@@ -539,11 +539,23 @@ fn mismatch(got: &ResultData, want: &str) -> Error {
 /// 要真并发就建多个 `Client`（各自一条连接）——这也正是连接池的形态。
 pub struct Client {
     http: http::Http,
+    /// 会话态（十八批 C1）：`None` = 未登录——静态凭证/匿名，行为与从前逐位
+    /// 一致。登录后，这里的凭证（重登用）+ `Http` 的 Bearer 头是**凭证的唯一
+    /// 真源**；`SESSION_REVOKED` 的自动重登靠它（无会话态 = 无凭证可重登）。
+    session: std::sync::Mutex<Option<SessionState>>,
+}
+
+/// 会话的内部态。重登凭证存这里；**刻意不实现 Debug**（凭证明文不该进任何
+/// 展示面）——`Client` 的 Debug 是手写的，只出 target，本类型不可达。
+struct SessionState {
+    info: SessionInfo,
+    user: String,
+    password: String,
 }
 
 impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // 只暴露目标，**不回显凭证**
+        // 只暴露目标，**不回显凭证 / token / 会话态**
         f.debug_struct("Client")
             .field("target", &self.http.target())
             .finish()
@@ -571,7 +583,168 @@ impl Client {
                 opt.connect_timeout,
                 opt.io_timeout,
             ),
+            session: std::sync::Mutex::new(None),
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // 会话（十八批 C1）
+    // -----------------------------------------------------------------------
+
+    /// Basic 凭证换取**进程态会话**：成功后本 Client 的所有请求自动带
+    /// `Bearer <token>`；撞 `SESSION_REVOKED`（被踢/服务端重启/空闲回收）
+    /// 自动用这里的凭证重登（见 [`Client::query_with`] 的重发分档）。
+    ///
+    /// 会话带来的能力：**踢人/审计归因/空闲回收/`USE` 默认库/grants 自查**——
+    /// 这些都是服务端会话面（十六批）的属性，`Auth::Basic` 直判角色的形态
+    /// 拿不到。重复 `login` = 换新会话（旧会话留在服务端直到空闲回收）。
+    ///
+    /// **凭证错就是错**（401 `UNAUTHORIZED` 原样返回）——绝不静默降级匿名。
+    pub fn login(&self, user: &str, password: &str) -> Result<SessionInfo> {
+        let auth = format!(
+            "Basic {}",
+            http::b64_encode(format!("{user}:{password}").as_bytes())
+        );
+        let resp = self.http.post_with_auth(
+            "/api/v1/auth/login",
+            "application/json",
+            b"{}",
+            Some(&auth),
+        )?;
+        if !(200..300).contains(&resp.head.status) {
+            return Err(json::api_error(resp.head.status, &resp.body));
+        }
+        let (token, info) = json::parse_login(&resp.body)?;
+        // 会话锁内换头：并发 login / 重登看到的是完整切换，不会撕裂
+        {
+            let mut st = self.session.lock().unwrap_or_else(|e| e.into_inner());
+            self.http.set_auth(Some(format!("Bearer {token}")));
+            *st = Some(SessionState {
+                info: info.clone(),
+                user: user.to_string(),
+                password: password.to_string(),
+            });
+        }
+        Ok(info)
+    }
+
+    /// 当前会话信息（未登录 → `None`）。`grants` 供调用方**自查**授权，
+    /// 不用撞 403 试探；判定以服务端每请求现查为准。
+    pub fn session(&self) -> Option<SessionInfo> {
+        self.session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|s| s.info.clone())
+    }
+
+    /// 设会话默认库（SQL `USE` 的 REST 落点）。**需要先 [`Client::login`]**
+    /// ——默认库是会话的属性；未登录 → [`Error::Usage`]。
+    ///
+    /// 之后 `QueryOptions.database` **缺省**的查询都落在这里；显式 `database`
+    /// 字段优先级更高（服务端语义：显式 ?? 会话默认库 ?? "default"）。
+    pub fn use_database(&self, db: &str) -> Result<()> {
+        if !self.has_session() {
+            return Err(Error::Usage(
+                "use_database 需要先 login()——默认库是会话的属性，Basic/匿名没有".into(),
+            ));
+        }
+        let body = serde_json::json!({ "database": db }).to_string();
+        let resp = self.http.put(
+            "/api/v1/sessions/current/database",
+            "application/json",
+            body.as_bytes(),
+        )?;
+        if !(200..300).contains(&resp.head.status) {
+            return Err(json::api_error(resp.head.status, &resp.body));
+        }
+        #[derive(serde::Deserialize)]
+        struct Ack {
+            #[serde(rename = "defaultDb")]
+            default_db: String,
+        }
+        let ack: Ack = serde_json::from_slice(&resp.body)
+            .map_err(|e| Error::Decode(format!("json: USE 回执不合法: {e}")))?;
+        let mut st = self.session.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = st.as_mut() {
+            s.info.default_db = ack.default_db;
+        }
+        Ok(())
+    }
+
+    fn has_session(&self) -> bool {
+        self.session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    /// 撞 `SESSION_REVOKED` 后的重登（**单飞**）：`stale_auth` = 失败请求所用
+    /// 的 Authorization 快照。锁内复检——快照已变 = 别的线程已重登过，直接
+    /// 返回（并发 N 个失败只产生一次 login 往返）。
+    ///
+    /// 返回 `Err` 只可能是**重登本身失败**（用户被删/口令被改）——原 401 由
+    /// 调用方照常拿到，这里是附加动作的成败。
+    fn relogin_if_stale(&self, stale_auth: &Option<String>) -> Result<()> {
+        let mut st = self.session.lock().unwrap_or_else(|e| e.into_inner());
+        if self.http.auth_snapshot() != *stale_auth {
+            return Ok(()); // 已有人重登，直接复用
+        }
+        let (user, password) = match st.as_ref() {
+            Some(s) => (s.user.clone(), s.password.clone()),
+            // 无会话态却进了这里 = 调用方判错（`has_session` 先行）；不重登
+            None => return Ok(()),
+        };
+        let auth = format!(
+            "Basic {}",
+            http::b64_encode(format!("{user}:{password}").as_bytes())
+        );
+        let resp = self.http.post_with_auth(
+            "/api/v1/auth/login",
+            "application/json",
+            b"{}",
+            Some(&auth),
+        )?;
+        if !(200..300).contains(&resp.head.status) {
+            return Err(json::api_error(resp.head.status, &resp.body));
+        }
+        let (token, info) = json::parse_login(&resp.body)?;
+        self.http.set_auth(Some(format!("Bearer {token}")));
+        if let Some(s) = st.as_mut() {
+            s.info = info;
+        }
+        Ok(())
+    }
+
+    /// **读路径**的 REVOKED 恢复包装：撞 401 `SESSION_REVOKED` 且有会话态 →
+    /// 单飞重登 → **原样重发一次**。安全依据（契约 §3.1）：服务端认证闸在
+    /// 执行**前**，401 = 语句从未运行——读请求重发无副作用。
+    fn read_with_relogin<T>(&self, f: impl Fn(&Client) -> Result<T>) -> Result<T> {
+        let stale_auth = self.http.auth_snapshot();
+        match f(self) {
+            Err(e @ Error::Api { status: 401, .. }) if e.code() == Some("SESSION_REVOKED") => {
+                if self.has_session() {
+                    self.relogin_if_stale(&stale_auth)?;
+                    f(self)
+                } else {
+                    Err(e) // 无凭证可重登（静态凭证失效/重启过），原错误交回
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// **写路径**的 REVOKED 处置：只重登、**不重发**——`append` 非幂等是本
+    /// crate 的第一设计约束，"服务端认证闸在执行前"虽然成立，也不让自动重发
+    /// 赌它。原 401 原样交回；**调用方直接重试即可成功**（重登已完成）。
+    fn write_handle_revoked<T>(&self, r: Result<T>) -> Result<T> {
+        if let Err(e @ Error::Api { status: 401, .. }) = &r {
+            if e.code() == Some("SESSION_REVOKED") {
+                let stale_auth = self.http.auth_snapshot();
+                let _ = self.relogin_if_stale(&stale_auth);
+            }
+        }
+        r
     }
 
     /// 跑一条 SQL，默认走 [`Format::Bulk`]。
@@ -600,7 +773,14 @@ impl Client {
     }
 
     /// 跑一条 SQL（指定通道/超时/query id）。
+    ///
+    /// **读路径**：撞 `SESSION_REVOKED`（登录后）自动单飞重登并重发一次
+    /// （认证闸在执行前 ⇒ 语句从未运行，重发无副作用）；未登录则原样返回。
     pub fn query_with(&self, sql: &str, opts: &QueryOptions) -> Result<ResultSet> {
+        self.read_with_relogin(|c| c.query_once(sql, opts))
+    }
+
+    fn query_once(&self, sql: &str, opts: &QueryOptions) -> Result<ResultSet> {
         let extra = extra_headers(opts);
         let body = body_of(sql, opts.format.as_str(), &opts.params);
         let resp = self.http.post_with(
@@ -622,6 +802,11 @@ impl Client {
     ///   在它被读完或 drop 之前，这个 `Client` 上的其它请求会用另一条连接；
     /// - 大结果**别用 `query` 再转行式**（那会把整份结果搬进内存），用这个。
     pub fn query_stream(&self, sql: &str, opts: &QueryOptions) -> Result<RowStream> {
+        // 读路径：同 query_with 的 REVOKED 自动重登+重发
+        self.read_with_relogin(|c| c.stream_once(sql, opts))
+    }
+
+    fn stream_once(&self, sql: &str, opts: &QueryOptions) -> Result<RowStream> {
         let extra = extra_headers(opts);
         let body = body_of(sql, "rows", &opts.params);
         let (head, mut body) = self.http.post_stream(
@@ -657,8 +842,15 @@ impl Client {
     /// 回执里的 `command` / `rows_affected` 是**结构化字段**；
     /// `message` 是给人看的文案，**不做兼容承诺**——判分支请用前两个。
     /// （`query` 也能拿到同样的东西，只是返回类型是 [`ResultSet`]。）
+    ///
+    /// **写路径**：撞 `SESSION_REVOKED`（登录后）只自动重登、**不重发**
+    /// （`append` 非幂等同款纪律）——原 401 照常返回，**直接重试本方法即可
+    /// 成功**（重登已完成，且该语句从未被服务端执行）。
     pub fn execute(&self, sql: &str) -> Result<JsonResult> {
-        self.query_with(sql, &QueryOptions::json())?.into_json()
+        let r = self
+            .query_once(sql, &QueryOptions::json())
+            .and_then(|rs| rs.into_json());
+        self.write_handle_revoked(r)
     }
 
     /// 批量装载若干列（走 `bulk` 通道，零 arrow 依赖）。
@@ -731,11 +923,16 @@ impl Client {
         if let Some(g) = opts.mode.expected_generation() {
             path.push_str(&format!("&expected_generation={g}"));
         }
-        let resp = self.http.post(&path, content_type, body)?;
-        if !(200..300).contains(&resp.head.status) {
-            return Err(json::api_error(resp.head.status, &resp.body));
-        }
-        json::parse_write_ack(&resp.body)
+        let resp = self.http.post(&path, content_type, body);
+        let r = match resp {
+            Ok(r) if !(200..300).contains(&r.head.status) => {
+                Err(json::api_error(r.head.status, &r.body))
+            }
+            Ok(r) => json::parse_write_ack(&r.body),
+            Err(e) => Err(e),
+        };
+        // 写路径（append 非幂等）：REVOKED 只重登、不重发——见 write_handle_revoked
+        self.write_handle_revoked(r)
     }
 
     /// 表名列表。
@@ -827,11 +1024,14 @@ impl Client {
     }
 
     fn get_json(&self, path: &str) -> Result<Vec<u8>> {
-        let resp = self.http.get(path)?;
-        if !(200..300).contains(&resp.head.status) {
-            return Err(json::api_error(resp.head.status, &resp.body));
-        }
-        Ok(resp.body)
+        // GET 元数据是幂等读：与 query 同款 REVOKED 自动重登+重发
+        self.read_with_relogin(|c| {
+            let resp = c.http.get(path)?;
+            if !(200..300).contains(&resp.head.status) {
+                return Err(json::api_error(resp.head.status, &resp.body));
+            }
+            Ok(resp.body)
+        })
     }
 }
 

@@ -808,3 +808,117 @@ fn 参数化查询往返() {
         "表必须还在、且还是 3 行（`DROP` 只是那串文本）"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 会话（十八批 C1）：login / 踢出后读自动恢复 / 写路径只重登不重发
+// ---------------------------------------------------------------------------
+
+/// 裸 HTTP（管理动作：踢会话——Client 刻意不暴露管理面）。
+fn raw_http(port: u16, method: &str, path: &str, body: &str) -> (u16, String) {
+    use std::io::{Read as _, Write as _};
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+         Connection: close\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes()).unwrap();
+    let mut raw = String::new();
+    s.read_to_string(&mut raw).unwrap();
+    let status: u16 = raw
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let body = raw
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    (status, body)
+}
+
+fn kick(s: &Server, sid: &str) {
+    let (st, body) = raw_http(s.port, "DELETE", &format!("/api/v1/sessions/{sid}"), "{}");
+    assert_eq!(st, 200, "kick 失败: {body}");
+}
+
+#[test]
+fn 会话登录_踢出恢复与写路径分档() {
+    let s = Server::start();
+    let c = s.client(); // 开放模式；login 拿 anonymous 会话
+    setup(&c);
+
+    // login：开放模式（无用户、无 token）→ anonymous 会话（admin 等价）
+    let si = c.login("anyone", "anypassword").expect("login");
+    assert!(!si.session_id.is_empty());
+    assert_eq!(si.user, "anonymous");
+    assert_eq!(si.role.as_deref(), Some("admin"));
+    assert_eq!(si.default_db, "default");
+    assert_eq!(c.session().expect("登录后可查").session_id, si.session_id);
+
+    // use_database 往返；未挂载的库显式 404
+    c.use_database("default").expect("use");
+    assert_eq!(c.session().unwrap().default_db, "default");
+    match c.use_database("nope") {
+        Err(Error::Api { status: 404, .. }) => {}
+        other => panic!("未挂载库应 404，实为 {other:?}"),
+    }
+    // 未登录的 Client → Usage（显式报错，不静默）
+    let fresh = s.client();
+    match fresh.use_database("default") {
+        Err(Error::Usage(_)) => {}
+        other => panic!("未登录应 Usage，实为 {other:?}"),
+    }
+
+    // 读路径：踢出 → 下一条 query **透明恢复**（自动重登 + 重发一次）
+    let sid1 = c.session().unwrap().session_id;
+    kick(&s, &sid1);
+    let rs = c
+        .query_with("SELECT count(*) FROM t", &QueryOptions::json())
+        .expect("踢出后读应透明恢复");
+    assert_eq!(rs.into_json().expect("json").row_count, Some(1));
+    let sid2 = c.session().expect("重登后有新会话").session_id;
+    assert_ne!(sid2, sid1, "恢复 = 换了新会话");
+
+    // 写路径（DML）：只重登不重发 → 错误原样返回，**立即重试即成功**
+    c.execute("CREATE TABLE wtest (a BIGINT)").expect("建表");
+    kick(&s, &sid2);
+    let e = c.execute("INSERT INTO wtest VALUES (1)").unwrap_err();
+    match &e {
+        Error::Api {
+            status: 401, code, ..
+        } => assert_eq!(code, "SESSION_REVOKED"),
+        other => panic!("应当 SESSION_REVOKED，实为 {other:?}"),
+    }
+    c.execute("INSERT INTO wtest VALUES (1)")
+        .expect("重试应成功（该语句从未被服务端执行）");
+
+    // 写路径（append 非幂等）同款分档
+    let sid3 = c.session().unwrap().session_id;
+    kick(&s, &sid3);
+    let cols: Vec<(&str, Column)> = vec![("a", vec![Some(7i64)].into())];
+    match c.append("wtest", &cols) {
+        Err(Error::Api {
+            status: 401, code, ..
+        }) => assert_eq!(code, "SESSION_REVOKED"),
+        other => panic!("append 应当 SESSION_REVOKED，实为 {other:?}"),
+    }
+    let ack = c.append("wtest", &cols).expect("重试应成功");
+    assert_eq!(ack.rows, 1);
+
+    // 并发单飞：踢出后两线程同时查询 → 都成功（一次重登、另一个复用新 token）
+    let sid4 = c.session().unwrap().session_id;
+    kick(&s, &sid4);
+    std::thread::scope(|sc| {
+        for _ in 0..2 {
+            let c = &c;
+            sc.spawn(move || {
+                let rs = c
+                    .query_with("SELECT 1", &QueryOptions::json())
+                    .expect("并发恢复都应成功");
+                assert_eq!(rs.into_json().unwrap().row_count, Some(1));
+            });
+        }
+    });
+}

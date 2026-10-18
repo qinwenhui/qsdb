@@ -490,8 +490,10 @@ pub(crate) struct Response {
 pub(crate) struct Http {
     host: String,
     port: u16,
-    /// 预拼好的 `Authorization` 头值（None = 匿名）。
-    auth: Option<String>,
+    /// 当前 `Authorization` 头值（None = 匿名）。**锁内可变**（十八批 C1）：
+    /// login / REVOKED 重登会把它从 Basic 换成 Bearer 会话 token——构造后
+    /// 仍可换，是会话态的落点。
+    auth: Mutex<Option<String>>,
     connect_timeout: Option<Duration>,
     io_timeout: Option<Duration>,
     conn: Mutex<Option<BufConn>>,
@@ -508,11 +510,22 @@ impl Http {
         Self {
             host,
             port,
-            auth,
+            auth: Mutex::new(auth),
             connect_timeout,
             io_timeout,
             conn: Mutex::new(None),
         }
+    }
+
+    /// 当前 Authorization 头值快照（克隆出锁）。REVOKED 重登的**单飞判据**：
+    /// 失败时的快照 ≠ 现值 ⇒ 别的线程已经重登过，直接重发即可。
+    pub(crate) fn auth_snapshot(&self) -> Option<String> {
+        self.auth.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// 换 Authorization 头（login 成功后调用）。
+    pub(crate) fn set_auth(&self, v: Option<String>) {
+        *self.auth.lock().unwrap_or_else(|e| e.into_inner()) = v;
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<BufConn>> {
@@ -531,6 +544,31 @@ impl Http {
 
     pub fn post(&self, path: &str, content_type: &str, body: &[u8]) -> Result<Response> {
         self.exchange("POST", path, Some(content_type), body, &[])
+    }
+
+    /// `PUT`（十八批 C1：`PUT /sessions/current/database`）。
+    pub fn put(&self, path: &str, content_type: &str, body: &[u8]) -> Result<Response> {
+        let auth_snap = self.auth_snapshot();
+        self.exchange_auth(
+            "PUT",
+            path,
+            Some(content_type),
+            &[],
+            body,
+            auth_snap.as_deref(),
+        )
+    }
+
+    /// `POST` + **显式** Authorization（login 专用：要带 Basic 凭证，
+    /// 不吃当前态的 token——那正是要被换掉的东西）。
+    pub(crate) fn post_with_auth(
+        &self,
+        path: &str,
+        content_type: &str,
+        body: &[u8],
+        auth: Option<&str>,
+    ) -> Result<Response> {
+        self.exchange_auth("POST", path, Some(content_type), &[], body, auth)
     }
 
     /// `POST` + 额外请求头（`X-QSDB-Timeout-Ms` / `X-QSDB-Query-Id`）。
@@ -565,13 +603,14 @@ impl Http {
             None => BufConn::connect(&self.host, self.port, self.connect_timeout)?,
         };
         conn.set_io_timeout(self.io_timeout)?;
+        let auth_snap = self.auth_snapshot();
         let (head, conn) = match conn.send(
             "POST",
             path,
             Some(content_type),
             extra,
             body,
-            self.auth.as_deref(),
+            auth_snap.as_deref(),
             true,
         ) {
             Ok(h) => (h, conn),
@@ -585,7 +624,7 @@ impl Http {
                     Some(content_type),
                     extra,
                     body,
-                    self.auth.as_deref(),
+                    auth_snap.as_deref(),
                     true,
                 )?;
                 (h, fresh)
@@ -604,6 +643,27 @@ impl Http {
         body: &[u8],
         extra: &[(&str, &str)],
     ) -> Result<Response> {
+        let auth_snap = self.auth_snapshot();
+        self.exchange_auth(
+            method,
+            path,
+            content_type,
+            extra,
+            body,
+            auth_snap.as_deref(),
+        )
+    }
+
+    /// `exchange` 的显式凭证形态（`exchange` = 用当前态快照调它）。
+    fn exchange_auth(
+        &self,
+        method: &str,
+        path: &str,
+        content_type: Option<&str>,
+        extra: &[(&str, &str)],
+        body: &[u8],
+        auth: Option<&str>,
+    ) -> Result<Response> {
         let mut slot = self.lock();
         let mut first = true;
         // `GET` 无副作用 ⇒ 允许"写出去了但没收到响应"时重发（见模块头第 2 条）
@@ -620,15 +680,7 @@ impl Http {
             }
             let attempt = {
                 let c = slot.as_mut().expect("刚连上");
-                c.send(
-                    method,
-                    path,
-                    content_type,
-                    extra,
-                    body,
-                    self.auth.as_deref(),
-                    false,
-                )
+                c.send(method, path, content_type, extra, body, auth, false)
             };
             match attempt {
                 Ok(head) => {

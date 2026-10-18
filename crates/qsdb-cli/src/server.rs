@@ -1305,6 +1305,9 @@ async fn auth_login(
     Json(serde_json::json!({
         "token": token,
         "sessionId": session_id,
+        // 十八批 C1 补：会话身份（客户端 SessionInfo 自查/展示用；开放模式 =
+        // "anonymous"）。只增字段，老客户端不受影响
+        "user": user,
         "role": role.map(|r| serde_json::json!(r.name())).unwrap_or(serde_json::Value::Null),
         "grants": grants,
         "defaultDb": "default",
