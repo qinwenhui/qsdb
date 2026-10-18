@@ -1279,3 +1279,17 @@ fn decimals_from_str_精确转换与拒绝() {
     let e = Column::decimals_from_str([Some("1.0"), Some("abc")], 10, 2).unwrap_err();
     assert!(e.contains("第 2 行"), "{e}");
 }
+
+/// 空实例的 `withSchema=1`：`{"tables":[]}` 此前被 untagged 解析误判成
+/// "服务端忽略了 withSchema"（空数组同时匹配两种形态，Names 在前）——
+/// 修复后 Detailed 优先，空表按请求形态返回。studio e2e 实测。
+#[test]
+fn 空实例_with_schema_不误判() {
+    let s = Server::start(); // 全新库 = 零表
+    let c = s.client();
+    let ts = c
+        .tables_with_schema()
+        .expect("空实例也应返回 Detailed 空表");
+    assert!(ts.is_empty(), "空实例零表: {ts:?}");
+    assert!(c.tables().unwrap().is_empty());
+}

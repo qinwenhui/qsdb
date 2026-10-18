@@ -178,10 +178,14 @@ struct RawTableInfo {
 #[derive(serde::Deserialize)]
 #[serde(untagged)]
 enum RawTables {
+    /// `{"tables": [{"name":…,"columns":[…]}]}`（`?withSchema=1`）。
+    /// **必须排在 `Names` 前**：untagged 按声明序尝试，空数组 `[]` 两者都
+    /// 匹配——Names 在前会把"空实例的 withSchema 响应"误判成"服务端忽略
+    /// 了 withSchema"（studio e2e 实测）。两形态的元素类型（对象 vs 字符串）
+    /// 无重叠，Detailed 在前对非空场景零影响。
+    Detailed(Vec<RawTableInfo>),
     /// `{"tables": ["a","b"]}`
     Names(Vec<String>),
-    /// `{"tables": [{"name":…,"columns":[…]}]}`（`?withSchema=1`）
-    Detailed(Vec<RawTableInfo>),
 }
 
 #[derive(serde::Deserialize)]
