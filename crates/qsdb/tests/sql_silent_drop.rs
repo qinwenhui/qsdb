@@ -216,23 +216,35 @@ fn select_level_clauses_are_rejected() {
 }
 
 /// ⑥ 别名与 DML：CTE/派生表**列别名**、`INSERT … ON CONFLICT`。
+///
+/// 2026-10-18（十九批 S2）：**列别名清单已实现**（按位置重命名）⇒ 两条从
+/// "拒绝"升值为**断言值**（别名接管列名，值不变——升值的理由与 FILTER 同款：
+/// 将来谁退回静默丢弃，值断言会当场红）。`ON CONFLICT` 继续拒。
 #[test]
 fn aliases_and_on_conflict_are_rejected() {
     let (db, root) = setup("alias");
-    rejected(
-        &db,
-        "WITH w(q) AS (SELECT a FROM t) SELECT q FROM w",
-        "CTE column alias",
+    // 列别名：名字换、值不变（t.a = 1,2,NULL,3 → q = 同序）
+    assert_eq!(
+        scalar(
+            &db,
+            "WITH w(q) AS (SELECT a FROM t) SELECT q FROM w WHERE q = 3"
+        ),
+        "3"
     );
-    rejected(
-        &db,
-        "SELECT x FROM (SELECT a FROM t) AS d(x)",
-        "derived-table column alias",
+    assert_eq!(
+        scalar(&db, "SELECT x FROM (SELECT a FROM t) AS d(x) WHERE x = 2"),
+        "2"
     );
     rejected(
         &db,
         "INSERT INTO u VALUES (1,'x') ON CONFLICT DO NOTHING",
         "ON CONFLICT",
+    );
+    // 边界：数不符照旧显式拒（响亮的 400，不是静默）
+    rejected(
+        &db,
+        "WITH w(q, r) AS (SELECT a FROM t) SELECT q FROM w",
+        "列别名",
     );
     // 对照组：带别名的 CTE（不带列清单）与普通派生表照常
     assert_eq!(
@@ -248,24 +260,37 @@ fn aliases_and_on_conflict_are_rejected() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// ⑦ JOIN 右表**裸列**：我们的规则是"裸名 = 左表、右表必须限定"（SQL-2 约束，
-/// 见 `translate_select_inner` 的 ctx 扩展注释）。
+/// ⑦ JOIN 右表**裸列**：此前规则是"裸名 = 左表、右表必须限定"，报错带指路。
 ///
-/// 这不是静默错值（永远只有一个候选），但与标准 SQL 不同——所以**报错要能指路**，
-/// 而不是干巴巴一句"列不存在"。
+/// 2026-10-18（十九批 S1）：裸名落空后做**限定列尾名回退**（PG/MySQL 同判）
+/// ⇒ 从"报错"升值为**断言值**。仍锁两条：真拼错的列照常 not found；
+/// **精确名优先**——左右同名时裸名取左（本仓既定解析序，比 PG 宽容且向后兼容）。
 #[test]
-fn right_side_bare_column_error_points_at_the_fix() {
-    let (db, root) = setup("joinhint");
-    match db.sql("SELECT t.a, c FROM t LEFT JOIN u ON t.a = u.a") {
-        Ok(_) => panic!("右表裸列应报错（本仓要求限定名）"),
-        Err(e) => {
-            let msg = format!("{e}");
-            assert!(msg.contains("column 'c'"), "{msg}");
-            assert!(
-                msg.contains("u.c") && msg.contains("left input only"),
-                "报错应指出限定名写法与规则，实得：{msg}"
-            );
-        }
+fn right_side_bare_column_resolves_and_exact_wins() {
+    let (db, root) = setup("joinbare");
+    // 右表裸列：现在解析到 u.c（匹配行 a=1 → 'u1'）
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT c FROM t LEFT JOIN u ON t.a = u.a WHERE t.a = 1"
+        ),
+        "u1"
+    );
+    // 精确名优先：两侧都有 a（左裸名 + 右 u.a）⇒ 裸 a 绑定左表。
+    // 判据：u.a=9 的那一行左 a 是 NULL —— 裸 a 若错绑右侧会回 1 行（值 9），
+    // 绑左侧（t.a 永远 ≠ 9）⇒ 0 行。
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT count(*) FROM t LEFT JOIN u ON t.a = u.a WHERE a = 9"
+        ),
+        "0",
+        "裸 a 精确命中左表 —— 精确名优先于尾名回退"
+    );
+    // 真不存在的列：照常 not found（尾名回退落空）
+    match db.sql("SELECT nope FROM t LEFT JOIN u ON t.a = u.a") {
+        Ok(_) => panic!("不存在的列应报错"),
+        Err(e) => assert!(format!("{e}").contains("column 'nope'"), "{e}"),
     }
     // 对照组：限定名照常
     assert_eq!(
@@ -308,10 +333,14 @@ fn gates_cover_nested_queries() {
         ),
         "2"
     );
+    // EXCLUDE 本身仍未实现（audit_select 的专属闸）。⚠️ 但
+    // `FROM t EXCLUDE (b)` 会被解析成「别名 `exclude` + 列清单 `(b)`」——
+    // 十九批 S2 实现列别名清单后，这条误解析从"静默拿全列"变成**列数不符的
+    // 显式 400**（3 列的表给 1 个别名）。陷阱从"静默"变"响亮"，仍拒。
     rejected(
         &db,
         "SELECT count(*) FROM (SELECT * FROM t EXCLUDE (b)) x",
-        "EXCLUDE",
+        "列别名",
     );
     // 对照：同样的嵌套形状，去掉静默子句就照常
     assert_eq!(scalar(&db, "SELECT count(*) FROM (SELECT a FROM t) x"), "4");

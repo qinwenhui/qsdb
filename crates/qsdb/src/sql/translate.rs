@@ -215,12 +215,10 @@ fn audit_query(q: &sqlparser::ast::Query) -> Result<()> {
     // `LIMIT` / `OFFSET` / `FETCH FIRST n ROWS ONLY`：**已实现**（见
     // `bind_limit_offset`），故不在此拒绝。`FETCH … PERCENT / WITH TIES`
     // 语义不同，在那个助手内单独拒绝。
-    // CTE 列别名：`WITH w(q) AS …`
+    // CTE 列别名 `WITH w(a,b) AS …`：**已实现**（十九批 S2，`bind_with_ctes`
+    // 里按位置重命名）。`CTE FROM clause` 仍拒。
     if let Some(w) = &q.with {
         for cte in &w.cte_tables {
-            if !cte.alias.columns.is_empty() {
-                return reject("CTE column alias list (WITH w(a,b) AS …)");
-            }
             if cte.from.is_some() {
                 return reject("CTE FROM clause");
             }
@@ -335,49 +333,36 @@ fn audit_table_factor(tf: &sqlparser::ast::TableFactor) -> Result<()> {
             "{what} is not supported — refusing rather than silently ignoring it"
         )))
     };
-    match tf {
-        TableFactor::Table {
-            alias,
-            sample,
-            version,
-            partitions,
-            with_hints,
-            args,
-            ..
-        } => {
-            // **表别名上的列清单**（`FROM t AS x(a,b)`）——同样被静默丢掉。
-            // 顺带提醒一个真实的踩坑：`SELECT * FROM t EXCLUDE (b)` 会被解析成
-            // 「别名 `exclude` + 列清单 `(b)`」，于是用户以为在写 Snowflake 的
-            // EXCLUDE，实际拿到了**全列**（静默多列）。故这里必须拦。
-            if let Some(a) = alias {
-                if !a.columns.is_empty() {
-                    return reject(
-                        "column alias list on a table factor (… AS x(a,b)) — note                          `SELECT * FROM t EXCLUDE (b)` parses as an alias `exclude`                          with a dropped column list, not as EXCLUDE",
-                    );
-                }
-            }
-            if sample.is_some() {
-                return reject("TABLESAMPLE");
-            }
-            // 时间旅行 / 分区选择：**静默忽略会读到别的数据**（最坏的一类）
-            if version.is_some() {
-                return reject("table version/time travel (AT VERSION / FOR SYSTEM_TIME)");
-            }
-            if !partitions.is_empty() {
-                return reject("table PARTITION (…) selector");
-            }
-            if !with_hints.is_empty() {
-                return reject("table hints (WITH (…))");
-            }
-            // 注意 `args` **不在**本闸门内：`read_parquet('…')` 这类表函数正是
-            // 经 `TableFactor::Table { args: Some(..) }` 表达，dpc 绑定器有专门分支
-            // （未知表函数会显式报错）——它不是"被忽略的字段"。
-            let _ = args;
+    // 表别名上的列清单 `FROM t AS x(a,b)`：**已实现**（十九批 S2，
+    // `resolve_from_factor` 里按位置重命名）。
+    // ⚠️ 历史踩坑存档：`SELECT * FROM t EXCLUDE (b)` 会被解析成
+    // 「别名 `exclude` + 列清单 `(b)`」——实现前那是"静默拿全列"，
+    // 实现后是**列数不符的显式 400**（EXCLUDE 本身另有专属闸），陷阱
+    // 从"静默"变成了"响亮"，可接受。
+    if let TableFactor::Table {
+        sample,
+        version,
+        partitions,
+        with_hints,
+        ..
+    } = tf
+    {
+        if sample.is_some() {
+            return reject("TABLESAMPLE");
         }
-        TableFactor::Derived { alias: Some(a), .. } if !a.columns.is_empty() => {
-            return reject("derived-table column alias list (… AS d(a,b))");
+        // 时间旅行 / 分区选择：**静默忽略会读到别的数据**（最坏的一类）
+        if version.is_some() {
+            return reject("table version/time travel (AT VERSION / FOR SYSTEM_TIME)");
         }
-        _ => {}
+        if !partitions.is_empty() {
+            return reject("table PARTITION (…) selector");
+        }
+        if !with_hints.is_empty() {
+            return reject("table hints (WITH (…))");
+        }
+        // 注意 `args` **不在**本闸门内：`read_parquet('…')` 这类表函数正是
+        // 经 `TableFactor::Table { args: Some(..) }` 表达，dpc 绑定器有专门分支
+        // （未知表函数会显式报错）——它不是"被忽略的字段"。
     }
     Ok(())
 }
@@ -1787,6 +1772,48 @@ impl SchemaCtx {
         Ok(hit)
     }
 
+    /// **裸名的限定列回退**（十九批 S1）：精确名没命中时，找"限定名的尾段
+    /// 恰好是它"的列 —— `SELECT w FROM t JOIN u ON …` 里右侧的 `u.w` 就该被
+    /// 裸名 `w` 解析到（PG/MySQL 同判；此前本仓"裸名恒左表"是比标准更严的
+    /// 自定规则，右侧列必须写全限定）。
+    ///
+    /// - `Ok(Some(i))`：**唯一**命中。
+    /// - `Ok(None)`：没有任何限定列的尾段是它（真不存在）。
+    /// - `Err(…)`：命中多个（`a.v` 与 `b.v` 并存）⇒ 与 [`Self::resolve_opt`]
+    ///   同款歧义错——PG 的措辞就是 `column reference is ambiguous`。
+    ///
+    /// 只匹配**含 `.`** 的注册名：左侧裸列（精确名）永远优先，本方法只在
+    /// 精确名落空后被调——既有查询的行为一个字不变（**纯放宽**）。
+    pub fn resolve_tail_opt(&self, name: &str) -> Result<Option<usize>> {
+        let lower = name.to_ascii_lowercase();
+        let mut hit: Option<usize> = None;
+        let mut hit_name = String::new();
+        let mut extra: Option<String> = None;
+        for (i, (n, _)) in self.cols.iter().enumerate() {
+            let Some((_, tail)) = n.rsplit_once('.') else {
+                continue; // 只看限定名
+            };
+            if !crate::catalog::ident_ok(tail) || tail.to_ascii_lowercase() != lower {
+                continue;
+            }
+            if hit.is_some() {
+                extra = Some(n.clone());
+                break;
+            }
+            hit = Some(i);
+            hit_name = n.clone();
+        }
+        match (hit, extra) {
+            (Some(i), None) => Ok(Some(i)),
+            (Some(_), Some(second)) => Err(QsdbError::invalid(format!(
+                "column reference '{name}' is ambiguous —— 未限定名同时命中多个表的限定列\
+                 （`{hit_name}` / `{second}`）。请写表限定（如 `{hit_name}`），\
+                 或在产生它们的 join 侧给其中一列起别名"
+            ))),
+            _ => Ok(None),
+        }
+    }
+
     pub fn ty_of(&self, idx: usize) -> &LogicalType {
         &self.cols[idx].1
     }
@@ -2818,6 +2845,18 @@ fn bind_with_ctes(
             let (sub, mut child_defs) =
                 translate_select_inner(*cte.query.clone(), resolver, &visible)?;
             let cols = plan_output_columns(&sub)?;
+            // 十九批 S2：`WITH w(a,b) AS …` —— 定义处按位置重命名一次，
+            // 此后所有引用看到的就是新名字
+            let (sub, cols) = if cte.alias.columns.is_empty() {
+                (sub, cols)
+            } else {
+                rename_output_columns(
+                    sub,
+                    cols,
+                    &cte.alias.columns,
+                    &format!("WITH {}(…)", cte.alias.name.value),
+                )?
+            };
             let id = next_cte_id();
             // 子级 WITH 的 CTE 先入列（执行层按序物化，被引用者在前）
             cte_defs.append(&mut child_defs);
@@ -3574,6 +3613,105 @@ fn collect_ident_names(e: &sqlparser::ast::Expr, out: &mut Vec<String>) {
     }
 }
 
+/// **按位置重命名**输出列（十九批 S2：表别名列清单）。
+///
+/// 覆盖三种同族写法（sqlparser 共用 `TableAlias.columns` 一个字段）：
+/// `WITH w(a,b) AS …` / `FROM (SELECT …) AS d(a,b)` / `FROM t AS x(a,b)`。
+/// 语义 = **位置重命名**，不是再加投影语义：第 i 个别名接管第 i 个输出列的
+/// 名字，类型与值一概不变。
+///
+/// 实现 = 包一层**全列 `Column` 投影**（执行器按列直通，Arc 克隆级别——这是
+/// 元数据操作的价格）。在**定义处**做一次，此后这个计划的所有引用看到的都是
+/// 新名字；引用处各记一张映射表 = 三处真相源，不做。
+///
+/// 边界显式拒：别名数 ≠ 输出列数（两侧数字都给）、别名重名（标准要求唯一，
+/// 静默去重 = "改用户的名字"）、别名不是合法标识符（结果集列名有约束）。
+fn rename_output_columns(
+    plan: LogicalPlan,
+    cols: Vec<(String, LogicalType)>,
+    aliases: &[sqlparser::ast::TableAliasColumnDef],
+    what: &str,
+) -> Result<(LogicalPlan, Vec<(String, LogicalType)>)> {
+    if aliases.len() != cols.len() {
+        return Err(QsdbError::invalid(format!(
+            "{what}: 列别名给了 {} 个名字，但输入有 {} 列",
+            aliases.len(),
+            cols.len()
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for a in aliases {
+        // 别名带类型（`WITH w(a INT) AS …`）：列类型由查询输出决定，写类型
+        // 是另一个真相源 —— 显式拒，不静默忽略
+        if a.data_type.is_some() {
+            return Err(QsdbError::invalid(format!(
+                "{what}: 列别名 `{}` 带了类型 —— 本仓列类型由查询输出决定，\
+                 别名只给名字",
+                a.name.value
+            )));
+        }
+        if !crate::catalog::ident_ok(&a.name.value) {
+            return Err(QsdbError::invalid(format!(
+                "{what}: 列别名 `{}` 不是合法标识符",
+                a.name.value
+            )));
+        }
+        if !seen.insert(a.name.value.to_ascii_lowercase()) {
+            return Err(QsdbError::invalid(format!(
+                "{what}: 列别名 `{}` 重复 —— 标准要求唯一",
+                a.name.value
+            )));
+        }
+    }
+    let exprs: Vec<PhysExpr> = cols
+        .iter()
+        .enumerate()
+        .map(|(i, (n, t))| PhysExpr::Column {
+            idx: i,
+            name: n.clone(),
+            ty: t.clone(),
+        })
+        .collect();
+    let new_cols: Vec<(String, LogicalType)> = aliases
+        .iter()
+        .map(|a| a.name.value.clone())
+        .zip(cols.into_iter().map(|(_, t)| t))
+        .collect();
+    Ok((
+        LogicalPlan::Project {
+            input: Box::new(plan),
+            exprs,
+            names: new_cols.iter().map(|(n, _)| n.clone()).collect(),
+        },
+        new_cols,
+    ))
+}
+
+/// 别名列清单的统一入口：别名带列清单（`… AS x(a,b)`）就按位置重命名，
+/// 否则原样。`resolve_from_factor` 的三个臂与 join 右侧共用。
+fn apply_alias_columns(
+    plan: LogicalPlan,
+    cols: Vec<(String, LogicalType)>,
+    alias: Option<&sqlparser::ast::TableAlias>,
+) -> Result<(LogicalPlan, SchemaCtx)> {
+    let (plan, cols) = rename_optional(plan, cols, alias)?;
+    Ok((plan, SchemaCtx { cols }))
+}
+
+/// [`rename_output_columns`] 的可选形态：别名缺失或没带列清单 → 原样返回。
+fn rename_optional(
+    plan: LogicalPlan,
+    cols: Vec<(String, LogicalType)>,
+    alias: Option<&sqlparser::ast::TableAlias>,
+) -> Result<(LogicalPlan, Vec<(String, LogicalType)>)> {
+    match alias {
+        Some(a) if !a.columns.is_empty() => {
+            rename_output_columns(plan, cols, &a.columns, "table alias column list")
+        }
+        _ => Ok((plan, cols)),
+    }
+}
+
 /// 单个 `TableFactor` → `(计划, 列)`。**FROM 主表位置**用；`PIVOT` 的内层表也走这里。
 ///
 /// 抽出来是为了 `PIVOT` —— 它的内层表因子要按**同一套**规则解析
@@ -3589,20 +3727,28 @@ fn resolve_from_factor(
         TableFactor::Table {
             name,
             args: Some(tf_args),
+            alias,
             ..
-        } => resolve_table_function(&object_name_single(name.clone())?, &tf_args.args),
+        } => {
+            let (p, c) = resolve_table_function(&object_name_single(name.clone())?, &tf_args.args)?;
+            apply_alias_columns(p, c.cols, alias.as_ref())
+        }
         TableFactor::Function { name, args, .. } => {
             resolve_table_function(&object_name_single(name.clone())?, args)
         }
-        TableFactor::Table { name, .. } => {
-            resolve_table_source(&object_name_single(name.clone())?, visible, resolver)
+        TableFactor::Table { name, alias, .. } => {
+            let (p, c) =
+                resolve_table_source(&object_name_single(name.clone())?, visible, resolver)?;
+            apply_alias_columns(p, c.cols, alias.as_ref())
         }
-        TableFactor::Derived { subquery, .. } => {
+        TableFactor::Derived {
+            subquery, alias, ..
+        } => {
             let (sub, child_defs) =
                 translate_select_inner((**subquery).clone(), resolver, visible)?;
             cte_defs.extend(child_defs);
             let cols = plan_output_columns(&sub)?;
-            Ok((sub, SchemaCtx { cols }))
+            apply_alias_columns(sub, cols, alias.as_ref())
         }
         TableFactor::Pivot {
             table,
@@ -4002,7 +4148,9 @@ fn translate_select_inner(
                     .as_ref()
                     .map(|a| a.name.value.clone())
                     .unwrap_or_else(|| "read_parquet".into());
-                (rn, p, c.cols)
+                // 十九批 S2：`… AS r(a,b)` —— join 右侧同样按位置重命名
+                let (p, cols) = rename_optional(p, c.cols, alias.as_ref())?;
+                (rn, p, cols)
             }
             TableFactor::Table { name, alias, .. } => {
                 let (rn, orig) = match alias {
@@ -4041,6 +4189,8 @@ fn translate_select_inner(
                             .collect(),
                     )
                 };
+                // 十九批 S2：`JOIN u AS x(a,b)` —— 右侧实表的别名列清单
+                let (plan, cols) = rename_optional(plan, cols, alias.as_ref())?;
                 (rn, plan, cols)
             }
             // JOIN 右侧派生表：FROM a JOIN (SELECT …) AS r ON …
@@ -4055,6 +4205,8 @@ fn translate_select_inner(
                     .as_ref()
                     .map(|a| a.name.value.clone())
                     .unwrap_or_else(|| "subquery".into());
+                // 十九批 S2：`JOIN (SELECT …) AS r(a,b) ON …`
+                let (sub, cols) = rename_optional(sub, cols, alias.as_ref())?;
                 (name, sub, cols)
             }
             // `A JOIN (…) t PIVOT (…) ON …`：JOIN 右侧的 PIVOT **显式拒**（语料里没有）。
@@ -5640,28 +5792,13 @@ fn output_name_of(e: &sqlparser::ast::Expr) -> String {
 
 /// 列名没解析到时的报错。
 ///
-/// **JOIN 右表的列只以限定名注册**（见 `translate_select_inner` 里 ctx 扩展处的
-/// 注释）：裸名恒解析到左表。所以"没找到"若其实是右侧的列，直接说清该怎么写 ——
-/// 否则用户只会看到"列不存在"而去怀疑列名拼错。
-///
-/// ⚠️ 判据必须要求那名**带限定符**（`n.rsplit_once('.')`）。F30 实测踩过：
-/// 这条提示原本只看"尾名相同"，于是对着**派生表**（输出名恰好叫 `t.v` 那种历史
-/// 形态）也会说 "a JOIN right-side column exists" —— **那句里根本没有 JOIN**，
-/// 用户会往完全错误的方向排查。剥限定符之后这种 ctx 不存在了，但仍保留判据，
-/// 因为"尾名相同但不是限定名"还能来自别处。
-fn not_found_with_hint(ctx: &SchemaCtx, name: &str) -> QsdbError {
-    let hint = ctx
-        .cols
-        .iter()
-        .find(|(n, _)| n.rsplit_once('.').is_some_and(|(_, c)| c == name))
-        .map(|(n, _)| {
-            format!(
-                " (a JOIN right-side column with this name exists — qualify it as `{n}`: \
-                 unqualified names resolve to the left input only)"
-            )
-        })
-        .unwrap_or_default();
-    QsdbError::column_not_found(format!("column '{name}'{hint}"))
+/// 十九批 S1 之后这条**提示退役了**：原提示是"右侧有同名限定列，请写全限定"
+/// ——但裸名现在自己就会解析到唯一的限定列（[`SchemaCtx::resolve_tail_opt`]），
+/// 还能走到"没找到"的只剩两种：**真拼错**（直接报列不存在），或**多个限定列
+/// 同名**（那在尾名回退里已按歧义报错，带出两侧列名）。提示没了生存空间，
+/// 与其留一条不可达的分支，不如删掉。
+fn column_not_found(name: &str) -> QsdbError {
+    QsdbError::column_not_found(format!("column '{name}'"))
 }
 
 // ---------------------------------------------------------------------------
@@ -5730,10 +5867,16 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
             if id.quote_style == Some('"') {
                 return Ok(PhysExpr::Lit(Literal::Utf8(id.value.clone())));
             }
-            // `resolve_opt`：**重名会 Err**（F30），不再静默取第一个
-            let idx = ctx
-                .resolve_opt(&id.value)?
-                .ok_or_else(|| not_found_with_hint(ctx, &id.value))?;
+            // `resolve_opt`：**重名会 Err**（F30），不再静默取第一个。
+            // 精确名落空 → 十九批 S1 的**限定列尾名回退**：join 右侧列只以
+            // `table.col` 注册，裸名该看到它（PG 同判）——唯一命中即绑，
+            // 多个命中是歧义错（同 F30 口径）。
+            let idx = match ctx.resolve_opt(&id.value)? {
+                Some(i) => i,
+                None => ctx
+                    .resolve_tail_opt(&id.value)?
+                    .ok_or_else(|| QsdbError::column_not_found(format!("column '{}'", id.value)))?,
+            };
             Ok(PhysExpr::Column {
                 idx,
                 name: ctx.cols[idx].0.clone(),
@@ -5748,7 +5891,7 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
                 Some(i) => i,
                 None => ctx
                     .resolve_opt(&parts[1].value)?
-                    .ok_or_else(|| not_found_with_hint(ctx, &parts[1].value))?,
+                    .ok_or_else(|| column_not_found(&parts[1].value))?,
             };
             Ok(PhysExpr::Column {
                 idx,
