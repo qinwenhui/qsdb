@@ -2133,14 +2133,22 @@ async fn query(
                             .rejected_result_size
                             .fetch_add(1, Ordering::Relaxed);
                         s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                        // 体量给人读的形态：< 1 MiB 直接报字节（整除归零的
+                        // "0 MiB" 是假信号）；≥ 1 MiB 才换算
+                        let human = |b: u64| {
+                            if b >= 1024 * 1024 {
+                                format!("~{} MiB ({} bytes)", b / (1024 * 1024), b)
+                            } else {
+                                format!("{b} bytes")
+                            }
+                        };
                         ErrorCode::ResultTooLarge.response(format!(
-                            "result is ~{} MiB (arrow estimate), exceeds max-result-mb {} ({} bytes); \
+                            "result is {} (arrow estimate), exceeds max-result-bytes {}; \
                              add LIMIT, use a streaming format (ipc/rows/bulk), or override \
                              this request with body maxRows / header X-QSDB-Max-Rows \
                              (full export: COPY (SELECT …) TO …)",
-                            est / (1024 * 1024),
-                            guard_bytes / (1024 * 1024),
-                            guard_bytes
+                            human(est),
+                            human(guard_bytes)
                         ))
                     } else if fmt.eq_ignore_ascii_case("ipc") {
                         match batches_to_ipc(&schema, &batches) {
