@@ -54,7 +54,11 @@ fn create_user_works_on_remote_store() {
     // 语义正确性（不只是"没报错"）：读回 + 校验
     let users = UserStore::read_all(db.store()).unwrap();
     assert_eq!(users.len(), 1);
-    assert_eq!(users["alice"].role, Role::Admin);
+    assert_eq!(
+        users["alice"].role,
+        Some(Role::Admin),
+        "M-C 起 role 是 Option<Role>"
+    );
 
     // 再写一个 → 覆盖"读-改-写整轮"（锁是给整轮用的）
     UserStore::add(db.store(), "bob", "pass456", Role::Reader).unwrap();

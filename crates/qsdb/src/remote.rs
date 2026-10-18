@@ -70,7 +70,7 @@ pub fn occ_commit(
     mut build: impl FnMut(
         Option<crate::manifest::PartitionManifest>,
     ) -> Result<crate::manifest::PartitionManifest>,
-) -> Result<()> {
+) -> Result<u64> {
     const MAX_RETRIES: usize = 8;
     let mut last_conflict = 0usize;
     for round in 0..MAX_RETRIES {
@@ -94,7 +94,10 @@ pub fn occ_commit(
             crate::error::QsdbError::meta(format!("serialize manifest failed: {e}"))
         })?;
         if store.put_if_etag(manifest_path, &bytes, etag.as_deref())? {
-            return Ok(());
+            // 十九批Ⅵ：把提交后的 generation **回传**给调用方——watch 事件
+            // （T2 加速器）靠它发"新版本号"；此前恒 0 ⇒ 远端写路径的事件
+            // 被 api::emit_commit 的守卫整条吞掉（远端库门铃不响的根因）
+            return Ok(next.generation);
         }
         last_conflict = round + 1;
     }

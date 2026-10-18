@@ -777,10 +777,11 @@ pub(crate) fn occ_append_entry(
     values: &[crate::types::Literal],
     entry: &SegmentEntry,
     epoch: u64,
-) -> Result<()> {
+) -> Result<u64> {
     let mpath = PartitionManifest::manifest_path(dir);
+    let mut new_gen = 0u64;
     crate::remote::with_partition_mutex(dir, || {
-        crate::remote::occ_commit(store, &mpath, |cur| {
+        new_gen = crate::remote::occ_commit(store, &mpath, |cur| {
             if let Some(c) = cur.as_ref() {
                 c.check_writer_epoch(epoch)?;
             }
@@ -803,7 +804,8 @@ pub(crate) fn occ_append_entry(
                 m.segments.push(entry.clone());
             }
             Ok(m)
-        })
+        })?;
+        Ok(new_gen)
     })
 }
 
@@ -850,19 +852,18 @@ fn append_partition_remote(
             &col_names,
         )?,
     };
+    let mut generation = 0u64;
     if staging.is_none() {
-        occ_append_entry(store, dir, def, values, &entry, epoch)?;
+        // 直写：occ_commit 已提交 ⇒ 回传提交后的 generation（watch 事件用）
+        generation = occ_append_entry(store, dir, def, values, &entry, epoch)?;
     }
+    // staged 路径此处仍为 0——提交在 flush_staged，事件也在那时发（ACK 时刻
+    // 无提交可言，emit_commit 的 0 守卫正确地不发）
     Ok(WriteResult {
         rows: entry.row_count,
         bytes: entry.byte_size,
         segments: 1,
-        // ⚠️ **远端路径暂不透出 generation**：它是在 `occ_commit` 的闭包里建好
-        // manifest 后提交的，那个值当下没有回传（要改 `occ_commit` 的返回类型）。
-        // 填 0 是**明确约定**：`api::emit_commit` 见到 0 **不发事件** ——
-        // 宁可不发，也不发一个假的 generation 让订阅方误判进度。
-        // 补法见 `docs/提交事件订阅与湖导出设计.md` §三 的 follow-up。
-        generation: 0,
+        generation,
     })
 }
 
@@ -944,10 +945,11 @@ pub(crate) fn occ_replace_entries(
     entries: &[SegmentEntry],
     expected: Option<u64>,
     epoch: u64,
-) -> Result<()> {
+) -> Result<u64> {
     let mpath = PartitionManifest::manifest_path(dir);
+    let mut new_gen = 0u64;
     crate::remote::with_partition_mutex(dir, || {
-        crate::remote::occ_commit(store, &mpath, |cur| {
+        new_gen = crate::remote::occ_commit(store, &mpath, |cur| {
             // F26：**身份代先判**，覆盖也是写，过期写者一样不许干。
             // 这一步省不得 —— 下面的 `PartitionManifest::new` 会把 epoch 抹回 0，
             // 于是一次"旧代写者的覆盖"不再是"没拦住"，而是**把盘上身份代降级**
@@ -973,7 +975,8 @@ pub(crate) fn occ_replace_entries(
             m.epoch = epoch; // F26：提交无条件盖章（与本地 `commit()`、`occ_append_entry` 同口径）
             m.segments = entries.to_vec();
             Ok(m)
-        })
+        })?;
+        Ok(new_gen)
     })
 }
 
@@ -1026,10 +1029,11 @@ fn overwrite_partition_remote(
         new_segments.push(entry);
     }
     if staging.is_none() {
-        occ_replace_entries(store, dir, def, values, &new_segments, expected, epoch)?;
+        result.generation =
+            occ_replace_entries(store, dir, def, values, &new_segments, expected, epoch)?;
     }
     // staging 路径：写盘即 ACK，提交在 `flush_staged` —— 期望值随暂存记录一起落盘，
-    // 由 flush 提交时校验（见 `StagedRecord::expected_generation`）
+    // 由 flush 提交时校验（见 `StagedRecord::expected_generation`）；事件也在 flush 发
     Ok(result)
 }
 

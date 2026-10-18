@@ -1263,8 +1263,9 @@ impl Qsdb {
         let mut rows = 0u64;
         let epoch = self.writer_epoch();
         let mpath = crate::manifest::PartitionManifest::manifest_path(dir);
+        let mut generation = 0u64;
         crate::remote::with_partition_mutex(dir, || {
-            crate::remote::occ_commit(&self.store, &mpath, |cur| {
+            generation = crate::remote::occ_commit(&self.store, &mpath, |cur| {
                 // F26：清空分区是**破坏性写**——过期写者能把新代的数据整块清掉，
                 // 且这条路径此前连校验都没有。与 append/overwrite 同闸。
                 if let Some(c) = cur.as_ref() {
@@ -1283,7 +1284,16 @@ impl Qsdb {
                 m.segments = Vec::new();
                 m.epoch = epoch; // 盖章（清空也是提交；此前只在既有 manifest 上继承旧值）
                 Ok(m)
-            })
+            })?;
+            // 十九批Ⅵ：occ_commit 回传真实 generation ⇒ 远端清空也发 Clear 事件
+            // （与本地 clear_partition 同款；此前 generation=0 被守卫整条吞掉）
+            self.emit_commit(
+                &def.name,
+                ordered,
+                generation,
+                crate::commit::CommitKind::Clear,
+            );
+            Ok(())
         })?;
         Ok(rows)
     }
@@ -1544,7 +1554,7 @@ impl Qsdb {
                     // 路径上，冲突只能推迟到提交时刻暴露（届时数据仍一致：报错则不提交）
                     // F26：身份代同 append 分支一致。覆盖分支此前漏传 epoch（既没校验
                     // 也没盖章），是"staged overwrite 能擦掉写者身份"的那一半。
-                    crate::write::occ_replace_entries(
+                    let generation = crate::write::occ_replace_entries(
                         &self.store,
                         &dir,
                         &def,
@@ -1553,8 +1563,16 @@ impl Qsdb {
                         rec.expected_generation,
                         self.writer_epoch(),
                     )?;
+                    // 十九批Ⅵ：staged 写的提交点在 flush ⇒ 事件也在这里发
+                    // （ACK 时刻 api::append 的 emit 被 generation=0 守卫正确吞掉）
+                    self.emit_commit(
+                        &rec.table,
+                        &rec.partition_values,
+                        generation,
+                        crate::commit::CommitKind::Overwrite,
+                    );
                 } else {
-                    crate::write::occ_append_entry(
+                    let generation = crate::write::occ_append_entry(
                         &self.store,
                         &dir,
                         &def,
@@ -1562,6 +1580,12 @@ impl Qsdb {
                         &rec.entry,
                         self.writer_epoch(),
                     )?;
+                    self.emit_commit(
+                        &rec.table,
+                        &rec.partition_values,
+                        generation,
+                        crate::commit::CommitKind::Append,
+                    );
                 }
                 st.remove_pair(&rec, &parquet);
                 uploaded += 1;
