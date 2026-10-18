@@ -2652,6 +2652,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "futures",
+ "futures-core",
  "qsdb",
  "qsdb-client",
  "rustyline",

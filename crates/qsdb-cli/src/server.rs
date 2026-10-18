@@ -2212,20 +2212,10 @@ async fn query(
                             }
                         }
                     } else {
-                        match batches_to_json(&schema, &batches) {
-                            Ok(v) => Json(serde_json::json!({
-                                "queryId": query_id,
-                                "schema": schema_fields(&schema),
-                                "rows": v,
-                                "rowCount": rows,
-                                "elapsedMs": elapsed as f64 / 1e6,
-                            }))
-                            .into_response(),
-                            Err(e) => {
-                                s.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-                                ErrorCode::Internal.response(e.to_string())
-                            }
-                        }
+                        // R2：JSON 逐批流式——服务端驻留与单个批（8192 行）相关、
+                        // 与总行数无关（原 batches_to_json 全量物化，500 万行 =
+                        // 行×列个 serde_json::Value 走 RSS 尖峰）。响应形态不变。
+                        json_query_response(&query_id, &schema, batches, rows, elapsed as f64 / 1e6)
                     }
                 }
             }
@@ -3058,6 +3048,10 @@ fn schema_fields(schema: &arrow::datatypes::SchemaRef) -> Vec<serde_json::Value>
         .collect()
 }
 
+/// 单批 → JSON 行片段（`rows` 数组元素的逗号拼接；**不含**首尾括号）。
+/// `first` = 是否整个结果的第一个批（决定要不要前导逗号——批间那道缝是
+/// 流式拼接最容易错的地方，单测锁定）。
+///
 /// 每行每列按 **Arrow 列类型**分派输出（J1+J2，2026-10-12）。
 ///
 /// 原实现忽略列类型，统一走「display 串 → parse::<i64> → parse::<f64> →
@@ -3069,26 +3063,121 @@ fn schema_fields(schema: &arrow::datatypes::SchemaRef) -> Vec<serde_json::Value>
 ///
 /// 现按类型分派：数值输出 number、精确类型（Decimal）输出字符串、
 /// 二进制输出小写 hex 字符串、其余按各自规范形态。
-fn batches_to_json(
-    _schema: &arrow::datatypes::SchemaRef,
-    batches: &[RecordBatch],
-) -> Result<Vec<Vec<serde_json::Value>>, QsdbError> {
-    let mut rows = Vec::new();
-    for b in batches {
-        for i in 0..b.num_rows() {
-            let mut row = Vec::with_capacity(b.num_columns());
-            for c in 0..b.num_columns() {
-                let arr = b.column(c);
-                if arr.is_null(i) {
-                    row.push(serde_json::Value::Null);
-                } else {
-                    row.push(json_value_typed(arr.as_ref(), i)?);
-                }
-            }
-            rows.push(row);
+fn batch_rows_to_json_text(b: &RecordBatch, first: bool) -> Result<String, QsdbError> {
+    let mut s = String::new();
+    for i in 0..b.num_rows() {
+        if i > 0 || !first {
+            s.push(',');
         }
+        let mut row = Vec::with_capacity(b.num_columns());
+        for c in 0..b.num_columns() {
+            let arr = b.column(c);
+            if arr.is_null(i) {
+                row.push(serde_json::Value::Null);
+            } else {
+                row.push(json_value_typed(arr.as_ref(), i)?);
+            }
+        }
+        s.push_str(&serde_json::Value::Array(row).to_string());
     }
-    Ok(rows)
+    Ok(s)
+}
+
+/// 流式 JSON 响应的**头**片段：`{"queryId":…,"schema":[…],"rows":[`。
+/// queryId/schema 的序列化经 serde_json 本尊（先建对象、剥尾括号后接
+/// `,"rows":[`——schema 恰是末键，`}` 前没有逗号，得自己补），不手拼值——
+/// 保证与全量物化路径逐字节同源。
+fn json_stream_head(query_id: &str, schema: &arrow::datatypes::SchemaRef) -> String {
+    let head_obj = serde_json::json!({
+        "queryId": query_id,
+        "schema": schema_fields(schema),
+    });
+    let s = head_obj.to_string();
+    format!("{},\"rows\":[", &s[..s.len() - 1])
+}
+
+/// 流式 JSON 响应的**尾**片段：`],"rowCount":N,"elapsedMs":X}`（键序随
+/// serde_json，合法即可——对象键序无关）。
+fn json_stream_tail(rows: usize, elapsed_ms: f64) -> String {
+    let tail_obj = serde_json::json!({ "rowCount": rows, "elapsedMs": elapsed_ms });
+    let s = tail_obj.to_string();
+    // 剥 `{` 补 `],`——rows 收括号与下一个键之间的逗号要自己补（与 head 同理）
+    format!("],{}", &s[1..])
+}
+
+/// 逐批 JSON 片段流（十七批 R2）：head → 每批一段 → tail。
+///
+/// 手写 `Stream`——`futures-core` 只提供 trait 本身（已是 tokio-util 的传递
+/// 依赖，零新增代码进树）。片段生成是纯 CPU 同步段（单批 8192 行量级），
+/// 在 poll 内直接做；**服务端驻留与单个批相关、与总行数无关**。
+struct JsonBatchStream {
+    batches: std::vec::IntoIter<RecordBatch>,
+    head: Option<String>,
+    tail: String,
+    first: bool,
+    done: bool,
+}
+
+impl futures_core::Stream for JsonBatchStream {
+    /// `Err` = 中途序列化失败（Arrow display 错，实际极罕见）：流以错误收尾，
+    /// hyper 截断 body ⇒ 客户端 JSON 解析必失败——**不是"成功的部分数据"**
+    /// （throw 不 break 同款判据；200 头已发出，截断是唯一诚实的失败形态）。
+    type Item = Result<axum::body::Bytes, Box<dyn std::error::Error + Send + Sync>>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        Poll::Ready(if let Some(h) = self.head.take() {
+            Some(Ok(axum::body::Bytes::from(h)))
+        } else if let Some(b) = self.batches.next() {
+            match batch_rows_to_json_text(&b, self.first) {
+                Ok(text) => {
+                    self.first = false;
+                    Some(Ok(axum::body::Bytes::from(text)))
+                }
+                Err(e) => Some(Err(Box::new(e))),
+            }
+        } else if !self.done {
+            self.done = true;
+            Some(Ok(axum::body::Bytes::from(std::mem::take(&mut self.tail))))
+        } else {
+            None
+        })
+    }
+}
+
+/// 查询结果的 JSON 响应——**逐批流式**（十七批 R2）。
+///
+/// 原 `batches_to_json` 先把全部行攒成 `Vec<Vec<Value>>` 再序列化：500 万行
+/// 的中间体是 行×列 个 `serde_json::Value`（每个 ~24B 起含装箱），服务端 RSS
+/// 跟着结果体量走尖峰。现按批产出片段（`Body::from_stream`）。**契约不变**：
+/// 响应仍是同一个 JSON 对象 `{"queryId","schema","rows":[…],"rowCount",
+/// "elapsedMs"}`——对象键序无关，任何 JSON 解析器按名取值；流式只改变
+/// "什么时候吐字节"，不改字段、不改值形态。
+fn json_query_response(
+    query_id: &str,
+    schema: &arrow::datatypes::SchemaRef,
+    batches: Vec<RecordBatch>,
+    rows: usize,
+    elapsed_ms: f64,
+) -> Response {
+    let stream = JsonBatchStream {
+        batches: batches.into_iter(),
+        head: Some(json_stream_head(query_id, schema)),
+        tail: json_stream_tail(rows, elapsed_ms),
+        first: true,
+        done: false,
+    };
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        )],
+        Body::from_stream(stream),
+    )
+        .into_response()
 }
 
 /// 单值按 Arrow 类型 → JSON（见 `batches_to_json` 的类型分派说明）。
@@ -3534,5 +3623,61 @@ mod tests {
         let b_big = batches_arrow_bytes(&[big]);
         assert!(b_small > b_empty, "行数增长 ⇒ 估算增长");
         assert!(b_big > b_small, "行数增长 ⇒ 估算增长");
+    }
+
+    /// R2：头片段 + 跨批行片段 + 尾片段 拼出**同一个 JSON 对象**——键值形态
+    /// 与全量物化路径逐字段一致（含 NULL → null、批间逗号那道缝）。
+    #[test]
+    fn json_stream_fragments_reassemble_to_same_shape() {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("a", arrow::datatypes::DataType::Int64, true),
+            arrow::datatypes::Field::new("s", arrow::datatypes::DataType::Utf8, true),
+        ]));
+        let mk = |vals: Vec<(Option<i64>, Option<&str>)>| {
+            let a = arrow::array::Int64Array::from(vals.iter().map(|v| v.0).collect::<Vec<_>>());
+            let s = arrow::array::StringArray::from(vals.iter().map(|v| v.1).collect::<Vec<_>>());
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(a), Arc::new(s)]).unwrap()
+        };
+        let b1 = mk(vec![(Some(1), Some("x")), (None, None)]);
+        let b2 = mk(vec![(Some(2), Some("y"))]);
+
+        let mut text = String::new();
+        text.push_str(&batch_rows_to_json_text(&b1, true).unwrap());
+        text.push_str(&batch_rows_to_json_text(&b2, false).unwrap());
+        let full = format!(
+            "{}{}{}",
+            json_stream_head("q-test", &schema),
+            text,
+            json_stream_tail(3, 1.5)
+        );
+        let v: serde_json::Value = serde_json::from_str(&full).expect("片段拼接必须是合法 JSON");
+        assert_eq!(v["queryId"], "q-test");
+        assert_eq!(v["rowCount"], 3);
+        assert_eq!(v["elapsedMs"], 1.5);
+        assert_eq!(v["schema"][0]["name"], "a");
+        assert_eq!(v["schema"][0]["type"], "Int64");
+        let rows = v["rows"].as_array().expect("rows 是数组");
+        assert_eq!(rows.len(), 3, "跨批拼接不得丢行");
+        assert_eq!(rows[0][0], 1);
+        assert_eq!(rows[0][1], "x");
+        assert!(
+            rows[1][0].is_null() && rows[1][1].is_null(),
+            "NULL 保持 null: {}",
+            rows[1]
+        );
+        assert_eq!(rows[2][0], 2, "第二批的首行（批间逗号缝）");
+        assert_eq!(rows[2][1], "y");
+
+        // 空批：first=true 的空批产出空片段——head+tail 直接闭合，仍合法
+        let empty_text = batch_rows_to_json_text(&mk(vec![]), true).unwrap();
+        let full0 = format!(
+            "{}{}{}",
+            json_stream_head("q0", &schema),
+            empty_text,
+            json_stream_tail(0, 0.0)
+        );
+        let v0: serde_json::Value = serde_json::from_str(&full0).expect("空结果合法 JSON");
+        assert_eq!(v0["rowCount"], 0);
+        assert_eq!(v0["rows"].as_array().unwrap().len(), 0);
     }
 }

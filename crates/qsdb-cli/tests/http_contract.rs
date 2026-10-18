@@ -2412,3 +2412,66 @@ fn result_guardrail_limit_override_hot_update_and_dml_exempt() {
     let v: f64 = line.rsplit(' ').next().unwrap().parse().unwrap();
     assert!(v >= 8.0, "护栏拒绝应已计数: {line}");
 }
+
+// ---------------------------------------------------------------------------
+// 23. R2：JSON 逐批流式——响应形态逐字段不变（跨批边界 / 零行 / 值形态）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_streaming_shape_unchanged_over_batch_boundaries() {
+    let srv = Server::start(&[]);
+    let p = srv.port;
+
+    assert_eq!(
+        query(p, "CREATE TABLE st (a BIGINT, s STRING)", None).status,
+        200
+    );
+    // 9000 行 > 单批 8192：强制走跨批拼接（批间逗号是最容易错的缝）
+    let mut vals = String::new();
+    for i in 0..9000i64 {
+        if i > 0 {
+            vals.push(',');
+        }
+        vals.push_str(&format!("({i},'s{i}')"));
+    }
+    let r = query(p, &format!("INSERT INTO st VALUES {vals}"), None);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+
+    let r = query(p, "SELECT * FROM st", None);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    // 响应仍是同一个 JSON 对象（能整段 parse 本身就是流式拼接正确性的证据）
+    let v = r.json();
+    assert_eq!(v["rowCount"], 9000);
+    let rows = v["rows"].as_array().expect("rows 是数组");
+    assert_eq!(rows.len(), 9000, "流式不得丢行");
+    assert_eq!(rows[0][0], 0);
+    assert_eq!(rows[0][1], "s0");
+    assert_eq!(rows[8191][0], 8191);
+    assert_eq!(rows[8192][0], 8192, "8192 处是批边界——不得丢行/重行/坏逗号");
+    assert_eq!(rows[8999][0], 8999);
+    assert_eq!(rows[8999][1], "s8999");
+    assert_eq!(v["schema"][0]["name"], "a");
+    assert_eq!(v["schema"][1]["type"], "Utf8");
+    assert!(v["queryId"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(v["elapsedMs"].is_number());
+    // Content-Type 不变
+    assert_eq!(r.header("content-type"), Some("application/json"));
+
+    // 零行：rows=[] / rowCount=0 形态不变
+    let r = query(p, "SELECT * FROM st WHERE a > 999999", None);
+    assert_eq!(r.status, 200);
+    let v = r.json();
+    assert_eq!(v["rowCount"], 0);
+    assert_eq!(v["rows"].as_array().unwrap().len(), 0);
+
+    // NULL 与值形态经流式路径不变（J1/J2 同款断言）
+    let r = query(p, "INSERT INTO st VALUES (NULL, NULL)", None);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let r = query(p, "SELECT * FROM st WHERE a IS NULL", None);
+    let v = r.json();
+    assert_eq!(v["rowCount"], 1);
+    assert!(
+        v["rows"][0][0].is_null() && v["rows"][0][1].is_null(),
+        "NULL 保持 null"
+    );
+}
