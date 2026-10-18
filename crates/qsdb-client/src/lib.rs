@@ -68,15 +68,28 @@
 //! 一句话：**值是 SQL 文本进（查询），批是二进制进（装载）**。没有第三条路——
 //! 也不用担心"函数调用面绕过了什么"，它落到的是同一批 HTTP 端点。
 //!
-//! ## 参数化查询：**目前没有**（明说，不装作有）
+//! ## 参数化查询（值永不进 SQL 文本）
 //!
-//! 协议面是 `{"sql": "..."}`，**没有绑定参数**。所以：
+//! [`QueryOptions::params`] + `WHERE g = $1`（或 `?` 按序）：服务端在内核
+//! **绑定器**里把参数变成 AST 字面量——**值从不进入 SQL 文本**，所以这里
+//! 不需要、也**不该**有"转义助手"。类型拿不准就写 [`Param::typed`]（显式
+//! 类型是裸值的超集）。
 //!
-//! - **不要把用户输入拼进 SQL 文本**——本 crate **不提供**转义助手，
-//!   因为"看着能跑"的转义（漏一个引号、漏一个反斜杠）就是注入；
-//! - 需要按值过滤时，**优先走服务端能力**：能当列值传的走 [`Client::append`]
-//!   落到临时表，或用 `read_csv`/`read_parquet` 读文件——都不过字符串拼接；
-//! - 绑定参数是内核侧的事（记在待办里），补上之前这里保持"没有就是没有"。
+//! ## 会话与多库（十六批面，十八批 C1/C3 接入）
+//!
+//! [`Client::login`] 用 Basic 凭证换**进程态会话**：之后的请求自动带
+//! `Bearer <token>`，撞 `SESSION_REVOKED`（被踢/服务端重启）**自动重登**——
+//! 读路径重发一次透明恢复；写路径只重登、原 401 返回，**重试即成功**
+//! （幂等纪律，见下）。会话带来的能力：踢人/审计归因/`USE` 默认库/
+//! grants 自查（[`Client::session`]）。多库：[`Client::databases`] 列挂载、
+//! [`QueryOptions::database`] 指定目标库（优先级高于会话默认库）。
+//!
+//! ## 大结果（十七批面）
+//!
+//! 默认 [`Format::Bulk`] 已是分块通道；大结果**优先在 SQL 里聚合**，取全量
+//! 用 [`Client::query_stream`]（rows 流式、内存恒定）；部署设了结果护栏时
+//! 撞 `RESULT_TOO_LARGE` → 加 `LIMIT`、换流式通道，或
+//! [`QueryOptions::max_rows`] 本请求覆盖（`0` = 不限）。
 //!
 //! ## 传输加密：**不手搓**（见 `docs/客户端与嵌入方指南.md` §四）
 //!
@@ -88,8 +101,10 @@
 //!
 //! `append` **非幂等**（`docs/对接契约.md` §四.4）：重试可能重复入段。
 //! 所以本客户端的透明重发**只在"一个字节都没写出去"时**发生
-//! （那意味着服务端根本没收到请求）。要 exactly-once 请用
-//! [`Mode::Overwrite`] / [`Mode::OverwriteCas`]（分区原子替换 + 乐观并发）。
+//! （那意味着服务端根本没收到请求）；`SESSION_REVOKED` 的写路径也**只重登
+//! 不重发**（认证闸在执行前 ⇒ 语句从未运行，但重试仍交调用方显式做）。
+//! 要 exactly-once 请用 [`Mode::Overwrite`] / [`Mode::OverwriteCas`]
+//! （分区原子替换 + 乐观并发）。
 
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
@@ -247,6 +262,17 @@ pub struct QueryOptions {
     /// 占位符有两种写法，用哪个都行（**同一句不许混用**）：
     /// `WHERE g = $1`（显式、可重复引用）或 `WHERE g = ?`（按出现顺序）。
     pub params: Vec<Param>,
+    /// 结果护栏的**本请求覆盖**（十七批 R1）→ body `"maxRows"`。
+    ///
+    /// **给出即接管本请求的护栏整体**：行数取此值、服务端的体量闸一并放开
+    /// （护栏只有一个豁免口径，客户端显式担责）；`0` = 本请求不限。`None`
+    /// = 服务器值说了算（缺省行为与从前逐位一致）。要在护栏内自限请直接在
+    /// SQL 里加 `LIMIT`。
+    pub max_rows: Option<u64>,
+    /// 请求目标库（十六批 M-B）→ body `"database"`。**优先级最高**：单段
+    /// 表名锚定在这里；未给 = 会话默认库（[`Client::use_database`]）??
+    /// `"default"`。库名必须在服务端挂载表里，否则 404。
+    pub database: Option<String>,
 }
 
 /// 一个参数值。
@@ -325,6 +351,18 @@ impl QueryOptions {
     /// 带上参数（见 [`Param`]）。
     pub fn with_params(mut self, params: impl IntoIterator<Item = Param>) -> Self {
         self.params = params.into_iter().collect();
+        self
+    }
+
+    /// 结果护栏的本请求覆盖（见 [`QueryOptions::max_rows`]）。
+    pub fn with_max_rows(mut self, n: u64) -> Self {
+        self.max_rows = Some(n);
+        self
+    }
+
+    /// 指定目标库（见 [`QueryOptions::database`]）。
+    pub fn with_database(mut self, db: impl Into<String>) -> Self {
+        self.database = Some(db.into());
         self
     }
 }
@@ -782,7 +820,7 @@ impl Client {
 
     fn query_once(&self, sql: &str, opts: &QueryOptions) -> Result<ResultSet> {
         let extra = extra_headers(opts);
-        let body = body_of(sql, opts.format.as_str(), &opts.params);
+        let body = body_of(sql, opts.format.as_str(), opts);
         let resp = self.http.post_with(
             "/api/v1/query",
             "application/json",
@@ -808,7 +846,7 @@ impl Client {
 
     fn stream_once(&self, sql: &str, opts: &QueryOptions) -> Result<RowStream> {
         let extra = extra_headers(opts);
-        let body = body_of(sql, "rows", &opts.params);
+        let body = body_of(sql, "rows", opts);
         let (head, mut body) = self.http.post_stream(
             "/api/v1/query",
             "application/json",
@@ -970,6 +1008,13 @@ impl Client {
         json::parse_stats(&self.get_json("/api/v1/stats")?)
     }
 
+    /// 挂载库清单（十六批 M-B）：admin 全列；非 admin 只列有 grant 的库
+    /// （服务端不泄露库名）。`read_only` 的库写 → 503 `READ_ONLY`（**永不
+    /// 重试**，换可写实例）。
+    pub fn databases(&self) -> Result<Vec<DbInfo>> {
+        json::parse_databases(&self.get_json("/api/v1/databases")?)
+    }
+
     /// 存活探针（**免鉴权**），返回服务端版本号。
     pub fn health(&self) -> Result<String> {
         #[derive(serde::Deserialize)]
@@ -1086,15 +1131,21 @@ fn dispatch(head: http::Head, body: Vec<u8>, query_id_hdr: Option<&str>) -> Resu
         body.len()
     )))
 }
-/// 请求体。**只在有参数时才带 `params` 字段** —— 没参数时请求体与从前逐字节相同
+/// 请求体。**只在有值时才带对应字段** —— 全缺省时请求体与从前逐字节相同
 /// （老服务端/老代理看到的报文一个字不变）。
-fn body_of(sql: &str, format: &str, params: &[Param]) -> String {
-    if params.is_empty() {
-        serde_json::json!({ "sql": sql, "format": format }).to_string()
-    } else {
-        let arr: Vec<serde_json::Value> = params.iter().map(Param::to_json).collect();
-        serde_json::json!({ "sql": sql, "format": format, "params": arr }).to_string()
+fn body_of(sql: &str, format: &str, opts: &QueryOptions) -> String {
+    let mut v = serde_json::json!({ "sql": sql, "format": format });
+    if !opts.params.is_empty() {
+        let arr: Vec<serde_json::Value> = opts.params.iter().map(Param::to_json).collect();
+        v["params"] = serde_json::Value::Array(arr);
     }
+    if let Some(n) = opts.max_rows {
+        v["maxRows"] = serde_json::json!(n);
+    }
+    if let Some(db) = &opts.database {
+        v["database"] = serde_json::json!(db);
+    }
+    v.to_string()
 }
 
 fn extra_headers(opts: &QueryOptions) -> Vec<(&'static str, String)> {

@@ -411,8 +411,6 @@ pub struct DbInfo {
     pub read_only: bool,
 }
 
-/// 十八批Ⅱ期（`Client::databases`）接线；Ⅰ期先行落了解析器故暂挂 dead_code。
-#[allow(dead_code)]
 pub(crate) fn parse_databases(bytes: &[u8]) -> Result<Vec<DbInfo>> {
     #[derive(serde::Deserialize)]
     struct RawDb {

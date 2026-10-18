@@ -922,3 +922,66 @@ fn 会话登录_踢出恢复与写路径分档() {
         }
     });
 }
+
+// ---------------------------------------------------------------------------
+// 护栏覆盖与多库（十八批 C2/C3）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn 结果护栏覆盖与多库清单() {
+    let s = Server::start();
+    let c = s.client();
+    setup(&c);
+    c.append("t", &sample()).expect("append"); // 3 行
+
+    // 服务端热更设护栏 2（管理面走裸 HTTP；Client 刻意不暴露 config）
+    let (st, body) = raw_http(s.port, "PUT", "/api/v1/config", r#"{"maxResultRows":2}"#);
+    assert_eq!(st, 200, "{body}");
+
+    // 不带覆盖：3 行 > 2 → RESULT_TOO_LARGE（Error::Api 按码分支自动跟上新码）
+    match c.query("SELECT * FROM t") {
+        Err(Error::Api {
+            status: 400, code, ..
+        }) => assert_eq!(code, "RESULT_TOO_LARGE"),
+        other => panic!("应被护栏拦下，实为 {other:?}"),
+    }
+    // max_rows=0 覆盖 = 本请求不限 → 全量回来
+    let rs = c
+        .query_with("SELECT * FROM t", &QueryOptions::default().with_max_rows(0))
+        .expect("豁免");
+    assert_eq!(rs.into_bulk().expect("bulk").num_rows(), 3);
+    // max_rows=2 是**收紧**（不是截断）：3 行仍被拦
+    match c.query_with("SELECT * FROM t", &QueryOptions::default().with_max_rows(2)) {
+        Err(Error::Api { code, .. }) => assert_eq!(code, "RESULT_TOO_LARGE"),
+        other => panic!("收紧的覆盖仍应拦，实为 {other:?}"),
+    }
+    // 要"护栏内自限"在 SQL 里加 LIMIT
+    let rs = c
+        .query_with(
+            "SELECT * FROM t LIMIT 2",
+            &QueryOptions::default().with_max_rows(2),
+        )
+        .expect("LIMIT 后过闸");
+    assert_eq!(rs.into_bulk().expect("bulk").num_rows(), 2);
+    // 还原
+    let (st, _) = raw_http(s.port, "PUT", "/api/v1/config", r#"{"maxResultRows":0}"#);
+    assert_eq!(st, 200);
+    assert!(c.query("SELECT * FROM t").is_ok(), "关闸后放行");
+
+    // 多库：挂载清单 + database 字段路由
+    let dbs = c.databases().expect("databases");
+    assert_eq!(dbs.len(), 1);
+    assert_eq!(dbs[0].name, "default");
+    assert!(!dbs[0].read_only);
+    let rs = c
+        .query_with(
+            "SELECT count(*) FROM t",
+            &QueryOptions::json().with_database("default"),
+        )
+        .expect("database=default");
+    assert_eq!(rs.into_json().unwrap().row_count, Some(1));
+    match c.query_with("SELECT 1", &QueryOptions::json().with_database("nope")) {
+        Err(Error::Api { status: 404, .. }) => {}
+        other => panic!("未挂载库应 404，实为 {other:?}"),
+    }
+}
