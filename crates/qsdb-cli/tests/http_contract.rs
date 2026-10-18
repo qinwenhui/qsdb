@@ -1751,10 +1751,14 @@ fn session_lifecycle_kick_revocation_and_attribution() {
         s0["client"]
     );
 
-    // ③ 权限边界：reader 列会话 → 403；看**自己的**详情 → 200；踢人（即使踢自己）→ 403
+    // ③ 权限边界（十九批Ⅶ 升值）：reader 列会话 → **200 但只看到自己的**
+    // （可见性按用户过滤）；看自己的详情 → 200；踢人（即使踢自己）→ 403
     let r = http(p, "GET", "/api/v1/sessions", &bob, b"");
-    assert_eq!(r.status, 403);
-    assert_eq!(r.code(), "FORBIDDEN");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let mine = r.json();
+    let mine_list = mine["sessions"].as_array().unwrap();
+    assert_eq!(mine_list.len(), 1, "bob 只看到自己的会话");
+    assert_eq!(mine_list[0]["user"], "bob");
     let r = http(p, "GET", &format!("/api/v1/sessions/{sid}"), &bob, b"");
     assert_eq!(
         r.status,
@@ -2734,4 +2738,140 @@ fn partitions_detail_携带字节量() {
     let body2 = http(p, "GET", "/api/v1/tables/bt/partitions", &[], &[]).json();
     let b2 = body2["detail"][0]["bytes"].as_u64().unwrap();
     assert!(b2 > b1, "追加数据后体积应增长: {b1} → {b2}");
+}
+
+/// 会话列表可见性（十九批Ⅶ）：admin 全量 / 非 admin 只看自己的。
+/// 服务器带 --token 起（超级 token = Admin；建用户后服务器要求认证，
+/// 匿名视角不复存在——测试全程用真实凭证）。
+#[test]
+fn sessions_list_可见性分档() {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("qsdb_sess_vis_{}_{}", std::process::id(), uniq));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_qsdb"))
+        .args(["server", "--path"])
+        .arg(&root)
+        .args(["--addr", "127.0.0.1:0", "--token", "t0k"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let mut buf = Vec::new();
+    let port = loop {
+        let mut chunk = [0u8; 512];
+        match stderr.read(&mut chunk) {
+            Ok(0) | Err(_) => panic!("server 提前退出"),
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(x) = parse_listening_port(&String::from_utf8_lossy(&buf)) {
+                    break x;
+                }
+            }
+        }
+    };
+    let post = |sql: &str, tok: &str| {
+        http(
+            port,
+            "POST",
+            "/api/v1/query",
+            &[
+                ("Content-Type", "application/json"),
+                ("Authorization", &format!("Bearer {tok}")),
+            ],
+            serde_json::json!({ "sql": sql }).to_string().as_bytes(),
+        )
+    };
+    eprintln!("STEP create table");
+    assert_eq!(post("CREATE TABLE t (a BIGINT)", "t0k").status, 200);
+    eprintln!("STEP create table ok");
+
+    // 两个普通用户 + rootx（admin）
+    for (u, pw) in [("u1", "pass1"), ("u2", "pass2"), ("rootx", "rootpass")] {
+        eprintln!("STEP create user {u}");
+        assert_eq!(
+            post(
+                &format!("CREATE USER {u} WITH PASSWORD '{pw}' ROLE reader"),
+                "t0k"
+            )
+            .status,
+            200,
+            "建 {u}"
+        );
+        eprintln!("STEP create user {u} ok");
+    }
+    eprintln!("STEP alter rootx");
+    assert_eq!(
+        post("ALTER USER rootx SET ROLE admin", "t0k").status,
+        200,
+        "rootx 升 admin"
+    );
+    eprintln!("STEP alter ok");
+
+    // 各自登录建会话
+    eprintln!("STEP login rootx");
+    let la = login(port, "rootx", "rootpass");
+    eprintln!("STEP login rootx ok");
+    let l1 = login(port, "u1", "pass1");
+    let _l2 = login(port, "u2", "pass2"); // u2 也登录建会话（admin 全量断言用）
+    let ta = format!("Bearer {}", la.json()["token"].as_str().unwrap());
+    let t1 = format!("Bearer {}", l1.json()["token"].as_str().unwrap());
+
+    // admin 全量：能看到 rootx / u1 / u2 三人的会话（user 字段各异）
+    let r = http(
+        port,
+        "GET",
+        "/api/v1/sessions",
+        &[("Authorization", &ta)],
+        &[],
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let users: Vec<String> = r.json()["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["user"].as_str().unwrap_or("").to_string())
+        .collect();
+    for want in ["rootx", "u1", "u2"] {
+        assert!(
+            users.contains(&want.to_string()),
+            "admin 应看到 {want}: {users:?}"
+        );
+    }
+
+    // u1 自查：只有自己的（user 字段全是 u1）
+    let r = http(
+        port,
+        "GET",
+        "/api/v1/sessions",
+        &[("Authorization", &t1)],
+        &[],
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let mine = r.json();
+    let list = mine["sessions"].as_array().unwrap();
+    assert!(!list.is_empty(), "u1 应至少看到自己的会话");
+    for x in list {
+        assert_eq!(x["user"], "u1", "非 admin 只看自己的: {x}");
+    }
+
+    // Basic 凭证查询：会话归属是**用户**而非凭证形态——u1 login 建的会话，
+    // 用 Basic 也能看到（仍是自己的，可见性规则不因凭证通道改变）
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode("u1:pass1");
+    let r = http(
+        port,
+        "GET",
+        "/api/v1/sessions",
+        &[("Authorization", &format!("Basic {b64}"))],
+        b"",
+    );
+    assert_eq!(r.status, 200);
+    assert_eq!(r.json()["count"], 1, "Basic 可见 = 自己名下的会话");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&root);
 }

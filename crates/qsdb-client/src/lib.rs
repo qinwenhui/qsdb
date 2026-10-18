@@ -1129,7 +1129,8 @@ impl Client {
         json::parse_watch(&self.get_json(&path)?)
     }
 
-    /// 登录会话清单（`GET /api/v1/sessions`，admin 专属）：谁连着、在跑什么、
+    /// 登录会话清单（`GET /api/v1/sessions`）：**admin 全量**；非 admin 只
+    /// 返回自己名下的会话。
     /// 多久没动。会话不持久化——服务端重启即清空。
     pub fn sessions_list(&self) -> Result<Vec<AdminSession>> {
         json::parse_sessions(&self.get_json("/api/v1/sessions")?)

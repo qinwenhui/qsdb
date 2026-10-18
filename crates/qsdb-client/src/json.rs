@@ -133,6 +133,8 @@ pub struct PartitionInfo {
     pub rows: u64,
     /// 段数。
     pub segments: u64,
+    /// 段文件字节总量（压缩后落盘体积；十九批Ⅶ，单表大小 = 各分区求和）。
+    pub bytes: u64,
 }
 
 /// 库统计（`GET /api/v1/stats`）。
@@ -238,6 +240,8 @@ struct RawPartitionDetail {
     rows: u64,
     #[serde(default)]
     segments: u64,
+    #[serde(default)]
+    bytes: u64,
 }
 
 #[derive(serde::Deserialize)]
@@ -256,6 +260,7 @@ pub(crate) fn parse_partitions(bytes: &[u8]) -> Result<Vec<PartitionInfo>> {
             generation: p.generation,
             rows: p.rows,
             segments: p.segments,
+            bytes: p.bytes,
         })
         .collect())
 }

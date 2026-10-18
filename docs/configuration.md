@@ -87,6 +87,7 @@
 | INSERT / POST /write | ✗ | ✓ | ✓ |
 | DDL（CREATE/DROP/ALTER/TRUNCATE/DELETE） | ✗ | ✗ | ✓ |
 | compact / gc / refresh-index / 用户管理 / `/config`（读与写都 admin——响应含挂载清单与启动期路径，非 admin 可从 `RESULT_TOO_LARGE` 等错误文案拿到运行期上限） | ✗ | ✗ | ✓ |
+| `/sessions` 列表 | — | — | admin 全量；**非 admin 只见自己名下**的会话（十九批Ⅶ） |
 
 **库级 grants（M-C，白名单制）**：
 ```jsonc

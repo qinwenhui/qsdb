@@ -913,6 +913,16 @@ struct Identity {
     session: Option<Arc<Session>>,
 }
 
+/// 当前请求的**用户名**（与 [`authenticate`] 同源）：Bearer 会话 = 登录用户 /
+/// Basic = 解析用户 / 超级 token = `__token__` / 开放模式 = `anonymous`。
+/// 会话列表的自查过滤用。
+fn authenticated_user(state: &AppState, headers: &HeaderMap) -> String {
+    match authenticate_identity(state, headers) {
+        Ok(ident) => ident.user,
+        Err(_) => "anonymous".to_string(),
+    }
+}
+
 fn authenticate_identity(
     state: &AppState,
     headers: &HeaderMap,
@@ -1509,13 +1519,22 @@ async fn auth_login(
 ///
 /// 在跑查询由**查询注册表反查**（唯一真源，不冗余存进 Session）。
 async fn list_sessions(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let role = match require_role(&s, &headers) {
-        Ok(r) => r,
-        Err(resp) => return *resp,
+    // 可见性（十九批Ⅶ，studio 需求）：**admin 全量 / 非 admin 只看自己的**——
+    // 用户名来自认证身份（Bearer 会话的登录用户 / Basic 的解析用户 /
+    // 开放模式的 anonymous）。单会话详情（admin 或本会话）早已是同款语义，
+    // 列表与之对齐。
+    let (role, me) = match authenticate(&s, &headers) {
+        Authed::Pass { role, .. } => (role, authenticated_user(&s, &headers)),
+        Authed::NoGrant { user, db } => {
+            return ErrorCode::Forbidden.response(format!(
+                "user '{user}' has no grant on database '{db}' (mounted: {})",
+                s.mount_names().join(", ")
+            ));
+        }
+        Authed::Revoked => return ErrorCode::SessionRevoked.response("session revoked; re-login"),
+        Authed::Deny => return ErrorCode::Unauthorized.response("unauthorized"),
     };
-    if !role.is_admin() {
-        return ErrorCode::Forbidden.response("session list requires admin");
-    }
+    let is_admin = role.is_admin();
     // 注册表反查：session id → 在跑 query ids
     let running: HashMap<String, Vec<String>> = match s.queries.lock() {
         Ok(q) => {
@@ -1530,7 +1549,11 @@ async fn list_sessions(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Re
         Err(_) => return ErrorCode::Internal.response("registry poisoned"),
     };
     let mut entries: Vec<Arc<Session>> = match s.sessions.lock() {
-        Ok(m) => m.values().cloned().collect(),
+        Ok(m) => m
+            .values()
+            .filter(|sess| is_admin || sess.user == me)
+            .cloned()
+            .collect(),
         Err(_) => return ErrorCode::Internal.response("session table poisoned"),
     };
     entries.sort_by(|a, b| (a.created_at_ms, &a.id).cmp(&(b.created_at_ms, &b.id)));
