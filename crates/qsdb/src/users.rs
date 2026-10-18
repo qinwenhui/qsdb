@@ -262,6 +262,39 @@ impl UserStore {
         Self::write_all(store, &users)
     }
 
+    /// **bootstrap 管理员 upsert**（十九批Ⅶ）：启动配置文件指定
+    /// `bootstrap_admin {user, password}` 时调用——用户不存在则建（admin），
+    /// 存在则把口令同步成配置值（**配置文件即口令真相源**，改配置重启即换密）。
+    /// 幂等：每次启动都跑，结果一致。
+    pub fn upsert_admin(store: &Store, name: &str, password: &str) -> Result<()> {
+        validate_username(name)?;
+        validate_password(password)?;
+        let mut users = Self::read_all(store)?;
+        match users.get_mut(name) {
+            Some(u) => {
+                let salt = random_salt();
+                u.salt = bytes_to_hex(&salt);
+                u.hash = hash_password(password, &salt);
+                u.role = Some(Role::Admin);
+                u.grants = None; // grants 形态让位：bootstrap 声明的是**全库 admin**
+            }
+            None => {
+                let salt = random_salt();
+                users.insert(
+                    name.to_string(),
+                    UserDef {
+                        name: name.to_string(),
+                        role: Some(Role::Admin),
+                        salt: bytes_to_hex(&salt),
+                        hash: hash_password(password, &salt),
+                        grants: None,
+                    },
+                );
+            }
+        }
+        Self::write_all(store, &users)
+    }
+
     /// 添加用户（grants 形态，M-C）：CLI `user add --grant` 的落点。
     /// 映射可含 `"*"`；**不含** = 白名单制（未列出的库一律无权）。
     pub fn add_with_grants(

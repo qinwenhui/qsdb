@@ -131,6 +131,8 @@ pub struct AppState {
     pub queries: std::sync::Mutex<HashMap<String, QueryEntry>>,
     /// 并发查询上限（0 = 不限）
     pub max_concurrent_queries: usize,
+    /// 会话数上限（十九批Ⅶ；0 = 不限）。登录闸在 auth_login
+    pub max_sessions: u64,
     /// 结果护栏·行数上限（十七批 R1；0 = 不限）。检查点在**执行后、序列化前**，
     /// 超限恒定 400 `RESULT_TOO_LARGE`（绝不返回部分数据）。落 AppState 而非
     /// 各挂载 runtime——护栏管的是**传输体量**（server 面），不是某个库的执行；
@@ -157,6 +159,7 @@ impl AppState {
         token: Option<String>,
         commits: Arc<crate::commit_log::CommitLog>,
         max_concurrent_queries: usize,
+        max_sessions: u64,
     ) -> Self {
         let mut mounts = HashMap::new();
         for (name, db) in mount_list {
@@ -173,6 +176,7 @@ impl AppState {
             metrics: Metrics::default(),
             queries: std::sync::Mutex::new(HashMap::new()),
             max_concurrent_queries,
+            max_sessions,
             max_result_rows: AtomicU64::new(0),
             max_result_bytes: AtomicU64::new(0),
         }
@@ -308,6 +312,8 @@ pub struct Metrics {
     pub rejected_memory: AtomicU64,
     /// 被结果护栏拒绝（`RESULT_TOO_LARGE`）次数（十七批 R1）
     pub rejected_result_size: AtomicU64,
+    /// 被会话上限拒绝（TOO_MANY_SESSIONS）的登录次数（十九批Ⅶ）
+    pub rejected_sessions: AtomicU64,
 }
 
 impl Metrics {
@@ -365,19 +371,101 @@ impl Metrics {
 
 /// 启动服务（阻塞至 Ctrl-C）。
 #[allow(clippy::too_many_arguments)]
-/// 服务器配置文件（可选 JSON）。
+/// 服务器配置文件（可选 JSON；`--config <路径>`）——**部署档案**。
+///
+/// 十九批Ⅶ 起**全量覆盖**启动参数与运行期四键：CLI 显式值 > 配置文件 >
+/// 内置默认；`deny_unknown_fields` ⇒ **键名拼错启动即失败**（不静默忽略——
+/// 写了不生效的配置比没有配置更危险）。键为 snake_case（与既有四键一致）。
 #[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfigFile {
+    // ---- 运行期四键（热更；PUT /config 亦可改）----
     #[serde(default)]
     pub query_timeout_ms: Option<u64>,
     #[serde(default)]
     pub query_memory_limit_bytes: Option<u64>,
-    /// 结果护栏（十七批 R1）：行数 / 体量（字节）。与 CLI 同名项同族——
-    /// CLI 显式值优先。
     #[serde(default)]
     pub max_result_rows: Option<u64>,
     #[serde(default)]
     pub max_result_bytes: Option<u64>,
+    // ---- 监听与鉴权 ----
+    #[serde(default)]
+    pub path: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub addr: Option<String>,
+    #[serde(default)]
+    pub token: Option<String>,
+    // ---- 容量与资源 ----
+    #[serde(default)]
+    pub cache_mb: Option<usize>,
+    #[serde(default)]
+    pub memory_budget_mb: Option<u64>,
+    #[serde(default)]
+    pub max_concurrent_queries: Option<usize>,
+    #[serde(default)]
+    pub max_sessions: Option<u64>,
+    #[serde(default)]
+    pub query_memory_limit_mb: Option<u64>,
+    #[serde(default)]
+    pub spill_dir: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub file_cache_mb: Option<u64>,
+    // ---- 会话与运维 ----
+    #[serde(default)]
+    pub session_idle_timeout_mins: Option<u64>,
+    #[serde(default)]
+    pub auto_compact_secs: Option<u64>,
+    #[serde(default)]
+    pub writer_epoch: Option<u64>,
+    #[serde(default)]
+    pub read_only: Option<bool>,
+    #[serde(default)]
+    pub durability: Option<String>,
+    #[serde(default)]
+    pub flight_bind: Option<String>,
+    #[serde(default)]
+    pub staging_dir: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub staging_upload_secs: Option<u64>,
+    // ---- 存储后端 ----
+    #[serde(default)]
+    pub storage_type: Option<String>,
+    #[serde(default)]
+    pub storage_endpoint: Option<String>,
+    #[serde(default)]
+    pub storage_region: Option<String>,
+    #[serde(default)]
+    pub storage_bucket: Option<String>,
+    #[serde(default)]
+    pub storage_hdfs_url: Option<String>,
+    #[serde(default)]
+    pub storage_prefix: Option<String>,
+    // ---- 多库挂载（结构化形态；等价 `--mount 名=路径[,budget-mb=N,read-only]`）----
+    #[serde(default)]
+    pub mounts: Option<Vec<MountConfig>>,
+    // ---- bootstrap 管理员（十九批Ⅶ）----
+    /// 启动时 upsert 的 admin 账号：不存在则建、存在则把口令同步成配置值
+    /// （配置即口令真相源，改配置重启即换密）。幂等。
+    #[serde(default)]
+    pub bootstrap_admin: Option<BootstrapAdmin>,
+}
+
+/// 多库挂载的配置形态（等价 `--mount` 字符串，校验共用同一套）。
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct MountConfig {
+    pub name: String,
+    pub path: std::path::PathBuf,
+    #[serde(default)]
+    pub budget_mb: Option<u64>,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// bootstrap 管理员（见 [`ServerConfigFile::bootstrap_admin`]）。
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct BootstrapAdmin {
+    pub user: String,
+    pub password: String,
 }
 
 /// 单查询执行内存的兜底默认闸门（4GB）。
@@ -406,23 +494,29 @@ pub async fn serve(
     // 默认 0 = 关）。默认关 ⇒ 升级零行为变更。
     max_result_rows: Option<u64>,
     max_result_mb: Option<u64>,
-    config_file: Option<&std::path::Path>,
+    // 服务器配置文件（十九批Ⅶ：main 已加载并合并，这里只消费运行期四键与
+    // bootstrap；max_sessions 单独传 AppState）
+    cfg: ServerConfigFile,
+    // 会话数上限（0 = 不限；登录闸在 auth_login）
+    max_sessions: u64,
+    // bootstrap 管理员（启动 upsert；见 BootstrapAdmin）
+    bootstrap: Option<BootstrapAdmin>,
     #[cfg_attr(not(feature = "flight"), allow(unused_variables))] flight_bind: Option<String>,
     #[cfg_attr(not(feature = "s3"), allow(unused_variables))] staging_upload_secs: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cfg = ServerConfigFile::default();
-    if let Some(path) = config_file {
-        let text = std::fs::read_to_string(path)?;
-        cfg = serde_json::from_str(&text)
-            .map_err(|e| format!("parse config {}: {e}", path.display()))?;
-        eprintln!("config file applied: {}", path.display());
-    }
     let state = Arc::new(AppState::with_mounts(
         mounts,
         token,
         commits,
         max_concurrent_queries.unwrap_or(0),
+        max_sessions,
     ));
+    // bootstrap 管理员（十九批Ⅶ）：upsert 幂等——不存在则建 admin、存在则
+    // 把口令同步成配置值（配置即口令真相源；改配置重启即换密）
+    if let Some(ba) = &bootstrap {
+        qsdb::users::UserStore::upsert_admin(state.db.store(), &ba.user, &ba.password)?;
+        eprintln!("bootstrap admin '{}' ready (password from config)", ba.user);
+    }
     // 运行期配置（超时/单查询配额）落**默认挂载**的 runtime；M-B 各挂载独立
     // runtime，运行期热更按同一值刷全部（见 put_config 的说明）。
     let db = Arc::clone(&state.db);
@@ -1360,6 +1454,18 @@ async fn auth_login(
             }
         }
     };
+    // 会话数上限（十九批Ⅶ）：登录时拒（503 TOO_MANY_SESSIONS，retry=yes——
+    // 等会话释放/被踢）；已有会话不受影响。开放模式/Basic 的匿名会话同限。
+    if s.max_sessions > 0 {
+        let cur = s.sessions.lock().map(|m| m.len()).unwrap_or(0);
+        if cur >= s.max_sessions as usize {
+            s.metrics.rejected_sessions.fetch_add(1, Ordering::Relaxed);
+            return ErrorCode::TooManySessions.response(format!(
+                "session limit reached ({cur}/{}); 等待会话释放，或由管理员 DELETE /sessions/{{id}} 踢出",
+                s.max_sessions
+            ));
+        }
+    }
     let token = new_session_token();
     let session = Arc::new(Session {
         id: new_session_id(),
@@ -2761,6 +2867,7 @@ async fn partitions(
                         "generation": p.generation,
                         "rows": p.rows,
                         "segments": p.segments,
+                        "bytes": p.bytes,
                     })
                 })
                 .collect();
@@ -3469,6 +3576,7 @@ mod tests {
             None,
             crate::commit_log::CommitLog::new(),
             0,
+            0, // 测试：会话上限关
         ));
         (state, root)
     }
@@ -3594,6 +3702,7 @@ mod tests {
             None,
             crate::commit_log::CommitLog::new(),
             0,
+            0, // 测试：会话上限关
         ));
         (state, d1, d2)
     }

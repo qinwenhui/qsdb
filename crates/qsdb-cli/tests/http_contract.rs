@@ -1308,7 +1308,7 @@ fn error_catalog_endpoint_and_no_off_catalog_codes() {
     // 条数与代码侧枚举一致（docs/error-codes.md ↔ enum 的逐字对账在单测里）
     // 条数（集成测试看不到 crate 内部枚举，故这里写死；**逐字对账在 `error_code.rs`
     // 的单测里**，那条才是防漂移的权威）
-    assert_eq!(codes.len(), 26, "目录应列出全部码（数错说明漏挂在 ALL 上）");
+    assert_eq!(codes.len(), 27, "目录应列出全部码（数错说明漏挂在 ALL 上）");
     for c in &codes {
         for k in ["code", "http", "retry", "category", "sqlState"] {
             assert!(c.get(k).is_some(), "目录条目缺字段 {k}: {c}");
@@ -2573,4 +2573,165 @@ fn copy_and_files_are_mount_aware() {
     // 表文件 = `<根>/<库名>/<表>/…`（历史形态，`default/…` 是库名目录不是
     // 挂载前缀）。所以 `default/exp_dft` 是"default 库目录下的 exp_dft"⇒ 404。
     assert!(http(p, "GET", "/api/v1/files?path=default/exp_dft", &[], &[]).status == 404);
+}
+
+// ---------------------------------------------------------------------------
+// 26. 配置文件全量化 + 会话上限 + bootstrap 管理员（十九批Ⅶ）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn 配置文件驱动启动_会话上限与bootstrap管理员() {
+    // 配置文件：token + 会话上限 1 + bootstrap root 管理员
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("qsdb_cfgfile_{}_{}", std::process::id(), uniq));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let cfg_path = root.join("qsdb.json");
+    std::fs::write(
+        &cfg_path,
+        br#"{
+  "path": "PLACEHOLDER",
+  "token": "cfgtok",
+  "max_sessions": 1,
+  "bootstrap_admin": { "user": "root", "password": "rootpass" },
+  "cache_mb": 64
+}"#,
+    )
+    .unwrap();
+
+    // 未知键 → 启动即失败（deny_unknown_fields，不静默忽略）
+    let bad = root.join("bad.json");
+    std::fs::write(&bad, br#"{"cache_mb": 64, "cache_nonsense": 1}"#).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_qsdb"))
+        .args(["server", "--path"])
+        .arg(&root)
+        .args(["--addr", "127.0.0.1:0", "--config"])
+        .arg(&bad)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "未知键必须启动失败");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unknown field"),
+        "要报 unknown field: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 正式起服务（配置文件给 token/会话上限/bootstrap；--path 走 CLI）
+    let mut child = Command::new(env!("CARGO_BIN_EXE_qsdb"))
+        .args(["server", "--path"])
+        .arg(&root)
+        .args(["--addr", "127.0.0.1:0", "--config"])
+        .arg(&cfg_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let mut buf = Vec::new();
+    let port = loop {
+        let mut chunk = [0u8; 512];
+        match stderr.read(&mut chunk) {
+            Ok(0) | Err(_) => panic!("server 提前退出: {}", String::from_utf8_lossy(&buf)),
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(p) = parse_listening_port(&String::from_utf8_lossy(&buf)) {
+                    break p;
+                }
+            }
+        }
+    };
+    // bootstrap 提示在日志里
+    assert!(
+        String::from_utf8_lossy(&buf).contains("bootstrap admin 'root'"),
+        "日志应有 bootstrap 提示"
+    );
+
+    // 配置 token 生效：错 token → 401
+    let r = http(
+        port,
+        "GET",
+        "/api/v1/tables",
+        &[("Authorization", "Bearer wrong")],
+        &[],
+    );
+    assert_eq!(r.status, 401);
+    // bootstrap root 管理员：登录 → admin（能读 /config）
+    let r = login(port, "root", "rootpass");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let tok = format!("Bearer {}", r.json()["token"].as_str().unwrap());
+    let r = http(
+        port,
+        "GET",
+        "/api/v1/config",
+        &[("Authorization", &tok)],
+        &[],
+    );
+    assert_eq!(r.status, 200, "bootstrap admin 应能读 /config");
+
+    // 会话上限 1：root 已占 1 个会话 → 第二个登录 503 TOO_MANY_SESSIONS
+    let r = login(port, "root", "rootpass");
+    assert_eq!(r.status, 503, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.code(), "TOO_MANY_SESSIONS");
+
+    // 踢掉会话后可以再登（等会话释放的语义闭环）
+    let sid = r0_session_id(port, &tok);
+    let rr = http(
+        port,
+        "DELETE",
+        &format!("/api/v1/sessions/{sid}"),
+        &[("Authorization", &tok)],
+        b"",
+    );
+    assert_eq!(rr.status, 200);
+    assert_eq!(login(port, "root", "rootpass").status, 200);
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 用 admin token 查当前会话 id（测试辅助）。
+fn r0_session_id(port: u16, tok: &str) -> String {
+    let r = http(
+        port,
+        "GET",
+        "/api/v1/sessions",
+        &[("Authorization", tok)],
+        &[],
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let sid = r.json()["sessions"][0]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(!sid.is_empty());
+    sid
+}
+
+/// 单表字节数（十九批Ⅶ，studio 单表大小菜单的数据源）：分区 detail 带
+/// `bytes`（压缩后落盘体积），且导出→重导的体积随之变化（不是恒 0/估算）。
+#[test]
+fn partitions_detail_携带字节量() {
+    let srv = Server::start(&[]);
+    let p = srv.port;
+    let q = |sql: &str| query(p, sql, None);
+    assert_eq!(q("CREATE TABLE bt (a BIGINT, s STRING)").status, 200);
+    assert_eq!(
+        q("INSERT INTO bt VALUES (1,'xxxxxxxxxx'),(2,'yyyyyyyyyy'),(3,'zzzzzzzzzz')").status,
+        200
+    );
+    // bytes > 0 且随数据变化
+    let body1 = http(p, "GET", "/api/v1/tables/bt/partitions", &[], &[]).json();
+    let b1 = body1["detail"][0]["bytes"].as_u64().expect("bytes 字段");
+    assert!(b1 > 0, "段文件字节量应 > 0: {}", body1);
+    assert_eq!(
+        q("INSERT INTO bt VALUES (4,'more data here to grow the segment size')").status,
+        200
+    );
+    let body2 = http(p, "GET", "/api/v1/tables/bt/partitions", &[], &[]).json();
+    let b2 = body2["detail"][0]["bytes"].as_u64().unwrap();
+    assert!(b2 > b1, "追加数据后体积应增长: {b1} → {b2}");
 }

@@ -16,7 +16,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use qsdb::{NotFoundKind, QsdbError};
 
-/// 目录里的全部错误码（26 个）。
+/// 目录里的全部错误码（27 个）。
 ///
 /// 顺序 = 文档 §三 表格顺序 = 目录端点输出顺序，便于对账。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +54,8 @@ pub enum ErrorCode {
     Forbidden,
     // ---- capacity ----
     TooManyQueries,
+    /// 会话数超上限（十九批Ⅶ --max-sessions；登录时拒，等会话释放或被踢）
+    TooManySessions,
     MemoryPressure,
     ReadOnly,
     // ---- storage ----
@@ -65,7 +67,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// 全量清单（目录端点与漂移测试的唯一来源）。
-    pub const ALL: [ErrorCode; 26] = [
+    pub const ALL: [ErrorCode; 27] = [
         Self::QueryTimeout,
         Self::QueryCancelled,
         Self::QueryMemoryLimit,
@@ -87,6 +89,7 @@ impl ErrorCode {
         Self::SessionRevoked,
         Self::Forbidden,
         Self::TooManyQueries,
+        Self::TooManySessions,
         Self::MemoryPressure,
         Self::ReadOnly,
         Self::MetadataError,
@@ -118,6 +121,7 @@ impl ErrorCode {
             Self::SessionRevoked => "SESSION_REVOKED",
             Self::Forbidden => "FORBIDDEN",
             Self::TooManyQueries => "TOO_MANY_QUERIES",
+            Self::TooManySessions => "TOO_MANY_SESSIONS",
             Self::MemoryPressure => "MEMORY_PRESSURE",
             Self::ReadOnly => "READ_ONLY",
             Self::MetadataError => "METADATA_ERROR",
@@ -149,9 +153,10 @@ impl ErrorCode {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::Unauthorized | Self::SessionRevoked => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
-            Self::TooManyQueries | Self::MemoryPressure | Self::ReadOnly => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            Self::TooManyQueries
+            | Self::TooManySessions
+            | Self::MemoryPressure
+            | Self::ReadOnly => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -162,7 +167,7 @@ impl ErrorCode {
     pub fn retryable(self) -> bool {
         matches!(
             self,
-            Self::TooManyQueries | Self::MemoryPressure | Self::IoError
+            Self::TooManyQueries | Self::TooManySessions | Self::MemoryPressure | Self::IoError
         )
     }
 
@@ -186,7 +191,10 @@ impl ErrorCode {
             | Self::NotFound => "resource",
             Self::InvalidArgument | Self::InvalidIpc => "request",
             Self::Unauthorized | Self::SessionRevoked | Self::Forbidden => "auth",
-            Self::TooManyQueries | Self::MemoryPressure | Self::ReadOnly => "capacity",
+            Self::TooManyQueries
+            | Self::TooManySessions
+            | Self::MemoryPressure
+            | Self::ReadOnly => "capacity",
             Self::MetadataError | Self::IoError => "storage",
             Self::Internal => "internal",
         }
@@ -225,6 +233,9 @@ impl ErrorCode {
             Self::Unauthorized | Self::SessionRevoked => "28000",
             Self::Forbidden => "42501",
             Self::TooManyQueries => "53300",
+            // 08004 = SQL 标准 connection_rejected: too_many_connections——
+            // 会话是**登录时**拒的，用连接类的标准码比容量类更准
+            Self::TooManySessions => "08004",
             Self::MemoryPressure => "53000",
             Self::ReadOnly => "25006",
             Self::IoError => "58030",
@@ -306,7 +317,9 @@ impl ErrorCode {
         match self {
             Self::QueryTimeout => Code::DeadlineExceeded,
             Self::QueryCancelled => Code::Cancelled,
-            Self::TooManyQueries | Self::MemoryPressure => Code::ResourceExhausted,
+            Self::TooManyQueries | Self::TooManySessions | Self::MemoryPressure => {
+                Code::ResourceExhausted
+            }
             Self::ReadOnly => Code::FailedPrecondition,
             Self::Unauthorized | Self::SessionRevoked => Code::Unauthenticated,
             Self::Forbidden => Code::PermissionDenied,

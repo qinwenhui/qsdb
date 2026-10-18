@@ -247,6 +247,9 @@ pub struct PartitionStat {
     pub generation: u64,
     pub rows: u64,
     pub segments: usize,
+    /// 该分区段文件的字节总量（sum of SegmentEntry.byte_size；十九批Ⅶ，
+    /// studio 单表大小菜单的数据源）。压缩后的落盘体积，非解压行宽。
+    pub bytes: u64,
 }
 
 /// 运行期可热更配置：原子量存储，新查询/新请求即时生效，**无需重启**。
@@ -1642,6 +1645,7 @@ impl Qsdb {
                     generation: m.generation,
                     rows: m.total_rows(),
                     segments: m.segments.len(),
+                    bytes: m.segments.iter().map(|sg| sg.byte_size).sum(),
                 })
                 .collect());
         }
@@ -1659,6 +1663,7 @@ impl Qsdb {
                     generation: m.generation,
                     rows: m.total_rows(),
                     segments: m.segments.len(),
+                    bytes: m.segments.iter().map(|sg| sg.byte_size).sum(),
                 });
             }
         }

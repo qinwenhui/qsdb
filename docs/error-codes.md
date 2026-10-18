@@ -73,6 +73,7 @@ retry, category, sqlState}` 全表——驱动冷启动即可自配置映射，�
 | `SESSION_REVOKED` | 401 | no | auth | **会话已失效**（被 `DELETE /api/v1/sessions/{id}` 踢出 / 空闲回收 / 服务端重启——会话不持久化）。与 `UNAUTHORIZED` 的区分：客户端**别再拿这把 token 重试**，它永远不会好 | 重新登录换新 token | `28000` |
 | `FORBIDDEN` | 403 | no | auth | 凭证有效但角色不足：reader 做 INSERT/DELETE（SQL 或 `/write`）、非 admin 做 DDL/运维/用户管理/改配置 | 换角色或申请授权 | `42501` |
 | `TOO_MANY_QUERIES` | 503 | yes | capacity | 并发查询超上限（`--max-concurrent-queries`） | **退避重试**（此时段并发已满） | `53300` |
+| `TOO_MANY_SESSIONS` | 503 | yes | capacity | 登录时会话数超上限（`--max-sessions`；会话=登录签发，进程态） | **退避或由管理员踢出会话**后重登；已有会话不受影响 | `08004` |
 | `MEMORY_PRESSURE` | 503 | yes | capacity | **全库内存预算**此刻耗尽（`--memory-budget-mb`；多为**他人占用**） | **退避重试**（别的查询跑完就好）；持续则调大预算 | `53000` |
 | `READ_ONLY` | 503 | no | capacity | 只读库（`--read-only`）拒绝写 | **永不重试**；换可写实例 | `25006` |
 | `METADATA_ERROR` | 500 | no | storage | manifest / 表格式元数据损坏或不一致 | 上报；可能需要 `refresh-index` 或人工介入 | `XX000` |

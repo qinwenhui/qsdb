@@ -69,9 +69,9 @@ enum Cmd {
     /// 启动 HTTP API 服务
     Server {
         #[arg(long)]
-        path: PathBuf,
-        #[arg(long, default_value = "0.0.0.0:9430")]
-        addr: String,
+        path: Option<PathBuf>,
+        #[arg(long)]
+        addr: Option<String>,
         /// bearer token 鉴权（不设则开放）
         #[arg(long)]
         token: Option<String>,
@@ -84,13 +84,13 @@ enum Cmd {
         /// ① 每次提交把它盖进 manifest，生态（qsdb-sync replica）据此用
         /// `(epoch, generation)` 复合序判增量——撞值不再可能；
         /// ② 配着小 epoch 的旧进程再连回来会被拒（`STALE_WRITER`）。
-        #[arg(long, default_value_t = 0)]
-        writer_epoch: u64,
+        #[arg(long)]
+        writer_epoch: Option<u64>,
         /// 热数据缓存预算（MB；0 = 关闭，默认 256）。
         /// 保守默认守低占用定位；宽投影要快请显式调大（代价见
         /// `QsdbOptions::scan_cache_bytes` 文档的内存-性能权衡）。
-        #[arg(long, default_value_t = 256)]
-        cache_mb: usize,
+        #[arg(long)]
+        cache_mb: Option<usize>,
         /// 并发查询上限（0 = 不限；**默认 0**）。超限请求直接 503
         /// `TOO_MANY_QUERIES`（不排队——闸门的职责是拒绝，不是缓冲）。
         ///
@@ -99,14 +99,19 @@ enum Cmd {
         /// 原先默认 16 是因为"它是唯一的系统级内存上界"，预算落地后这个理由
         /// 不成立了；且按条数限流会误伤 µs 级轻查询。真需要限流（过载保护/
         /// 公平性）时按机器容量显式给。
-        #[arg(long, default_value_t = 0)]
-        max_concurrent_queries: usize,
+        #[arg(long)]
+        max_concurrent_queries: Option<usize>,
         /// **会话空闲回收**（分钟；0 = 永不回收，默认关）。超时会话按"踢人"
         /// 路径清理（取消在跑查询 + 吊销 token，之后 401 `SESSION_REVOKED`）。
         /// 默认关的理由：踢错活跃会话的代价大于泄漏代价（会话对象 ~百字节级，
         /// 泄漏是审计噪音不是内存问题）。
-        #[arg(long, default_value_t = 0)]
-        session_idle_timeout_mins: u64,
+        #[arg(long)]
+        session_idle_timeout_mins: Option<u64>,
+        /// **会话数上限**（0 = 不限，默认 0）。登录时超限 → 503
+        /// `TOO_MANY_SESSIONS`（等会话释放/被踢）；已有会话不受影响。
+        /// 会话=登录签发的进程态凭证（Basic/开放模式不建会话，不受此限）。
+        #[arg(long)]
+        max_sessions: Option<u64>,
         /// **溢出目录**（排序/聚合/join 落盘用；默认 `<库根>/_spill`）。
         ///
         /// 溢出量可以很大（5M 行排序就是几十上百 MB）——**默认与数据同盘**，
@@ -122,8 +127,8 @@ enum Cmd {
         /// 503 `MEMORY_PRESSURE`（可退避重试），**不是 OOM**。
         /// 与 `--query-memory-limit-mb` 的分工：那个是「单个查询的配额」
         /// （超了是 400 `QUERY_MEMORY_LIMIT`，改查询才有用）。
-        #[arg(long, default_value_t = 4096)]
-        memory_budget_mb: u64,
+        #[arg(long)]
+        memory_budget_mb: Option<u64>,
         /// 单查询执行内存上限（MB；**0 = 不限**；不给则默认 4096 = 4GB）。
         /// **防 OOM 双闸之二**，只约束显式物化算子的记账（join build /
         /// sort spill / window / udaf；流式扫描/聚合不驻留故不记账）。
@@ -149,11 +154,11 @@ enum Cmd {
         #[arg(long)]
         flight_bind: Option<String>,
         /// 远端外表（read_parquet s3://）段文件本地缓存（MB；0 = 关闭）
-        #[arg(long, default_value_t = 0)]
-        file_cache_mb: u64,
+        #[arg(long)]
+        file_cache_mb: Option<u64>,
         /// 存储后端类型：local（默认）| s3（需 --features s3 编译）
-        #[arg(long, default_value = "local")]
-        storage_type: String,
+        #[arg(long)]
+        storage_type: Option<String>,
         /// S3 兼容端点（AWS 官方留空；http:// 端点自动 allow_http）
         #[arg(long)]
         storage_endpoint: Option<String>,
@@ -166,19 +171,19 @@ enum Cmd {
         #[arg(long)]
         storage_hdfs_url: Option<String>,
         /// bucket 内 key 前缀（多租户/多库共存）
-        #[arg(long, default_value = "")]
-        storage_prefix: String,
+        #[arg(long)]
+        storage_prefix: Option<String>,
         /// 远端写 staging 目录（M6-4：写盘即 ACK，后台上传；
         /// 需 --storage-type s3。建议放本地高速盘/与库根不同盘）
         #[arg(long)]
         staging_dir: Option<PathBuf>,
         /// staging 后台上传周期（秒；默认 5）
-        #[arg(long, default_value_t = 5)]
-        staging_upload_secs: u64,
+        #[arg(long)]
+        staging_upload_secs: Option<u64>,
         /// 数据耐久性：process-crash（默认，页缓存即持久）/ power-loss
         /// （segment/元数据 rename 前 fsync，掉电安全，写吞吐实测约 -25%）
-        #[arg(long, default_value = "process-crash")]
-        durability: String,
+        #[arg(long)]
+        durability: Option<String>,
         /// 只读模式（standby/只读副本）：写/DDL 一律 503 `READ_ONLY`
         /// （读完全不受影响；客户端**永不重试**该码，换可写实例才对）
         #[arg(long, default_value_t = false)]
@@ -636,6 +641,7 @@ fn main() {
             cache_mb,
             max_concurrent_queries,
             session_idle_timeout_mins,
+            max_sessions,
             spill_dir,
             memory_budget_mb,
             query_memory_limit_mb,
@@ -656,6 +662,90 @@ fn main() {
             mounts,
             config,
         } => {
+            // ---- 配置文件（十九批Ⅶ）：部署档案；CLI 显式值 > 配置文件 > 默认 ----
+            // deny_unknown_fields：键名拼错在这里显式失败（写了不生效的配置
+            // 比没有配置更危险）
+            let cfg: crate::server::ServerConfigFile = match &config {
+                Some(cp) => {
+                    let text = std::fs::read_to_string(cp).unwrap_or_else(|e| {
+                        eprintln!("error: read config {}: {e}", cp.display());
+                        std::process::exit(1);
+                    });
+                    serde_json::from_str(&text).unwrap_or_else(|e| {
+                        eprintln!(
+                            "error: parse config {}: {e}
+（配置不接受未知键——键名拼错会在此报错）",
+                            cp.display()
+                        );
+                        std::process::exit(1);
+                    })
+                }
+                None => Default::default(),
+            };
+            let path = path.or_else(|| cfg.path.clone()).unwrap_or_else(|| {
+                eprintln!("error: --path（或配置文件里的 path）必须提供其一");
+                std::process::exit(1);
+            });
+            let addr = addr
+                .or(cfg.addr.clone())
+                .unwrap_or_else(|| "0.0.0.0:9430".to_string());
+            let token = token.or(cfg.token.clone());
+            let auto_compact_secs = auto_compact_secs.or(cfg.auto_compact_secs);
+            let writer_epoch = writer_epoch.unwrap_or(cfg.writer_epoch.unwrap_or(0));
+            let cache_mb = cache_mb.or(cfg.cache_mb).unwrap_or(256);
+            let max_concurrent_queries = max_concurrent_queries
+                .or(cfg.max_concurrent_queries)
+                .unwrap_or(0);
+            let session_idle_timeout_mins = session_idle_timeout_mins
+                .or(cfg.session_idle_timeout_mins)
+                .unwrap_or(0);
+            let max_sessions = max_sessions.or(cfg.max_sessions).unwrap_or(0);
+            let memory_budget_mb = memory_budget_mb.or(cfg.memory_budget_mb).unwrap_or(4096);
+            let file_cache_mb = file_cache_mb.or(cfg.file_cache_mb).unwrap_or(0);
+            let staging_upload_secs = staging_upload_secs.or(cfg.staging_upload_secs).unwrap_or(5);
+            let durability = durability
+                .or(cfg.durability.clone())
+                .unwrap_or_else(|| "process-crash".to_string());
+            let storage_type = storage_type
+                .or(cfg.storage_type.clone())
+                .unwrap_or_else(|| "local".to_string());
+            let storage_endpoint = storage_endpoint.or(cfg.storage_endpoint.clone());
+            let storage_region = storage_region.or(cfg.storage_region.clone());
+            let storage_bucket = storage_bucket.or(cfg.storage_bucket.clone());
+            let storage_hdfs_url = storage_hdfs_url.or(cfg.storage_hdfs_url.clone());
+            let storage_prefix = storage_prefix.or(cfg.storage_prefix.clone());
+            let read_only = read_only || cfg.read_only.unwrap_or(false);
+            let spill_dir = spill_dir.or(cfg.spill_dir.clone());
+            let flight_bind = flight_bind.or(cfg.flight_bind.clone());
+            let staging_dir = staging_dir.or(cfg.staging_dir.clone());
+            // 单查询内存：CLI MB > 配置 bytes > 配置 MB > serve 兜底 4GB
+            let query_memory_limit_bytes = query_memory_limit_mb
+                .map(|mb| mb.saturating_mul(1024 * 1024))
+                .or(cfg.query_memory_limit_bytes)
+                .or(cfg
+                    .query_memory_limit_mb
+                    .map(|mb| mb.saturating_mul(1024 * 1024)));
+            let mut mounts = mounts;
+            if mounts.is_empty() {
+                if let Some(ms) = &cfg.mounts {
+                    // 配置挂载转成与 --mount 相同的字符串形态——校验/语义共用一套
+                    mounts = ms
+                        .iter()
+                        .map(|m| {
+                            let mut x = format!("{}={}", m.name, m.path.display());
+                            if let Some(b) = m.budget_mb {
+                                x.push_str(&format!(",budget-mb={b}"));
+                            }
+                            if m.read_only {
+                                x.push_str(",read-only");
+                            }
+                            x
+                        })
+                        .collect();
+                }
+            }
+            let bootstrap = cfg.bootstrap_admin.clone();
+
             // 存储后端解析（cli 层校验，错误走统一 exit 风格）
             let storage = match storage_type.as_str() {
                 "local" => qsdb::api::StorageConfig::Local,
@@ -857,11 +947,12 @@ fn main() {
                 auto_compact_secs,
                 Some(max_concurrent_queries),
                 Some(session_idle_timeout_mins),
-                // MB → 字节；未显式给则 None（让配置文件优先，再由 serve 兜 4GB）
-                query_memory_limit_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
+                query_memory_limit_bytes,
                 max_result_rows,
                 max_result_mb,
-                config.as_deref(),
+                cfg,
+                max_sessions,
+                bootstrap,
                 flight_bind,
                 staging_secs,
             )) {
