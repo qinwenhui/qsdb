@@ -273,18 +273,20 @@ impl QsdbRuntime {
     }
 
     pub fn query_timeout_ms(&self) -> Option<u64> {
-        match self.query_timeout_ms.load(Ordering::Relaxed) {
+        // Acquire/Release：热更的承诺是「新请求即时生效」——setter 返回后的
+        // 查询必须看到新值，Relaxed 的短暂 stale 会把旧 deadline 泄给新查询。
+        match self.query_timeout_ms.load(Ordering::Acquire) {
             0 => None,
             v => Some(v),
         }
     }
 
     pub fn set_query_timeout_ms(&self, ms: u64) {
-        self.query_timeout_ms.store(ms, Ordering::Relaxed);
+        self.query_timeout_ms.store(ms, Ordering::Release);
     }
 
     pub fn query_memory_limit_bytes(&self) -> Option<u64> {
-        match self.query_memory_limit_bytes.load(Ordering::Relaxed) {
+        match self.query_memory_limit_bytes.load(Ordering::Acquire) {
             0 => None,
             v => Some(v),
         }
@@ -292,7 +294,7 @@ impl QsdbRuntime {
 
     pub fn set_query_memory_limit_bytes(&self, bytes: u64) {
         self.query_memory_limit_bytes
-            .store(bytes, Ordering::Relaxed);
+            .store(bytes, Ordering::Release);
     }
 }
 

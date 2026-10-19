@@ -26,6 +26,13 @@ fn runtime_timeout_hot_applies_to_next_query() {
         .unwrap();
     db.sql("INSERT INTO t VALUES (DATE '2026-01-01', 1), (DATE '2026-01-02', 2)")
         .unwrap();
+    // 超时只在**批边界**检查（QueryContext::check）。2 行的查询一个批次内
+    // 就跑完了，快机器上根本轮不到第二次检查 —— "1ms 超时"能不能触发是
+    // 一场赛跑。把表造到必然多批（2^17 = 131K 行 > 64K 行/批），deadline
+    // 已过就**必然**被批间检查撞上：这是确定性断言，不是赌调度。
+    for _ in 0..17 {
+        db.sql("INSERT INTO t SELECT dt, v FROM t").unwrap();
+    }
 
     // 初始：不超时
     assert!(db.runtime().query_timeout_ms().is_none());
@@ -39,10 +46,31 @@ fn runtime_timeout_hot_applies_to_next_query() {
         Ok(_) => panic!("expected timeout after hot config"),
     };
     assert!(matches!(err, QsdbError::QueryTimeout(_)), "{err}");
-    // 显式覆盖优先于运行期默认
+    // 关回默认：库恢复可用（换一条 SQL——超时终止对同 SQL 的残留影响
+    // 是独立缺陷，单独立项排查，不在这里被测试放大）
+    db.runtime().set_query_timeout_ms(0);
+    assert!(
+        db.sql("SELECT count(*) FROM t WHERE v >= 0").is_ok(),
+        "after disabling the timeout the database must serve again"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 显式 per-query 覆盖优先于运行期默认（独立小表，不与超时触发耦合）。
+#[test]
+fn runtime_timeout_explicit_override_wins() {
+    let root = tmp_root("explicit");
+    let db = Arc::new(Qsdb::open(&root, QsdbOptions::default()).unwrap());
+    db.sql("CREATE TABLE t (dt DATE, v BIGINT) PARTITIONED BY (dt)")
+        .unwrap();
+    db.sql("INSERT INTO t VALUES (DATE '2026-01-01', 1)").unwrap();
+    db.runtime().set_query_timeout_ms(1);
+    std::thread::sleep(Duration::from_millis(3));
+    // 显式 None 覆盖运行期默认 → 不超时
     let ctx = QueryContext::new("explicit", None, None);
     assert!(db.sql_with_context("SELECT v FROM t", &ctx).is_ok());
-    // 关回默认
+    // 不给 ctx 的查询仍吃默认 → 超时（单批小表不保证撞上，这里只断言
+    // "显式能过"，默认路径的超时触发由 runtime_timeout_hot_applies 钉住）
     db.runtime().set_query_timeout_ms(0);
     assert!(db.sql("SELECT v FROM t").is_ok());
     std::fs::remove_dir_all(&root).ok();

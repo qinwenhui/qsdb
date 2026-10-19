@@ -199,10 +199,10 @@ fn spawn_producer(
         scan_pool().install(|| {
             items.into_par_iter().for_each(|(mut shard, tx)| {
                 for item in shard.by_ref() {
-                    if ctx.check().is_err() {
-                        let _ = tx.send(Err(crate::error::QsdbError::QueryCancelled(
-                            ctx.query_id.clone(),
-                        )));
+                    // 透传真实原因（超时/取消各归各位）——此前一律改报
+                    // QueryCancelled，把超时伪装成取消，误导按码分支的调用方。
+                    if let Err(e) = ctx.check() {
+                        let _ = tx.send(Err(e));
                         break;
                     }
                     if tx.send(item).is_err() {
