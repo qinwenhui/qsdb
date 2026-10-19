@@ -8,7 +8,7 @@
 
 官网：**[qsdb.qinwh.cn](http://qsdb.qinwh.cn)**
 
-English | [简体中文](README.zh-CN.md)
+[English](README.md) | 简体中文
 
 QSDB 是面向大数据量场景的分析数据库——GB 级表、分区化 Parquet 湖、
 亿级行聚合。它只做三件事并做到极致：**读写速度、资源占用、并发能力**，
@@ -23,7 +23,7 @@ QSDB 是面向大数据量场景的分析数据库——GB 级表、分区化 Pa
 
 - **自研向量化执行引擎** —— 哈希 join（字符串键零拷贝）、DECIMAL 窗口函数、
   排序/聚合落盘溢出、高基数 `count(DISTINCT)` 的密集直索引路径。
-  每个版本都对照 DuckDB 跑基准；方法论与逐格数字全部公开。
+  每个版本都跑 19 例基准套件（带值断言）；方法论与数字全部公开。
 - **深度裁剪的 Parquet 存储** —— 列统计 + 分区/行组两级裁剪直接做进扫描路径；
   单核扫描吞吐以数百 MB/s 计。
 - **列式、不可变文件** —— append + 分区级原子 overwrite；无行级
@@ -121,13 +121,13 @@ for batch in db.scan(Default::default())? { /* RecordBatch 流 */ }
 ## 性能
 
 基准套件在 `crates/qsdb-bench`——19 个用例（导入、扫描、聚合、join、
-去重、导出），每个都带值断言，在专用基准机上对照 DuckDB 跑：
+去重、导出），每个都带值断言，在专用基准机上跑：
 
 ```bash
 cargo run -p qsdb-bench --bin bench_suite -- --dir <数据目录> --rows 5000000 --all
 ```
 
-方法论、逐格数字、以及每个剩余差距的根因分析都在
+方法论、逐格数字、以及背后的剖析都在
 [`docs/真机基准对账.md`](docs/真机基准对账.md)。我们在那里遵守一条
 简单的纪律：**每个数字只有一个真源，每个回退都有根因，而不是耸肩。**
 

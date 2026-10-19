@@ -9,7 +9,7 @@ Parquet-backed. Zero external services.**
 
 Website: **[qsdb.qinwh.cn](http://qsdb.qinwh.cn)**
 
-[English](README.md) | 简体中文
+English | [简体中文](README.zh-CN.md)
 
 QSDB is an analytical database built for large datasets — multi-gigabyte
 tables, partitioned parquet lakes, aggregates over hundreds of millions of
@@ -24,7 +24,7 @@ a delivery mode, not a different product**.
 
 ## Highlights
 
-- **Vectorized execution engine, written from scratch** — hash join (zero-copy string keys), window functions over DECIMAL, sort/aggregate spill, and a dense direct-index path for high-cardinality `count(DISTINCT)`. Benchmarked against DuckDB on every release; methodology and per-case numbers are public.
+- **Vectorized execution engine, written from scratch** — hash join (zero-copy string keys), window functions over DECIMAL, sort/aggregate spill, and a dense direct-index path for high-cardinality `count(DISTINCT)`. Every release runs a 19-case benchmark suite with value assertions; methodology and numbers are public.
 - **Parquet storage with deep pruning** — column statistics, partition- and row-group-level pruning baked into the scan path; scan throughput measured in hundreds of MB/s per core.
 - **Columnar, immutable files** — append + partition-level atomic overwrite; no row-level UPDATE/DELETE (analytics don't need it, and immutability is what makes the rest cheap).
 - **Arrow end-to-end** — `RecordBatch` with zero-copy handoff in-process; Arrow IPC on the wire when you want it.
@@ -116,17 +116,17 @@ outlive your process, or multiple clients need it, run the server.
 ## Performance
 
 The benchmark suite lives in `crates/qsdb-bench` — 19 cases (load, scan,
-aggregate, join, distinct, export) each with value assertions, run against
-DuckDB as the reference engine on a dedicated machine:
+aggregate, join, distinct, export), each with value assertions, run on a
+dedicated reference machine:
 
 ```bash
 cargo run -p qsdb-bench --bin bench_suite -- --dir <data-dir> --rows 5000000 --all
 ```
 
-Methodology, per-case numbers, and the reasoning behind every remaining gap
-are tracked in [`docs/真机基准对账.md`](docs/真机基准对账.md). We hold
-ourselves to a simple rule there: **every number has exactly one source of
-truth, and every regression gets a root cause, not a shrug.**
+Methodology, per-case numbers, and the profiling behind them are tracked in
+[`docs/真机基准对账.md`](docs/真机基准对账.md). We hold ourselves to a
+simple rule there: **every number has exactly one source of truth, and every
+regression gets a root cause, not a shrug.**
 
 ## Documentation
 
