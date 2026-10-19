@@ -129,3 +129,4 @@ jobs:
         with:
           files: dist/**
           fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
