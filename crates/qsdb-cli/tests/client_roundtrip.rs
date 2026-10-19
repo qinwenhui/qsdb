@@ -1293,3 +1293,101 @@ fn 空实例_with_schema_不误判() {
     assert!(ts.is_empty(), "空实例零表: {ts:?}");
     assert!(c.tables().unwrap().is_empty());
 }
+
+/// 文件管理面（二十批）：`files_list` / `files_detail` / `file_trash` 往返
+/// ——客户端的解析器 vs 服务端的 JSON 形状对撞；`readSql` 闭环到真查询。
+#[test]
+fn files_浏览详情与回收站往返() {
+    let s = Server::start();
+    let c = s.client();
+    c.execute("CREATE TABLE p (dt DATE, id BIGINT) PARTITIONED BY (dt)")
+        .expect("create");
+    c.execute("INSERT INTO p VALUES (DATE '2026-01-01',1),(DATE '2026-01-01',2)")
+        .expect("insert");
+
+    // ① 根清单：mounts 是浏览器起点
+    let root = c.files_list("").expect("root listing");
+    assert!(
+        root.mounts
+            .iter()
+            .any(|m| m.name == "default" && m.is_default),
+        "{:?}",
+        root.mounts
+    );
+    assert!(root.entries.iter().any(|e| e.is_dir && e.name == "default"));
+
+    // ② 分区清单：段文件免读 parquet 带摘要
+    let dir = "default/p/dt=2026-01-01";
+    let listing = c.files_list(dir).expect("partition listing");
+    let seg = listing
+        .entries
+        .iter()
+        .find(|e| !e.is_dir && e.name.starts_with("seg_"))
+        .expect("该有段文件");
+    let brief = seg.segment.as_ref().expect("段摘要");
+    assert_eq!(brief.referenced, Some(true));
+    assert_eq!(brief.rows, Some(2));
+    assert!(seg.size.unwrap_or(0) > 0);
+
+    // ③ 详情：归属 + 列统计 + readSql；readSql 拿去真查（往返闭环）
+    let addr = format!("{dir}/{}", seg.name);
+    let d = c.files_detail(&addr).expect("detail");
+    assert_eq!(d.kind, "segment");
+    assert_eq!(d.db, "default");
+    assert_eq!(d.table.as_deref(), Some("p"));
+    assert_eq!(d.partition.as_deref(), Some("dt=2026-01-01"));
+    let full = d.segment.as_ref().expect("段详情");
+    let id = full
+        .columns
+        .iter()
+        .find(|col| col.name == "id")
+        .expect("id 列统计");
+    assert_eq!(id.min.as_deref(), Some("1"));
+    assert_eq!(id.max.as_deref(), Some("2"));
+    let read_sql = d.read_sql.as_deref().expect("readSql");
+    assert!(
+        read_sql.starts_with("SELECT * FROM read_parquet("),
+        "{read_sql}"
+    );
+    let t = c
+        .query(read_sql)
+        .expect("预览查询")
+        .into_bulk()
+        .expect("bulk");
+    assert_eq!(t.num_rows(), 2, "预览读出的就是段里的行");
+
+    // ④ 引用段禁删 → 409 SEGMENT_REFERENCED（码穿透到客户端）
+    let err = c.file_trash(&addr).unwrap_err();
+    match err {
+        Error::Api {
+            status,
+            code,
+            message,
+        } => {
+            assert_eq!(status, 409);
+            assert_eq!(code, "SEGMENT_REFERENCED");
+            assert!(message.contains("DELETE WHERE"), "{message}");
+        }
+        other => panic!("该是 Api 错误，实为 {other:?}"),
+    }
+
+    // ⑤ 孤儿段：复制 → referenced=false → 进回收站
+    let pdir = s.root.join("default").join("p").join("dt=2026-01-01");
+    std::fs::copy(pdir.join(&seg.name), pdir.join("seg_orphan_rt.parquet")).unwrap();
+    let listing = c.files_list(dir).expect("orphan listing");
+    let orphan = listing
+        .entries
+        .iter()
+        .find(|e| e.name == "seg_orphan_rt.parquet")
+        .expect("孤儿该在清单");
+    assert_eq!(
+        orphan.segment.as_ref().and_then(|sg| sg.referenced),
+        Some(false)
+    );
+    let ack = c
+        .file_trash("default/p/dt=2026-01-01/seg_orphan_rt.parquet")
+        .expect("trash orphan");
+    assert!(ack.trashed);
+    let listing = c.files_list(dir).expect("after trash");
+    assert!(!listing.entries.iter().any(|e| e.name.contains("orphan")));
+}

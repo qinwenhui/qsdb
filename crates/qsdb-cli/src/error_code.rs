@@ -16,7 +16,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use qsdb::{NotFoundKind, QsdbError};
 
-/// 目录里的全部错误码（27 个）。
+/// 目录里的全部错误码（28 个）。
 ///
 /// 顺序 = 文档 §三 表格顺序 = 目录端点输出顺序，便于对账。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +42,10 @@ pub enum ErrorCode {
     StaleWriter,
     /// 订阅游标太旧（缓冲区挤掉 / 服务端重启）—— **必须重新对账**，不能续着等
     CursorTooOld,
+    /// 段文件被存活 manifest 引用（二十批文件管理面）：拒绝移入回收站——
+    /// 删被引用段 = 表读取永久损坏。与 WRITE_CONFLICT 同为 409 但语义相反：
+    /// 那个"重读再试"有用，这个**必须换动作**（DELETE WHERE / 清空分区）
+    SegmentReferenced,
     NotFound,
     // ---- request ----
     InvalidArgument,
@@ -67,7 +71,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// 全量清单（目录端点与漂移测试的唯一来源）。
-    pub const ALL: [ErrorCode; 27] = [
+    pub const ALL: [ErrorCode; 28] = [
         Self::QueryTimeout,
         Self::QueryCancelled,
         Self::QueryMemoryLimit,
@@ -82,6 +86,7 @@ impl ErrorCode {
         Self::WriteConflict,
         Self::StaleWriter,
         Self::CursorTooOld,
+        Self::SegmentReferenced,
         Self::InvalidArgument,
         Self::InvalidIpc,
         Self::NotFound,
@@ -114,6 +119,7 @@ impl ErrorCode {
             Self::WriteConflict => "WRITE_CONFLICT",
             Self::StaleWriter => "STALE_WRITER",
             Self::CursorTooOld => "CURSOR_TOO_OLD",
+            Self::SegmentReferenced => "SEGMENT_REFERENCED",
             Self::InvalidArgument => "INVALID_ARGUMENT",
             Self::InvalidIpc => "INVALID_IPC",
             Self::NotFound => "NOT_FOUND",
@@ -147,9 +153,11 @@ impl ErrorCode {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
             Self::Unsupported => StatusCode::NOT_IMPLEMENTED,
-            Self::AlreadyExists | Self::WriteConflict | Self::StaleWriter | Self::CursorTooOld => {
-                StatusCode::CONFLICT
-            }
+            Self::AlreadyExists
+            | Self::WriteConflict
+            | Self::StaleWriter
+            | Self::CursorTooOld
+            | Self::SegmentReferenced => StatusCode::CONFLICT,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::Unauthorized | Self::SessionRevoked => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
@@ -188,6 +196,7 @@ impl ErrorCode {
             | Self::WriteConflict
             | Self::StaleWriter
             | Self::CursorTooOld
+            | Self::SegmentReferenced
             | Self::NotFound => "resource",
             Self::InvalidArgument | Self::InvalidIpc => "request",
             Self::Unauthorized | Self::SessionRevoked | Self::Forbidden => "auth",
@@ -227,6 +236,10 @@ impl ErrorCode {
             // 游标过期**不是**任何 SQL 标准条件 —— HY000 是 JDBC 的"一般错误"，
             // 比硬套 40001（并发冲突）诚实
             Self::CursorTooOld => "HY000",
+            // 55006 = object_in_use：段正被存活 manifest 引用——"对象在用中"
+            // 的标准类；与 WRITE_CONFLICT 的 40001（并发冲突，重读再试）刻意
+            // 区分——这里重试无用，必须换动作（DELETE WHERE / 清空分区）
+            Self::SegmentReferenced => "55006",
             Self::InvalidArgument => "42000",
             Self::InvalidIpc => "08P01",
             Self::NotFound => "42704",
@@ -320,7 +333,7 @@ impl ErrorCode {
             Self::TooManyQueries | Self::TooManySessions | Self::MemoryPressure => {
                 Code::ResourceExhausted
             }
-            Self::ReadOnly => Code::FailedPrecondition,
+            Self::ReadOnly | Self::SegmentReferenced => Code::FailedPrecondition,
             Self::Unauthorized | Self::SessionRevoked => Code::Unauthenticated,
             Self::Forbidden => Code::PermissionDenied,
             Self::Unsupported => Code::Unimplemented,

@@ -66,6 +66,7 @@ retry, category, sqlState}` 全表——驱动冷启动即可自配置映射，�
 | `WRITE_CONFLICT` | 409 | no | resource | **分区乐观并发冲突**：`overwrite_partition` 传了 `expected_generation`，而分区当前 `generation` 不符（已被他人改写） | **重读该分区最新 `generation` 再决定**（重试/换分区/人工介入）——盲目重试无用 | `40001` |
 | `STALE_WRITER` | 409 | no | resource | **过期写者**：分区的 `epoch`（写者身份代，见 `QsdbOptions::writer_epoch`）比本进程配置的大——本进程要么连错了库，要么接管身份没抬 epoch | **别重试**：确需接管就抬高 `--writer-epoch`（≥ 盘上值）后重启；否则检查连的哪个库 | `40001` |
 | `CURSOR_TOO_OLD` | 409 | no | resource | **订阅游标太旧**（`GET /api/v1/watch`）：事件缓冲已滚过这段，或服务端重启过（缓冲清零）—— 唯一一条路径是 `/tables` + `/partitions` 或 `generation` 对账 | **别原样重试**（同一个游标永远不会好）：做一次全量对账，再从**响应里的新 `next`** 续订 | `HY000` |
+| `SEGMENT_REFERENCED` | 409 | no | resource | **段被存活 manifest 引用**（`POST /api/v1/files/trash`）：删被引用段 = 表读取永久损坏（manifest 是唯一真值）——服务端在分区锁内查证后拒绝 | **别重试**（同一文件永远不会变得可删）：删数据走 `DELETE WHERE <分区>` 或 `INSERT OVERWRITE`；孤儿段（GC 遗留/崩溃残留）才进回收站 | `55006` |
 | `INVALID_ARGUMENT` | 400 | no | request | 参数非法：请求体形状错、值不在白名单、抽取失败 | 修请求（**拼错会显式报错，不静默兜底**） | `42000` |
 | `INVALID_IPC` | 400 | no | request | `/write` 的 Arrow IPC 流非法（缺 schema / 截断 / 列不匹配） | 修客户端编码 | `08P01` |
 | `NOT_FOUND` | 404 | no | resource | **资源端点**（`/files`、`/tables/{t}/schema` 等）的对象不存在 | 资源名写错？ | `42704` |
@@ -147,6 +148,7 @@ retry, category, sqlState}` 全表——驱动冷启动即可自配置映射，�
 | `ALREADY_EXISTS` | `ALREADY_EXISTS` |
 | `WRITE_CONFLICT` | `ABORTED` |
 | `CURSOR_TOO_OLD` | `ABORTED` |
+| `SEGMENT_REFERENCED` | `FAILED_PRECONDITION` |
 | 其余（表/列不存在、解析、类型、参数、内存超限、panic、元数据、内部） | `INVALID_ARGUMENT` / `INTERNAL` |
 
 **消息里附带码名**（`… [TABLE_NOT_FOUND]`）：gRPC 没有 `code` 字段，不带码名

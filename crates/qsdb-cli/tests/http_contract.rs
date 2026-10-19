@@ -1308,7 +1308,7 @@ fn error_catalog_endpoint_and_no_off_catalog_codes() {
     // 条数与代码侧枚举一致（docs/error-codes.md ↔ enum 的逐字对账在单测里）
     // 条数（集成测试看不到 crate 内部枚举，故这里写死；**逐字对账在 `error_code.rs`
     // 的单测里**，那条才是防漂移的权威）
-    assert_eq!(codes.len(), 27, "目录应列出全部码（数错说明漏挂在 ALL 上）");
+    assert_eq!(codes.len(), 28, "目录应列出全部码（数错说明漏挂在 ALL 上）");
     for c in &codes {
         for k in ["code", "http", "retry", "category", "sqlState"] {
             assert!(c.get(k).is_some(), "目录条目缺字段 {k}: {c}");
@@ -1321,6 +1321,11 @@ fn error_catalog_endpoint_and_no_off_catalog_codes() {
             .unwrap_or_else(|| panic!("目录缺 {want}"))
             .clone()
     };
+    // 二十批新码：409 但**不**与 WRITE_CONFLICT 同族（那个"重读再试"有用，
+    // 这个必须换动作）——码的存在本身就是给驱动的动作提示
+    assert_eq!(find("SEGMENT_REFERENCED")["http"], 409);
+    assert_eq!(find("SEGMENT_REFERENCED")["retry"], false);
+    assert_eq!(find("SEGMENT_REFERENCED")["sqlState"], "55006");
     // 两个 503：状态码相同、retry 相反——驱动靠 code 而非状态码决策
     assert_eq!(find("TOO_MANY_QUERIES")["http"], 503);
     assert_eq!(find("TOO_MANY_QUERIES")["retry"], true);

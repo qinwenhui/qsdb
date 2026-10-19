@@ -555,6 +555,9 @@ pub async fn serve(
         .route("/api/v1/auth/login", post(auth_login))
         .route("/api/v1/error-codes", get(error_codes))
         .route("/api/v1/files", get(download_file))
+        .route("/api/v1/files/list", get(list_files))
+        .route("/api/v1/files/detail", get(file_detail))
+        .route("/api/v1/files/trash", post(trash_file))
         .route("/api/v1/users/export", get(export_users))
         .route("/api/v1/users/{name}/grants", put(put_user_grants))
         .route("/api/v1/query", post(query))
@@ -1813,6 +1816,128 @@ async fn set_session_database(
     .into_response()
 }
 
+// ===================== 文件管理面（二十批，docs/文件管理面设计.md） =====================
+
+#[derive(serde::Deserialize)]
+struct FileParams {
+    path: String,
+}
+
+#[derive(serde::Deserialize)]
+struct FilesListParams {
+    dir: Option<String>,
+}
+
+/// 文件面路径解析结果：归属挂载句柄 + 归属库名（grants 判定键）+ 存储根下相对路径。
+struct FilesPath {
+    db: Arc<Qsdb>,
+    db_name: String,
+    rel: String,
+}
+
+/// 文件面路径安全检查：分隔符归一；`..` / 绝对路径拒绝；内部路径
+/// （`_trash`/`_spill`/`_filecache`，含不带尾斜杠的目录本身）403。
+fn files_normalize(rel: &str) -> Result<String, Box<Response>> {
+    let rel = rel.replace('\\', "/");
+    if rel.contains("..") || rel.starts_with('/') {
+        return Err(Box::new(
+            ErrorCode::InvalidArgument.response("invalid path"),
+        ));
+    }
+    for internal in ["_trash", "_filecache", "_spill"] {
+        if rel == internal || rel.starts_with(&format!("{internal}/")) {
+            return Err(Box::new(
+                ErrorCode::Forbidden.response("internal paths not accessible"),
+            ));
+        }
+    }
+    Ok(rel)
+}
+
+/// 文件面路径解析（四个端点共用，行为不分叉）：`<挂载名>/存储根相对路径`。
+/// ⚠️ `default` **不剥**：存储布局是 `<根>/<库名>/<表>/…`，default 库的文件
+/// 历史上就以 `default/…` 寻址（剥了 = 全部历史路径 404）；非默认挂载剥挂载名
+/// 落到该库存储根（其内层 `default/` 是内核句柄的库目录，照旧保留）。
+fn files_resolve(s: &AppState, rel: &str) -> FilesPath {
+    let first = rel.split('/').next().unwrap_or("");
+    if first != "default" {
+        if let Some(m) = s.mounts.get(first) {
+            let rest = rel
+                .split_once('/')
+                .map(|(_, r)| r.to_string())
+                .unwrap_or_default();
+            return FilesPath {
+                db: Arc::clone(&m.db),
+                db_name: first.to_string(),
+                rel: rest,
+            };
+        }
+    }
+    FilesPath {
+        db: Arc::clone(&s.db),
+        db_name: "default".to_string(),
+        rel: rel.to_string(),
+    }
+}
+
+/// 文件面**读**权限：对路径归属库有任意角色即可（list/detail/下载）。
+/// reader 本来就能 SELECT 全库数据——段文件里没有 SELECT 拿不到的东西，
+/// "能浏览却不能打开"是假权限。401（身份）/403（无 grant）分档与 SQL 面一致。
+fn files_read_access(s: &AppState, user: &str, db_name: &str) -> Result<(), Box<Response>> {
+    if resolved_role_for(s, user, db_name).is_some() {
+        return Ok(());
+    }
+    Err(Box::new(no_grant_response(s, user, db_name)))
+}
+
+/// 调用方是否 admin（现查 grants）：隐式身份（超级 token / 开放模式）恒是；
+/// 否则任一挂载上有 admin 角色即是。
+fn caller_is_admin(s: &AppState, user: &str) -> bool {
+    user == "__token__"
+        || user == "anonymous"
+        || s.mounts
+            .keys()
+            .any(|m| resolved_role_for(s, user, m).is_some_and(|r| r.is_admin()))
+}
+
+/// 内核错误 → 契约错误响应（资源语义面：NotFound → 404 而非 400）。
+fn files_err(e: &QsdbError) -> Response {
+    ErrorCode::from_qsdb(e, false).response(e.to_string())
+}
+
+/// 段文件名？（`seg_*.parquet`——write 路径的段命名，别处不要碰）
+fn is_segment_file(name: &str) -> bool {
+    name.starts_with("seg_") && name.ends_with(".parquet")
+}
+
+/// manifest 里一个段的归一化摘要。`with_columns` = 带列统计（detail 用）；
+/// list 只带行数/字节（免读 parquet 就能标"这个文件是什么"）。
+fn segment_json(e: &qsdb::SegmentEntry, generation: u64, with_columns: bool) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "referenced": true,
+        "rows": e.row_count,
+        "bytes": e.byte_size,
+        "createdAtMs": e.created_at,
+        "generation": generation,
+    });
+    if with_columns {
+        let cols: Vec<serde_json::Value> = e
+            .column_stats
+            .iter()
+            .map(|(name, st)| {
+                serde_json::json!({
+                    "name": name,
+                    "min": st.min.as_ref().map(|l| l.to_string()),
+                    "max": st.max.as_ref().map(|l| l.to_string()),
+                    "nullCount": st.null_count,
+                })
+            })
+            .collect();
+        v["columns"] = serde_json::Value::Array(cols);
+    }
+    v
+}
+
 /// GET /api/v1/files?path=<相对 db root 的路径>——物理复制源（qsdb-sync F11）。
 /// 路径白名单：禁止 `_trash`/`_filecache`/`..`；其余（manifest/segment/table.json/
 /// partitions.idx）均可下载。配合 read_only 模式即成为标准复制源。
@@ -1821,58 +1946,32 @@ async fn set_session_database(
 /// 多少——复制大段会把源端打爆）。现在按 8KB 块边读边发，源端内存与段大小无关。
 /// `Content-Length` 照给（从 `metadata()` 拿），所以客户端仍能校验完整性；
 /// 中途读失败就断开连接、**响应体短于 Content-Length**，客户端据此可判为失败重试。
-#[derive(serde::Deserialize)]
-struct FileParams {
-    path: String,
-}
-
+///
+/// 权限（二十批放宽）：从 admin 专属改为**对归属库有读授权**——reader 本来就
+/// 能 SELECT 全库，段文件里没有 SELECT 拿不到的东西；qsdb-sync 走 admin 不受影响。
 async fn download_file(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
     StructuredQuery(p): StructuredQuery<FileParams>,
 ) -> Response {
-    let role = match require_role(&s, &headers) {
+    let ident = match authenticate_identity(&s, &headers) {
+        Ok(i) => i,
+        Err(resp) => return *resp,
+    };
+    let rel = match files_normalize(&p.path) {
         Ok(r) => r,
         Err(resp) => return *resp,
     };
-    if !role.is_admin() {
-        return ErrorCode::Forbidden.response("file download requires admin");
+    let fp = files_resolve(&s, &rel);
+    if let Err(resp) = files_read_access(&s, &ident.user, &fp.db_name) {
+        return *resp;
     }
-    // 路径安全检查
-    let rel = p.path.replace('\\', "/");
-    if rel.contains("..") || rel.starts_with('/') {
-        return ErrorCode::InvalidArgument.response("invalid path");
-    }
-    if rel.starts_with("_trash/") || rel.starts_with("_filecache/") || rel.starts_with("_spill/") {
-        return ErrorCode::Forbidden.response("internal paths not downloadable");
-    }
-    // 十八批Ⅵ：`path` 支持 `<挂载名>/存储根相对路径` 前缀——多挂载下载任意
-    // 库的文件。⚠️ `default` **不剥**：存储布局是 `<根>/<库名>/<表>/…`，
-    // default 库的文件历史上就以 `default/…` 寻址（剥了 = 全部历史路径 404）；
-    // 非默认挂载（`settle/…`）剥挂载名落到该库存储根（其内层 `default/` 是
-    // 内核句柄的库目录，照旧保留）。
-    let (db_handle, rel) = {
-        let first = rel.split('/').next().unwrap_or("");
-        if first != "default" {
-            if let Some(m) = s.mounts.get(first) {
-                let rest = rel
-                    .split_once('/')
-                    .map(|(_, r)| r.to_string())
-                    .unwrap_or_default();
-                (Arc::clone(&m.db), rest)
-            } else {
-                (Arc::clone(&s.db), rel.clone())
-            }
-        } else {
-            (Arc::clone(&s.db), rel.clone())
-        }
-    };
-    let full = db_handle.root().join(&rel);
+    let full = fp.db.root().join(&fp.rel);
     // 目录要先挡掉：`File::open` 在 Linux 上能打开目录，读起来报 EISDIR，
     // 那时响应头已经发出去了 —— 只能变成"截断的 200"，很难排查。
     let md = match tokio::fs::metadata(&full).await {
         Ok(m) if m.is_file() => m,
-        Ok(_) => return ErrorCode::NotFound.response(format!("not a file: {rel}")),
+        Ok(_) => return ErrorCode::NotFound.response(format!("not a file: {}", fp.rel)),
         Err(e) => return ErrorCode::NotFound.response(format!("file not found: {e}")),
     };
     let f = match tokio::fs::File::open(&full).await {
@@ -1890,6 +1989,335 @@ async fn download_file(
         h.insert(axum::http::header::CONTENT_LENGTH, v);
     }
     resp
+}
+
+/// GET /api/v1/files/list?dir=<挂载/相对路径>（缺省 = 存储根顶层）——目录浏览。
+///
+/// - 目录排前、名字序；段文件**免读 parquet** 就带归属摘要（同目录所有段共享
+///   一份 manifest，读一次全标好：referenced/rows/bytes）。
+/// - manifest 读不到时 `referenced: null`——**未知 ≠ 未引用**，null 不给
+///   删除按钮亮绿灯（trash 端点会再查证，这里只是展示层的诚实）。
+/// - 非 admin 列根 = **虚拟视图**：只回自己有 grant 的挂载名，不回真实文件
+///   系统根（`_catalog`/`_trash` 等内部物根本不出现）。admin 列根 = 真实目录
+///   （`_` 开头的内部目录隐藏，与下载 403 口径一致）+ `mounts` 清单。
+async fn list_files(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    StructuredQuery(p): StructuredQuery<FilesListParams>,
+) -> Response {
+    let ident = match authenticate_identity(&s, &headers) {
+        Ok(i) => i,
+        Err(resp) => return *resp,
+    };
+    let admin = caller_is_admin(&s, &ident.user);
+    let mut names: Vec<&String> = s.mounts.keys().collect();
+    names.sort();
+    let mounts: Vec<serde_json::Value> = names
+        .iter()
+        .filter(|m| admin || resolved_role_for(&s, &ident.user, m).is_some())
+        .map(|m| serde_json::json!({"name": m, "isDefault": m.as_str() == "default"}))
+        .collect();
+    let rel = match files_normalize(p.dir.as_deref().unwrap_or("")) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    // 非 admin 列根 = 虚拟视图：只有挂载名本身
+    if rel.is_empty() && !admin {
+        let entries: Vec<serde_json::Value> = mounts
+            .iter()
+            .map(|m| serde_json::json!({"name": m["name"], "type": "dir"}))
+            .collect();
+        let count = entries.len();
+        return Json(serde_json::json!({
+            "dir": "", "mounts": mounts, "count": count, "entries": entries,
+        }))
+        .into_response();
+    }
+    let fp = files_resolve(&s, &rel);
+    if let Err(resp) = files_read_access(&s, &ident.user, &fp.db_name) {
+        return *resp;
+    }
+    let dir_full = fp.db.root().join(&fp.rel);
+    if !fp.db.store().exists(&dir_full) {
+        return ErrorCode::NotFound.response(format!("not found: {}", fp.rel));
+    }
+    let entries = match fp.db.store().read_dir(&dir_full) {
+        Ok(e) => e,
+        Err(e) => return files_err(&e),
+    };
+    // 目录排前、名字序
+    let mut entries = entries;
+    entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
+    // 同目录所有段共享一份 manifest——遇到第一个段文件时读一次。
+    // None = 还没读；Ok(None) = 目录里没有 manifest（段必是孤儿）；
+    // Err = 损坏（未知 ≠ 未引用，别亮绿灯）
+    let mut seg_manifest: Option<std::result::Result<Option<qsdb::PartitionManifest>, QsdbError>> =
+        None;
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(entries.len());
+    for e in &entries {
+        // 库根层隐藏内部目录（`_catalog`/`_trash`/…）——存在性也不回显
+        if fp.rel.is_empty() && e.name.starts_with('_') {
+            continue;
+        }
+        if e.is_dir {
+            out.push(serde_json::json!({"name": e.name, "type": "dir"}));
+            continue;
+        }
+        let mut item = match fp.db.store().stat(&e.path) {
+            Ok(Some(m)) => serde_json::json!({
+                "name": e.name, "type": "file",
+                "size": m.size, "modifiedMs": m.mtime_ms,
+            }),
+            Ok(None) => serde_json::json!({"name": e.name, "type": "file"}),
+            Err(err) => return files_err(&err),
+        };
+        if is_segment_file(&e.name) {
+            if seg_manifest.is_none() {
+                seg_manifest = Some(qsdb::PartitionManifest::read(fp.db.store(), &dir_full));
+            }
+            let seg = match &seg_manifest {
+                Some(Ok(Some(m))) => match m.segments.iter().find(|sg| sg.file_name == e.name) {
+                    Some(sg) => segment_json(sg, m.generation, false),
+                    // manifest 在、段不在 = 孤儿（权威判据）
+                    None => serde_json::json!({"referenced": false}),
+                },
+                // 目录里根本没有 manifest ⇒ 不可能被引用
+                Some(Ok(None)) => serde_json::json!({"referenced": false}),
+                // manifest 损坏 = 未知
+                Some(Err(_)) | None => serde_json::json!({"referenced": null}),
+            };
+            item["segment"] = seg;
+        }
+        out.push(item);
+    }
+    let count = out.len();
+    Json(serde_json::json!({
+        "dir": rel, "mounts": mounts, "count": count, "entries": out,
+    }))
+    .into_response()
+}
+
+/// GET /api/v1/files/detail?path=…——单文件/目录详情。
+///
+/// 段文件：归属（库/表/分区，路径即语义）+ manifest 里的行数/字节/列统计
+/// （min/max/nullCount，**不读 parquet**）+ `readSql`（Studio"预览此文件"
+/// 直接拿去走查询面）。manifest 文件本身可 detail（generation/行数/段数）；
+/// table.json 解析成功时内嵌原样 JSON。
+async fn file_detail(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    StructuredQuery(p): StructuredQuery<FileParams>,
+) -> Response {
+    let ident = match authenticate_identity(&s, &headers) {
+        Ok(i) => i,
+        Err(resp) => return *resp,
+    };
+    let rel = match files_normalize(&p.path) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    let fp = files_resolve(&s, &rel);
+    if let Err(resp) = files_read_access(&s, &ident.user, &fp.db_name) {
+        return *resp;
+    }
+    let full = fp.db.root().join(&fp.rel);
+    let meta = match fp.db.store().stat(&full) {
+        Ok(Some(m)) => m,
+        Ok(None) => return ErrorCode::NotFound.response(format!("not found: {}", fp.rel)),
+        Err(e) => return files_err(&e),
+    };
+    // 归属解析（尽力而为，路径即语义）：`<库目录>/<表>/<分区…>/<文件>`
+    let parts: Vec<&str> = fp.rel.split('/').filter(|s| !s.is_empty()).collect();
+    let table = (parts.len() >= 3).then(|| parts[1].to_string());
+    let partition = (parts.len() >= 4)
+        .then(|| parts[2..parts.len() - 1].join("/"))
+        .filter(|s| !s.is_empty());
+    let name = parts.last().copied().unwrap_or("");
+    let kind = if name.starts_with("seg_") && name.ends_with(".parquet") {
+        "segment"
+    } else if name == qsdb::MANIFEST_FILE {
+        "manifest"
+    } else if name == qsdb::INDEX_FILE {
+        "index"
+    } else if name == "table.json" {
+        "tabledef"
+    } else {
+        "other"
+    };
+    let is_dir = fp.db.store().read_dir(&full).is_ok();
+    let mut body = serde_json::json!({
+        "path": rel,
+        "name": name,
+        "type": if is_dir { "dir" } else { "file" },
+        "kind": if is_dir { "dir" } else { kind },
+        "size": meta.size,
+        "modifiedMs": meta.mtime_ms,
+        "db": fp.db_name,
+    });
+    if let Some(t) = &table {
+        body["table"] = serde_json::json!(t);
+    }
+    if let Some(pv) = &partition {
+        body["partition"] = serde_json::json!(pv);
+    }
+    if is_dir {
+        // 目录：浅层汇总（子目录数/文件数/合计字节）
+        let (mut dirs, mut files, mut bytes) = (0u64, 0u64, 0u64);
+        if let Ok(sub) = fp.db.store().read_dir(&full) {
+            for e in &sub {
+                if e.is_dir {
+                    dirs += 1;
+                } else {
+                    files += 1;
+                    if let Ok(Some(m)) = fp.db.store().stat(&e.path) {
+                        bytes += m.size;
+                    }
+                }
+            }
+        }
+        body["summary"] = serde_json::json!({"dirs": dirs, "files": files, "bytes": bytes});
+        return Json(body).into_response();
+    }
+    match kind {
+        "segment" => {
+            let pdir = full.parent().unwrap_or(&full).to_path_buf();
+            match qsdb::PartitionManifest::read(fp.db.store(), &pdir) {
+                Ok(m) => {
+                    match m
+                        .as_ref()
+                        .and_then(|m| m.segments.iter().find(|sg| sg.file_name == name))
+                    {
+                        Some(sg) => {
+                            let generation = m.as_ref().map(|m| m.generation).unwrap_or(0);
+                            body["segment"] = segment_json(sg, generation, true);
+                        }
+                        // manifest 在、段不在 = 孤儿；manifest 缺失/损坏 = 未知
+                        None => {
+                            body["segment"] = serde_json::json!({
+                                "referenced": m.as_ref().map(|_| false),
+                            });
+                        }
+                    }
+                }
+                Err(e) => return files_err(&e),
+            }
+            if fp.db.store().is_local() {
+                body["readSql"] =
+                    serde_json::json!(format!("SELECT * FROM read_parquet('{}')", full.display()));
+            }
+        }
+        "manifest" => {
+            let pdir = full.parent().unwrap_or(&full).to_path_buf();
+            match qsdb::PartitionManifest::read(fp.db.store(), &pdir) {
+                Ok(Some(m)) => {
+                    let pvs: serde_json::Map<String, serde_json::Value> = m
+                        .partition_values
+                        .iter()
+                        .map(|(k, v)| (k.clone(), serde_json::json!(v.to_string())))
+                        .collect();
+                    body["manifest"] = serde_json::json!({
+                        "generation": m.generation,
+                        "rows": m.total_rows(),
+                        "segments": m.segments.len(),
+                        "version": m.version,
+                        "partitionValues": pvs,
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => return files_err(&e),
+            }
+        }
+        "tabledef" => {
+            if let Ok(Some(txt)) = fp.db.store().read_to_string(&full) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                    body["tableDef"] = v;
+                }
+            }
+        }
+        _ => {}
+    }
+    Json(body).into_response()
+}
+
+/// POST /api/v1/files/trash?path=…——把**未引用的段文件**移入 `_trash`
+/// （admin 专属）。删除安全的完整边界见设计稿 §三：
+///
+/// 1. 只收 `seg_*.parquet`——manifest/idx/table.json 是元数据，删了就是毁表；
+/// 2. 持分区锁（与写路径同一把 `.lock`）内**重读 manifest 查证**：被引用 →
+///    409 `SEGMENT_REFERENCED`（指路正确动作）；孤儿才动；
+/// 3. 进 `_trash` 而非 unlink——静默期内 `admin trash restore` 可捞回；
+/// 4. 远端 Store 显式拒绝（`move_to_trash` 是本地原语，绝不假装删了）。
+async fn trash_file(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    StructuredQuery(p): StructuredQuery<FileParams>,
+) -> Response {
+    let role = match require_role(&s, &headers) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    if !role.is_admin() {
+        return ErrorCode::Forbidden.response("file trash requires admin");
+    }
+    let rel = match files_normalize(&p.path) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    let fp = files_resolve(&s, &rel);
+    if !fp.db.store().is_local() {
+        return ErrorCode::Unsupported.response("file trash requires a local store");
+    }
+    let name = fp.rel.rsplit('/').next().unwrap_or("");
+    if !is_segment_file(name) {
+        return ErrorCode::InvalidArgument.response(format!(
+            "only segment files (seg_*.parquet) can be trashed; got {name:?} — \
+             table data is deleted via DELETE WHERE / INSERT OVERWRITE, never by file"
+        ));
+    }
+    let full = fp.db.root().join(&fp.rel);
+    if !fp.db.store().exists(&full) {
+        return ErrorCode::NotFound.response(format!("not found: {}", fp.rel));
+    }
+    let pdir = match full.parent() {
+        Some(d) => d.to_path_buf(),
+        None => return ErrorCode::InvalidArgument.response("invalid path"),
+    };
+    // 与写路径同一把分区锁：查证（manifest 重读）与移动之间没有写者插进来
+    let _guard = match qsdb::fsutil::PartitionLock::acquire_local(&pdir.join(".lock")) {
+        Ok(g) => g,
+        Err(e) => return files_err(&e),
+    };
+    match qsdb::PartitionManifest::read(fp.db.store(), &pdir) {
+        Ok(Some(m)) if m.segments.iter().any(|sg| sg.file_name == name) => {
+            let pv = m
+                .partition_values
+                .iter()
+                .map(|(k, v)| format!("{k}={}", v))
+                .collect::<Vec<_>>()
+                .join("/");
+            return ErrorCode::SegmentReferenced.response(format!(
+                "segment {name:?} is referenced by the live manifest — deleting it would \
+                 corrupt the table. Delete the data via `DELETE WHERE` on partition [{pv}] \
+                 or INSERT OVERWRITE; only orphaned segments (GC leftovers, crashed writers) \
+                 may be trashed"
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => return files_err(&e),
+    }
+    match qsdb::fsutil::move_to_trash(fp.db.root(), &full) {
+        Ok(true) => Json(serde_json::json!({
+            "trashed": true,
+            "path": rel,
+            "note": "moved to _trash; recoverable via `admin trash restore` within the grace period",
+        }))
+        .into_response(),
+        // 前面刚查过存在 → false 只能是 Windows 句柄占用（下轮 GC 再清）
+        Ok(false) => ErrorCode::IoError.response(
+            "file is locked by another handle (Windows); retry later",
+        ),
+        Err(e) => files_err(&e),
+    }
 }
 
 /// GET /api/v1/users/export —— **用户面导出**（qsdb-sync 用户面同步的 HTTP 源）。

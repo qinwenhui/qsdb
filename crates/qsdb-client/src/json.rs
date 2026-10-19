@@ -775,3 +775,362 @@ pub(crate) fn parse_queries(bytes: &[u8]) -> Result<Vec<QueryInfo>> {
         })
         .collect())
 }
+
+// ---------------------------------------------------------------------------
+// 文件管理面（二十批：/files/list、/files/detail、/files/trash）
+// ---------------------------------------------------------------------------
+
+/// 可见挂载（`files/list` 的 `mounts`——文件浏览器的起点清单）。
+#[derive(Debug, Clone)]
+pub struct FileMount {
+    /// 挂载名（路径寻址的前缀）。
+    pub name: String,
+    /// 是否默认库。
+    pub is_default: bool,
+}
+
+/// 一列的 min/max/NULL 统计（manifest 内嵌，**不读 parquet** 就有）。
+#[derive(Debug, Clone)]
+pub struct FileColumnStat {
+    /// 列名。
+    pub name: String,
+    /// 最小值（`Literal` 的 Display 形态；全 NULL 列为 `None`）。
+    pub min: Option<String>,
+    /// 最大值（同上）。
+    pub max: Option<String>,
+    /// NULL 计数。
+    pub null_count: u64,
+}
+
+/// 段摘要（来自同目录 manifest）。`referenced` 三态：
+/// `Some(true)` = 被存活 manifest 引用（**不可删**）；`Some(false)` = 孤儿
+/// （GC 遗留/崩溃残留，可进回收站）；`None` = 未知（manifest 缺失/损坏——
+/// 未知 ≠ 未引用，别当 false 用）。
+#[derive(Debug, Clone)]
+pub struct FileSegment {
+    /// 三态引用标记，见类型文档。
+    pub referenced: Option<bool>,
+    /// 行数。
+    pub rows: Option<u64>,
+    /// 落盘字节。
+    pub bytes: Option<u64>,
+    /// 段创建时间（毫秒 epoch）。
+    pub created_at_ms: Option<i64>,
+    /// 所在分区的提交计数器。
+    pub generation: Option<u64>,
+    /// 列统计（仅 `files_detail` 填；list 不带）。
+    pub columns: Vec<FileColumnStat>,
+}
+
+/// 目录清单里的一条（目录排前、名字序——服务端已排）。
+#[derive(Debug, Clone)]
+pub struct FileEntry {
+    /// 条目名（不含路径）。
+    pub name: String,
+    /// 目录还是文件。
+    pub is_dir: bool,
+    /// 仅文件有。
+    pub size: Option<u64>,
+    /// 最后修改（毫秒 epoch）。
+    pub modified_ms: Option<u64>,
+    /// 仅段文件（`seg_*.parquet`）有。
+    pub segment: Option<FileSegment>,
+}
+
+/// 目录浏览一页（`GET /api/v1/files/list`）。
+#[derive(Debug, Clone)]
+pub struct FileListing {
+    /// 归一化后的目录（空串 = 存储根顶层）。
+    pub dir: String,
+    /// 调用方可见的挂载（非 admin 只含有 grant 的）——文件浏览器的起点。
+    pub mounts: Vec<FileMount>,
+    /// 目录条目。
+    pub entries: Vec<FileEntry>,
+}
+
+/// 目录浅层汇总（`files_detail` 对目录的 `summary`）。
+#[derive(Debug, Clone, Default)]
+pub struct DirSummary {
+    /// 子目录数。
+    pub dirs: u64,
+    /// 文件数。
+    pub files: u64,
+    /// 文件字节合计（不含子目录内部）。
+    pub bytes: u64,
+}
+
+/// manifest 文件本身的详情（`files_detail` 的 `manifest` 字段）。
+#[derive(Debug, Clone)]
+pub struct ManifestDetail {
+    /// 分区提交计数器。
+    pub generation: u64,
+    /// 分区总行数。
+    pub rows: u64,
+    /// 段数。
+    pub segments: u64,
+    /// manifest 磁盘格式版本。
+    pub version: u32,
+    /// 分区键值（Display 形态）。
+    pub partition_values: Vec<(String, String)>,
+}
+
+/// 单文件/目录详情（`GET /api/v1/files/detail`）。
+#[derive(Debug, Clone)]
+pub struct FileDetail {
+    /// 寻址路径（调用方传入的 `<挂载>/相对路径` 原样回显）。
+    pub path: String,
+    /// 最后一节名字。
+    pub name: String,
+    /// 目录还是文件。
+    pub is_dir: bool,
+    /// `segment` | `manifest` | `index` | `tabledef` | `other`；目录恒 `dir`。
+    pub kind: String,
+    /// 字节。
+    pub size: u64,
+    /// 最后修改（毫秒 epoch）。
+    pub modified_ms: u64,
+    /// 归属库（挂载名；grants 判定键）。
+    pub db: String,
+    /// 归属表（路径形状推断，尽力而为）。
+    pub table: Option<String>,
+    /// 归属分区（`dt=2026-01-01` 形态；无分区表为 `None`）。
+    pub partition: Option<String>,
+    /// 目录时的浅层汇总。
+    pub summary: Option<DirSummary>,
+    /// 段详情（kind = `segment`；孤儿时 `referenced=false`、统计为空）。
+    pub segment: Option<FileSegment>,
+    /// manifest 文件详情（kind = `manifest`）。
+    pub manifest: Option<ManifestDetail>,
+    /// table.json 原样 JSON（kind = `tabledef` 且解析成功）。
+    pub table_def: Option<serde_json::Value>,
+    /// 单文件预览 SQL（本地库才有——拿去走查询面，权限由查询面管）。
+    pub read_sql: Option<String>,
+}
+
+/// 进回收站回执（`POST /api/v1/files/trash`）。
+#[derive(Debug, Clone)]
+pub struct TrashAck {
+    /// 恒 `true`（失败走 [`Error::Api`]）。
+    pub trashed: bool,
+    /// 寻址路径回显。
+    pub path: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RawFileMount {
+    name: String,
+    #[serde(default, rename = "isDefault")]
+    is_default: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct RawFileColumnStat {
+    name: String,
+    #[serde(default)]
+    min: Option<String>,
+    #[serde(default)]
+    max: Option<String>,
+    #[serde(default, rename = "nullCount")]
+    null_count: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct RawFileSegment {
+    #[serde(default)]
+    referenced: Option<bool>,
+    #[serde(default)]
+    rows: Option<u64>,
+    #[serde(default)]
+    bytes: Option<u64>,
+    #[serde(default, rename = "createdAtMs")]
+    created_at_ms: Option<i64>,
+    #[serde(default)]
+    generation: Option<u64>,
+    #[serde(default)]
+    columns: Vec<RawFileColumnStat>,
+}
+
+impl RawFileSegment {
+    fn into_segment(self) -> FileSegment {
+        FileSegment {
+            referenced: self.referenced,
+            rows: self.rows,
+            bytes: self.bytes,
+            created_at_ms: self.created_at_ms,
+            generation: self.generation,
+            columns: self
+                .columns
+                .into_iter()
+                .map(|c| FileColumnStat {
+                    name: c.name,
+                    min: c.min,
+                    max: c.max,
+                    null_count: c.null_count,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RawFileEntry {
+    name: String,
+    #[serde(rename = "type")]
+    type_name: String,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default, rename = "modifiedMs")]
+    modified_ms: Option<u64>,
+    #[serde(default)]
+    segment: Option<RawFileSegment>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawFileListing {
+    #[serde(default)]
+    dir: String,
+    #[serde(default)]
+    mounts: Vec<RawFileMount>,
+    #[serde(default)]
+    entries: Vec<RawFileEntry>,
+}
+
+pub(crate) fn parse_file_list(bytes: &[u8]) -> Result<FileListing> {
+    let r: RawFileListing = serde_json::from_slice(bytes)
+        .map_err(|e| Error::Decode(format!("json: /files/list 响应不合法: {e}")))?;
+    Ok(FileListing {
+        dir: r.dir,
+        mounts: r
+            .mounts
+            .into_iter()
+            .map(|m| FileMount {
+                name: m.name,
+                is_default: m.is_default,
+            })
+            .collect(),
+        entries: r
+            .entries
+            .into_iter()
+            .map(|e| FileEntry {
+                name: e.name,
+                is_dir: e.type_name == "dir",
+                size: e.size,
+                modified_ms: e.modified_ms,
+                segment: e.segment.map(RawFileSegment::into_segment),
+            })
+            .collect(),
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct RawFileDetail {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    name: String,
+    #[serde(rename = "type")]
+    type_name: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    size: u64,
+    #[serde(default, rename = "modifiedMs")]
+    modified_ms: u64,
+    #[serde(default)]
+    db: String,
+    #[serde(default)]
+    table: Option<String>,
+    #[serde(default)]
+    partition: Option<String>,
+    #[serde(default)]
+    summary: Option<RawDirSummary>,
+    #[serde(default)]
+    segment: Option<RawFileSegment>,
+    #[serde(default)]
+    manifest: Option<RawManifestDetail>,
+    #[serde(default, rename = "tableDef")]
+    table_def: Option<serde_json::Value>,
+    #[serde(default, rename = "readSql")]
+    read_sql: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawDirSummary {
+    #[serde(default)]
+    dirs: u64,
+    #[serde(default)]
+    files: u64,
+    #[serde(default)]
+    bytes: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct RawManifestDetail {
+    #[serde(default)]
+    generation: u64,
+    #[serde(default)]
+    rows: u64,
+    #[serde(default)]
+    segments: u64,
+    #[serde(default)]
+    version: u32,
+    #[serde(default, rename = "partitionValues")]
+    partition_values: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+pub(crate) fn parse_file_detail(bytes: &[u8]) -> Result<FileDetail> {
+    let r: RawFileDetail = serde_json::from_slice(bytes)
+        .map_err(|e| Error::Decode(format!("json: /files/detail 响应不合法: {e}")))?;
+    Ok(FileDetail {
+        path: r.path,
+        name: r.name,
+        is_dir: r.type_name == "dir",
+        kind: r.kind,
+        size: r.size,
+        modified_ms: r.modified_ms,
+        db: r.db,
+        table: r.table,
+        partition: r.partition,
+        summary: r.summary.map(|s| DirSummary {
+            dirs: s.dirs,
+            files: s.files,
+            bytes: s.bytes,
+        }),
+        segment: r.segment.map(RawFileSegment::into_segment),
+        manifest: r.manifest.map(|m| ManifestDetail {
+            generation: m.generation,
+            rows: m.rows,
+            segments: m.segments,
+            version: m.version,
+            partition_values: m
+                .partition_values
+                .into_iter()
+                .map(|(k, v)| {
+                    let s = match v {
+                        serde_json::Value::String(s) => s,
+                        other => other.to_string(),
+                    };
+                    (k, s)
+                })
+                .collect(),
+        }),
+        table_def: r.table_def,
+        read_sql: r.read_sql,
+    })
+}
+
+pub(crate) fn parse_trash(bytes: &[u8]) -> Result<TrashAck> {
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        #[serde(default)]
+        trashed: bool,
+        #[serde(default)]
+        path: String,
+    }
+    let r: Raw = serde_json::from_slice(bytes)
+        .map_err(|e| Error::Decode(format!("json: /files/trash 响应不合法: {e}")))?;
+    Ok(TrashAck {
+        trashed: r.trashed,
+        path: r.path,
+    })
+}

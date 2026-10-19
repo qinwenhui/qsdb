@@ -123,8 +123,10 @@ use std::time::Duration;
 pub use crate::bulk::{BulkTable, Column, ColumnIter, ColumnView, Row, Rows};
 pub use crate::error::{Error, Result};
 pub use crate::json::{
-    AdminSession, CommitEvent, ConfigPatch, ConfigPutAck, DbInfo, JsonResult, PartitionInfo,
-    QueryInfo, RuntimeConfig, SessionInfo, Stats, TableInfo, WatchPage, WriteAck,
+    AdminSession, CommitEvent, ConfigPatch, ConfigPutAck, DbInfo, DirSummary, FileColumnStat,
+    FileDetail, FileEntry, FileListing, FileMount, FileSegment, JsonResult, ManifestDetail,
+    PartitionInfo, QueryInfo, RuntimeConfig, SessionInfo, Stats, TableInfo, TrashAck, WatchPage,
+    WriteAck,
 };
 pub use crate::rows::{Chunk, ChunkRow, RowStream, RowsData};
 pub use crate::value::{ColumnDesc, ColumnInfo, Tag, Value, ValueRef};
@@ -1193,6 +1195,65 @@ impl Client {
         self.write_handle_revoked(r)
     }
 
+    /// 目录浏览（`GET /api/v1/files/list`）：像看文件目录一样列存储一层。
+    ///
+    /// `dir` = `<挂载名>/<相对路径>`（与 [`Client::download_file`] 同款寻址）；
+    /// 空串 = 存储根顶层（非 admin 得到**虚拟视图**：只有自己有 grant 的挂载名）。
+    /// 段文件（`seg_*.parquet`）免读 parquet 就带 [`FileSegment`] 摘要
+    /// （referenced/rows/bytes——同目录一份 manifest 全标好）。
+    pub fn files_list(&self, dir: &str) -> Result<FileListing> {
+        let mut p = "/api/v1/files/list".to_string();
+        if !dir.is_empty() {
+            let q = dir
+                .split('/')
+                .map(http::percent_encode)
+                .collect::<Vec<_>>()
+                .join("/");
+            p.push_str(&format!("?dir={q}"));
+        }
+        json::parse_file_list(&self.get_json(&p)?)
+    }
+
+    /// 单文件/目录详情（`GET /api/v1/files/detail`）：段文件带归属
+    /// （库/表/分区）、manifest 列统计（min/max/NULL——**不读 parquet**）与
+    /// [`FileDetail::read_sql`]（Studio"预览此文件"直接拿去 `query`）。
+    pub fn files_detail(&self, path: &str) -> Result<FileDetail> {
+        let q = path
+            .split('/')
+            .map(http::percent_encode)
+            .collect::<Vec<_>>()
+            .join("/");
+        json::parse_file_detail(&self.get_json(&format!("/api/v1/files/detail?path={q}"))?)
+    }
+
+    /// 把**未引用的段文件**移入回收站（`POST /api/v1/files/trash`，admin 专属）。
+    ///
+    /// 只收 `seg_*.parquet`；被存活 manifest 引用的段服务端以 409
+    /// `SEGMENT_REFERENCED` 拒绝（删被引用段 = 毁表）——删数据请走
+    /// `DELETE WHERE <分区>` / `INSERT OVERWRITE`。成功 = 进 `_trash`
+    /// （静默期内 `admin trash restore` 可捞回），不是直接 unlink。
+    pub fn file_trash(&self, path: &str) -> Result<TrashAck> {
+        let q = path
+            .split('/')
+            .map(http::percent_encode)
+            .collect::<Vec<_>>()
+            .join("/");
+        let resp = self.http.post(
+            &format!("/api/v1/files/trash?path={q}"),
+            "application/json",
+            b"",
+        );
+        let r = match resp {
+            Ok(r) if !(200..300).contains(&r.head.status) => {
+                Err(json::api_error(r.head.status, &r.body))
+            }
+            Ok(r) => json::parse_trash(&r.body),
+            Err(e) => Err(e),
+        };
+        // 写动作不幂等：REVOKED 只重登不重发（与会话/授权管理面同款）
+        self.write_handle_revoked(r)
+    }
+
     fn get_json(&self, path: &str) -> Result<Vec<u8>> {
         // GET 元数据是幂等读：与 query 同款 REVOKED 自动重登+重发
         self.read_with_relogin(|c| {
@@ -1204,7 +1265,8 @@ impl Client {
         })
     }
 
-    /// 下载服务端文件（`GET /api/v1/files`，**admin 专属**）。
+    /// 下载服务端文件（`GET /api/v1/files`，对归属库有读授权即可——
+    /// 二十批起从 admin 专属放宽：reader 本来就能 SELECT 全库）。
     ///
     /// `COPY (SELECT …) TO '<dir>'` 的取回闭环：服务端 COPY 写盘，本方法把
     /// 文件**流式**拉回——逐块写进 `out`，两端内存恒定（服务端 `ReaderStream`，
