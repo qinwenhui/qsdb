@@ -10,11 +10,15 @@
 
 ## 每次发布
 
-### 1. 生成公开分支
+### 1. 生成公开分支（推送前现场生成，**平时不保留**）
 
 ```bash
 bash tools/internal/make_public_branch.sh
 ```
+
+> **分支生命周期 = 生成 → 立即推送 → 删除**。平时仓库里只有开发分支；
+> 每次 public 重新生成都替换旧分支，推不出去的旧生成物一律 `git branch -D public`
+> + `git gc --prune=now` 清掉——不给本地 .git 留任何公开面历史残留。
 
 脚本自动做：白名单复制 → 敏感串扫描（密码/内网 IP/业务词/AI 尾注，**命中即失败**）→
 孤立单提交（author/committer = qinwh，无尾注）→ 更新本仓 `public` 分支。
@@ -65,9 +69,8 @@ git push origin v0.1.0
 ```bash
 # 开发分支上改完、提交后：
 bash tools/internal/make_public_branch.sh
-git push origin public:main          # 强推语义？否——单提交历史，更新用 --force
-# 实际上每次重新生成都是全新提交，需要：
-git push --force origin public:main
+git push --force origin public:main   # 每次重新生成都替换远程为全新单提交
+git branch -D public                  # 推完即删，本地不保留
 ```
 
 > 用 `--force` 是**设计内**的：public 永远只有一个"Initial public release"式
