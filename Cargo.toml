@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = ["crates/qsdb", "crates/qsdb-cli", "crates/qsdb-bench", "crates/qsdb-client"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/qinwenhui/qsdb"
+
+[workspace.dependencies]
+# 内存模型与文件格式（唯二重依赖，版本严格同步）
+arrow = "60"
+parquet = { version = "60", default-features = false, features = ["arrow", "zstd", "snap"] }
+
+# 元数据
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["use-std"] }
+
+# 基础
+thiserror = "2"
+tracing = "0.1"
+rayon = "1"
+hashbrown = "0.17"
+fs2 = "0.4"
+uuid = { version = "1", features = ["v7"] }
+windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
+
+# 前端/门面
+# "visitor" = 多库限定名路由（M-B）用的 AST 遍历器；对内核本身无行为影响
+sqlparser = { version = "0.63", features = ["visitor"] }
+clap = { version = "4", features = ["derive"] }
+rustyline = "18"
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "fs"] }
+## 只为 `tokio_util::io::ReaderStream`（`GET /api/v1/files` 流式下载，qsdb-sync F11）。
+## 注意：**它本来就在依赖树里**（axum → h2/tower → tokio-util），这里只是打开 `io`
+## feature 并声明成直接依赖 —— 不新增任何 crate，二进制增量 ≈ 0。
+tokio-util = { version = "0.7", features = ["io"] }
+
+# 内部 crate
+qsdb = { path = "crates/qsdb" }
+
+# panic=unwind（不用 abort）：会话隔离层的 catch_unwind 依赖 unwind 表。
+# 代价实测 +7.8MB（arrow/parquet 泛型代码的 landing pads）——故障隔离优先于体积。
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
+# 基准构建：快编译 + 可观测
+[profile.bench-release]
+inherits = "release"
+debug = "line-tables-only"
+lto = "off"
+codegen-units = 16

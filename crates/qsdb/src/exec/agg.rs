@@ -1,0 +1,2979 @@
+//! 两阶段哈希聚合：GroupTable（分组 + 状态）→ partial / merge / finalize。
+//!
+//! 性能要点（1 亿行 gate）：
+//! - group key 编码复用 buffer（零分配），FxHash 8 字节块哈希
+//! - 行→组 id 一次遍历；各聚合列独立数组序更新（缓存友好）
+//! - DECIMAL sum 走 i256；float sum Kahan 补偿
+//!
+//! partial 产出即 GroupTable 本身（内存态），merge 直接合并表——
+//! 并行路径（文件分片 × rayon）在 exec_builder 层展开。
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int8Array, Int16Array, Int32Array, Int64Array, StringArray, Time64NanosecondArray,
+    TimestampNanosecondArray,
+};
+use arrow::datatypes::{DataType, i256};
+use arrow::record_batch::RecordBatch;
+
+use crate::error::{QsdbError, Result};
+use crate::expr::{AggExpr, PhysExpr, eval};
+use crate::types::{DecimalMeta, Literal, LogicalType};
+
+// ---------------------------------------------------------------------------
+// FxHash（简版，8 字节块）
+// ---------------------------------------------------------------------------
+
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+#[inline]
+pub(crate) fn fxhash_bytes(bytes: &[u8]) -> u64 {
+    let mut h = FX_SEED;
+    let mut chunks = bytes.chunks_exact(8);
+    for c in &mut chunks {
+        let v = u64::from_le_bytes(c.try_into().unwrap());
+        h = (h.rotate_left(5) ^ v).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    let rem = chunks.remainder();
+    if !rem.is_empty() {
+        let mut buf = [0u8; 8];
+        buf[..rem.len()].copy_from_slice(rem);
+        h = (h.rotate_left(5) ^ u64::from_le_bytes(buf)).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    h
+}
+
+// ---------------------------------------------------------------------------
+// group key 编码（复用 buffer）
+// ---------------------------------------------------------------------------
+
+/// 聚合参数求值 + **常量参数广播**（`sum(1)` 这类：下游同样按**行号**索引参数
+/// 数组，常量参数不广播就同样越界 panic —— 与分组键同一个坑）。
+fn eval_agg_arrays(aggs: &[AggExpr], batch: &RecordBatch) -> Result<Vec<Option<ArrayRef>>> {
+    let n = batch.num_rows();
+    aggs.iter()
+        .map(|a| -> Result<Option<ArrayRef>> {
+            match &a.arg {
+                Some(e) => Ok(Some(crate::exec::broadcast_const(
+                    &eval::eval(e, batch)?,
+                    n,
+                )?)),
+                None => Ok(None),
+            }
+        })
+        .collect()
+}
+
+/// 每个聚合自己的 `FILTER (WHERE …)` 掩码（按**批内行号**；`None` = 该聚合没写）。
+///
+/// **逐聚合算、逐聚合用**：同一条 SELECT 里两个聚合可以各有各的谓词，所以
+/// **不能**在批次层面统一预筛（那会让它们互相污染）。分组键的形成**不受** FILTER
+/// 影响 —— 谓词只决定"这行要不要喂给某个聚合"，不决定组存不存在
+/// （PG 同样：`count(*) FILTER (…)` 全不匹配的组照样出现，回 0）。
+fn eval_agg_filters(aggs: &[AggExpr], batch: &RecordBatch) -> Result<Vec<Option<BooleanArray>>> {
+    let n = batch.num_rows();
+    aggs.iter()
+        .map(|a| -> Result<Option<BooleanArray>> {
+            let Some(p) = &a.filter else {
+                return Ok(None);
+            };
+            let v = crate::exec::broadcast_const(&eval::eval(p, batch)?, n)?;
+            Ok(Some(
+                v.as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| QsdbError::type_err("FILTER (WHERE …) must be boolean"))?
+                    .clone(),
+            ))
+        })
+        .collect()
+}
+
+/// 按 `mask` 从 `(sel, group_ids)` 里筛出**这一个聚合**要看的行。
+/// 返回两份**等长且对齐**的向量（`update_aggs_sel` 的约定）。
+///
+/// SQL 三值：只有 **TRUE** 通过（NULL / UNKNOWN 不通过）。
+fn filter_rows(mask: &BooleanArray, sel: &[u32], group_ids: &[u32]) -> (Vec<u32>, Vec<u32>) {
+    let mut fs = Vec::with_capacity(sel.len());
+    let mut fg = Vec::with_capacity(sel.len());
+    for (i, &s) in sel.iter().enumerate() {
+        let r = s as usize;
+        if !mask.is_null(r) && mask.value(r) {
+            fs.push(s);
+            fg.push(group_ids[i]);
+        }
+    }
+    (fs, fg)
+}
+
+/// 分组键求值 + **常量键广播**。
+///
+/// `eval` 对常量键（`GROUP BY 'k'`，或 `GROUP BY 1` 指向的那个常量）返回**长度 1**
+/// 的数组，而下游一律按**批内行号**索引键数组 ⇒ 不广播就**越界 panic**
+/// （实测 `Trying to access an element at index 1 from a StringArray of length 1`，
+/// 被 panic 隔离层兜住，用户看到的是"查询 panic"）。同一族坑还有
+/// `SELECT 1, g FROM t`（见 `ProjectExec`）—— 常量数组走到哪里都要先对齐长度。
+fn eval_group_arrays(group: &[PhysExpr], batch: &RecordBatch) -> Result<Vec<ArrayRef>> {
+    let n = batch.num_rows();
+    group
+        .iter()
+        .map(|g| crate::exec::broadcast_const(&eval::eval(g, batch)?, n))
+        .collect()
+}
+
+/// 把一行各 group 列编码进 buf（tag + bytes）；失败列按 raw 字符串兜底。
+///
+/// ⚠️ 按**行号**索引 `arrays`：调用方须保证它是**批长**的（常量键先过
+/// [`eval_group_arrays`] 广播），否则越界 panic。
+pub(crate) fn encode_key_row(arrays: &[ArrayRef], row: usize, buf: &mut Vec<u8>) {
+    buf.clear();
+    for a in arrays {
+        if a.is_null(row) {
+            buf.push(0);
+        } else {
+            buf.push(1);
+            encode_value(a, row, buf);
+        }
+    }
+}
+
+fn encode_value(a: &dyn Array, i: usize, buf: &mut Vec<u8>) {
+    use arrow::datatypes::*;
+    match a.data_type() {
+        DataType::Int8 => buf.extend_from_slice(
+            &a.as_any()
+                .downcast_ref::<arrow::array::Int8Array>()
+                .unwrap()
+                .value(i)
+                .to_le_bytes(),
+        ),
+        DataType::Int16 => buf.extend_from_slice(
+            &a.as_any()
+                .downcast_ref::<arrow::array::Int16Array>()
+                .unwrap()
+                .value(i)
+                .to_le_bytes(),
+        ),
+        DataType::Int32 => buf.extend_from_slice(
+            &a.as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .unwrap()
+                .value(i)
+                .to_le_bytes(),
+        ),
+        DataType::Int64
+        | DataType::Timestamp(TimeUnit::Nanosecond, _)
+        | DataType::Time64(TimeUnit::Nanosecond) => {
+            let v = if matches!(a.data_type(), DataType::Int64) {
+                a.as_any().downcast_ref::<Int64Array>().unwrap().value(i)
+            } else if matches!(a.data_type(), DataType::Timestamp(_, _)) {
+                a.as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap()
+                    .value(i)
+            } else {
+                a.as_any()
+                    .downcast_ref::<Time64NanosecondArray>()
+                    .unwrap()
+                    .value(i)
+            };
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        DataType::Float32 => buf.extend_from_slice(
+            &a.as_any()
+                .downcast_ref::<arrow::array::Float32Array>()
+                .unwrap()
+                .value(i)
+                .to_le_bytes(),
+        ),
+        DataType::Float64 => buf.extend_from_slice(
+            &a.as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(i)
+                .to_le_bytes(),
+        ),
+        DataType::Date32 => buf.extend_from_slice(
+            &a.as_any()
+                .downcast_ref::<Date32Array>()
+                .unwrap()
+                .value(i)
+                .to_le_bytes(),
+        ),
+        DataType::Boolean => buf.push(u8::from(
+            a.as_any().downcast_ref::<BooleanArray>().unwrap().value(i),
+        )),
+        DataType::Decimal128(_, _) => buf.extend_from_slice(
+            &a.as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .value(i)
+                .to_le_bytes(),
+        ),
+        DataType::Utf8 => {
+            let s = a.as_any().downcast_ref::<StringArray>().unwrap().value(i);
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+        other => {
+            // 兜底：显示文本
+            let s = format!("{other:?}:{i}");
+            buf.extend_from_slice(s.as_bytes());
+        }
+    }
+}
+
+/// 快路径比较：现有 Literal（同型）与新原生值比较。
+/// 数组取值 → Literal（全部类型；NULL → Literal::Null）。
+pub fn array_value_to_literal(a: &dyn Array, i: usize) -> Literal {
+    use arrow::datatypes::*;
+    if a.is_null(i) {
+        return Literal::Null;
+    }
+    match a.data_type() {
+        DataType::Int8 => Literal::Int8(
+            a.as_any()
+                .downcast_ref::<arrow::array::Int8Array>()
+                .unwrap()
+                .value(i),
+        ),
+        DataType::Int16 => Literal::Int16(
+            a.as_any()
+                .downcast_ref::<arrow::array::Int16Array>()
+                .unwrap()
+                .value(i),
+        ),
+        DataType::Int32 => Literal::Int32(
+            a.as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .unwrap()
+                .value(i),
+        ),
+        DataType::Int64 => {
+            Literal::Int64(a.as_any().downcast_ref::<Int64Array>().unwrap().value(i))
+        }
+        DataType::Float32 => Literal::Float32(
+            a.as_any()
+                .downcast_ref::<arrow::array::Float32Array>()
+                .unwrap()
+                .value(i),
+        ),
+        DataType::Float64 => {
+            Literal::Float64(a.as_any().downcast_ref::<Float64Array>().unwrap().value(i))
+        }
+        DataType::Date32 => {
+            Literal::Date(a.as_any().downcast_ref::<Date32Array>().unwrap().value(i))
+        }
+        DataType::Time64(TimeUnit::Nanosecond) => Literal::Time(
+            a.as_any()
+                .downcast_ref::<Time64NanosecondArray>()
+                .unwrap()
+                .value(i),
+        ),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => Literal::Timestamp(
+            a.as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap()
+                .value(i),
+        ),
+        DataType::Boolean => {
+            Literal::Boolean(a.as_any().downcast_ref::<BooleanArray>().unwrap().value(i))
+        }
+        DataType::Decimal128(p, s) => Literal::Decimal {
+            unscaled: a
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .value(i),
+            meta: DecimalMeta::try_new(*p, *s).unwrap_or(DecimalMeta::new(38, 0)),
+        },
+        DataType::Utf8 => Literal::Utf8(
+            a.as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(i)
+                .to_string(),
+        ),
+        _ => Literal::Null,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 聚合状态
+// ---------------------------------------------------------------------------
+
+fn pick(a: Option<Literal>, b: Option<Literal>, keep_min: bool) -> Option<Literal> {
+    match (a, b) {
+        (None, x) | (x, None) => x,
+        (Some(x), Some(y)) => {
+            if let Ok(Some(o)) = x.partial_cmp_literal(&y) {
+                let better = if keep_min {
+                    o == std::cmp::Ordering::Less
+                } else {
+                    o == std::cmp::Ordering::Greater
+                };
+                if better { Some(x) } else { Some(y) }
+            } else {
+                Some(x)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GroupTable
+// ---------------------------------------------------------------------------
+
+fn combine_min(a: Option<Literal>, b: Option<Literal>) -> Option<Literal> {
+    pick(a, b, true)
+}
+fn combine_max(a: Option<Literal>, b: Option<Literal>) -> Option<Literal> {
+    pick(a, b, false)
+}
+
+/// 类型化切片求和进 i128 累加器：null_count=0 时 `values()` 切片直加
+/// （免逐行判空，LLVM 自动向量化）；含 NULL 退回判空循环。
+fn sum_slice<T: arrow::datatypes::ArrowPrimitiveType>(
+    acc: &mut [i128],
+    arr: &arrow::array::PrimitiveArray<T>,
+) where
+    i128: From<T::Native>,
+{
+    let a = &mut acc[0];
+    if arr.null_count() == 0 {
+        for v in arr.values() {
+            *a += i128::from(*v);
+        }
+    } else {
+        for i in 0..arr.len() {
+            if !arr.is_null(i) {
+                *a += i128::from(arr.value(i));
+            }
+        }
+    }
+}
+
+/// Kahan 补偿求和（迭代器形态；f32 上游转 f64）。
+fn kahan_slice(it: impl Iterator<Item = f64>, out: &mut (f64, f64)) {
+    for x in it {
+        let y = x - out.1;
+        let t = out.0 + y;
+        out.1 = (t - out.0) - y;
+        out.0 = t;
+    }
+}
+
+/// typed 数组 SIMD 最小值 → Literal（忽略 NULL；形态由调用方验证）。
+fn typed_scalar_min(a: &dyn arrow::array::Array) -> Option<crate::types::Literal> {
+    use crate::types::Literal;
+    use arrow::compute::min;
+    macro_rules! m {
+        ($t:ident, $lit:expr) => {{ min(a.as_any().downcast_ref::<$t>().unwrap()).map($lit) }};
+    }
+    match a.data_type() {
+        DataType::Int8 => m!(Int8Array, Literal::Int8),
+        DataType::Int16 => m!(Int16Array, Literal::Int16),
+        DataType::Int32 => m!(Int32Array, Literal::Int32),
+        DataType::Int64 => m!(Int64Array, Literal::Int64),
+        DataType::Float32 => m!(Float32Array, Literal::Float32),
+        DataType::Float64 => m!(Float64Array, Literal::Float64),
+        DataType::Date32 => m!(Date32Array, Literal::Date),
+        _ => None,
+    }
+}
+
+/// typed 数组 SIMD 最大值 → Literal。
+fn typed_scalar_max(a: &dyn arrow::array::Array) -> Option<crate::types::Literal> {
+    use crate::types::Literal;
+    use arrow::compute::max;
+    macro_rules! m {
+        ($t:ident, $lit:expr) => {{ max(a.as_any().downcast_ref::<$t>().unwrap()).map($lit) }};
+    }
+    match a.data_type() {
+        DataType::Int8 => m!(Int8Array, Literal::Int8),
+        DataType::Int16 => m!(Int16Array, Literal::Int16),
+        DataType::Int32 => m!(Int32Array, Literal::Int32),
+        DataType::Int64 => m!(Int64Array, Literal::Int64),
+        DataType::Float32 => m!(Float32Array, Literal::Float32),
+        DataType::Float64 => m!(Float64Array, Literal::Float64),
+        DataType::Date32 => m!(Date32Array, Literal::Date),
+        _ => None,
+    }
+}
+/// 数值累加列（sum/avg 的 sum 部分；按输入类型选一种，SoA 稠密向量）。
+enum SumCol {
+    /// 非数值聚合列（count-only / min-max）不占状态
+    None,
+    /// 整型族 i128 累加（16B/组）
+    Int(Vec<i128>),
+    /// 浮点 Kahan 补偿 (sum, c)（16B/组）
+    Flt(Vec<(f64, f64)>),
+    /// Decimal i256 精确（32B/组）
+    Dec(Vec<i256>),
+}
+
+/// `by_hash` 的桶值：**内联一格**的小向量（零新依赖，就一个 enum）。
+///
+/// 动机来自 `perf` 实录（2026-10-11，`count(DISTINCT gs)` 5M 行 / 2.801s）：
+/// **哈希查找 36.7% + libc 分配器 18.9%**，两者都长在这个结构上。
+/// `HashMap<u64, Vec<u32>>` 在**高基数**下每个桶只装一个 gid，却要付两次代价：
+/// ① 每组一次 `Vec` 堆分配；② 查找时多追一次指针（数据在别处，又一条 cache line）。
+///
+/// `One` 把那个 gid 直接放在哈希桶里 ⇒ **不分配**，且与键相邻、同一条 cache line。
+/// 低基数（多 gid 落同一哈希）才退到 `Many(Vec<u32>)`，行为与原来一致、不回退。
+///
+/// ⚠️ 值变大到 32 字节（原 `Vec` 是 24），但省掉了**每组一次堆分配**与它带的
+/// 头开销：250 万组时实测总内存反而降（见 `基准对账笔记` §二之四）。
+#[derive(Clone)]
+enum Bucket {
+    One(u32),
+    Many(Vec<u32>),
+}
+
+impl Bucket {
+    /// 追加一个 gid；**返回本次新增的堆字节**（供 `payload_bytes` 增量记账）。
+    #[inline]
+    fn push(&mut self, gid: u32) -> u64 {
+        match self {
+            // 1 → 2：这一跳才真正要堆（低基数路径；高基数永远停在 One）
+            Bucket::One(cur) => {
+                let mut v = Vec::with_capacity(4);
+                v.push(*cur);
+                v.push(gid);
+                let heap = v.capacity() as u64 * 4;
+                *self = Bucket::Many(v);
+                heap
+            }
+            Bucket::Many(v) => {
+                let before = v.capacity();
+                v.push(gid);
+                (v.capacity() - before) as u64 * 4
+            }
+        }
+    }
+
+    /// 桶里第一个满足 `pred` 的 gid。
+    ///
+    /// 调用方拿它做"键字节比对"（`key_of(gid) == key`）——**不能只看哈希**，
+    /// 那是有碰撞概率的**静默错值**。
+    #[inline]
+    fn find(&self, mut pred: impl FnMut(u32) -> bool) -> Option<u32> {
+        match self {
+            Bucket::One(g) => {
+                if pred(*g) {
+                    Some(*g)
+                } else {
+                    None
+                }
+            }
+            Bucket::Many(v) => v.iter().copied().find(|&g| pred(g)),
+        }
+    }
+
+    /// 这个桶**额外占用的堆字节**（`One` 不占堆 ⇒ 0）。
+    #[inline]
+    fn heap_bytes(&self) -> u64 {
+        match self {
+            Bucket::One(_) => 0,
+            Bucket::Many(v) => v.capacity() as u64 * 4,
+        }
+    }
+}
+
+/// 分组聚合表（SoA：key 单一 arena + 偏移，聚合状态按列稠密——
+/// 百万级组数时散布步长 8~40B，不再逐组堆分配；P3 性能重做）。
+#[derive(Default)]
+
+pub struct GroupTable {
+    by_hash: HashMap<u64, Bucket, crate::exec::join::BuildI64Hasher>,
+    pending_arity: Option<usize>,
+    /// Int64 fast path 的持久化开放寻址索引（(hash, gid)；跨批存活）
+    fast_slots: Vec<(u64, u32)>,
+    /// 单 Int64 分组列专用：槽内直存键值 (key, gid)——免 key_arena 二次
+    /// 随机访问（高基数下每次命中省一次 cache miss）与每行 key_bytes 构造。
+    /// 与 fast_slots 互斥（按列数选用），merge 后一并清空。
+    fast_slots_inline: Vec<(i64, u32)>,
+    // —— 组数据（SoA）——
+    /// 全部组 key 的单一 arena（fast 格式定长内联 / 慢路径 tag+bytes 变长）
+    key_arena: Vec<u8>,
+    /// key 偏移（len = 组数+1；组数 = len-1）
+    key_off: Vec<u32>,
+    /// 组键 literal（[分组列][gid]，建组时按 gid 顺序追加）
+    group_lits: Vec<Vec<Literal>>,
+    /// `by_hash` 各桶的**载荷字节**（`capacity()*4 + Vec 头`）**增量累计值**。
+    ///
+    /// 为什么要单独存：`estimated_bytes` 原先每调一次就
+    /// `by_hash.values().map(...).sum()` 遍历**全部条目**——**每批调一次**，
+    /// 于是成本是 `组数 × 批数`。实测（2026-10-11）：250 万字符串组 × 610 批
+    /// ≈ 每次流过 **80MB**、合计 **48GB 内存流量 ≈ 5 秒**，
+    /// 这正是 `SELECT DISTINCT gs`（5M 行）6.0s 里的绝大部分
+    /// （对照组：同样 5M 行、500 万**整数**组的 `DISTINCT v` 只要 0.16s
+    /// —— 整数键走 `fast_slots_inline`，`by_hash` 基本是空的，所以没被这条拖累）。
+    ///
+    /// 其余项本来都是 O(1) 的 `capacity()`（或 O(列数)），只有这一项是 O(组数)。
+    payload_bytes: u64,
+    /// 聚合列状态种类（首批 ingest 初始化）
+    kinds: Vec<crate::expr::AggFunc>,
+    /// Count 值 / Sum·Avg 的非空计数
+    counts: Vec<Vec<u64>>,
+    sums: Vec<SumCol>,
+    /// Min/Max 值（仅 Min/Max 列分配）
+    minmax: Vec<Vec<Option<Literal>>>,
+    /// **只要"组数"、不要组键正文**（`count(DISTINCT x)` 的融合计数节点）。
+    ///
+    /// 关掉 `group_lits`（不建）—— 250 万字符串组里，它的 `Literal` 槽 + 每组
+    /// 一次 `String` 克隆正是"组表仍胖"的大头，而编码后的键**已经在
+    /// `key_arena` 里**。
+    count_only: bool,
+    /// **count-only + 单 Int64 分组列**专用内联槽：槽 = `(键值, gid)`，
+    /// **键存在槽里** ⇒ 命中判定完全不碰 `key_arena`。
+    ///
+    /// 为什么值得单开一张：实测「**每行对 `key_arena` 的一次随机访问**」就是这条
+    /// 路径的全部开销——同一份数据（`DISTINCT v`，100 万组）**0.168s vs 0.913s
+    /// （5.4×）**，差别只在"键存槽里"还是"回 arena 取真值"。
+    /// （见 `基准对账笔记` §二之四。）
+    ///
+    /// 与既有 [`GroupTable::fast_slots_inline`] 的两点差别，都因为 count-only：
+    /// 1. **NULL 走专门的槽**（`count_only_null_gid`）——**不能用键值哨兵**，
+    ///    `i64::MIN` 是合法值；
+    /// 2. `key_arena` 里存的仍是**规范编码**（`encode_key_row` 的 `[1]+LE8` / `[0]`），
+    ///    因为溢出分区的路由按它算 ⇒ 这张索引是**缓存**，随时可按 arena 重建。
+    ///
+    /// ⚠️ **走不走这条路是类型驱动的**（"分组是单列 Int64"），**不是"这批有没有
+    /// NULL"**：逐批判定会让同一个值在两种编码下各建一次组（**静默多数**）。
+    int_slots: Vec<(i64, u32)>,
+    /// 上面那张表的 NULL 组（count-only 单 Int64 列专用）。
+    count_only_null_gid: Option<u32>,
+    /// **count-only + 单 Int64 键**的密集直索引（第十五批，
+    /// `整型去重密集直索引设计稿`）：`slots[k - min] = gid`，4B/槽、
+    /// 免哈希免探测。与 `int_slots` **互斥持有**（锚定/增长时清槽表，
+    /// 坠回时清 dense）；剖面依据：16B 槽表在 100 万组时 32MB = 本机 L3 的
+    /// 2 倍（cache-miss 率 45%、24.7ns/行），同路 10 万组（4MB，L3 内）
+    /// 只要 1.6ns/行。
+    dense: Option<DenseInt>,
+    /// dense 判过"span 超 CAP"⇒ **永久坠回槽路**（span 单调不减，无翻案）。
+    dense_dead: bool,
+}
+
+/// 密集直索引的槽（`整型去重密集直索引设计稿` §二）。
+/// `slots[i]` = 键值 `min + i` 的 gid；`EMPTY` = 无组。
+/// **只与 `GroupTable` 同模块使用**——`key_arena` 里的规范编码是唯一真相，
+/// 这张表随时可按 arena 重建（锚定回填 / 增长重建 / 坠回重建三条路同源）。
+struct DenseInt {
+    /// 数组锚点：`slots[i]` 对应键值 `min + i`
+    min: i64,
+    /// 已见最大键值（增长时算 need span 用；命中路不更新——命中 ⇒ 该值先前
+    /// 插入过 ⇒ 归纳法 ≤ max_seen；新组与越界路才更新）
+    max_seen: i64,
+    slots: Vec<u32>,
+}
+
+/// dense 槽的空标记。是 **gid 侧**的哨兵（u32::MAX 不可能是合法 gid），
+/// 与键值无关 ⇒ `i64::MIN` 作为键值合法（count-only 的 NULL 另走专门槽）。
+const DENSE_SLOT_EMPTY: u32 = u32::MAX;
+
+impl GroupTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.key_off.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.key_off.len().saturating_sub(1)
+    }
+
+    /// 组表**内存占用的量级估算**（字节）——供内存预算记账。
+    ///
+    /// 口径是「分配的容器容量」而非「元素个数」：账要覆盖**已保留的内存**，
+    /// 而不是逻辑数据量。不追求逐字节精确（HashMap 桶开销、分配器对齐、
+    /// 容量翻倍余量都是估的），但**不系统性低估**——高基数下组表是内存大头，
+    /// 估错一个量级就等于预算失效。
+    ///
+    /// 用它的地方：`HashAggExec` 按本值增量预留（见 `exec/mod.rs`），
+    /// 从而把「每分片各建一份完整组表」的**分片放大**如实记进全局预算。
+    /// **组件级占用剖析**（`QSDB_AGG_PROF=1` 时由执行器打印）。
+    ///
+    /// 为什么要有它：`estimated_bytes` 只给一个总数，而"组表胖"有好几种完全不同的
+    /// 成因（键 arena 涨 / 每组的 `Vec` 头 / 每组一个 `Literal` 堆对象 /
+    /// 哈希桶失衡），总数看不出是哪一种，改起来就只能猜。
+    /// 实测（2026-10-11）`SELECT DISTINCT gs` 250 万字符串组占 4.4GB，
+    /// 而 500 万 int64 组只占 569MB —— 差的就是这张表要指出的东西。
+    pub fn profile_bytes(&self) -> Vec<(&'static str, u64)> {
+        vec![
+            ("key_arena", self.key_arena.len() as u64),
+            ("key_arena_cap", self.key_arena.capacity() as u64),
+            ("key_off", self.key_off.len() as u64 * 4),
+            ("key_off_cap", self.key_off.capacity() as u64 * 4),
+            (
+                "by_hash_buckets",
+                self.by_hash.capacity() as u64 * (std::mem::size_of::<(u64, Bucket)>() as u64 + 1),
+            ),
+            ("by_hash_len", self.by_hash.len() as u64),
+            (
+                "by_hash_payload",
+                // 同 `bucket_push` 口径：只有 `Many` 占堆
+                self.by_hash.values().map(Bucket::heap_bytes).sum(),
+            ),
+            ("by_hash_one", {
+                // 高基数场景下这里应接近 `by_hash_len`（每个桶一个 gid）
+                self.by_hash
+                    .values()
+                    .filter(|b| matches!(b, Bucket::One(_)))
+                    .count() as u64
+            }),
+            ("fast_slots_cap", self.fast_slots.capacity() as u64 * 16),
+            (
+                "fast_slots_inline_cap",
+                self.fast_slots_inline.capacity() as u64 * 16,
+            ),
+            ("int_slots_cap", self.int_slots.capacity() as u64 * 16),
+            (
+                "dense_slots_cap",
+                self.dense
+                    .as_ref()
+                    .map_or(0, |d| d.slots.capacity() as u64 * 4),
+            ),
+            (
+                "group_lits_cap",
+                self.group_lits
+                    .iter()
+                    .map(|v| v.capacity() as u64 * std::mem::size_of::<Literal>() as u64)
+                    .sum(),
+            ),
+            // **堆内字符串**（`Literal::Utf8` 的 String 体）——`estimated_bytes`
+            // **没有**把这块算进去（它只数容器容量）。这一行就是为了让那笔账可见。
+            (
+                "group_lits_heap_str",
+                self.group_lits
+                    .iter()
+                    .flat_map(|v| v.iter())
+                    .map(|l| match l {
+                        Literal::Utf8(s) => s.capacity() as u64 + 32,
+                        _ => 0,
+                    })
+                    .sum(),
+            ),
+        ]
+    }
+
+    /// **载荷项的全量重算**（仅测试用）：与增量维护的 `payload_bytes` 对拍。
+    ///
+    /// ⚠️ 只重算**载荷那一项**——`estimated_bytes` 还有 `by_hash.capacity()*33`、
+    /// `group_lits` 容量等**本来就 O(1)** 的项，拿整条估计值来比会误判成"不一致"。
+    #[cfg(test)]
+    pub fn payload_bytes_full(&self) -> u64 {
+        // 与 `bucket_push` 同口径：只有 `Many` 占堆（`One` 的 gid 在桶里）
+        self.by_hash.values().map(Bucket::heap_bytes).sum()
+    }
+
+    pub fn estimated_bytes(&self) -> u64 {
+        let mut b: u64 = 0;
+        b += self.key_arena.capacity() as u64;
+        b += self.key_off.capacity() as u64 * 4;
+        b += self.fast_slots.capacity() as u64 * 16; // (u64, u32) + padding
+        b += self.fast_slots_inline.capacity() as u64 * 16; // (i64, u32) + padding
+        b += self.int_slots.capacity() as u64 * 16; // count-only 单 Int64 列内联槽
+        b += self
+            .dense
+            .as_ref()
+            .map_or(0, |d| d.slots.capacity() as u64 * 4); // 密集直索引（与 int_slots 互斥）
+        // HashMap<u64, Vec<u32>>：桶 + 每组一个 Vec 头
+        let vec_hdr = std::mem::size_of::<Vec<u32>>() as u64;
+        b += self.by_hash.capacity() as u64 * (std::mem::size_of::<(u64, Bucket)>() as u64 + 1);
+        // **增量维护**（见 `payload_bytes` 的注释）：这里以前是全量遍历，
+        // 每批一次 ⇒ 组数 × 批数，是 `SELECT DISTINCT` 高基数下的平方级热点。
+        b += self.payload_bytes;
+        let lit = std::mem::size_of::<Literal>() as u64;
+        b += self.group_lits.capacity() as u64 * vec_hdr;
+        b += self
+            .group_lits
+            .iter()
+            .map(|v| v.capacity() as u64 * lit)
+            .sum::<u64>();
+        b += self.counts.capacity() as u64 * vec_hdr;
+        b += self
+            .counts
+            .iter()
+            .map(|v| v.capacity() as u64 * 8)
+            .sum::<u64>();
+        for s in &self.sums {
+            let per = match s {
+                SumCol::None => 0,
+                SumCol::Int(v) => v.capacity() as u64 * 16,
+                SumCol::Flt(v) => v.capacity() as u64 * 16,
+                SumCol::Dec(v) => v.capacity() as u64 * 32,
+            };
+            b += per;
+        }
+        b += self.minmax.capacity() as u64 * vec_hdr;
+        b += self
+            .minmax
+            .iter()
+            .map(|v| v.capacity() as u64 * (lit + 8))
+            .sum::<u64>();
+        b
+    }
+
+    /// 组 g 的 key 字节。
+    #[inline]
+    pub(crate) fn key_of(&self, g: usize) -> &[u8] {
+        &self.key_arena[self.key_off[g] as usize..self.key_off[g + 1] as usize]
+    }
+
+    /// 追加一个新组（key 入 arena，键 literal 与各聚合列状态按 gid 对齐扩展）。
+    /// 新建组。`lits` 按引用传入——调用方用栈数组（避免每组一次 Vec 堆分配：
+    /// 高基数 89 万组时实测是主要开销）。
+    fn push_group(&mut self, key: &[u8], lits: &[Literal]) -> u32 {
+        if self.key_off.is_empty() {
+            self.key_off.push(0); // 首组前压起点哨兵
+        }
+        let gid = self.len() as u32;
+        self.key_off.push((self.key_arena.len() + key.len()) as u32);
+        self.key_arena.extend_from_slice(key);
+        for (c, l) in self.group_lits.iter_mut().zip(lits.iter()) {
+            c.push(l.clone());
+        }
+        for c in &mut self.counts {
+            c.push(0);
+        }
+        for s in &mut self.sums {
+            match s {
+                SumCol::None => {}
+                SumCol::Int(v) => v.push(0),
+                SumCol::Flt(v) => v.push((0.0, 0.0)),
+                SumCol::Dec(v) => v.push(i256::from_i128(0)),
+            }
+        }
+        for m in &mut self.minmax {
+            m.push(None);
+        }
+        gid
+    }
+
+    /// **补「空组」：无 `GROUP BY` 的聚合必须恰好一行**（SQL 契约）。
+    ///
+    /// 零输入时组表是空的——`ingest` 对零行批直接 early-return，`try_global_fast`
+    /// 也只在**有行**时 `push_group`，于是 `init_cols`/`push_group` 一次都没跑过。
+    /// 调用方看到 `is_empty()` 就吐零个批 ⇒ `SELECT sum(v) FROM t WHERE false`
+    /// 返回**空结果集**而不是"一行 NULL"。
+    ///
+    /// 类型信息必须从**计划**取（`agg.arg` 的 Arrow 类型）：空的实参批拿不到
+    /// 类型，而 `init_cols` 就靠它分派 `SumCol::Int/Flt/Dec`。
+    fn seed_global_group(&mut self, aggs: &[AggExpr]) {
+        let args: Vec<Option<ArrayRef>> = aggs
+            .iter()
+            .map(|a| {
+                a.arg
+                    .as_ref()
+                    .map(|e| arrow::array::new_empty_array(&e.data_type().arrow_type()))
+            })
+            .collect();
+        self.init_cols(&[], aggs, &args);
+        if self.key_off.is_empty() {
+            self.push_group(&[], &[]);
+        }
+    }
+
+    /// 首批初始化：分组列数 + 各聚合列状态种类。
+    fn init_cols(&mut self, group: &[PhysExpr], aggs: &[AggExpr], arrays: &[Option<ArrayRef>]) {
+        if !self.kinds.is_empty() {
+            return;
+        }
+        // count-only：**不建** group_lits（见该字段说明）。留空即可——
+        // `push_group` 的 zip 会自然跳过，`estimated_bytes` 也自然记 0。
+        if self.group_lits.is_empty() && !self.count_only {
+            self.group_lits = vec![Vec::new(); group.len()];
+        }
+        self.kinds = aggs.iter().map(|a| a.func).collect();
+        for (ai, agg) in aggs.iter().enumerate() {
+            let dt = arrays[ai]
+                .as_ref()
+                .map(|a| a.data_type().clone())
+                .unwrap_or(DataType::Int64);
+            use crate::expr::AggFunc::*;
+            match agg.func {
+                Count | Udaf => {
+                    self.counts.push(Vec::new());
+                    self.sums.push(SumCol::None);
+                    self.minmax.push(Vec::new());
+                }
+                Sum | Avg => {
+                    self.counts.push(Vec::new());
+                    self.sums.push(match dt {
+                        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                            SumCol::Int(Vec::new())
+                        }
+                        DataType::Float32 | DataType::Float64 => SumCol::Flt(Vec::new()),
+                        DataType::Decimal128(_, _) => SumCol::Dec(Vec::new()),
+                        _ => SumCol::None,
+                    });
+                    self.minmax.push(Vec::new());
+                }
+                Min | Max => {
+                    self.counts.push(Vec::new());
+                    self.sums.push(SumCol::None);
+                    self.minmax.push(Vec::new());
+                }
+            }
+        }
+    }
+
+    /// 全局聚合（无 GROUP BY）零迭代快路径——「缓存聚合 0.04x」的底座修复：
+    /// `count(*)` = `num_rows`（**O(1)**）、`count(col)` = `num_rows − null_count`
+    /// （**O(1)**）、整型 sum = 类型化 `values()` 切片直加（null_count=0 免逐行
+    /// 判空，自动向量化；i128 累加无溢出）、float sum = 切片 Kahan、
+    /// min/max = typed 数组 SIMD `min()`/`max()`。
+    /// 逐批成本从 ~6ns/行 降到 ~0.3ns/行 + O(1) 计数。
+    /// 返回 Ok(false) = 形态不支持（零状态变更，调用方回退原路径）。
+    fn try_global_fast(
+        &mut self,
+        aggs: &[AggExpr],
+        arrays: &[Option<ArrayRef>],
+        n: usize,
+    ) -> Result<bool> {
+        use crate::expr::AggFunc::*;
+        // 先验证全形态可加速（不变更状态）
+        for (ai, agg) in aggs.iter().enumerate() {
+            match agg.func {
+                Count => {}
+                Sum | Avg => {
+                    let Some(a) = &arrays[ai] else {
+                        return Ok(false);
+                    };
+                    let ok = matches!(
+                        (&self.sums[ai], a.data_type()),
+                        (
+                            SumCol::Int(_),
+                            DataType::Int8
+                                | DataType::Int16
+                                | DataType::Int32
+                                | DataType::Int64
+                                | DataType::Date32
+                        ) | (SumCol::Flt(_), DataType::Float32 | DataType::Float64)
+                            | (SumCol::Dec(_), DataType::Decimal128(_, _))
+                    );
+                    if !ok {
+                        return Ok(false);
+                    }
+                }
+                Min | Max => {
+                    let Some(a) = &arrays[ai] else {
+                        return Ok(false);
+                    };
+                    let ok = matches!(
+                        a.data_type(),
+                        DataType::Int8
+                            | DataType::Int16
+                            | DataType::Int32
+                            | DataType::Int64
+                            | DataType::Float32
+                            | DataType::Float64
+                            | DataType::Date32
+                    );
+                    if !ok {
+                        return Ok(false);
+                    }
+                }
+                Udaf => return Ok(false),
+            }
+        }
+        // 应用（全局唯一组 gid 0；首批建空键组）
+        if self.is_empty() {
+            self.push_group(&[], &[]);
+        }
+        for (ai, agg) in aggs.iter().enumerate() {
+            let arr = arrays[ai].as_deref();
+            match agg.func {
+                Count => {
+                    let add = match arr {
+                        None => n,
+                        Some(a) => n - a.null_count(),
+                    };
+                    self.counts[ai][0] += add as u64;
+                }
+                Sum | Avg => {
+                    let a = arr.unwrap();
+                    self.counts[ai][0] += (n - a.null_count()) as u64;
+                    match (&mut self.sums[ai], a.data_type()) {
+                        (SumCol::Int(acc), DataType::Int8) => {
+                            sum_slice(acc, a.as_any().downcast_ref::<Int8Array>().unwrap())
+                        }
+                        (SumCol::Int(acc), DataType::Int16) => {
+                            sum_slice(acc, a.as_any().downcast_ref::<Int16Array>().unwrap())
+                        }
+                        (SumCol::Int(acc), DataType::Int32) => {
+                            sum_slice(acc, a.as_any().downcast_ref::<Int32Array>().unwrap())
+                        }
+                        (SumCol::Int(acc), DataType::Int64) => {
+                            sum_slice(acc, a.as_any().downcast_ref::<Int64Array>().unwrap())
+                        }
+                        (SumCol::Int(acc), DataType::Date32) => {
+                            sum_slice(acc, a.as_any().downcast_ref::<Date32Array>().unwrap())
+                        }
+                        (SumCol::Flt(acc), DataType::Float64) => {
+                            let f = a.as_any().downcast_ref::<Float64Array>().unwrap();
+                            if f.null_count() == 0 {
+                                kahan_slice(f.values().iter().copied(), &mut acc[0])
+                            } else {
+                                kahan_slice(
+                                    (0..n).filter(|&i| !f.is_null(i)).map(|i| f.value(i)),
+                                    &mut acc[0],
+                                )
+                            }
+                        }
+                        (SumCol::Flt(acc), DataType::Float32) => {
+                            let f = a.as_any().downcast_ref::<Float32Array>().unwrap();
+                            kahan_slice(
+                                (0..n)
+                                    .filter(|&i| !f.is_null(i))
+                                    .map(|i| f64::from(f.value(i))),
+                                &mut acc[0],
+                            )
+                        }
+                        (SumCol::Dec(acc), DataType::Decimal128(_, _)) => {
+                            let d = a.as_any().downcast_ref::<Decimal128Array>().unwrap();
+                            for i in 0..n {
+                                if !d.is_null(i) {
+                                    acc[0] += i256::from_i128(d.value(i));
+                                }
+                            }
+                        }
+                        _ => unreachable!("validated above"),
+                    }
+                }
+                Min | Max => {
+                    let a = arr.unwrap();
+                    let slot = &mut self.minmax[ai][0];
+                    // 单一槽位只存该聚合自己的极值（min 聚合取 min、max 取 max）
+                    let v = if agg.func == Min {
+                        typed_scalar_min(a)
+                    } else {
+                        typed_scalar_max(a)
+                    };
+                    if let Some(v) = v {
+                        *slot = crate::write::combine_lit(slot.take(), Some(v), agg.func == Min);
+                    }
+                }
+                Udaf => unreachable!("validated above"),
+            }
+        }
+        Ok(true)
+    }
+
+    /// 掩码摄入（semi/anti + 聚合融合路径）：只处理 `sel` 列出的行，
+    /// 全程零中间物化——semi 条件直接变行选择喂聚合内核。
+    pub fn ingest_with_sel(
+        &mut self,
+        group: &[PhysExpr],
+        aggs: &[AggExpr],
+        batch: &RecordBatch,
+        sel: &[u32],
+    ) -> Result<()> {
+        if sel.is_empty() {
+            return Ok(());
+        }
+        let group_arrays = eval_group_arrays(group, batch)?;
+        let agg_arrays = eval_agg_arrays(aggs, batch)?;
+        let filters = eval_agg_filters(aggs, batch)?;
+        self.init_cols(group, aggs, &agg_arrays);
+
+        // 全选 + 全局聚合 → 零迭代快路径（O(1) 计数 + SIMD 列和）。
+        // **有 FILTER 就不走**：它一上来对整批做 SIMD 求和，压根没有"逐行筛"这一步。
+        if group.is_empty()
+            && sel.len() == batch.num_rows()
+            && filters.iter().all(|f| f.is_none())
+            && self.try_global_fast(aggs, &agg_arrays, batch.num_rows())?
+        {
+            return Ok(());
+        }
+
+        // 行 → 组 id（仅选中行；group_id 走通用路径——fast 槽表在其内部
+        // 维护，与 ingest 全量路径共用同一张探测表，跨批一致）
+        let mut group_ids: Vec<u32> = Vec::with_capacity(sel.len());
+        {
+            let mut key_buf: Vec<u8> = Vec::with_capacity(64);
+            for &s in sel {
+                encode_key_row(&group_arrays, s as usize, &mut key_buf);
+                let gid = self.group_id(&key_buf, &group_arrays, s as usize);
+                group_ids.push(gid);
+            }
+        }
+        for (ai, agg) in aggs.iter().enumerate() {
+            match &filters[ai] {
+                // 无 FILTER：原路径一字不改（热路径不付任何代价）
+                None => {
+                    self.update_aggs_sel(ai, agg, agg_arrays[ai].as_deref(), &group_ids, sel)?
+                }
+                Some(m) => {
+                    let (s2, g2) = filter_rows(m, sel, &group_ids);
+                    self.update_aggs_sel(ai, agg, agg_arrays[ai].as_deref(), &g2, &s2)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// update_aggs 的选择向量变体（数组取值按 sel 间接；group_ids 与 sel 等长）。
+    fn update_aggs_sel(
+        &mut self,
+        ai: usize,
+        agg: &AggExpr,
+        arr: Option<&dyn Array>,
+        group_ids: &[u32],
+        sel: &[u32],
+    ) -> Result<()> {
+        use crate::expr::AggFunc::*;
+        match agg.func {
+            Count => {
+                let col = &mut self.counts[ai];
+                match arr {
+                    None => {
+                        for &g in group_ids {
+                            col[g as usize] += 1;
+                        }
+                    }
+                    Some(a) => {
+                        for (&s, &g) in sel.iter().zip(group_ids.iter()) {
+                            if !a.is_null(s as usize) {
+                                col[g as usize] += 1;
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Sum | Avg => {
+                let a = arr.ok_or_else(|| {
+                    QsdbError::invalid(format!("{} requires an argument", agg.func.name()))
+                })?;
+                self.update_sum_sel(ai, a, group_ids, sel)
+            }
+            Min | Max => {
+                let a = arr.ok_or_else(|| {
+                    QsdbError::invalid(format!("{} requires an argument", agg.func.name()))
+                })?;
+                self.update_min_max_sel(ai, agg.func == Min, a, group_ids, sel)
+            }
+            Udaf => Ok(()),
+        }
+    }
+
+    /// update_sum 的选择向量变体：零拷贝类型化迭代 + sel 行间接。
+    fn update_sum_sel(
+        &mut self,
+        ai: usize,
+        a: &dyn Array,
+        group_ids: &[u32],
+        sel: &[u32],
+    ) -> Result<()> {
+        let dt = a.data_type().clone();
+        match dt {
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                let cnt = &mut self.counts[ai];
+                let SumCol::Int(acc) = &mut self.sums[ai] else {
+                    return Err(QsdbError::type_err("sum column kind mismatch (internal)"));
+                };
+                let v8 = a.as_any().downcast_ref::<arrow::array::Int8Array>();
+                let v16 = a.as_any().downcast_ref::<arrow::array::Int16Array>();
+                let v32 = a.as_any().downcast_ref::<arrow::array::Int32Array>();
+                let v64 = a.as_any().downcast_ref::<Int64Array>();
+                for (&s, &g) in sel.iter().zip(group_ids.iter()) {
+                    let row = s as usize;
+                    let val = if let Some(x) = v64 {
+                        (!x.is_null(row)).then(|| i128::from(x.value(row)))
+                    } else if let Some(x) = v32 {
+                        (!x.is_null(row)).then(|| i128::from(x.value(row)))
+                    } else if let Some(x) = v16 {
+                        (!x.is_null(row)).then(|| i128::from(x.value(row)))
+                    } else if let Some(x) = v8 {
+                        (!x.is_null(row)).then(|| i128::from(x.value(row)))
+                    } else {
+                        None
+                    };
+                    if let Some(v) = val {
+                        let g = g as usize;
+                        acc[g] += v;
+                        cnt[g] += 1;
+                    }
+                }
+            }
+            DataType::Float64 => {
+                let f = a.as_any().downcast_ref::<Float64Array>().unwrap();
+                let cnt = &mut self.counts[ai];
+                let SumCol::Flt(acc) = &mut self.sums[ai] else {
+                    return Err(QsdbError::type_err("sum column kind mismatch (internal)"));
+                };
+                for (&s, &g) in sel.iter().zip(group_ids.iter()) {
+                    let row = s as usize;
+                    if !f.is_null(row) {
+                        let v = f.value(row);
+                        let g = g as usize;
+                        let sm = &mut acc[g];
+                        let y = v - sm.1;
+                        let t = sm.0 + y;
+                        sm.1 = (t - sm.0) - y;
+                        sm.0 = t;
+                        cnt[g] += 1;
+                    }
+                }
+            }
+            DataType::Decimal128(_, _) => {
+                let d = a.as_any().downcast_ref::<Decimal128Array>().unwrap();
+                let cnt = &mut self.counts[ai];
+                let SumCol::Dec(acc) = &mut self.sums[ai] else {
+                    return Err(QsdbError::type_err("sum column kind mismatch (internal)"));
+                };
+                for (&s, &g) in sel.iter().zip(group_ids.iter()) {
+                    let row = s as usize;
+                    if !d.is_null(row) {
+                        let g = g as usize;
+                        acc[g] += i256::from_i128(d.value(row));
+                        cnt[g] += 1;
+                    }
+                }
+            }
+            other => {
+                return Err(QsdbError::unsupported(format!(
+                    "sum/avg on {other:?} not supported"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// update_min_max 的选择向量变体（typed 快路径同款，行取值按 sel）。
+    fn update_min_max_sel(
+        &mut self,
+        ai: usize,
+        is_min: bool,
+        a: &dyn Array,
+        group_ids: &[u32],
+        sel: &[u32],
+    ) -> Result<()> {
+        use arrow::datatypes::TimeUnit;
+        let col = &mut self.minmax[ai];
+        macro_rules! fast {
+            ($ty:ty, $make:expr) => {{
+                let arr = a.as_any().downcast_ref::<$ty>().unwrap();
+                for (&s, &g) in sel.iter().zip(group_ids.iter()) {
+                    let row = s as usize;
+                    if arr.is_null(row) {
+                        continue;
+                    }
+                    let v = arr.value(row);
+                    let slot = &mut col[g as usize];
+                    match slot {
+                        None => *slot = Some($make(v)),
+                        Some(cur) => {
+                            let cmp = cur.partial_cmp_literal(&$make(v));
+                            if let Ok(Some(o)) = cmp {
+                                let replace = if is_min {
+                                    o == std::cmp::Ordering::Greater
+                                } else {
+                                    o == std::cmp::Ordering::Less
+                                };
+                                if replace {
+                                    *slot = Some($make(v));
+                                }
+                            }
+                        }
+                    }
+                }
+            }};
+        }
+        match a.data_type() {
+            arrow::datatypes::DataType::Int64 => fast!(Int64Array, Literal::Int64),
+            arrow::datatypes::DataType::Float64 => fast!(Float64Array, Literal::Float64),
+            arrow::datatypes::DataType::Date32 => fast!(Date32Array, Literal::Date),
+            arrow::datatypes::DataType::Utf8 => {
+                fast!(StringArray, |v: &str| { Literal::Utf8(v.to_string()) })
+            }
+            arrow::datatypes::DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                fast!(TimestampNanosecondArray, |v: i64| Literal::Timestamp(v))
+            }
+            _ => {
+                return Err(QsdbError::unsupported(format!(
+                    "min/max on {:?} in fused path not supported",
+                    a.data_type()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// 单批摄入：group 表达式求值 → 行分组 → 各聚合更新。
+    pub fn ingest(
+        &mut self,
+        group: &[PhysExpr],
+        aggs: &[AggExpr],
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        let n = batch.num_rows();
+        if n == 0 {
+            return Ok(());
+        }
+        static BATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static ROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static MAXB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static MINB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+        BATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ROWS.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        MAXB.fetch_max(n as u64, std::sync::atomic::Ordering::Relaxed);
+        MINB.fetch_min(n as u64, std::sync::atomic::Ordering::Relaxed);
+        if std::env::var("QSDB_AGG_TIMING").is_ok()
+            && BATCHES.load(std::sync::atomic::Ordering::Relaxed) % 500 == 0
+        {
+            eprintln!(
+                "[agg-timing] batches={} rows={} min={} max={}",
+                BATCHES.load(std::sync::atomic::Ordering::Relaxed),
+                ROWS.load(std::sync::atomic::Ordering::Relaxed),
+                MINB.load(std::sync::atomic::Ordering::Relaxed),
+                MAXB.load(std::sync::atomic::Ordering::Relaxed)
+            );
+        }
+        let group_arrays = eval_group_arrays(group, batch)?;
+        let agg_arrays = eval_agg_arrays(aggs, batch)?;
+        // count-only 的**单 Int64 列**走上表内联槽（键存槽里 ⇒ 不碰 arena，
+        // 实测 5.4×）。注意它与 `fast_slots_inline` **不是同一张表**：那张要求
+        // 逐批无非空才启用，而这里的判定是**类型驱动**的，且 NULL 有专门槽。
+        let count_int = if self.count_only {
+            match group_arrays.as_slice() {
+                [a] if matches!(a.data_type(), DataType::Int64) => {
+                    a.as_any().downcast_ref::<Int64Array>()
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        // 非 count-only 的既有内联快路径（要求逐批全非空）
+        let fast_cols = if self.count_only {
+            None
+        } else {
+            int64_group_columns(&group_arrays)
+        };
+
+        let filters = eval_agg_filters(aggs, batch)?;
+        self.init_cols(group, aggs, &agg_arrays);
+
+        // 全局聚合零迭代快路径（O(1) 计数 + SIMD 列和；形态不中则原路径）。
+        // **有 FILTER 就不走**（同 `ingest_with_sel`）。
+        if group.is_empty()
+            && filters.iter().all(|f| f.is_none())
+            && self.try_global_fast(aggs, &agg_arrays, n)?
+        {
+            return Ok(());
+        }
+
+        // 行 → 组 id
+        // fast path：分组列全为非空 Int64 —— 内联 key 拼接 + 开放寻址表
+        let mut group_ids: Vec<u32> = Vec::with_capacity(n);
+        if let Some(col) = count_int {
+            self.assign_groups_count_only_int(col, &mut group_ids);
+        } else if let Some(cols) = fast_cols {
+            self.assign_groups_fast(&cols, &mut group_ids);
+        } else {
+            let mut key_buf: Vec<u8> = Vec::with_capacity(64);
+            for row in 0..n {
+                encode_key_row(&group_arrays, row, &mut key_buf);
+                let gid = self.group_id(&key_buf, &group_arrays, row);
+                group_ids.push(gid);
+            }
+        }
+        // 各聚合列更新（数组序）
+        if filters.iter().all(|f| f.is_none()) {
+            for (ai, agg) in aggs.iter().enumerate() {
+                self.update_aggs(ai, agg, agg_arrays[ai].as_deref(), &group_ids)?;
+            }
+        } else {
+            // 有 FILTER：**逐聚合**筛行（各自的谓词不同，不能统一预筛）
+            let all: Vec<u32> = (0..n as u32).collect();
+            for (ai, agg) in aggs.iter().enumerate() {
+                match &filters[ai] {
+                    None => self.update_aggs(ai, agg, agg_arrays[ai].as_deref(), &group_ids)?,
+                    Some(m) => {
+                        let (s2, g2) = filter_rows(m, &all, &group_ids);
+                        self.update_aggs_sel(ai, agg, agg_arrays[ai].as_deref(), &g2, &s2)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 单 Int64 键内联槽探测：槽 = (key, gid)，命中判定只比槽内键，
+    /// 无 key_arena 访问、无每行字节缓冲构造。
+    fn assign_groups_fast_inline(&mut self, col: &Int64Array, out: &mut Vec<u32>) {
+        const EMPTY: u32 = u32::MAX;
+        let n = col.len();
+        if self.fast_slots_inline.is_empty() {
+            let mut cap: usize = 16;
+            while cap < (self.len() + n + 1) * 2 {
+                cap <<= 1;
+            }
+            self.fast_slots_inline = vec![(0, EMPTY); cap];
+            // 已有组回填（merge 后继续 ingest 的组键完整性——M4-1 教训）
+            for gid in 0..self.len() {
+                let k = match self.group_lits.first().and_then(|c| c.get(gid)) {
+                    Some(crate::types::Literal::Int64(v)) => *v,
+                    _ => continue,
+                };
+                let h = crate::exec::agg::fxhash_bytes(&k.to_le_bytes()) | 1;
+                Self::insert_slot_inline(&mut self.fast_slots_inline, h, k, gid as u32);
+            }
+        }
+        for row in 0..n {
+            let k = col.value(row);
+            let h = crate::exec::agg::fxhash_bytes(&k.to_le_bytes()) | 1;
+            let mask = self.fast_slots_inline.len() - 1;
+            let mut idx = (h as usize) & mask;
+            loop {
+                let (sk, sg) = self.fast_slots_inline[idx];
+                if sg == EMPTY {
+                    let gid = self.push_group(&k.to_le_bytes(), &[crate::types::Literal::Int64(k)]);
+                    self.fast_slots_inline[idx] = (k, gid);
+                    // 负载因子 0.5（实测 0.75 更慢：探测链变长的代价 > 表变小的收益）
+                    if self.len() * 2 >= self.fast_slots_inline.len() {
+                        let mut cap = self.fast_slots_inline.len() * 2;
+                        while cap < (self.len() + 1) * 2 {
+                            cap <<= 1;
+                        }
+                        let old = std::mem::take(&mut self.fast_slots_inline);
+                        self.fast_slots_inline = vec![(0, EMPTY); cap];
+                        for (ok, og) in old {
+                            if og != EMPTY {
+                                let oh = crate::exec::agg::fxhash_bytes(&ok.to_le_bytes()) | 1;
+                                Self::insert_slot_inline(&mut self.fast_slots_inline, oh, ok, og);
+                            }
+                        }
+                    }
+                    out.push(gid);
+                    break;
+                }
+                if sk == k {
+                    out.push(sg);
+                    break;
+                }
+                idx = (idx + 1) & mask;
+            }
+        }
+    }
+
+    fn insert_slot_inline(slots: &mut [(i64, u32)], h: u64, k: i64, gid: u32) {
+        let mask = slots.len() - 1;
+        let mut idx = (h as usize) & mask;
+        while slots[idx].1 != u32::MAX {
+            idx = (idx + 1) & mask;
+        }
+        slots[idx] = (k, gid);
+    }
+
+    /// Int64 分组列特化：key = 列值序列直接内联，开放寻址探测。
+    ///
+    /// 探测表（fast_slots）是 GroupTable 的持久化字段——跨批存活，
+    /// 否则每批重建会丢失已建组索引导致组键分裂（M4-1 bug）。
+    fn assign_groups_fast(&mut self, cols: &[&Int64Array], out: &mut Vec<u32>) {
+        // 单列 → 内联槽快路径（高基数 group by 的主形态）
+        if cols.len() == 1 {
+            self.assign_groups_fast_inline(cols[0], out);
+            return;
+        }
+        const EMPTY: u32 = u32::MAX;
+        let n = cols.first().map(|c| c.len()).unwrap_or(0);
+        if self.fast_slots.is_empty() {
+            // 初始容量：2×当前组数与合理下限取大（留扩容余量）
+            let mut cap: usize = 16;
+            while cap < (self.len() + n + 1) * 2 {
+                cap <<= 1;
+            }
+            self.fast_slots = vec![(0, EMPTY); cap];
+            // 已有组（如 merge 后继续 ingest）回填索引
+            for gid in 0..self.len() {
+                let h = fxhash_bytes(self.key_of(gid)) | 1;
+                Self::insert_slot(&mut self.fast_slots, h, gid as u32);
+            }
+        }
+        let mut key_bytes: Vec<u8> = Vec::with_capacity(cols.len() * 8);
+
+        for row in 0..n {
+            key_bytes.clear();
+            for c in cols {
+                key_bytes.extend_from_slice(&c.value(row).to_le_bytes());
+            }
+            let h = fxhash_bytes(&key_bytes) | 1;
+            let mut idx = (h as usize) & (self.fast_slots.len() - 1);
+            let gid;
+            loop {
+                let slot = self.fast_slots[idx];
+                if slot.1 == EMPTY {
+                    let lits: Vec<Literal> =
+                        cols.iter().map(|c| Literal::Int64(c.value(row))).collect();
+                    gid = self.push_group(&key_bytes, &lits);
+                    self.fast_slots[idx] = (h, gid);
+                    // 负载因子 >= 50% 扩容重排
+                    if self.len() * 2 >= self.fast_slots.len() {
+                        let mut cap = self.fast_slots.len() * 2;
+                        while cap < (self.len() + 1) * 2 {
+                            cap <<= 1;
+                        }
+                        let old = std::mem::take(&mut self.fast_slots);
+                        self.fast_slots = vec![(0, EMPTY); cap];
+                        for (oh, og) in old {
+                            if og != EMPTY {
+                                Self::insert_slot(&mut self.fast_slots, oh, og);
+                            }
+                        }
+                    }
+                    break;
+                }
+                if slot.0 == h && self.key_of(slot.1 as usize) == key_bytes.as_slice() {
+                    gid = slot.1;
+                    break;
+                }
+                idx = (idx + 1) & (self.fast_slots.len() - 1);
+            }
+            out.push(gid);
+        }
+    }
+
+    #[inline]
+    fn insert_slot(slots: &mut [(u64, u32)], h: u64, gid: u32) {
+        let mask = slots.len() - 1;
+        let mut idx = (h as usize) & mask;
+        while slots[idx].1 != u32::MAX {
+            idx = (idx + 1) & mask;
+        }
+        slots[idx] = (h, gid);
+    }
+
+    /// 往 `by_hash` 的桶里追加一个 gid，并**增量**维护 [`GroupTable::payload_bytes`]。
+    ///
+    /// 见该字段的注释：这一项以前是"每次 `estimated_bytes` 全量重算"，是平方级开销。
+    fn bucket_push(&mut self, h: u64, gid: u32) {
+        use std::collections::hash_map::Entry;
+        // `One` 的首个 gid **不进堆** ⇒ 载荷只在 `Many` 上累加（原实现是
+        // "每组一个 Vec 头"，那正是 perf 里 18.9% 分配器的一部分）。
+        match self.by_hash.entry(h) {
+            Entry::Vacant(e) => {
+                e.insert(Bucket::One(gid));
+            }
+            Entry::Occupied(mut e) => {
+                let added = e.get_mut().push(gid);
+                self.payload_bytes += added;
+            }
+        }
+    }
+
+    fn group_id(&mut self, key: &[u8], arrays: &[ArrayRef], row: usize) -> u32 {
+        let h = fxhash_bytes(key);
+        if let Some(b) = self.by_hash.get(&h) {
+            if let Some(gid) = b.find(|gid| self.key_of(gid as usize) == key) {
+                return gid;
+            }
+        }
+        // 新组（count-only 不建 literal —— 这是该模式省下的主要内存与拷贝）
+        let lits: Vec<Literal> = if self.count_only {
+            Vec::new()
+        } else {
+            arrays
+                .iter()
+                .map(|a| array_value_to_literal(a, row))
+                .collect()
+        };
+        let gid = self.push_group(key, &lits);
+        self.bucket_push(h, gid);
+        gid
+    }
+
+    /// 新建一张**只数组数**的表（[`GroupTable::count_only`]）。
+    pub fn new_count_only() -> Self {
+        Self {
+            count_only: true,
+            ..Self::default()
+        }
+    }
+
+    /// 只按**已经编码好的键字节**建组（不碰 literal、不进内联快路径）。
+    ///
+    /// 给融合计数节点的**溢出重分区**用：把内存里已建的组按同一个键字节口径
+    /// 重新灌进各分区的表。两边必须用同一种编码——所以 count-only 表禁用了
+    /// 内联快路径（见该字段说明）。
+    /// 按 `key_arena` 里的**规范编码**回填内联槽（`insert_raw_key` 灌完之后、
+    /// 或首次用到时）。规范编码是确定的（`[1]+LE8` = 非空 / `[0]` = NULL）
+    /// ⇒ 这条重建是**可逆且无歧义**的。
+    fn rebuild_int_slots(&mut self) {
+        const EMPTY: u32 = u32::MAX;
+        let mut cap: usize = 1024;
+        while cap < (self.len() + 1) * 2 {
+            cap <<= 1;
+        }
+        self.int_slots = vec![(0, EMPTY); cap];
+        self.count_only_null_gid = None;
+        for gid in 0..self.len() {
+            let kb = self.key_of(gid);
+            let k = if kb.len() == 9 && kb[0] == 1 {
+                i64::from_le_bytes(kb[1..9].try_into().unwrap())
+            } else if kb.len() == 1 && kb[0] == 0 {
+                self.count_only_null_gid = Some(gid as u32);
+                continue;
+            } else {
+                // count-only + 单 Int64 分组列 ⇒ 键只可能是上面两种形态。
+                // 走到这里说明建组路径与索引口径对不上了 —— **不能默默跳过**
+                // （少一个槽 = 下次 ingest 重复建组 = 计数变大）。
+                debug_assert!(false, "int 槽表遇到非规范编码的组键（长度 {}）", kb.len());
+                continue;
+            };
+            let h = fxhash_bytes(&k.to_le_bytes()) | 1;
+            Self::insert_slot_inline(&mut self.int_slots, h, k, gid as u32);
+        }
+    }
+
+    /// count-only + **单 Int64 分组列**：密集直索引优先（第十五批），
+    /// 不中或中途坠回 ⇒ 内联槽建组。
+    ///
+    /// 键**存在槽里** ⇒ 命中判定不碰 `key_arena`（实测这条差别 = 5.4×）。
+    /// NULL 走 `count_only_null_gid`；`key_arena` 里一律写**规范编码**，
+    /// 供溢出分区路由与 `insert_raw_key` 用。
+    ///
+    /// ⚠️ 与"走不走必须类型驱动"的旧纪律**不冲突**：dense 改变的只是**索引**，
+    /// 所有组（dense/槽/坠回）都经 `push_group` 建在**同一份规范编码**上
+    /// —— gid 空间唯一，坠回前已 push 的 out 前缀无需修补。
+    fn assign_groups_count_only_int(&mut self, col: &Int64Array, out: &mut Vec<u32>) {
+        // dense 试锚（首批/清空后首次进入）；开关与 CAP 每次进批读一次
+        // env（每批 ~100ns，量级可忽略），不用 OnceLock——进程内测试要能改 CAP。
+        if self.dense.is_none() && !self.dense_dead && std::env::var("QSDB_NO_DENSE_GROUP").is_err()
+        {
+            self.dense_try_anchor(col);
+        }
+        let from = if self.dense.is_some() {
+            self.assign_dense(col, out)
+        } else {
+            0
+        };
+        if from >= col.len() {
+            return;
+        }
+        const EMPTY: u32 = u32::MAX;
+        if self.int_slots.is_empty() {
+            self.rebuild_int_slots();
+        }
+        for row in from..col.len() {
+            // ⚠️ **每次都要重取**：表会在下面这个循环里扩容（`len*2 >= cap`），
+            // 把 mask 提到循环外 ⇒ 扩容后仍按老宽度取模，探测只在**老区间**里走，
+            // 已有键一律找不到 ⇒ 每行都新建组（**静默多数 + 内存雪崩**，
+            // `.14` 上 500 万行直接跑到超时）。`assign_groups_fast_inline`
+            // 也是逐行取的，别"优化"掉。
+            let mask = self.int_slots.len() - 1;
+            if col.is_null(row) {
+                let g = match self.count_only_null_gid {
+                    Some(g) => g,
+                    None => {
+                        let g = self.push_group(&[0u8], &[]);
+                        self.count_only_null_gid = Some(g);
+                        g
+                    }
+                };
+                out.push(g);
+                continue;
+            }
+            let k = col.value(row);
+            let h = fxhash_bytes(&k.to_le_bytes()) | 1;
+            let mut idx = (h as usize) & mask;
+            let gid = loop {
+                let (sk, sg) = self.int_slots[idx];
+                if sg == EMPTY {
+                    let mut kb = [0u8; 9];
+                    kb[0] = 1;
+                    kb[1..].copy_from_slice(&k.to_le_bytes());
+                    let g = self.push_group(&kb, &[]);
+                    self.int_slots[idx] = (k, g);
+                    // 负载因子 >= 50% 扩容重排（与其它槽表同款）
+                    if self.len() * 2 >= self.int_slots.len() {
+                        let mut cap = self.int_slots.len() * 2;
+                        while cap < (self.len() + 1) * 2 {
+                            cap <<= 1;
+                        }
+                        let old = std::mem::take(&mut self.int_slots);
+                        self.int_slots = vec![(0, EMPTY); cap];
+                        for (ok, og) in old {
+                            if og != EMPTY {
+                                let oh = fxhash_bytes(&ok.to_le_bytes()) | 1;
+                                Self::insert_slot_inline(&mut self.int_slots, oh, ok, og);
+                            }
+                        }
+                    }
+                    break g;
+                }
+                if sk == k {
+                    break sg;
+                }
+                idx = (idx + 1) & mask;
+            };
+            out.push(gid);
+        }
+    }
+
+    // ── 密集直索引（第十五批，`整型去重密集直索引设计稿`）──────────
+
+    /// dense 槽容量上界（默认 8M 槽 = 32MB）。每次锚定/增长时读 env——
+    /// 故意不用 OnceLock：进程内测试要能改它。
+    fn dense_cap() -> usize {
+        std::env::var("QSDB_DENSE_GROUP_CAP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&c| c > 0)
+            .unwrap_or(8_000_000)
+    }
+
+    /// 按 `key_arena` 的规范编码回填 dense 槽（锚定与增长重建共用；
+    /// arena 是唯一真相，`key_of` 只可能给出 `[1]+LE8` / `[0]` 两种形态
+    /// —— 与 `rebuild_int_slots` 同一句论证，走不到 else，else 即口径错位）。
+    fn dense_fill_from_arena(&self, slots: &mut [u32], min: i64) {
+        for gid in 0..self.len() {
+            let kb = self.key_of(gid);
+            if kb.len() == 9 && kb[0] == 1 {
+                let k = i64::from_le_bytes(kb[1..9].try_into().unwrap());
+                slots[(k - min) as usize] = gid as u32;
+            } else {
+                debug_assert!(
+                    kb.len() == 1 && kb[0] == 0,
+                    "dense 回填遇到非规范编码的组键（长度 {}）",
+                    kb.len()
+                );
+            }
+        }
+    }
+
+    /// 试锚：用**当前批**的 min/max（表非空时并上 arena 既有键的范围）
+    /// 决定要不要建 dense。span > CAP ⇒ `dense_dead`（span 单调 ⇒ 永不翻案）。
+    /// 批内无非空值 ⇒ 不锚定（纯 NULL 批交给 null 槽），下批再试。
+    ///
+    /// ⚠️ 范围必须**并上 arena**：`insert_raw_key` 灌过键的表（溢出分区形状）
+    /// 首个 ingest 批的值域盖不住既有键 ⇒ 只按批锚定会让回填下标越界。
+    fn dense_try_anchor(&mut self, col: &Int64Array) {
+        let mut lo = i64::MAX;
+        let mut hi = i64::MIN;
+        if col.null_count() == 0 {
+            for &k in col.values() {
+                if k < lo {
+                    lo = k;
+                }
+                if k > hi {
+                    hi = k;
+                }
+            }
+        } else {
+            for row in 0..col.len() {
+                if col.is_null(row) {
+                    continue;
+                }
+                let k = col.value(row);
+                if k < lo {
+                    lo = k;
+                }
+                if k > hi {
+                    hi = k;
+                }
+            }
+        }
+        // arena 既有键（含 NULL 键——顺手把 null 组认领了，见下）
+        if !self.is_empty() {
+            for gid in 0..self.len() {
+                let kb = self.key_of(gid);
+                if kb.len() == 9 && kb[0] == 1 {
+                    let k = i64::from_le_bytes(kb[1..9].try_into().unwrap());
+                    if k < lo {
+                        lo = k;
+                    }
+                    if k > hi {
+                        hi = k;
+                    }
+                } else if kb.len() == 1 && kb[0] == 0 && self.count_only_null_gid.is_none() {
+                    // `insert_raw_key` 灌进来的 NULL 组：不认领的话，下个 NULL 行
+                    // 会再建一个 [0] 组（静默多数）。
+                    self.count_only_null_gid = Some(gid as u32);
+                }
+            }
+        }
+        if lo > hi {
+            return; // 全 NULL（或空批+空表）
+        }
+        let cap = Self::dense_cap();
+        if hi as i128 - lo as i128 + 1 > cap as i128 {
+            self.dense_dead = true;
+            return;
+        }
+        let need = (hi - lo) as usize + 1;
+        let mut slots = vec![DENSE_SLOT_EMPTY; need];
+        if !self.is_empty() {
+            self.dense_fill_from_arena(&mut slots, lo);
+        }
+        self.dense = Some(DenseInt {
+            min: lo,
+            max_seen: hi,
+            slots,
+        });
+    }
+
+    /// dense 行循环。返回**处理到的行号**：== `col.len()` 整批走完；
+    /// < `col.len()` = 中途坠回槽路，调用方从该行续跑（out 前缀已就位，
+    /// gid 空间与槽路同一——见 `assign_groups_count_only_int` 头注释）。
+    fn assign_dense(&mut self, col: &Int64Array, out: &mut Vec<u32>) -> usize {
+        let n = col.len();
+        let mut row = 0usize;
+        while row < n {
+            if col.is_null(row) {
+                let g = match self.count_only_null_gid {
+                    Some(g) => g,
+                    None => {
+                        let g = self.push_group(&[0u8], &[]);
+                        self.count_only_null_gid = Some(g);
+                        g
+                    }
+                };
+                out.push(g);
+                row += 1;
+                continue;
+            }
+            let k = col.value(row);
+            let (in_range, idx) = {
+                let d = self.dense.as_ref().unwrap();
+                let i = k as i128 - d.min as i128;
+                (i >= 0 && i < d.slots.len() as i128, i.max(0) as usize)
+            };
+            if in_range {
+                let hit = self.dense.as_ref().unwrap().slots[idx];
+                if hit != DENSE_SLOT_EMPTY {
+                    out.push(hit);
+                    row += 1;
+                    continue;
+                }
+                // 新组：arena 写规范编码（唯一真相），槽里放 gid
+                let mut kb = [0u8; 9];
+                kb[0] = 1;
+                kb[1..].copy_from_slice(&k.to_le_bytes());
+                let g = self.push_group(&kb, &[]);
+                let d = self.dense.as_mut().unwrap();
+                d.slots[idx] = g;
+                if k > d.max_seen {
+                    d.max_seen = k;
+                }
+                out.push(g);
+            } else if self.dense_grow(k) {
+                continue; // 增长完成，重试本行（每批至多一两次，翻倍摊还）
+            } else {
+                return row; // 坠回：dense 已清、槽表已按 arena 重建
+            }
+            row += 1;
+        }
+        n
+    }
+
+    /// 越界值 `k`：span（并上 `k`）仍 ≤ CAP ⇒ 几何增长重建，返回 true；
+    /// 超 CAP ⇒ 坠回（清 dense、按 arena 重建槽表），返回 false。
+    ///
+    /// span 用 **i128** 算（`i64::MIN..=i64::MAX` 全域 = 2^64，不会回绕）。
+    fn dense_grow(&mut self, k: i64) -> bool {
+        let (old_min, old_max, old_len) = {
+            let d = self.dense.as_ref().unwrap();
+            (d.min, d.max_seen, d.slots.len())
+        };
+        let lo = old_min.min(k);
+        let hi = old_max.max(k);
+        let need = hi as i128 - lo as i128 + 1;
+        let cap = Self::dense_cap();
+        if need > cap as i128 {
+            self.dense = None;
+            self.dense_dead = true;
+            if self.int_slots.is_empty() {
+                self.rebuild_int_slots();
+            }
+            return false;
+        }
+        let new_alloc = (need as usize)
+            .max(old_len.saturating_mul(2))
+            .min(cap.max(1));
+        let mut slots = vec![DENSE_SLOT_EMPTY; new_alloc];
+        self.dense_fill_from_arena(&mut slots, lo);
+        let d = self.dense.as_mut().unwrap();
+        d.min = lo;
+        d.max_seen = hi;
+        d.slots = slots;
+        true
+    }
+
+    pub fn insert_raw_key(&mut self, key: &[u8]) -> u32 {
+        // 原始键是**绕过索引**直接进 `key_arena` 的 ⇒ 内联槽会过期
+        // （同一个键可能已有槽、也可能没有）。清掉即可：下次 `ingest` 会按
+        // arena 的规范编码重建（见 `rebuild_int_slots`）。
+        //
+        // ⚠️ 但**清槽之前**得先确认 `by_hash` 认得全部已有的组 —— 否则上面那句
+        // "清掉即可"是**假的**：`int_slots` 这条路**从不写 `by_hash`**
+        // （新建组只走 `push_group`），而下面那次查找用的正是它 ⇒ 一个**已经存在**
+        // 的键会被**再建一次组**（静默多数）。
+        //
+        // 判据取"有组但 `by_hash` 空"：通用路（`group_id`）新建组必 `bucket_push`，
+        // 所以这只可能是"整表由内联槽喂出来的"。今天所有调用点灌的都是**空白表**
+        // （溢出重分区，见 `DistinctCountExec::drain_partitions`）⇒ 这是给"以后有人
+        // 在非空表上用它"留的守卫，代价在空表上是一次 no-op。
+        // 回归：`exec::agg::tests::insert_raw_key_does_not_duplicate_existing_groups`。
+        if !self.is_empty() && self.by_hash.is_empty() {
+            for gid in 0..self.len() {
+                let h = fxhash_bytes(self.key_of(gid));
+                self.bucket_push(h, gid as u32);
+            }
+        }
+        self.int_slots.clear();
+        self.dense = None;
+        self.count_only_null_gid = None;
+        let h = fxhash_bytes(key);
+        if let Some(b) = self.by_hash.get(&h) {
+            if let Some(gid) = b.find(|gid| self.key_of(gid as usize) == key) {
+                return gid;
+            }
+        }
+        let gid = self.push_group(key, &[]);
+        self.bucket_push(h, gid);
+        gid
+    }
+
+    // ── 融合维表链聚合的种子/直写口（第十四批刀 C，
+    //    `join 发射设计稿`）──────────────────────────
+
+    /// 手工种子建组：键 = **canonical 编码**（`encode_key_row` 口径），返回 gid
+    /// （键已存在 ⇒ 返回既有 gid）。与 [`Self::group_id`] 的"新组"臂走同一条
+    /// `push_group` + `bucket_push`；首次调用按 `kinds`/`sum_types` 初始化列
+    /// 结构（`init_cols` 同款——但不依赖实批：融合路的聚合参数不在种子里）。
+    /// ⚠️ 键编码与 `ingest` 建出来的表必须逐位一致，否则 merge/finalize 分叉
+    /// ——回归钉在 `tests/fused_dim_agg.rs`（种子路 vs ingest 路 finalize 同值）。
+    pub fn seed_group(
+        &mut self,
+        key: &[u8],
+        lits: Vec<Literal>,
+        group_width: usize,
+        kinds: &[crate::expr::AggFunc],
+        sum_types: &[arrow::datatypes::DataType],
+    ) -> u32 {
+        if self.kinds.is_empty() {
+            if self.group_lits.is_empty() && !self.count_only {
+                self.group_lits = vec![Vec::new(); group_width];
+            }
+            self.kinds = kinds.to_vec();
+            for (ai, k) in kinds.iter().enumerate() {
+                use crate::expr::AggFunc::*;
+                match k {
+                    Count | Udaf | Min | Max => {
+                        self.counts.push(Vec::new());
+                        self.sums.push(SumCol::None);
+                        self.minmax.push(Vec::new());
+                    }
+                    Sum | Avg => {
+                        self.counts.push(Vec::new());
+                        self.sums.push(match &sum_types[ai] {
+                            DataType::Int8
+                            | DataType::Int16
+                            | DataType::Int32
+                            | DataType::Int64 => SumCol::Int(Vec::new()),
+                            DataType::Float32 | DataType::Float64 => SumCol::Flt(Vec::new()),
+                            DataType::Decimal128(_, _) => SumCol::Dec(Vec::new()),
+                            _ => SumCol::None,
+                        });
+                        self.minmax.push(Vec::new());
+                    }
+                }
+            }
+        }
+        let h = fxhash_bytes(key);
+        if let Some(b) = self.by_hash.get(&h) {
+            if let Some(gid) = b.find(|gid| self.key_of(gid as usize) == key) {
+                return gid;
+            }
+        }
+        let gid = self.push_group(key, &lits);
+        self.bucket_push(h, gid);
+        gid
+    }
+
+    /// 融合探测的计数直写（口径同 `update_aggs`：count(*) 全行、count(col) 非空）。
+    #[inline]
+    pub fn fused_add_count(&mut self, ai: usize, gid: usize, by: u64) {
+        self.counts[ai][gid] += by;
+    }
+
+    /// 融合探测的整型 sum 直写（i128 累加 + 非空计数，口径同 `update_sum`）。
+    #[inline]
+    pub fn fused_add_sum_int(&mut self, ai: usize, gid: usize, v: i128) {
+        if let SumCol::Int(acc) = &mut self.sums[ai] {
+            acc[gid] += v;
+        }
+        self.counts[ai][gid] += 1;
+    }
+
+    /// 融合探测的 float sum 直写（Kahan 补偿公式逐位同 `update_sum`）。
+    #[inline]
+    pub fn fused_add_sum_f64(&mut self, ai: usize, gid: usize, v: f64) {
+        if let SumCol::Flt(acc) = &mut self.sums[ai] {
+            let s = &mut acc[gid];
+            let y = v - s.1;
+            let t = s.0 + y;
+            s.1 = (t - s.0) - y;
+            s.0 = t;
+        }
+        self.counts[ai][gid] += 1;
+    }
+
+    /// merge 另一张 partial 表（两表结构一致：同 group/aggs 语义）。
+    /// merge 后 fast 索引置空（下次 fast ingest 时按 groups 惰性回填）。
+    /// 空表首并直接整体接管（move，零拷贝）。
+    pub fn merge(&mut self, other: GroupTable, agg_count: usize) {
+        if self.is_empty() {
+            *self = other;
+            self.fast_slots.clear();
+            self.fast_slots_inline.clear();
+            self.dense = None;
+            return;
+        }
+        let other_len = other.len();
+        self.merge_subset(&other, (0..other_len).collect(), agg_count);
+    }
+
+    /// merge 另一张表的指定组子集（并行分区 merge 用：调用方按 hash 把
+    /// shard 组分桶，各桶独立合并）。
+    pub fn merge_subset(&mut self, other: &GroupTable, ogs: Vec<usize>, agg_count: usize) {
+        self.fast_slots.clear();
+        self.fast_slots_inline.clear();
+        // 内联索引（int_slots / dense）都是"键 → 本表 gid"的缓存：merge 进来
+        // 的新组没经过它们的建组路 ⇒ 过期。清掉，下次 assign 按 arena 重建。
+        // （count-only 表今天没人 merge——与 fast_slots 同样的防御线。）
+        self.int_slots.clear();
+        self.count_only_null_gid = None;
+        self.dense = None;
+        // 高基数下本循环是热点（组数 × 分片数）：key/lits 全部缓冲复用，
+        // 免每次跨表合并的两次堆分配（原实现 14M 次 malloc 是主要开销）
+        let mut key_buf: Vec<u8> = Vec::with_capacity(64);
+        let mut lits_buf: Vec<Literal> = Vec::new();
+        for og in ogs {
+            key_buf.clear();
+            key_buf.extend_from_slice(other.key_of(og));
+            let key: &[u8] = &key_buf;
+            let h = fxhash_bytes(key);
+            let gid = match self
+                .by_hash
+                .get(&h)
+                .and_then(|b| b.find(|g| self.key_of(g as usize) == key))
+            {
+                Some(g) => g,
+                None => {
+                    // 列状态种类未初始化（**还没有任何组**）：从 other 继承结构。
+                    //
+                    // 判据是"还没有组"而不是 `kinds.is_empty()`：DISTINCT/无聚合列
+                    // 的表 `kinds` **恒为空**，用它当代理会导致每新增一组就重置一次
+                    // `group_lits` → 组键列表与 `key_off` 长度错位 → 输出时越界
+                    // （实测：DISTINCT 溢出路径 panic "len is 126 but index is 126"）。
+                    if self.key_off.is_empty() {
+                        self.kinds = other.kinds.clone();
+                        self.group_lits = other
+                            .group_lits
+                            .iter()
+                            .map(|c| Vec::with_capacity(c.len()))
+                            .collect();
+                        for (ai, _k) in self.kinds.iter().enumerate() {
+                            self.counts.push(Vec::new());
+                            self.sums.push(match &other.sums[ai] {
+                                SumCol::None => SumCol::None,
+                                SumCol::Int(_) => SumCol::Int(Vec::new()),
+                                SumCol::Flt(_) => SumCol::Flt(Vec::new()),
+                                SumCol::Dec(_) => SumCol::Dec(Vec::new()),
+                            });
+                            self.minmax.push(Vec::new());
+                        }
+                    }
+                    lits_buf.clear();
+                    lits_buf.extend(other.group_lits.iter().map(|c| c[og].clone()));
+                    let gid = self.push_group(key, &lits_buf);
+                    self.bucket_push(h, gid);
+                    gid
+                }
+            };
+            let g = gid as usize;
+            for ai in 0..agg_count {
+                if let (Some(dst), Some(src)) = (self.counts.get_mut(ai), other.counts.get(ai)) {
+                    dst[g] += src[og];
+                }
+                if let (Some(d), Some(s)) = (self.sums.get_mut(ai), other.sums.get(ai)) {
+                    match (d, s) {
+                        (SumCol::Int(d), SumCol::Int(s)) => d[g] += s[og],
+                        (SumCol::Flt(d), SumCol::Flt(s)) => {
+                            let t = d[g].0 + s[og].0;
+                            d[g].1 += s[og].1 - (t - d[g].0 - s[og].0);
+                            d[g].0 = t;
+                        }
+                        (SumCol::Dec(d), SumCol::Dec(s)) => d[g] += s[og],
+                        _ => {}
+                    }
+                }
+                if let (Some(dst), Some(src)) = (self.minmax.get_mut(ai), other.minmax.get(ai)) {
+                    let cur = dst[g].take();
+                    let merged = if self.kinds.get(ai) == Some(&crate::expr::AggFunc::Min) {
+                        combine_min(cur, src[og].clone())
+                    } else {
+                        combine_max(cur, src[og].clone())
+                    };
+                    dst[g] = merged;
+                }
+            }
+        }
+    }
+
+    /// 组 key 的 hash（分区 merge 分桶用）。
+    pub fn group_hash(&self, g: usize) -> u64 {
+        fxhash_bytes(self.key_of(g))
+    }
+
+    /// 各组的分组键 Literal（`[列][组]`）。溢出路由要用它算出"这一组属于哪个分区"。
+    pub fn group_lits(&self) -> &[Vec<Literal>] {
+        &self.group_lits
+    }
+
+    /// partial 分片执行辅助：聚合列数注册（首批前调用；列状态首批 ingest 落地）。
+    pub fn set_arity(&mut self, n: usize) {
+        self.pending_arity = Some(n);
+    }
+
+    pub fn arity(&self) -> usize {
+        self.pending_arity.unwrap_or(0)
+    }
+
+    // `group_keys()` **已删**（2026-10-11）：它把列式的 `group_lits` 转置成
+    // `Vec<Vec<Literal>>`（每组一个 Vec 堆对象 + 一次 Literal 克隆），调用方再转回
+    // 列式——一进一出纯白扔。唯一调用方 `DistinctExec` 改走列式的
+    // [`build_output_batch_cols`]。留着它就是留着一个"顺手拿行式键"的陷阱。
+
+    fn update_aggs(
+        &mut self,
+        ai: usize,
+        agg: &AggExpr,
+        arr: Option<&dyn Array>,
+        group_ids: &[u32],
+    ) -> Result<()> {
+        use crate::expr::AggFunc::*;
+        match agg.func {
+            Count => {
+                let col = &mut self.counts[ai];
+                match arr {
+                    None => {
+                        // COUNT(*)：全部行
+                        for &g in group_ids {
+                            col[g as usize] += 1;
+                        }
+                    }
+                    Some(a) => {
+                        for (row, &g) in group_ids.iter().enumerate() {
+                            if !a.is_null(row) {
+                                col[g as usize] += 1;
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Sum | Avg => {
+                let a = arr.ok_or_else(|| {
+                    QsdbError::invalid(format!("{} requires an argument", agg.func.name()))
+                })?;
+                self.update_sum(ai, a, group_ids)
+            }
+            Min | Max => {
+                let a = arr.ok_or_else(|| {
+                    QsdbError::invalid(format!("{} requires an argument", agg.func.name()))
+                })?;
+                self.update_min_max(ai, agg.func == Min, a, group_ids)
+            }
+            // UDAF 不走 GroupTable 状态路径（UdafAggExec 串行物化分组）
+            Udaf => Ok(()),
+        }
+    }
+
+    fn update_sum(&mut self, ai: usize, a: &dyn Array, group_ids: &[u32]) -> Result<()> {
+        let dt = a.data_type().clone();
+        match dt {
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                // 直接迭代类型化数组（零拷贝；整列拷贝在此上下文实测病理级慢）
+                let cnt = &mut self.counts[ai];
+                let SumCol::Int(acc) = &mut self.sums[ai] else {
+                    return Err(QsdbError::type_err("sum column kind mismatch (internal)"));
+                };
+                let v8 = a.as_any().downcast_ref::<arrow::array::Int8Array>();
+                let v16 = a.as_any().downcast_ref::<arrow::array::Int16Array>();
+                let v32 = a.as_any().downcast_ref::<arrow::array::Int32Array>();
+                let v64 = a.as_any().downcast_ref::<Int64Array>();
+                for (row, &g) in group_ids.iter().enumerate() {
+                    let val = if let Some(x) = v64 {
+                        if x.is_null(row) {
+                            None
+                        } else {
+                            Some(i128::from(x.value(row)))
+                        }
+                    } else if let Some(x) = v32 {
+                        if x.is_null(row) {
+                            None
+                        } else {
+                            Some(i128::from(x.value(row)))
+                        }
+                    } else if let Some(x) = v16 {
+                        if x.is_null(row) {
+                            None
+                        } else {
+                            Some(i128::from(x.value(row)))
+                        }
+                    } else if let Some(x) = v8 {
+                        if x.is_null(row) {
+                            None
+                        } else {
+                            Some(i128::from(x.value(row)))
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(v) = val {
+                        let g = g as usize;
+                        acc[g] += v;
+                        cnt[g] += 1;
+                    }
+                }
+            }
+            DataType::Float64 => {
+                let f = a.as_any().downcast_ref::<Float64Array>().unwrap();
+                let cnt = &mut self.counts[ai];
+                let SumCol::Flt(acc) = &mut self.sums[ai] else {
+                    return Err(QsdbError::type_err("sum column kind mismatch (internal)"));
+                };
+                for (row, &g) in group_ids.iter().enumerate() {
+                    if !f.is_null(row) {
+                        let v = f.value(row);
+                        let g = g as usize;
+                        let s = &mut acc[g];
+                        let y = v - s.1;
+                        let t = s.0 + y;
+                        s.1 = (t - s.0) - y;
+                        s.0 = t;
+                        cnt[g] += 1;
+                    }
+                }
+            }
+            DataType::Decimal128(_, _) => {
+                let d = a.as_any().downcast_ref::<Decimal128Array>().unwrap();
+                let cnt = &mut self.counts[ai];
+                let SumCol::Dec(acc) = &mut self.sums[ai] else {
+                    return Err(QsdbError::type_err("sum column kind mismatch (internal)"));
+                };
+                for (row, &g) in group_ids.iter().enumerate() {
+                    if !d.is_null(row) {
+                        let g = g as usize;
+                        acc[g] += i256::from_i128(d.value(row));
+                        cnt[g] += 1;
+                    }
+                }
+            }
+            other => {
+                return Err(QsdbError::unsupported(format!(
+                    "sum/avg on {other:?} not supported"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn update_min_max(
+        &mut self,
+        ai: usize,
+        is_min: bool,
+        a: &dyn Array,
+        group_ids: &[u32],
+    ) -> Result<()> {
+        use arrow::datatypes::TimeUnit;
+        let col = &mut self.minmax[ai];
+        // typed 快路径：直接以原生值比较，跳过逐行 Literal 构造
+        macro_rules! fast {
+            ($ty:ty, $make:expr) => {{
+                let arr = a.as_any().downcast_ref::<$ty>().unwrap();
+                for (row, &g) in group_ids.iter().enumerate() {
+                    if arr.is_null(row) {
+                        continue;
+                    }
+                    let v = arr.value(row);
+                    let slot = &mut col[g as usize];
+                    match slot {
+                        None => *slot = Some($make(v)),
+                        Some(cur) => match cur {
+                            crate::types::Literal::Null => *slot = Some($make(v)),
+                            _ => match cur.partial_cmp_literal(&$make(v)) {
+                                Ok(Some(o)) => {
+                                    let better = if is_min {
+                                        o == std::cmp::Ordering::Greater
+                                    } else {
+                                        o == std::cmp::Ordering::Less
+                                    };
+                                    if better {
+                                        *slot = Some($make(v));
+                                    }
+                                }
+                                _ => {}
+                            },
+                        },
+                    }
+                }
+                return Ok(());
+            }};
+        }
+        match a.data_type() {
+            DataType::Int64 => fast!(Int64Array, Literal::Int64),
+            DataType::Float64 => fast!(Float64Array, Literal::Float64),
+            DataType::Date32 => fast!(Date32Array, Literal::Date),
+            DataType::Utf8 => fast!(StringArray, |v: &str| Literal::Utf8(v.to_string())),
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                fast!(TimestampNanosecondArray, Literal::Timestamp)
+            }
+            _ => {}
+        }
+        // 通用路径（其余类型）
+        for (row, &g) in group_ids.iter().enumerate() {
+            if a.is_null(row) {
+                continue;
+            }
+            let v = array_value_to_literal(a, row);
+            let cur = col[g as usize].take();
+            col[g as usize] = if is_min {
+                combine_min(cur, Some(v))
+            } else {
+                combine_max(cur, Some(v))
+            };
+        }
+        Ok(())
+    }
+}
+
+/// 全部分组列均为非空 Int64 时返回其值副本（否则 None）。
+/// 空分组列表（无 GROUP BY）返回 None——走通用路径（单一全局组）。
+/// 全部分组列为非空 Int64 时返回数组引用（零拷贝；value(i) 带 offset 语义）。
+fn int64_group_columns(arrays: &[ArrayRef]) -> Option<Vec<&Int64Array>> {
+    if arrays.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(arrays.len());
+    for a in arrays {
+        let arr = a.as_any().downcast_ref::<Int64Array>()?;
+        if arr.null_count() > 0 {
+            return None;
+        }
+        out.push(arr);
+    }
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------
+// finalize
+// ---------------------------------------------------------------------------
+
+/// 组键 + 状态 → 输出批。
+/// **无 `GROUP BY` 且整条输入为空**时的那唯一一行（`count`→0，其余→NULL）。
+///
+/// 分片并行收尾必须用这个函数在**外层补一次**，不能在每个分片里各补一次：
+/// 全局聚合只有一个组，它按 `group_hash` 只落在一个分片上，其余分片是空的——
+/// 各补一行就会拼出 P 行（P = 分片数）。
+pub fn finalize_global_empty(
+    aggs: &[AggExpr],
+    schema: &arrow::datatypes::SchemaRef,
+) -> Result<RecordBatch> {
+    let mut t = GroupTable::new();
+    t.seed_global_group(aggs);
+    finalize_table(&t, aggs, &[], schema)
+}
+
+/// 聚合收尾统一入口：**无 `GROUP BY` 恰好一行**（SQL 契约）。
+///
+/// 空输入时组表里一个组都没有，但无 `GROUP BY` 的聚合仍必须回一行
+/// （`count`→0、`sum`/`avg`/`min`/`max`→NULL）——由 [`finalize_global_empty`]
+/// 补的那个「空组」产出。**所有聚合收尾点都该走这里**，别直接调
+/// [`finalize_table`]：直接调会把"零输入"变成零行、再被调用方当成"没有结果"丢掉。
+pub fn finalize_agg(
+    table: &GroupTable,
+    aggs: &[AggExpr],
+    group: &[PhysExpr],
+    schema: &arrow::datatypes::SchemaRef,
+) -> Result<RecordBatch> {
+    if table.is_empty() && group.is_empty() {
+        return finalize_global_empty(aggs, schema);
+    }
+    finalize_table(table, aggs, group, schema)
+}
+
+/// 分片/分区收尾：`None` = 该片没有输出。
+///
+/// 只判"**有 `GROUP BY`** 且零组"（那才是真·零行，如
+/// `SELECT a, count(*) FROM t WHERE false GROUP BY a`）；无 `GROUP BY` 的
+/// 空输入**不能在这里各补一行**，见 [`finalize_global_empty`]。
+pub fn finalize_or_none(
+    table: &GroupTable,
+    aggs: &[AggExpr],
+    group: &[PhysExpr],
+    schema: &arrow::datatypes::SchemaRef,
+) -> Result<Option<RecordBatch>> {
+    if table.is_empty() {
+        return Ok(None);
+    }
+    finalize_agg(table, aggs, group, schema).map(Some)
+}
+
+pub fn finalize_table(
+    table: &GroupTable,
+    aggs: &[AggExpr],
+    group: &[PhysExpr],
+    schema: &arrow::datatypes::SchemaRef,
+) -> Result<RecordBatch> {
+    let n = table.len();
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(group.len() + aggs.len());
+    // group 列
+    for (gi, g) in group.iter().enumerate() {
+        let lits: Vec<&Literal> = (0..n).map(|gid| &table.group_lits[gi][gid]).collect();
+        cols.push(literals_to_array(&lits, &g.data_type())?);
+    }
+    // agg 列
+    for (ai, agg) in aggs.iter().enumerate() {
+        cols.push(finalize_col(table, ai, agg, n)?);
+    }
+    RecordBatch::try_new(Arc::clone(schema), cols)
+        .map_err(|e| QsdbError::invalid(format!("agg output: {e}")))
+}
+
+/// 单聚合列：SoA 状态 → 输出数组（不做行式 AggState 物化）。
+fn finalize_col(table: &GroupTable, ai: usize, agg: &AggExpr, n: usize) -> Result<ArrayRef> {
+    use crate::expr::AggFunc::*;
+    match agg.func {
+        Udaf => Err(QsdbError::unsupported(
+            "UDAF 走 UdafAggExec 串行物化路径（不应到达 finalize）",
+        )),
+        Count => {
+            let c = &table.counts[ai];
+            let out: Int64Array = c.iter().take(n).map(|v| Some(*v as i64)).collect();
+            Ok(Arc::new(out))
+        }
+        Sum => {
+            // count=0（未见任何非空值）→ NULL（全 NULL 组语义）
+            let cnt = &table.counts[ai];
+            match agg.out_ty {
+                LogicalType::Int64 => {
+                    let SumCol::Int(v) = &table.sums[ai] else {
+                        return Err(QsdbError::type_err("sum column kind mismatch (internal)"));
+                    };
+                    let out: Int64Array = (0..n)
+                        .map(|g| {
+                            if cnt[g] == 0 {
+                                None
+                            } else {
+                                i64::try_from(v[g]).ok()
+                            }
+                        })
+                        .collect();
+                    Ok(Arc::new(out))
+                }
+                LogicalType::Float64 => {
+                    let SumCol::Flt(v) = &table.sums[ai] else {
+                        return Err(QsdbError::type_err("sum column kind mismatch (internal)"));
+                    };
+                    let out: Float64Array = (0..n)
+                        .map(|g| if cnt[g] == 0 { None } else { Some(v[g].0) })
+                        .collect();
+                    Ok(Arc::new(out))
+                }
+                LogicalType::Decimal(m) => {
+                    let SumCol::Dec(v) = &table.sums[ai] else {
+                        return Err(QsdbError::type_err("sum column kind mismatch (internal)"));
+                    };
+                    // ⚠️ **溢出必须报错，不许静默变 NULL**：`i256` 能装 76 位，而输出
+                    //   类型声明的是 `min(p+10, 38)` —— 装不下时 `to_i128()` 回 `None`，
+                    //   直接 collect 成 `Option` 就等于把「求和超范围」说成「这组全空」。
+                    //   两个含义天差地别，而调用方无从分辨（2026-10-17 修）。
+                    let out: Decimal128Array = (0..n)
+                        .map(|g| {
+                            if cnt[g] == 0 {
+                                return Ok(None);
+                            }
+                            v[g].to_i128().map(Some).ok_or_else(|| {
+                                QsdbError::invalid(
+                                    "sum(DECIMAL) 超出 DECIMAL 能表示的范围（38 位十进制）—— \
+                                     结果装不进声明的输出精度。请缩窄精度或分批计算；\
+                                     本仓不做静默截断、也不回 NULL",
+                                )
+                            })
+                        })
+                        .collect::<Result<_>>()?;
+                    Ok(Arc::new(out.with_data_type(DataType::Decimal128(
+                        m.precision,
+                        m.scale,
+                    ))))
+                }
+                _ => Err(QsdbError::type_err("bad sum output type")),
+            }
+        }
+        Avg => match agg.out_ty {
+            LogicalType::Float64 => {
+                let cnt = &table.counts[ai];
+                let out: Float64Array = match &table.sums[ai] {
+                    SumCol::Flt(v) => v
+                        .iter()
+                        .take(n)
+                        .zip(cnt.iter())
+                        .map(|(x, c)| Some(x.0 / *c as f64))
+                        .collect(),
+                    SumCol::Int(v) => v
+                        .iter()
+                        .take(n)
+                        .zip(cnt.iter())
+                        .map(|(x, c)| Some(*x as f64 / *c as f64))
+                        .collect(),
+                    SumCol::Dec(v) => v
+                        .iter()
+                        .take(n)
+                        .zip(cnt.iter())
+                        .map(|(x, c)| Some(x.to_i128().unwrap_or(0) as f64 / *c as f64))
+                        .collect(),
+                    SumCol::None => (0..n).map(|_| None).collect(),
+                };
+                // count = 0 → NULL（空组不产生：组只在见到行时创建，但 merge 后可能）
+                let out: Float64Array = out
+                    .iter()
+                    .zip(cnt.iter())
+                    .map(|(v, c)| if *c == 0 { None } else { v })
+                    .collect();
+                Ok(Arc::new(out))
+            }
+            LogicalType::Decimal(m) => {
+                let cnt = &table.counts[ai];
+                let SumCol::Dec(v) = &table.sums[ai] else {
+                    return Err(QsdbError::type_err("sum column kind mismatch (internal)"));
+                };
+                // HALF_UP(sum / count) 到 avg_result scale
+                let out: Decimal128Array = v
+                    .iter()
+                    .take(n)
+                    .zip(cnt.iter())
+                    .map(|(x, c)| {
+                        if *c == 0 {
+                            return Ok(None);
+                        }
+                        let cnt_v = i256::from_i128(*c as i128);
+                        // ⚠️ **输出 scale 可能 ≠ 输入 scale**（Spark 的 `avg` 规则是 `s+4`）
+                        // ⇒ 把**分母**放大 `10^(s_out - s_in)`，等价于把商放大同样倍数。
+                        //
+                        // 不这么做就是"声明 scale 8、却按 scale 4 除" ⇒ **值小 1 万倍**。
+                        // 2026-10-17 实测：`avg(DECIMAL(18,4))` 回 `0.00301750` 而不是
+                        // `30.1750` —— **不报错、只是数小了**，最坏的一种。
+                        // 旧规则 `max(s,4)` 在被测的 s=4 上恰好等于输入 scale，所以一直蒙对。
+                        let in_scale = match agg.arg.as_ref().map(|a| a.data_type()) {
+                            Some(LogicalType::Decimal(sm)) => sm.scale,
+                            _ => m.scale,
+                        };
+                        let shift = i32::from(m.scale) - i32::from(in_scale);
+                        // 输出 scale **更大** ⇒ 放大**分子**（unscaled = avg × 10^s_out）；
+                        // 更小 ⇒ 放大**分母**（先除、再交给下面按 scale 取整）。
+                        let (num, den) = if shift >= 0 {
+                            (
+                                *x * i256::from_i128(crate::types::decimal::pow10(shift as u32)),
+                                cnt_v,
+                            )
+                        } else {
+                            (
+                                *x,
+                                cnt_v
+                                    * i256::from_i128(crate::types::decimal::pow10(
+                                        (-shift) as u32,
+                                    )),
+                            )
+                        };
+                        let q = num / den;
+                        let rem = num % den;
+                        let two = i256::from_i128(2);
+                        let round_up = rem != i256::from_i128(0)
+                            && rem.wrapping_mul(two).wrapping_abs() >= den;
+                        let adj = if round_up {
+                            if num >= i256::from_i128(0) {
+                                q + i256::from_i128(1)
+                            } else {
+                                q - i256::from_i128(1)
+                            }
+                        } else {
+                            q
+                        };
+                        // 同 sum：**溢出报错，不回 NULL**（2026-10-17 修）
+                        adj.to_i128().map(Some).ok_or_else(|| {
+                            QsdbError::invalid(
+                                "avg(DECIMAL) 超出 DECIMAL 能表示的范围（38 位十进制）—— \
+                                 结果装不进声明的输出精度；本仓不静默截断、也不回 NULL",
+                            )
+                        })
+                    })
+                    .collect::<Result<_>>()?;
+                Ok(Arc::new(out.with_data_type(DataType::Decimal128(
+                    m.precision,
+                    m.scale,
+                ))))
+            }
+            _ => Err(QsdbError::type_err("bad avg output type")),
+        },
+        Min | Max => {
+            let col = &table.minmax[ai];
+            let lits: Vec<&Literal> = (0..n)
+                .map(|g| col[g].as_ref().unwrap_or(&Literal::Null))
+                .collect();
+            let ty = agg
+                .arg
+                .as_ref()
+                .map(|e| e.data_type())
+                .unwrap_or(LogicalType::Int64);
+            literals_to_array(&lits, &ty)
+        }
+    }
+}
+
+/// Literal 列表 → arrow 数组。
+///
+/// **快路径 = 一次遍历的 typed builder**（常见类型）；不认识的类型退回
+/// [`literals_to_array_slow`]。
+///
+/// 为什么要有快路径（2026-10-11 实测）：慢路径是"**每行建一个单元素 Arrow 数组
+/// 再 `interleave` 拼起来**"——n 行 = **n 个数组**，每个自带 `ArrayData` +
+/// buffers + `Arc` 链。`SELECT DISTINCT gs`（250 万字符串组）因此吃满 **4.4GB / 9s**
+/// （组表本身账上只有 449MB），对照 `count(DISTINCT gs)` 的 DuckDB 0.20s/400MB
+/// 差 87×。builder 是 O(n) 一趟、增量扩容，没有逐行的数组对象。
+///
+/// 快路径**只在字面量变体与目标 arrow 类型精确对应时**生效；需要隐式转换
+/// （如 `Int32` → `Int64`、带时区的 timestamp、decimal 精度调整）的一律退回慢路径——
+/// 那里有无条件 cast，语义完全一致。**宁可慢，不许悄悄换语义。**
+pub fn literals_to_array(lits: &[&Literal], ty: &LogicalType) -> Result<ArrayRef> {
+    use arrow::array::{BooleanBuilder, StringBuilder};
+    use arrow::datatypes::{DataType, Int8Type, Int16Type, Int32Type, Int64Type, TimeUnit};
+
+    if lits.is_empty() {
+        return Ok(arrow::array::new_empty_array(&ty.arrow_type()));
+    }
+    let dt = ty.arrow_type();
+
+    /// 数值/时间类共用的 builder 循环：`f` 做不到就是"类型不精确对应" → 退慢路径。
+    fn prim<T, F>(lits: &[&Literal], f: F) -> Option<ArrayRef>
+    where
+        T: arrow::datatypes::ArrowPrimitiveType,
+        F: Fn(&Literal) -> Option<T::Native>,
+    {
+        use arrow::array::PrimitiveBuilder;
+        let mut b = PrimitiveBuilder::<T>::with_capacity(lits.len());
+        for l in lits {
+            match l {
+                Literal::Null => b.append_null(),
+                other => b.append_value(f(other)?),
+            }
+        }
+        Some(std::sync::Arc::new(b.finish()) as ArrayRef)
+    }
+
+    let fast: Option<ArrayRef> = match &dt {
+        DataType::Int64 => prim::<Int64Type, _>(lits, |l| match l {
+            Literal::Int64(v) => Some(*v),
+            _ => None,
+        }),
+        DataType::Int32 => prim::<Int32Type, _>(lits, |l| match l {
+            Literal::Int32(v) => Some(*v),
+            _ => None,
+        }),
+        DataType::Int16 => prim::<Int16Type, _>(lits, |l| match l {
+            Literal::Int16(v) => Some(*v),
+            _ => None,
+        }),
+        DataType::Int8 => prim::<Int8Type, _>(lits, |l| match l {
+            Literal::Int8(v) => Some(*v),
+            _ => None,
+        }),
+        DataType::Float64 => prim::<arrow::datatypes::Float64Type, _>(lits, |l| match l {
+            Literal::Float64(v) => Some(*v),
+            _ => None,
+        }),
+        DataType::Float32 => prim::<arrow::datatypes::Float32Type, _>(lits, |l| match l {
+            Literal::Float32(v) => Some(*v),
+            _ => None,
+        }),
+        DataType::Date32 => prim::<arrow::datatypes::Date32Type, _>(lits, |l| match l {
+            Literal::Date(v) => Some(*v),
+            _ => None,
+        }),
+        // 只在**无时区**时走快路径：带 tz 的目标类型要 cast，交给慢路径。
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => {
+            prim::<arrow::datatypes::TimestampNanosecondType, _>(lits, |l| match l {
+                Literal::Timestamp(v) => Some(*v),
+                _ => None,
+            })
+        }
+        DataType::Boolean => {
+            let mut b = BooleanBuilder::with_capacity(lits.len());
+            let mut ok = true;
+            for l in lits {
+                match l {
+                    Literal::Null => b.append_null(),
+                    Literal::Boolean(v) => b.append_value(*v),
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            ok.then(|| std::sync::Arc::new(b.finish()) as ArrayRef)
+        }
+        DataType::Utf8 => {
+            let bytes: usize = lits
+                .iter()
+                .map(|l| match l {
+                    Literal::Utf8(s) => s.len(),
+                    _ => 0,
+                })
+                .sum();
+            let mut b = StringBuilder::with_capacity(lits.len(), bytes);
+            let mut ok = true;
+            for l in lits {
+                match l {
+                    Literal::Null => b.append_null(),
+                    Literal::Utf8(s) => b.append_value(s),
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            ok.then(|| std::sync::Arc::new(b.finish()) as ArrayRef)
+        }
+        _ => None,
+    };
+    if let Some(a) = fast {
+        return Ok(a);
+    }
+    literals_to_array_slow(lits, ty)
+}
+
+/// 慢路径：每行一个单元素数组 + `interleave`。
+///
+/// **只用于快路径覆盖不到的类型**（decimal / Binary / Interval / Time /
+/// LargeUtf8 / 带时区 ts / 需要隐式 cast 的混合字面量）。它正确但沉重——
+/// 别把它当默认路径用，见 [`literals_to_array`] 的实测数字。
+fn literals_to_array_slow(lits: &[&Literal], ty: &LogicalType) -> Result<ArrayRef> {
+    let dt = ty.arrow_type();
+    let mut one_by_one: Vec<ArrayRef> = Vec::with_capacity(lits.len());
+    for l in lits {
+        let one = match l {
+            Literal::Null => arrow::array::new_null_array(&dt, 1),
+            lit => {
+                let arr = crate::expr::eval::literal_array(lit)?;
+                // 与目标类型一致化（decimal/tz 差异）
+                if arr.data_type() != &dt {
+                    arrow::compute::cast_with_options(
+                        arr.as_ref(),
+                        &dt,
+                        &arrow::compute::CastOptions::default(),
+                    )?
+                } else {
+                    arr
+                }
+            }
+        };
+        one_by_one.push(one);
+    }
+    if one_by_one.is_empty() {
+        return Ok(arrow::array::new_empty_array(&dt));
+    }
+    // interleave 拼接
+    let refs: Vec<&dyn Array> = one_by_one.iter().map(|a| a.as_ref()).collect();
+    let indices: Vec<(usize, usize)> = (0..lits.len()).map(|i| (i, 0)).collect();
+    arrow::compute::interleave(&refs, &indices)
+        .map_err(|e| QsdbError::invalid(format!("interleave literals: {e}")))
+}
+
+/// Distinct 输出（**列式**：直接从组表的 SoA 取键，不做行式转置）。
+///
+/// 早先 `DistinctExec` 走的是 `group_keys()`——把列式的 `group_lits` 转置成
+/// `Vec<Vec<Literal>>`（**每组一个 Vec 堆对象**：250 万组 = 250 万次分配），
+/// 交给 `build_output_batch` 再转回列式。**这一进一出纯属白扔**：
+/// `group_lits` 本来就是列式的（`finalize_table` 里的循环是同款）。
+pub fn build_output_batch_cols(
+    table: &GroupTable,
+    schema: &arrow::datatypes::SchemaRef,
+) -> Result<RecordBatch> {
+    let n = table.len();
+    let ncol = schema.fields().len();
+    // 组键列数必须与 schema 对齐：错位会静默把 A 列的值写进 B 列
+    if ncol != table.group_lits.len() {
+        return Err(QsdbError::invalid(format!(
+            "distinct 输出：schema {} 列 vs 组键 {} 列",
+            ncol,
+            table.group_lits.len()
+        )));
+    }
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(ncol);
+    for (gi, f) in schema.fields().iter().enumerate() {
+        let lits: Vec<&Literal> = (0..n).map(|gid| &table.group_lits[gi][gid]).collect();
+        let ty = LogicalType::try_from_arrow(f.data_type()).unwrap_or(LogicalType::Int64);
+        cols.push(literals_to_array(&lits, &ty)?);
+    }
+    RecordBatch::try_new(Arc::clone(schema), cols)
+        .map_err(|e| QsdbError::invalid(format!("distinct out: {e}")))
+}
+
+// `build_output_batch(keys: &[Vec<Literal>], …)` **已删**（2026-10-11）：行式键的唯一
+// 来源是上面删掉的 `group_keys()`，两个一起走。列式入口见
+// [`build_output_batch_cols`]（`GROUP BY` 侧一直用的是同款列式循环 `finalize_table`）。
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **增量记账必须恒等于全量重算**——它驱动溢出决策，算错就是"该落盘没落盘"。
+    ///
+    /// 背景：`payload_bytes` 是为了干掉 `estimated_bytes` 里的平方级全量遍历
+    /// （250 万组 × 610 批 ≈ 48GB 内存流量）才改的增量维护。
+    /// 这条测试把它钉在"与重算逐字节相等"上。
+    #[test]
+    fn incremental_payload_matches_full_recompute() {
+        use std::sync::Arc;
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("k", arrow::datatypes::DataType::Utf8, true),
+        ]));
+        let ks: Vec<Option<String>> = (0..5000)
+            .map(|i| {
+                if i % 97 == 0 {
+                    None
+                } else {
+                    Some(format!("k-{}", i % 700))
+                }
+            })
+            .collect();
+        let arr = StringArray::from(ks);
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)]).unwrap();
+        let g = vec![PhysExpr::Column {
+            idx: 0,
+            name: "k".into(),
+            ty: LogicalType::Varchar { max_chars: None },
+        }];
+
+        let mut a = GroupTable::default();
+        a.ingest(&g, &[], &batch).unwrap();
+        assert_eq!(a.len(), 701, "700 个 k-* 组 + 1 个 NULL 组");
+        assert_eq!(a.payload_bytes, a.payload_bytes_full(), "单表 ingest 后");
+        // 整条估计值也得自洽（载荷只是其中一项，其余是 O(1) 的 capacity 项）
+        assert!(a.estimated_bytes() >= a.payload_bytes);
+
+        // merge_subset 也往 by_hash 里插 ⇒ 同样要一致
+        let mut b = GroupTable::default();
+        b.ingest(&g, &[], &batch).unwrap();
+        a.merge_subset(&b, (0..b.len()).collect(), 0);
+        assert_eq!(a.payload_bytes, a.payload_bytes_full(), "merge 后");
+
+        // 空表整体接管（`*self = other`）也不许漏
+        let mut c = GroupTable::default();
+        c.merge(b, 0);
+        assert_eq!(c.payload_bytes, c.payload_bytes_full(), "整体接管后");
+    }
+
+    /// ★ `insert_raw_key` **不许把已有的键再建一次组**。
+    ///
+    /// 靶子：内联槽这条路（`int_slots`）**从不写 `by_hash`**，而 `insert_raw_key`
+    /// 的查找用的正是 `by_hash` ⇒ 少了上面那个守卫就会重复建组（**静默多数**）。
+    /// 今天所有调用点灌的都是空白表（溢出重分区），所以它是**防御性**的 ——
+    /// 这条测试让 `insert_raw_key` 文档里那句"清掉即可"从"目前碰巧成立"变成真的。
+    #[test]
+    fn insert_raw_key_does_not_duplicate_existing_groups() {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("k", arrow::datatypes::DataType::Int64, true),
+        ]));
+        let arr = Int64Array::from((0..100i64).collect::<Vec<_>>());
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)]).unwrap();
+        let g = vec![PhysExpr::Column {
+            idx: 0,
+            name: "k".into(),
+            ty: LogicalType::Int64,
+        }];
+        let mut t = GroupTable::new_count_only();
+        t.ingest(&g, &[], &batch).unwrap();
+        assert_eq!(t.len(), 100);
+        // 第十五批起 dense 优先：span 100 ≤ CAP ⇒ 走密集直索引，int_slots 保持空
+        let d = t.dense.as_ref().expect("单 Int64 列应走 dense 直索引");
+        assert_eq!(d.slots.len(), 100, "锚定 span = 批内值域 0..99");
+        assert!(
+            d.slots.iter().all(|&g| g != u32::MAX),
+            "0..99 逐个建组后槽应全满"
+        );
+        assert!(t.int_slots.is_empty(), "dense 与 int_slots 互斥");
+        assert_eq!(t.by_hash.len(), 0, "内联索引这条路不写 by_hash");
+        for gid in 0..t.len() {
+            let kb = t.key_of(gid).to_vec();
+            assert_eq!(
+                t.insert_raw_key(&kb) as usize,
+                gid,
+                "同一个键必须回到同一个 gid"
+            );
+        }
+        assert_eq!(t.len(), 100, "raw 键不该建出新组");
+        assert!(
+            t.dense.is_none(),
+            "insert_raw_key 后 dense 已清（按 arena 再锚定）"
+        );
+    }
+
+    #[test]
+    fn fxhash_basic() {
+        assert_ne!(fxhash_bytes(b"abc"), fxhash_bytes(b"abd"));
+        assert_eq!(fxhash_bytes(b"abc"), fxhash_bytes(b"abc"));
+        // 非 8 倍长
+        assert_ne!(fxhash_bytes(b"abcdefghijklm"), 0);
+    }
+
+    // ── dense 直索引单元测试（第十五批）────────────────────────────
+    // 不碰 env（lib 测试进程内并行线程共享环境变量，CAP 开关的对撞测试
+    // 放 tests/distinct_int_dense.rs 的 SERIAL 锁下）。增长/坠回/重锚定
+    // 全部用**确定的批边界**驱动，不依赖扫描器的分批行为。
+
+    fn int_batch(vals: &[Option<i64>]) -> RecordBatch {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("k", arrow::datatypes::DataType::Int64, true),
+        ]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vals.to_vec()))]).unwrap()
+    }
+
+    fn int_group_expr() -> Vec<PhysExpr> {
+        vec![PhysExpr::Column {
+            idx: 0,
+            name: "k".into(),
+            ty: LogicalType::Int64,
+        }]
+    }
+
+    /// 跨批增长：锚定 → 右扩两次 → 全命中批不再建组。
+    #[test]
+    fn dense_grows_across_batches() {
+        let mut t = GroupTable::new_count_only();
+        let g = int_group_expr();
+        let b1: Vec<Option<i64>> = (0..100).map(Some).collect();
+        t.ingest(&g, &[], &int_batch(&b1)).unwrap();
+        assert!(t.dense.is_some(), "批 1 应锚定 dense");
+        let b2: Vec<Option<i64>> = (1000..1100).map(Some).collect();
+        t.ingest(&g, &[], &int_batch(&b2)).unwrap();
+        let d = t.dense.as_ref().unwrap();
+        assert_eq!(d.min, 0);
+        assert_eq!(d.max_seen, 1099);
+        assert!(
+            (1100..=8_000_000).contains(&d.slots.len()),
+            "增长要盖住 need（具体分配是策略，契约是覆盖 [0, max_seen]）"
+        );
+        let b3: Vec<Option<i64>> = (5000..5100).map(Some).collect();
+        t.ingest(&g, &[], &int_batch(&b3)).unwrap();
+        let d = t.dense.as_ref().unwrap();
+        assert_eq!(d.max_seen, 5099);
+        assert_eq!(t.len(), 300);
+        // 全命中批：值都见过 ⇒ 不建新组
+        t.ingest(&g, &[], &int_batch(&b1)).unwrap();
+        t.ingest(&g, &[], &int_batch(&b3)).unwrap();
+        assert_eq!(t.len(), 300, "命中批不许建新组");
+        assert!(t.dense.is_some());
+    }
+
+    /// i64 端值逼出**中途坠回**：批 2 的 i64::MIN 让 span 变 2^64 ⇒ 超任何 CAP
+    /// ⇒ 清 dense、按 arena 重建槽表、本行起槽路接手；已有组的 gid 不变。
+    #[test]
+    fn dense_falls_back_mid_batch_on_i64_extremes() {
+        let mut t = GroupTable::new_count_only();
+        let g = int_group_expr();
+        let b1: Vec<Option<i64>> = (0..100).map(Some).collect();
+        t.ingest(&g, &[], &int_batch(&b1)).unwrap();
+        assert!(t.dense.is_some());
+        let b2 = vec![Some(i64::MIN), Some(i64::MAX), Some(55), Some(55), None];
+        t.ingest(&g, &[], &int_batch(&b2)).unwrap();
+        assert!(t.dense.is_none(), "坠回后 dense 必须已清");
+        assert!(t.dense_dead);
+        assert!(!t.int_slots.is_empty(), "坠回必须留下可用的槽表");
+        // 0..99（100 组）+ MIN + MAX + NULL = 103；55 重复
+        assert_eq!(t.len(), 103);
+        // 坠回后继续走槽路（dead 永不翻案）
+        let b3 = vec![Some(7), Some(i64::MAX), None];
+        t.ingest(&g, &[], &int_batch(&b3)).unwrap();
+        assert_eq!(t.len(), 103, "dead 后不再建组");
+    }
+
+    /// 锚定期就超 span（批内 MIN..MAX）：dense 不落地，整批槽路。
+    #[test]
+    fn dense_anchor_rejects_huge_span() {
+        let mut t = GroupTable::new_count_only();
+        let g = int_group_expr();
+        let b1 = vec![Some(i64::MIN), Some(0), Some(i64::MAX)];
+        t.ingest(&g, &[], &int_batch(&b1)).unwrap();
+        assert!(t.dense.is_none());
+        assert!(t.dense_dead, "span 单调 ⇒ 锚定超界即永死");
+        assert_eq!(t.len(), 3);
+        let b2 = vec![Some(1), Some(2), Some(3)];
+        t.ingest(&g, &[], &int_batch(&b2)).unwrap();
+        assert_eq!(t.len(), 6);
+        assert!(t.dense_dead);
+    }
+
+    /// `insert_raw_key` 灌过键的表再 ingest（溢出分区形状）：
+    /// 重锚定必须**并上 arena 既有键的范围**（只按批锚会让回填下标越界），
+    /// 且必须**认领** arena 里的 NULL 组（否则下个 NULL 行再建一个 [0] 组）。
+    #[test]
+    fn dense_reanchors_over_arena_union_and_claims_null() {
+        let mut t = GroupTable::new_count_only();
+        let g = int_group_expr();
+        let b1: Vec<Option<i64>> = (0..50).map(Some).collect();
+        t.ingest(&g, &[], &int_batch(&b1)).unwrap();
+        assert_eq!(t.len(), 50);
+        // 灌批外键 60..70 + 一个 NULL 键（规范编码）
+        for k in 60..70i64 {
+            let mut kb = [0u8; 9];
+            kb[0] = 1;
+            kb[1..].copy_from_slice(&k.to_le_bytes());
+            t.insert_raw_key(&kb);
+        }
+        let null_gid = t.insert_raw_key(&[0u8]);
+        assert_eq!(t.len(), 61);
+        assert!(t.dense.is_none(), "insert_raw_key 清 dense");
+        let mut b2: Vec<Option<i64>> = (100..150).map(Some).collect();
+        b2.push(None); // 必须落进被认领的 NULL 组，而不是新建 [0] 组
+        t.ingest(&g, &[], &int_batch(&b2)).unwrap();
+        let d = t.dense.as_ref().expect("批 2 应重锚定");
+        assert_eq!(d.min, 0, "锚点必须并上 arena 的 0..49");
+        assert_eq!(d.max_seen, 149);
+        assert_eq!(t.len(), 111, "50 + 10 + 50 + 1（NULL 组复用，不许 +2）");
+        let ng = t.count_only_null_gid.expect("NULL 组必须被认领");
+        assert_eq!(ng, null_gid, "认领的必须是 insert_raw_key 建的那个组");
+        assert_eq!(t.key_of(ng as usize), &[0u8]);
+    }
+
+    /// 纯 NULL 批先行：不锚定（无可锚值域）也不建错组；值批来了再锚定；
+    /// 后续 NULL 行与先前的 NULL 组必须是**同一个 gid**。
+    #[test]
+    fn dense_all_null_batch_then_values() {
+        let mut t = GroupTable::new_count_only();
+        let g = int_group_expr();
+        let b1 = vec![None, None, None, None, None];
+        t.ingest(&g, &[], &int_batch(&b1)).unwrap();
+        assert!(t.dense.is_none(), "全 NULL 批无可锚值域");
+        assert_eq!(t.len(), 1);
+        let null_gid = t.count_only_null_gid.unwrap();
+        let b2: Vec<Option<i64>> = (10..20).map(Some).collect();
+        t.ingest(&g, &[], &int_batch(&b2)).unwrap();
+        assert!(t.dense.is_some(), "值批应锚定");
+        assert_eq!(t.len(), 11);
+        let b3 = vec![None, Some(15)];
+        t.ingest(&g, &[], &int_batch(&b3)).unwrap();
+        assert_eq!(t.len(), 11, "NULL 与 15 都见过");
+        assert_eq!(t.count_only_null_gid, Some(null_gid), "NULL 组 gid 稳定");
+    }
+}

@@ -1,0 +1,48 @@
+[package]
+name = "qsdb-cli"
+description = "QSDB standalone binary: shell / query / admin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "qsdb"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+qsdb = { workspace = true }
+clap = { workspace = true }
+rustyline = { workspace = true }
+arrow = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+## 多库限定名路由（M-B）：与内核**同一版本**的 sqlparser 做表引用的 AST 级
+## 重写（剥挂载限定符）——版本不同会重序列化出内核解析不了的 SQL
+sqlparser = { workspace = true }
+## 大结果 JSON 逐批流式（十七批 R2）：只需 Stream/TryStream trait 本身——
+## futures-core 已是 tokio-util/axum 的传递依赖，这里只是显式声明，**零新增
+## 代码进树**（守二进制依赖红线；完整的 futures 仍是 flight 可选依赖）
+futures-core = "0.3"
+arrow-flight = { version = "60", optional = true }
+tonic = { version = "0.14", optional = true }
+futures = { version = "0.3", optional = true }
+
+[dev-dependencies]
+## 往返测试用真客户端打真 server（跨实现一致性）。打开 ipc 是为了**连 IPC 通道一起测**
+## ——客户端的 IPC 解码要与内核的编码对死，关着 feature 就等于那条通道没人守。
+qsdb-client = { path = "../qsdb-client", features = ["ipc"] }
+
+[features]
+## Arrow Flight 数据面（gRPC/h2c，独立监听口）。默认关闭守二进制红线。
+flight = ["dep:arrow-flight", "dep:tonic", "dep:futures"]
+## S3 及兼容对象存储只读外表（read_parquet s3://…）。默认关闭守二进制红线。
+s3 = ["qsdb/s3"]
+## HDFS 管理表（hdfs-native 纯 Rust 客户端）。默认关闭守二进制红线。
+hdfs = ["qsdb/hdfs"]
+

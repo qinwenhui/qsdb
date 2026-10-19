@@ -1,0 +1,41 @@
+[package]
+name = "qsdb"
+description = "QSDB core: embeddable columnar analytical read/write store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+parquet = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+postcard = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+fs2 = { workspace = true }
+rayon = { workspace = true }
+# bytes 仅类型引用（parquet ChunkReader::get_bytes 签名；已是 arrow/parquet 传递依赖，不增树）
+bytes = "1"
+sqlparser = { workspace = true }
+object_store = { version = "0.14.2", default-features = false, features = ["aws", "fs"], optional = true }
+tokio = { workspace = true, optional = true }
+futures-util = { version = "0.3", default-features = false, optional = true }
+hdfs-native-object-store = { version = "0.17.0", optional = true, default-features = false }
+async-trait = { version = "0.1", optional = true }
+hdfs-native = { version = "0.14", optional = true, default-features = false }
+sha2 = "0.11.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[features]
+# 远端后端共享机件（Store::Remote + OCC + staging + GC；s3/hdfs 激活）
+remote = ["dep:object_store", "dep:tokio", "dep:futures-util"]
+# S3 及兼容对象存储（外表 read_parquet + 管理表）
+s3 = ["remote"]
+# HDFS 后端（hdfs-native 纯 Rust 客户端 + object_store 适配）
+hdfs = ["remote", "dep:hdfs-native-object-store", "dep:hdfs-native", "dep:async-trait"]
+

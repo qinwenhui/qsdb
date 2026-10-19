@@ -1,0 +1,43 @@
+# Rust
+/target
+**/*.rs.bk
+*.profraw
+coverage/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# AI/agent 工作区（私有，不入库）
+.claude/
+.claudeignore
+
+# OS
+Thumbs.db
+.DS_Store
+
+# 运行时产物
+*.tmp
+*.lock.tmp
+/data/
+
+# 基准/压测产物
+bench_out/
+/results/
+*.sarif
+
+# 环境与密钥（绝不入库）
+.env
+.env.*
+*.pem
+*.key
+*.p12
+
+# 开发工作区：业务脚本/实验产物不新增入库
+# （历史上已跟踪的 work/ 文件保留，公开分支生成脚本会整个排除 work/）
+/work/
+
+# 往轮遗留的临时补丁脚本/日志（不进版本库）
+patch_*.py
+soak_*.log

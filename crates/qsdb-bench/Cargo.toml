@@ -1,0 +1,41 @@
+[package]
+name = "qsdb-bench"
+description = "QSDB macro benchmarks (scan / metadata / write)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "qsdb-bench"
+path = "src/main.rs"
+
+# HTTP 批量写通道实测（生态工具 / ODBC·JDBC 桥走的那条路）
+[[bin]]
+name = "http_bulk"
+path = "src/bin/http_bulk.rs"
+
+# 综合基准套件（导入四路 / 导出 / 分析 SQL / 峰值 RSS / DuckDB 对照）
+[[bin]]
+name = "bench_suite"
+path = "src/bin/bench_suite.rs"
+
+[dependencies]
+qsdb = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true }
+rayon = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_SystemInformation", "Win32_System_Kernel"] }
+
+[features]
+# DuckDB 进程内对比（bundled 编译 C++，首次编译数分钟）
+duckdb = ["dep:duckdb"]
+
+[dependencies.duckdb]
+version = "1.4.5"
+optional = true
+features = ["bundled"]
