@@ -1,0 +1,131 @@
+name: Release
+
+# 推 v* tag 触发；workflow_dispatch 用于演练。
+# 产物：`qsdb` 单二进制（server/shell/query 同体），默认 feature（S3/HDFS 编译开关不进发布件）。
+#
+# Linux 兼容性口径：
+#   *x86_64/aarch64-centos7 —— cargo-zigbuild 按 glibc 2.17（CentOS 7）交叉编译，
+#     在更老的 glibc 上也能跑（上游官方二进制要求 2.23+ 装不上 CentOS 7，这是本仓
+#     自己踩过的坑，发布件不重蹈）。
+#   *musl —— 静态链接，无 glibc 依赖，任何 Linux 发行版开箱即用。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            zig: "2.17"
+            name: linux-x86_64-centos7
+            archive: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            zig: "2.17"
+            name: linux-aarch64-centos7
+            archive: tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            zig: ""
+            name: linux-x86_64-musl
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            zig: ""
+            name: windows-x86_64
+            archive: zip
+          - os: macos-14
+            target: aarch64-apple-darwin
+            zig: ""
+            name: macos-aarch64
+            archive: tar.gz
+          - os: macos-14
+            target: x86_64-apple-darwin
+            zig: ""
+            name: macos-x86_64
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools (musl target)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cargo-zigbuild (centos7 targets; pip 包自带匹配的 zig)
+        if: matrix.zig != ''
+        run: pip install cargo-zigbuild
+
+      # macOS 交叉出两个架构（一台 arm runner 干两个 target，省一个 job）
+      - name: Add cross target (macos-x86_64 on arm runner)
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: rustup target add x86_64-apple-darwin
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.zig }}" ]; then
+            cargo zigbuild --release --target "${{ matrix.target }}.${{ matrix.zig }}" -p qsdb-cli --bin qsdb
+          else
+            cargo build --release --target ${{ matrix.target }} -p qsdb-cli --bin qsdb
+          fi
+          ls -la "target/${{ matrix.target }}/release/" | grep qsdb
+
+      - name: Package (unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          DIR="qsdb-${GITHUB_REF_NAME#v}-${{ matrix.name }}"
+          mkdir -p "$DIR"
+          cp "target/${{ matrix.target }}/release/qsdb" "$DIR/"
+          cp README.md LICENSE "$DIR/"
+          tar czf "qsdb-${GITHUB_REF_NAME#v}-${{ matrix.name }}.tar.gz" "$DIR"
+          sha256sum "qsdb-${GITHUB_REF_NAME#v}-${{ matrix.name }}.tar.gz" > "qsdb-${GITHUB_REF_NAME#v}-${{ matrix.name }}.tar.gz.sha256"
+
+      - name: Package (windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $dir = "qsdb-$($env:GITHUB_REF_NAME.TrimStart('v'))-${{ matrix.name }}"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/qsdb.exe" $dir/
+          Copy-Item README.md, LICENSE $dir/
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          (Get-FileHash "$dir.zip" -Algorithm SHA256).Hash.ToLower() | Out-File "$dir.zip.sha256" -Encoding ascii
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            qsdb-*-${{ matrix.name }}.*
+            qsdb-*-${{ matrix.name }}.*.sha256
+
+  release:
+    name: attach to GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Attach files to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**
+          fail_on_unmatched_files: true
