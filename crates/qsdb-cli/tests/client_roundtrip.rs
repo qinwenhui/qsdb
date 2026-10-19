@@ -1414,3 +1414,31 @@ fn server_elapsed_ms_查询与流式都暴露() {
     assert!(sms >= 0.0, "{sms}");
     while st.next_chunk().unwrap().is_some() {}
 }
+
+/// 流式**中途停止**（Studio 实测反馈：只调 cancel 停不住 10 万行传输）。
+/// 语义：执行段 cancel 有效 / 传输段 = abort/drop 关连接。本测试钉住
+/// abort 后**同一 Client 立即可用**（流独占的连接带 Connection: close，
+/// 不会把"读了一半的 socket"还回池子）。
+#[test]
+fn 流式中途停止_abort后客户端立即可用() {
+    let s = Server::start();
+    let c = s.client();
+    c.execute("CREATE TABLE ab (a BIGINT)").unwrap();
+    c.execute("INSERT INTO ab VALUES (1),(2),(3)").unwrap();
+
+    let mut st = c
+        .query_stream("SELECT a FROM ab", &QueryOptions::default())
+        .unwrap();
+    let first = st.next_chunk().unwrap().expect("至少一块");
+    assert_eq!(first.num_rows(), 3);
+    st.abort(); // 读了一半就停
+
+    // 同一 Client 立刻做别的请求——池没被毒死、服务端也没被半截连接卡住
+    let t = c
+        .query("SELECT count(*) FROM ab")
+        .unwrap()
+        .into_bulk()
+        .unwrap();
+    assert_eq!(t.num_rows(), 1);
+    assert_eq!(t.value(0, 0).unwrap().to_value(), Value::I64(3));
+}

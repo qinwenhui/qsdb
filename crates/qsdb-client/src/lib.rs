@@ -868,6 +868,23 @@ impl Client {
     /// - 返回的 [`RowStream`] **独占一条连接**（该请求带 `Connection: close`）：
     ///   在它被读完或 drop 之前，这个 `Client` 上的其它请求会用另一条连接；
     /// - 大结果**别用 `query` 再转行式**（那会把整份结果搬进内存），用这个。
+    ///
+    /// # 中途停止（两段式，只调 `cancel` 停不住——Studio 实测 10 万行）
+    ///
+    /// 服务端**先执行完、注销查询，才开始传输**——所以大结果的绝大部分
+    /// 时间在传输段，那时 `cancel` 已经 404。停止按钮的完整配方：
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), qsdb_client::Error> {
+    /// # let c = qsdb_client::Client::connect("http://127.0.0.1:9430", qsdb_client::Auth::None)?;
+    /// // 发起时报名 query id（执行段才能被 cancel 命中）
+    /// let opts = qsdb_client::QueryOptions::default().with_query_id("studio-42");
+    /// let mut st = c.query_stream("SELECT * FROM big", &opts)?;
+    /// // ……用户点了停止：
+    /// let _ = c.cancel("studio-42"); // 执行段有效；传输段 404，忽略
+    /// st.abort();                    // 传输段立即生效（关连接）
+    /// # Ok(()) }
+    /// ```
     pub fn query_stream(&self, sql: &str, opts: &QueryOptions) -> Result<RowStream> {
         // 读路径：同 query_with 的 REVOKED 自动重登+重发
         self.read_with_relogin(|c| c.stream_once(sql, opts))

@@ -426,6 +426,36 @@ impl RowStream {
         }
     }
 
+    /// **立即中断**传输（消费 self；等价 `drop(self)`——给"停止"按钮一个
+    /// 可搜的名字）。
+    ///
+    /// 流式查询的停止分**两段**，只调 `cancel` 停不住：
+    ///
+    /// 1. **执行段**（服务端还在跑 SQL）：[`Client::cancel`] 有效——前提是
+    ///    发起时用 `QueryOptions::query_id` 报了名；
+    /// 2. **传输段**（行已经在路上——大结果的绝大部分时间在这段）：查询
+    ///    早已执行完并注销，`cancel` 回 404 **没用**；停 = **关连接** =
+    ///    本方法/drop：socket 立即关闭、客户端当场脱身，服务端下一块写
+    ///    失败自动收尾，零残留。
+    ///
+    /// 正确的停止按钮 = 先 `cancel`（命中执行段；传输段忽略 404）再
+    /// `abort`（命中传输段）。
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), qsdb_client::Error> {
+    /// # let c = qsdb_client::Client::connect("http://127.0.0.1:9430", qsdb_client::Auth::None)?;
+    /// # let (mut s, qid) = (c.query_stream("SELECT 1", &Default::default())?, "q-1");
+    /// // 用户点了停止：
+    /// let _ = c.cancel(qid); // 执行段有效；传输段 404，忽略即可
+    /// s.abort();             // 传输段立即生效
+    /// # Ok(()) }
+    /// ```
+    pub fn abort(self) {
+        // [`crate::http::Body`] 独占连接，drop 即关 socket——这里没有别的
+        // 动作可做；方法存在的意义是把「停止 = 断开」这个协议语义写在
+        // 类型上（Studio 实测：只调 cancel 时 10 万行传输停不住）。
+    }
+
     /// 已读块数。
     pub fn chunks_read(&self) -> u64 {
         self.chunks
