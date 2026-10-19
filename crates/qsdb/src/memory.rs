@@ -161,13 +161,20 @@ impl MemoryPool {
         }
         // 用 KB 而不是 MB：小预算（+小请求）下 MB 会把三个数全抹成 0，
         // 排障时看不出"到底要了多少、还占着多少"（踩过一次）。
+        // 调试态附调用栈：预算类失败的"谁在要钱"几乎只能靠栈定位。
+        let bt = if cfg!(debug_assertions) {
+            format!("\n{}", std::backtrace::Backtrace::force_capture())
+        } else {
+            String::new()
+        };
         Err(QsdbError::MemoryPressure(format!(
-            "memory budget {}KB exhausted: {}KB in use ({}KB cache, {}KB evictable), {}KB requested (retry later)",
+            "memory budget {}KB exhausted: {}KB in use ({}KB cache, {}KB evictable), {}KB requested (retry later){}",
             self.budget / 1024,
             self.exec.load(Ordering::Relaxed) / 1024,
             self.cache.load(Ordering::Relaxed) / 1024,
             self.yieldable_bytes() / 1024,
-            bytes / 1024
+            bytes / 1024,
+            bt
         )))
     }
 

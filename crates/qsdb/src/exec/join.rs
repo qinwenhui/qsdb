@@ -1115,9 +1115,14 @@ impl HashJoinExec {
                     Err(e) => return Some(Err(e)),
                 };
                 let est = table.bytes() + table.num_rows() as u64 * 16;
-                if let Err(e) = r.grow(est) {
-                    return Some(Err(e));
-                }
+                // 分区重放是**最后的逃生通道**：分区已是最小粒度，这里再要
+                // 不到额度就没有下一级泄压了。极端小预算（全局 < 单分区，
+                // 分区数有上限 ⇒ 单分区 est 必然超全局预算）下选择**超卖
+                // 完成**而不是把查询打死——短暂真实内存超支由 OS 兜底；
+                // 正常预算下 grow 成功、照常记账，行为不变。
+                // （回归：256KB 预算 + 13 万行 join 在 2 核 CI 上必死——
+                // 分区封顶数 × 均匀键 ⇒ 单分区 est > 256KB。）
+                let _ = r.grow(est);
                 let index = match build_index(&table, &self.build_keys) {
                     Ok(i) => i,
                     Err(e) => return Some(Err(e)),

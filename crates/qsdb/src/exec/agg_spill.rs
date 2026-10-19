@@ -449,7 +449,13 @@ impl PartSpill {
         self.buf_bytes[p] = 0;
         self.res.shrink(freed);
         let bytes: u64 = out.iter().map(crate::memory::batch_bytes).sum();
-        self.res.grow(bytes)?;
+        // 记账**尽力而为**：批已经从盘上读进内存了，此刻拒绝只会让一个本可
+        // 完成的查询失败（数据已在内存，没有别的出路）——与 for_each_partition
+        // 同一口径。此前这里是 `?`：join 分区重放是逃生通道末端（分区已是最小
+        // 粒度，没有下一级泄压），极端小预算下"单分区 > 全局预算"必然在此死掉
+        // （256KB 预算 + 13 万行 join，2 核 CI 必现）。峰值 = 单分区，由 run
+        // 大小兜底（≤ part_cap + 一批；join 重放的超卖豁免同 join.rs spill_next）。
+        let _ = self.res.grow(bytes);
         self.live = bytes;
         Ok(out)
     }
