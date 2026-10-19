@@ -1,4 +1,4 @@
-//! **`INSERT INTO t (cols) VALUES …` 允许部分列**（2026-10-13 放宽）。
+//! **`INSERT INTO t (cols) VALUES …` 允许部分列**（2026-10-11 放宽）。
 //!
 //! 原契约：VALUES 源的列清单**必须覆盖全部表列**，否则报
 //! `INSERT column list has N entries, table X has M`——理由是"宁可报错，也不要补
@@ -64,7 +64,7 @@ fn partial_column_list_is_null_filled() {
 
     // 注：这里原写 `ORDER BY id NULLS LAST` ——**该子句当时是被静默忽略的**，
     // 只是 ASC 的默认放置恰好就是 NULLS LAST，所以断言才一直成立。
-    // 2026-10-13 起 `NULLS FIRST/LAST` 未实现即显式拒绝（见
+    // 2026-10-11 起 `NULLS FIRST/LAST` 未实现即显式拒绝（见
     // `tests/sql_silent_drop.rs`），故去掉该子句；期望顺序不变（默认即 NULLS LAST）。
     assert_eq!(
         rows(&db, "SELECT id, name, v FROM t ORDER BY id, v"),

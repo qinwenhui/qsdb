@@ -100,8 +100,7 @@ while let Some(chunk) = s.next_chunk()? { /* … */ }
 ```
 
 客户端在手写 HTTP/1.1 之上只依赖 `serde`——**零网络依赖**，除非显式打开
-Arrow IPC（`features = ["ipc"]`）。接入方式怎么选（服务端 vs 嵌入）见
-[`docs/客户端与嵌入方指南.md`](docs/客户端与嵌入方指南.md)。
+Arrow IPC（`features = ["ipc"]`）。
 
 ## 嵌入式 API
 
@@ -127,24 +126,17 @@ for batch in db.scan(Default::default())? { /* RecordBatch 流 */ }
 cargo run -p qsdb-bench --bin bench_suite -- --dir <数据目录> --rows 5000000 --all
 ```
 
-方法论、逐格数字、以及背后的剖析都在
-[`docs/真机基准对账.md`](docs/真机基准对账.md)。我们在那里遵守一条
-简单的纪律：**每个数字只有一个真源，每个回退都有根因，而不是耸肩。**
+方法论、逐格数字、以及背后的剖析都随源码一起维护在工程笔记里。我们遵守
+一条简单的纪律：**每个数字只有一个真源，每个回退都有根因，而不是耸肩。**
 
 ## 文档
 
 | 文档 | 内容 |
 |---|---|
-| [`docs/客户端与嵌入方指南.md`](docs/客户端与嵌入方指南.md) | 客户端 vs 嵌入、传输、性能杠杆 |
-| [`docs/对接契约.md`](docs/对接契约.md) | 完整 HTTP API 契约（端点、头、错误体） |
 | [`docs/error-codes.md`](docs/error-codes.md) | 全部错误码：HTTP 状态、分类、SQLSTATE、gRPC 映射 |
 | [`docs/configuration.md`](docs/configuration.md) | 全量配置项，按生效层级组织 |
 | [`docs/format-spec.md`](docs/format-spec.md) | 磁盘布局与提交协议 |
 | [`docs/bulk-format.md`](docs/bulk-format.md) / [`docs/rows-format.md`](docs/rows-format.md) | 二进制批格式（写路径、流式读） |
-| [`docs/多库访问控制与会话设计.md`](docs/多库访问控制与会话设计.md) | 会话、挂载、库级权限 |
-| [`docs/文件管理面设计.md`](docs/文件管理面设计.md) | 安全浏览/查验/回收存储文件 |
-
-更多设计稿在 `docs/`——每份文档就是对应批次落地的设计记录。
 
 ## 仓库结构
 

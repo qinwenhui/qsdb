@@ -197,7 +197,7 @@ fn insert_values_semantics() {
     // 列序重排
     db.sql("INSERT INTO events (cnt, score, amount, tenant, dt) VALUES (99, 9.9, 1.0000, 'z', DATE '2026-01-06')").unwrap();
     assert!(q(&db, "SELECT tenant FROM events WHERE cnt = 99") == vec!["z"]);
-    // **部分列清单合法**（2026-10-13 起与 SELECT 源一致：未列出的列补 NULL）——
+    // **部分列清单合法**（2026-10-11 起与 SELECT 源一致：未列出的列补 NULL）——
     // 此前这条被写成"必须报错"，它当年之所以"绿"，靠的正是 `reorder_rows`
     // 把 `(dt, tenant)` 误判成恒等映射的那个 bug（见 tests/insert_partial.rs）。
     db.sql("INSERT INTO events (dt, tenant) VALUES (DATE '2026-01-07', 'p')")
@@ -576,7 +576,7 @@ fn parallel_agg_matches_serial() {
 fn error_paths_and_edges() {
     let (db, root) = setup_events("err");
     // 不支持语法明确报错（M7-B4 后：UNION / CREATE VIEW / LIKE 已支持，移出清单；
-    // 2026-10-13 后 INSERT … SELECT 已支持，移出清单——正例见
+    // 2026-10-11 后 INSERT … SELECT 已支持，移出清单——正例见
     // tests/insert_select.rs）
     for sql in [
         "UPDATE events SET cnt = 1",

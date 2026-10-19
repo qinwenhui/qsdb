@@ -1,4 +1,4 @@
-//! 并行扫描互锁回归（2026-10-13 修）。
+//! 并行扫描互锁回归（2026-10-11 修）。
 //!
 //! **症状**：`SELECT k, v FROM p UNION ALL SELECT k, v FROM p` 在多段的表上
 //! **永久挂死**（`qsdb-bench/src/bin/hang_repro.rs` 里那句"UNION ALL … 挂点"

@@ -7,7 +7,7 @@
 //!    `SELECT count(a) FROM t WHERE <不匹配>` 在网线上就是空数组，
 //!    而不是 `0`；`sum`/`avg`/`min`/`max` 同理（应为一行 NULL）。
 //!    根因：`ingest` 对零行批 early-return，组表里一个组都没有。
-//! ② **零行结果仍带一个空批 + 完整 schema**（`对接契约.md` §二 的 schema
+//! ② **零行结果仍带一个空批 + 完整 schema**（`对接契约` §二 的 schema
 //!    协商承诺，`LIMIT 0` 是标准姿势）。此前是零个批，schema 只在
 //!    `SqlResult::Query.schema` 里，逐批消费的调用方拿不到列名。
 //! ③ **聚合参数上的 `DISTINCT` 曾被静默丢弃**：`count(DISTINCT a)` 当成
@@ -90,7 +90,7 @@ fn global_aggregate_over_empty_input_returns_exactly_one_row() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// **② 零行结果 → 一个空批 + 完整 schema**（`对接契约.md` §二）。
+/// **② 零行结果 → 一个空批 + 完整 schema**（`对接契约` §二）。
 #[test]
 fn zero_row_result_carries_one_empty_batch_with_schema() {
     let root = tmp("zero");

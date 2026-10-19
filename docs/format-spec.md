@@ -1,7 +1,7 @@
 # QSDB 磁盘格式规范（v1 冻结）
 
 > 状态：M0 冻结，M1 实现以此为准。任何字段变更必须 bump `version` 并写迁移。
-> 上游设计：`QSDB设计开发文档.md` §6–7。
+> 上游设计：`主设计稿` §6–7。
 
 ## 1. 总览
 
@@ -75,9 +75,9 @@
 - append：锁内 `旧 manifest + 新 segment` → generation+1 → `.tmp` + rename。
 - overwrite：锁内写全新 segments 的新 manifest → rename。**旧数据文件留原地**（延迟回收：
   按 manifest 快照规划的在途扫描在安全期内仍可打开；GC 按「替换 manifest 的 mtime
-  年龄 ≥ 静默期」清理孤儿——qsdb-sync soak 反馈修正，2026-10-12）。
+  年龄 ≥ 静默期」清理孤儿——qsdb-sync soak 反馈修正，2026-10-10）。
 - clear/TRUNCATE：锁内空 manifest 替换，**generation 继承 +1**（单调递增是同步工具
-  的增量判据契约，不回退——qsdb-sync F2 修正，2026-10-12）。
+  的增量判据契约，不回退——qsdb-sync F2 修正，2026-10-10）。
 - manifest rename 即提交点；此前任何中断留下的是可清理的孤儿（`seg_*.parquet` 不被任何 manifest 引用即孤儿）。
 
 ## 5. Parquet 数据文件

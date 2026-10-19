@@ -43,19 +43,9 @@ cp README.md README.zh-CN.md LICENSE Cargo.toml Cargo.lock .gitignore .gitattrib
 cp .github/workflows/*.yml "$STAGE/.github/workflows/"
 
 # docs 白名单（与 tools/internal/RELEASING.md 的清单保持一致）
+# 定案（2026-10-19）：公开面只保留规范/契约 5 份，其余设计稿留在开发分支
 DOCS=(
   configuration.md error-codes.md format-spec.md bulk-format.md rows-format.md
-  参数化查询设计.md 文件管理面设计.md 大结果集分页与截断设计.md
-  SQL支持面.md SQL支持面补齐设计.md 多库访问控制与会话设计.md
-  存储层设计.md 内存预算与溢出设计.md
-  join补全设计.md join字符串键零拷贝设计.md join发射与维表链聚合融合设计.md
-  去重计数性能设计.md 去重分区路v2设计.md 整型去重密集直索引设计.md
-  列裁剪穿透窗口设计.md 列转行与行转列设计.md
-  容量与性能预期.md 真机基准对账.md 分组聚合性能专项方案.md
-  提交事件订阅与湖导出设计.md 主备与qsdb-sync设计.md
-  生态能力契约.md 生态工具全景.md 生态功能补齐.md
-  QSDB设计开发文档.md 结果集列名口径.md 客户端采纳设计.md
-  客户端与嵌入方指南.md 对接契约.md
 )
 for d in "${DOCS[@]}"; do
   if [ ! -f "docs/$d" ]; then

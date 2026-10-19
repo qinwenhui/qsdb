@@ -142,7 +142,7 @@ curl -X POST 'http://host:9430/api/v1/query' -H 'Content-Type: application/json'
 > **JDBC `fetchSize` 的对应实现（十七批 R1 注记）**：驱动拿到 `rows` 响应后
 > **按块增量消费、逐块喂给 `ResultSet.next()`**，不必等整个 body 落地——
 > 这就是 PG/MySQL 驱动 fetch-size 流式在本库的对应物（结果护栏超限时驱动
-> 应改用本通道，见 [对接契约 §3.7](对接契约.md)）。`json` 通道服务端虽已
+> 应改用本通道，见 对接契约 §3.7）。`json` 通道服务端虽已
 > 逐批流式输出（R2），但客户端仍整段收——程序化大结果请走分块通道。
 | 嵌套类型 | 支持 | 暂不支持（显式拒绝） | 暂不支持（显式拒绝） | 不支持 |
 

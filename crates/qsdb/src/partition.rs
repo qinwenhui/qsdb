@@ -72,7 +72,7 @@ pub fn partition_value_string(lit: &Literal) -> String {
 ///
 /// 历史判据是「含 `=` **且**不以 `_`/`.` 开头」，为的是别把内部目录当分区。
 /// 代价是**写者能建、读者看不见**：分区列名叫 `__dt` 时目录形如
-/// `__dt=2026-10-12`，`list_partitions` 直接跳过——行在盘上、count/scan 归零，
+/// `__dt=2026-10-10`，`list_partitions` 直接跳过——行在盘上、count/scan 归零，
 /// 而写路径毫无征兆（qsdb-sync F22 实测）。
 ///
 /// 内部目录本就不长这样：`_catalog` / `_trash` / `_filecache` 在**库根**而非

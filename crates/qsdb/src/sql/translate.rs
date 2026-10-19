@@ -184,7 +184,7 @@ pub type InsertRows = Vec<Vec<Literal>>;
 /// 所以这里反过来做：**枚举"我们不读的字段"，逐个判处置**。
 ///
 /// **维护约定**：新增 SQL 能力时，要么在绑定器里读那个字段，要么在这里拒绝
-/// ——**没有第三条路**。本函数的检查表 = `docs/SQL支持面.md` 的"显式拒绝"列。
+/// ——**没有第三条路**。本函数的检查表 = `内部 SQL 支持面清单` 的"显式拒绝"列。
 /// 例外：**纯建议性**的东西（`optimizer_hints` 这类 hint）忽略掉是正确语义，不列。
 ///
 /// 挂载点是绑定器自己的递归入口（见 `translate_select_inner`），所以**嵌套子查询
@@ -1599,7 +1599,7 @@ pub(crate) fn value_to_literal(v: &sqlparser::ast::Value) -> Result<Literal> {
         // **参数化查询的落点**：`$n` 在这里变成**字面量节点**（不是 SQL 文本）。
         // 放在 `value_to_literal` 而不是 `bind_expr` 里，是为了让**所有**绑定入口
         // 都自动认（`bind_expr` 与 `rebind_over_agg` 那条重绑路径都走这里）。
-        // 值从不进入文本 ⇒ 注入无从谈起（见 `docs/参数化查询设计.md` §七）。
+        // 值从不进入文本 ⇒ 注入无从谈起（见 `参数化查询设计稿` §七）。
         V::Placeholder(p) => {
             let idx = crate::sql::params::placeholder_index(p)?;
             crate::sql::params::lookup(idx)
@@ -1774,7 +1774,7 @@ impl SchemaCtx {
     ///
     /// ⚠️ 只给"这个 ctx 里有没有 X"这类判断用。**解析用户写的列名一律走
     /// [`SchemaCtx::resolve_opt`]** —— 它重名会报错，这条是 F30 的核心
-    /// （见 `docs/结果集列名口径.md` §三）。
+    /// （见 `结果集列名口径` §三）。
     pub fn index_of(&self, name: &str) -> Option<usize> {
         let lower = name.to_ascii_lowercase();
         self.cols
@@ -3466,7 +3466,7 @@ fn proj_item_expr(it: &sqlparser::ast::SelectItem) -> Option<&sqlparser::ast::Ex
 /// （见 `resolve_table_source` / `exec_builder` 的 `add_cte_batches`）。真实语料那 28 个块
 /// 的 `stack` **全部**挂在 CTE 上。`FROM` 是实表/派生表时才会真的算 n 遍。
 ///
-/// 边界一律**显式拒**（见 `docs/列转行与行转列设计.md`）：无两列别名、`stack` 被别的
+/// 边界一律**显式拒**（见 `列转行与行转列设计稿`）：无两列别名、`stack` 被别的
 /// 表达式包住、与聚合/窗口/GROUP BY 混用、`n` 不是正整数字面量、参数个数对不上。
 fn try_rewrite_stack(q: &sqlparser::ast::Query) -> Result<Option<sqlparser::ast::Query>> {
     use sqlparser::ast::*;
@@ -5696,7 +5696,7 @@ fn parse_window_fn(
         // 用 `Option<PhysExpr>` 区分（`None` = `*`）—— 与聚合那边同一套表示。
         // 此前窗口这边**没有** `*` 的表示，于是 `count(*) OVER (…)` 报
         // "needs an argument"（把"没实现"说成"你写错了"），而
-        // `docs/SQL支持面.md` 声称窗口 `count` 可用 —— F29 那一类。
+        // `内部 SQL 支持面清单` 声称窗口 `count` 可用 —— F29 那一类。
         "count" => {
             let arg = match arg_exprs.first() {
                 Some(e) => Some(bind(e)?),
@@ -5802,7 +5802,7 @@ fn expr_display(e: &sqlparser::ast::Expr) -> String {
 
 /// 剥掉表限定：`t.v` ⇒ `v`（**段数不匹配就原样返回**，不猜）。
 ///
-/// F30（`docs/结果集列名口径.md`）：结果集的列名与 PG 对齐 —— **只剥限定符**。
+/// F30（`结果集列名口径`）：结果集的列名与 PG 对齐 —— **只剥限定符**。
 /// 分界线是「**剥掉限定符 ≠ 编造名字**」：
 /// - `t.v` ⇒ `v`：`v` 就是用户写的列名，去掉的只是**消歧用的表限定** —— 该做；
 /// - `count(*)` ⇒ `count`：`count` 用户从没写过 —— **不做**（那正是本仓一路在
@@ -6264,7 +6264,7 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
         // （`Expr::Trim`，不是 `Function`）⇒ `trim(x)` 掉进兜底、报一句泛化的
         // unsupported。而 `expr::scalar` 的注册表里**有** `trim`、模块头也写着它是内置的
         // ⇒ **"文档说 ✅、实测不 ✅"**（本仓第四次栽在同一个形态上；前三次见
-        // `SQL支持面.md` 的 `GROUP BY` 行、F29 两处）。
+        // `内部 SQL 支持面清单` 的 `GROUP BY` 行、F29 两处）。
         //
         // ⚠️ 其余形态（`LEADING`/`TRAILING`、`TRIM(chars FROM x)`、`TRIM(x, chars)`）
         // **显式拒**——绝不许落到"只去空白"的那条路上**假装支持**（那正是本仓
@@ -6461,7 +6461,7 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
         other => {
             let d = format!("{other:?}");
             Err(QsdbError::unsupported(format!(
-                "expression `{}` not supported (list: docs/SQL支持面.md §三)",
+                "expression `{}` not supported",
                 ast_head(&d)
             )))
         }

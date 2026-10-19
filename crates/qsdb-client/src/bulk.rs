@@ -202,7 +202,7 @@ impl BulkTable {
     }
 
     /// 是否零行（**零行结果是合法的**：`LIMIT 0` 会回一个空表 + 完整 schema，
-    /// 见 `docs/对接契约.md` §二之一）。
+    /// 见 `对接契约` §二之一）。
     pub fn is_empty(&self) -> bool {
         self.n_rows == 0
     }

@@ -93,7 +93,7 @@ fn bulk_解码手推字节取值正确() {
 
 #[test]
 fn bulk_零行结果保留完整_schema() {
-    // `LIMIT 0` 的姿势：零行 + 完整 schema（docs/对接契约.md §二之一）
+    // `LIMIT 0` 的姿势：零行 + 完整 schema（对接契约 §二之一）
     let cols = [("a", Column::I64(vec![])), ("b", Column::Utf8(vec![]))];
     let bytes = encode_bulk(&cols).unwrap();
     let t = decode_bulk(bytes).unwrap();

@@ -658,7 +658,7 @@ pub struct SortKey {
     /// `DESC ⇒ NULLS FIRST`，与 PG 一致）。
     ///
     /// **为什么是 Option 而不是 bool**：要区分"没写"与"写了默认值"——前者是
-    /// 未指定语义，后者在更早的版本里曾**被静默忽略**（见 `docs/SQL支持面.md`）。
+    /// 未指定语义，后者在更早的版本里曾**被静默忽略**（见 `内部 SQL 支持面清单`）。
     pub nulls_first: Option<bool>,
 }
 
@@ -1390,7 +1390,7 @@ impl ExecNode for PartitionedDistinctCountExec {
 
 // ---------------------------------------------------------------------------
 // `count(*) over DISTINCT` 的**排序去重**路（v2，第十三批）—— 见
-// `docs/去重分区路v2设计.md`。与 v1（[`PartitionedDistinctCountExec`]）的
+// `去重分区路 v2 设计稿`。与 v1（[`PartitionedDistinctCountExec`]）的
 // 三点结构差异（都来自 .14 的相拆账实测：相 1 顺序 228ms、相 2 并行 420ms）：
 //
 //   1. **条目零拷贝**：相 1 不再"编码 → 拷进分区 arena"，只存
@@ -1873,7 +1873,7 @@ impl ExecNode for HashAggExec {
     }
 }
 
-/// v2 排序去重的**碰撞路径**单元测试（`docs/去重分区路v2设计.md` §三）。
+/// v2 排序去重的**碰撞路径**单元测试（`去重分区路 v2 设计稿` §三）。
 /// 随机数据撞不出 64 位哈希碰撞 ⇒ 伪造同哈希条目，确定性地走到
 /// "同哈希 run 内比真字节"那条分支 —— 这类优化的失败模式是静默少数/多数，
 /// 只看"跑得通"完全看不出来。

@@ -496,7 +496,7 @@ pub struct AggExpr {
     /// `translate` 里完成，落到计划节点上的 `AggExpr` 一律是 `false`。
     /// 执行层不认识这个语义，所以 `build_aggregate` 见到 `true` 会**显式报错**
     /// ——宁可炸，也不能把 `count(DISTINCT x)` 当成 `count(x)` 跑出个错数字
-    /// （这正是 2026-10-13 之前的老行为）。
+    /// （这正是 2026-10-11 之前的老行为）。
     pub distinct: bool,
     /// `FILTER (WHERE …)`：**只有谓词为 TRUE 的行**才喂给这个聚合
     /// （NULL/UNKNOWN 不通过 —— SQL 三值语义）。

@@ -94,8 +94,6 @@ while let Some(chunk) = s.next_chunk()? { /* … */ }
 
 The client is hand-rolled HTTP/1.1 on top of `serde` — **zero network
 dependencies** unless you opt into Arrow IPC (`features = ["ipc"]`).
-See [`docs/客户端与嵌入方指南.md`](docs/客户端与嵌入方指南.md) for the
-embedded-vs-server decision table.
 
 ## Embedded API
 
@@ -123,26 +121,19 @@ dedicated reference machine:
 cargo run -p qsdb-bench --bin bench_suite -- --dir <data-dir> --rows 5000000 --all
 ```
 
-Methodology, per-case numbers, and the profiling behind them are tracked in
-[`docs/真机基准对账.md`](docs/真机基准对账.md). We hold ourselves to a
-simple rule there: **every number has exactly one source of truth, and every
-regression gets a root cause, not a shrug.**
+Methodology, per-case numbers, and the profiling behind them live in the
+engineering notes kept alongside the source. We hold ourselves to a simple
+rule: **every number has exactly one source of truth, and every regression
+gets a root cause, not a shrug.**
 
 ## Documentation
 
 | Doc | What it covers |
 |---|---|
-| [`docs/客户端与嵌入方指南.md`](docs/客户端与嵌入方指南.md) | Client vs embedded, transport, performance levers |
-| [`docs/对接契约.md`](docs/对接契约.md) | Full HTTP API contract (endpoints, headers, error bodies) |
 | [`docs/error-codes.md`](docs/error-codes.md) | Every error code: HTTP status, category, SQLSTATE, gRPC mapping |
 | [`docs/configuration.md`](docs/configuration.md) | All configuration knobs, by effect level |
 | [`docs/format-spec.md`](docs/format-spec.md) | On-disk layout & commit protocol |
 | [`docs/bulk-format.md`](docs/bulk-format.md) / [`docs/rows-format.md`](docs/rows-format.md) | Binary batch formats (write path, streaming reads) |
-| [`docs/多库访问控制与会话设计.md`](docs/多库访问控制与会话设计.md) | Sessions, mounts, per-database grants |
-| [`docs/文件管理面设计.md`](docs/文件管理面设计.md) | Browse/inspect/trash storage files safely |
-
-More design notes live in `docs/` — each document is the design of record for
-the batch that shipped it.
 
 ## Repository layout
 

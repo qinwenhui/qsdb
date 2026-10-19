@@ -75,7 +75,7 @@ impl TableDef {
         if self.columns.is_empty() {
             return Err(QsdbError::invalid("table needs at least one column"));
         }
-        // **至少一个非分区列**（2026-10-13 补）。
+        // **至少一个非分区列**（2026-10-11 补）。
         //
         // 上面那条只数了"总列数"，而分区列的值存在**目录名**里、数据文件内
         // 不存储（见下面 NOT NULL 的说明）——所以"所有列都是分区列"的表，

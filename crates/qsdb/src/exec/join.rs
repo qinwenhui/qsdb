@@ -412,7 +412,7 @@ struct BuildState {
 }
 
 /// 键 → build 行号列表。单整数键（Int/Date/Boolean/Timestamp）用 i64 直查；
-/// 单 UTF8 键用**零拷贝**字符串索引（`docs/join字符串键零拷贝设计.md`）。
+/// 单 UTF8 键用**零拷贝**字符串索引（`join 字符串键零拷贝设计稿`）。
 pub(crate) enum HashIndex {
     /// 值用 [`SmallRows`]（首个行号内联）：一一 join（绝大多数）**零分配、
     /// 一次指针追逐** —— 此前 `Vec<u32>` 每键一个堆分配，probe 每次 get
@@ -449,7 +449,7 @@ impl HashIndex {
             )
     }
 
-    /// 单 UTF8 键判定（`docs/join字符串键零拷贝设计.md`）。
+    /// 单 UTF8 键判定（`join 字符串键零拷贝设计稿`）。
     fn str_ok(keys: &[PhysExpr]) -> bool {
         keys.len() == 1
             && matches!(
@@ -1576,7 +1576,7 @@ pub(crate) struct RowIndex {
     by_hash: std::collections::HashMap<u64, KeySlot, BuildByteHasher>,
 }
 
-/// 单列 UTF8 join 键的**零拷贝**索引（`docs/join字符串键零拷贝设计.md`）。
+/// 单列 UTF8 join 键的**零拷贝**索引（`join 字符串键零拷贝设计稿`）。
 ///
 /// 建侧**不复制键字节**：保住 build 批的 `StringArray`，索引只存
 /// 「字节哈希 → 建侧全局行号」。probe 命中后与建侧箭头缓冲**原地比字节**

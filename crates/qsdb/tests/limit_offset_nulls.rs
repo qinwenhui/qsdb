@@ -1,7 +1,7 @@
 //! `OFFSET` / `FETCH FIRST` / `NULLS FIRST|LAST` 的**语义回归**。
 //!
 //! 三者此前都是**静默丢弃**（`LIMIT 10 OFFSET 20` 少翻页、`NULLS FIRST` 恒用默认…
-//! 见 `docs/SQL支持面.md`），后改为显式拒绝，2026-10-13 实现。
+//! 见 `内部 SQL 支持面清单`），后改为显式拒绝，2026-10-13 实现。
 //! 本文件钉住**实现是对的**——尤其：
 //! - `OFFSET` 要能**跨批**跳过（不是只在第一批里切）；
 //! - `ORDER BY … LIMIT n OFFSET m` 走 TopN 快路径时，上界必须是 `n+m` 且仍要跳 m

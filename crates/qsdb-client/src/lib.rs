@@ -91,7 +91,7 @@
 //! 撞 `RESULT_TOO_LARGE` → 加 `LIMIT`、换流式通道，或
 //! [`QueryOptions::max_rows`] 本请求覆盖（`0` = 不限）。
 //!
-//! ## 传输加密：**不手搓**（见 `docs/客户端与嵌入方指南.md` §四）
+//! ## 传输加密：**不手搓**（见 `客户端指南` §四）
 //!
 //! 默认明文直连（内网的标准答案）。要加密：**前面挂 TLS 终止代理**
 //! （nginx/haproxy），别自己写"服务端加密 / 客户端解密"——那是
@@ -99,7 +99,7 @@
 //!
 //! ## 幂等性（写路径的硬约束）
 //!
-//! `append` **非幂等**（`docs/对接契约.md` §四.4）：重试可能重复入段。
+//! `append` **非幂等**（`对接契约` §四.4）：重试可能重复入段。
 //! 所以本客户端的透明重发**只在"一个字节都没写出去"时**发生
 //! （那意味着服务端根本没收到请求）；`SESSION_REVOKED` 的写路径也**只重登
 //! 不重发**（认证闸在执行前 ⇒ 语句从未运行，但重试仍交调用方显式做）。
@@ -260,7 +260,7 @@ pub struct QueryOptions {
     /// 所以**以响应回显为准**（[`JsonResult::query_id`] / [`ResultSet::query_id`]），
     /// 别拿你发出去的值去取消。
     pub query_id: Option<String>,
-    /// **参数化查询**的值（`docs/参数化查询设计.md`）。
+    /// **参数化查询**的值（`参数化查询设计稿`）。
     ///
     /// 服务端在**内核绑定器**里把它们变成 AST 字面量 —— **值从不进入 SQL 文本**，
     /// 所以这里不需要、也**不该**有"转义助手"。
@@ -1094,7 +1094,7 @@ impl Client {
         json::parse_schema(&self.get_json(&p)?)
     }
 
-    /// 一张表的分区（`generation` 是同步增量判据，见 `docs/对接契约.md` §一.3）。
+    /// 一张表的分区（`generation` 是同步增量判据，见 `对接契约` §一.3）。
     pub fn partitions(&self, table: &str) -> Result<Vec<PartitionInfo>> {
         let p = format!("/api/v1/tables/{}/partitions", http::percent_encode(table));
         json::parse_partitions(&self.get_json(&p)?)
@@ -1505,7 +1505,7 @@ fn parse_url(url: &str) -> Result<(String, u16)> {
     } else if url.starts_with("https://") || url.starts_with("qsdbs://") {
         return Err(Error::Usage(format!(
             "{url}: 本客户端不做 TLS。内网直连请用 qsdb://（或 http://）；要加密请在库前面挂 TLS 终止代理\
-             （见 docs/客户端与嵌入方指南.md §四）"
+             （见 客户端指南 §四）"
         )));
     } else {
         return Err(Error::Usage(format!(

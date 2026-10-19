@@ -271,7 +271,7 @@ fn not_in_null_semantics() {
     let (db, root) = setup_semi("notin-null");
     // build 含 NULL → NOT IN 恒空（SQL 三值）。空输入的无 GROUP BY 聚合
     // **恰好一行、值为 0**——此前返回零行，本用例按现状断言并把"单行化"
-    // 记为后置项；2026-10-13 已实现（`exec::agg::finalize_agg` 补"空组"），
+    // 记为后置项；2026-10-11 已实现（`exec::agg::finalize_agg` 补"空组"），
     // 故这里改为断言正确语义。
     db.sql("INSERT INTO dims VALUES (NULL, 'nil')").unwrap();
     let r = q(

@@ -1,6 +1,6 @@
 # SQL 支持面（对外声明 · 可执行）
 
-> 版本：v1（2026-10-13）——起因是一次**系统扫描**：绑定器是「逐字段读」的，
+> 版本：v1（2026-10-11）——起因是一次**系统扫描**：绑定器是「逐字段读」的，
 > AST 里**没读的字段默认被忽略**，于是"语法合法但没实现"的子句会**安静地按没写执行**。
 > 这类 bug 不报错、不打日志，只能靠人撞见（`count(DISTINCT)` 那条就是手滑撞见的）。
 >
@@ -61,7 +61,7 @@
 | `ORDER BY ALL` / `ORDER BY … USING` | ✋ / ⛔ | |
 | `TOP n`（SQL Server 形） | ✋ | 用 `LIMIT` |
 | `LIMIT n` | ✅ | |
-| `OFFSET n`（含 `LIMIT n OFFSET m`、`LIMIT n, m`、`OFFSET n ROWS`） | ✅ | 此前**静默丢掉 offset** ⇒ 少翻页，2026-10-13 实现 |
+| `OFFSET n`（含 `LIMIT n OFFSET m`、`LIMIT n, m`、`OFFSET n ROWS`） | ✅ | 此前**静默丢掉 offset** ⇒ 少翻页，2026-10-11 实现 |
 | `FETCH FIRST n ROWS ONLY` | ✅ | 等价 `LIMIT n` |
 | `FETCH FIRST … PERCENT ROWS` / `… WITH TIES` | ✋ | **语义与 LIMIT 不同**（按比例 / 含并列），故不实现即拒绝——绝不当 LIMIT 执行 |
 | `QUALIFY` / `PREWHERE` / `CLUSTER BY` / `DISTRIBUTE BY` / `SORT BY` | ✋ | |
@@ -194,7 +194,7 @@
    （正例），防止"一刀切"把正常查询也拒了。
 3. **别信"没人会这么写"**：这份清单里 **12 条**静默丢弃中，有 **5 条是常见写法**
    （`FILTER`、窗口帧、`OFFSET`、`NULLS FIRST`、`ON CONFLICT`）——其中 3 条
-   （`OFFSET`/`FETCH`/`NULLS`）在 2026-10-13 已从"拒"实现为"能"。
+   （`OFFSET`/`FETCH`/`NULLS`）在 2026-10-11 已从"拒"实现为"能"。
 4. **顺手挖到的真实踩坑**：`SELECT * FROM t EXCLUDE (b)` 会被解析成「表别名
    `exclude` + 列清单 `(b)`」⇒ **静默拿到全列**（Snowflake 用户会中招）。同类
    写法 `FROM t AS x(a,b)` 一并拦。

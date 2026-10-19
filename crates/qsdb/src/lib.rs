@@ -1,6 +1,6 @@
 //! QSDB 核心库：单机、嵌入式、列式、Arrow-native、Parquet-backed 的分析型读写库。
 //!
-//! 里程碑路线（见 `docs/QSDB设计开发文档.md` §14）：
+//! 里程碑路线（见 `主设计稿` §14）：
 //! - M0：类型系统 ✓
 //! - M1：表格式 + 提交协议 + 裁剪扫描 + 嵌入式 API（当前）
 //! - M2：向量化执行 + SQL-0/1
@@ -61,7 +61,7 @@ pub use memory::{MemoryPool, Reservation};
 //
 // 本组列出的是**格式契约的一部分**：与 `docs/format-spec.md` 同源冻结，变更走
 // format-spec 的流程（追加式 / 版本号），**不是普通 pub 项的"可能随版本变化"**。
-// 未列出的 pub 项仍按 `docs/对接契约.md` 开头的原则——内部实现，不通知不迁移。
+// 未列出的 pub 项仍按 `对接契约` 开头的原则——内部实现，不通知不迁移。
 pub use index::{INDEX_FILE, INDEX_LOCK, PartitionsIndex};
 pub use manifest::MANIFEST_FILE;
 pub use partition::{

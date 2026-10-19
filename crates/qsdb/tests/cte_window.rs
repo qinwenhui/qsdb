@@ -86,7 +86,7 @@ fn basic_cte() {
 #[test]
 fn cte_dead_and_shadow() {
     let (db, root) = setup("cte2");
-    // 注意：**分区表必须至少有一个非分区列**（2026-10-13 起 DDL 层拒绝
+    // 注意：**分区表必须至少有一个非分区列**（2026-10-11 起 DDL 层拒绝
     // "所有列都是分区列"——那会产出零列数据文件，见 `catalog::validate`）。
     // 本用例不关心分区语义，加一列数据列即可。
     db.sql("CREATE TABLE t (a BIGINT, v BIGINT) PARTITIONED BY (a)")

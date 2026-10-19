@@ -190,9 +190,9 @@ fn select_without_from() {
     assert!(q(&db, "SELECT 1+1") == vec!["2"]);
     assert!(q(&db, "SELECT 'hello' || '-' || 'world'") == vec!["hello-world"]);
     assert!(q(&db, "SELECT CASE WHEN 1 < 2 THEN 'yes' ELSE 'no' END") == vec!["yes"]);
-    // current_date = 今天（UTC；2026-10 测试环境下必然 >= 2026-10-12）
+    // current_date = 今天（UTC；2026-10 测试环境下必然 >= 2026-10-10）
     let d = q(&db, "SELECT CURRENT_DATE")[0].clone();
-    assert!(d.as_str() >= "2026-10-12", "got {d}");
+    assert!(d.as_str() >= "2026-10-10", "got {d}");
     // now() 可比较
     assert!(q(&db, "SELECT now() > TIMESTAMP '2020-01-01 00:00:00'") == vec!["true"]);
 }

@@ -32,7 +32,7 @@ pub enum Durability {
     ProcessCrash,
     /// **掉电安全**：segment / 元数据 / staging 文件均在 rename 前 fsync
     /// （POSIX 另加目录 sync）。代价 = 每段一次强制落盘（损耗实测见
-    /// docs/QSDB设计开发文档.md 耐久性专项）。
+    /// 主设计稿 耐久性专项）。
     PowerLoss,
 }
 
@@ -73,7 +73,7 @@ pub struct QsdbOptions {
     /// 热数据缓存预算（字节）：segment 级**解码后**的 Arrow 批 LRU 缓存。
     /// `0` = 关闭；默认 **256MB**（保守值，守低占用定位）。
     ///
-    /// **权衡（2026-10-12 实测，10M × 4 列）**：
+    /// **权衡（2026-10-10 实测，10M × 4 列）**：
     /// - 256MB：缓存上界 `budget/8 = 32MB` **卡在分片片段（32~64MB）边缘**
     ///   → 16 分片只进 11 个 → **付了缓存成本却几乎不命中**（0.18s，比关缓存
     ///   的 0.14s 还慢）；但查询期工作集仅 **15~17MB**。
@@ -92,7 +92,7 @@ pub struct QsdbOptions {
     /// 但它不是与"每次现解码"的引擎（如 DuckDB `read_parquet`）可直接比较的
     /// 口径。对外性能声明必须显式标注是否启用（`crates/qsdb-bench/src/bin/
     /// fair_vs.rs` 的权威口径为 `scan_cache_bytes = 0` 冷读 + 分进程独立测量；
-    /// 详见 `docs/QSDB设计开发文档.md` 性能口径一节）。
+    /// 详见 `主设计稿` 性能口径一节）。
     pub scan_cache_bytes: usize,
     /// 默认查询超时（毫秒）；None/0 = 不超时
     pub query_timeout_ms: Option<u64>,
@@ -119,7 +119,7 @@ pub struct QsdbOptions {
     ///
     /// **库默认不限**（嵌入方自控）；`qsdb server` 兜底 **4GB**
     /// （`--memory-budget-mb`）。只约束**记账到的**内存：物化算子 + 解码缓存；
-    /// 流式在途批的残留上界见 `docs/内存预算与溢出设计.md` §七。
+    /// 流式在途批的残留上界见 `内存预算与溢出设计稿` §七。
     pub memory_budget_bytes: Option<u64>,
     /// **溢出目录根**（`None` = 系统临时目录）。
     ///
@@ -1123,7 +1123,7 @@ impl Qsdb {
 
     /// 带**参数** + 角色 + 上下文执行（server 的 `/query` 走这条）。
     ///
-    /// 参数见 `docs/参数化查询设计.md`：值在绑定期变成 AST 字面量，**从不进入
+    /// 参数见 `参数化查询设计稿`：值在绑定期变成 AST 字面量，**从不进入
     /// SQL 文本**（注入无从谈起）。
     pub fn sql_with_role_and_params_context(
         &self,
@@ -1630,7 +1630,7 @@ impl Qsdb {
     /// 分区统计（qsdb-sync 轮询契约）：每分区 (名, generation, 行数, 段数)。
     /// 优先读表级索引 `partitions.idx`（单文件快路径，万级分区 <50ms）；
     /// 缺失/损坏回退 list + 逐分区 manifest。generation 单调——同步工具
-    /// 以此判断增量，见 docs/主备与qsdb-sync设计.md §3.2。
+    /// 以此判断增量，见 主备与同步设计稿 §3.2。
     pub fn partition_stats(&self, table: &str) -> Result<Vec<PartitionStat>> {
         let def = self.def(None, table)?;
         let tdir = table_dir(self.store.root(), DEFAULT_DB, table);
@@ -1910,13 +1910,13 @@ mod tests {
         let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
         db.sql("CREATE TABLE t (__dt DATE, v BIGINT) PARTITIONED BY (__dt)")
             .unwrap();
-        db.sql("INSERT INTO t VALUES ('2026-10-12', 1), ('2026-10-12', 2)")
+        db.sql("INSERT INTO t VALUES ('2026-10-10', 1), ('2026-10-10', 2)")
             .unwrap();
 
         // ① 元数据面可见
         let parts = db.partition_stats("t").unwrap();
         assert_eq!(parts.len(), 1, "分区目录必须被认出来: {parts:?}");
-        assert_eq!(parts[0].name, "__dt=2026-10-12");
+        assert_eq!(parts[0].name, "__dt=2026-10-10");
         assert_eq!(parts[0].rows, 2);
 
         // ② 扫描面可见（这才是 F22 的病灶：数据在、读不到）
@@ -1938,7 +1938,7 @@ mod tests {
                 predicate: Some(crate::scan::Predicate::Eq {
                     column: "__dt".into(),
                     value: crate::types::cast::cast_literal(
-                        &crate::types::Literal::Utf8("2026-10-12".into()),
+                        &crate::types::Literal::Utf8("2026-10-10".into()),
                         &LogicalType::Date,
                     )
                     .unwrap(),

@@ -147,7 +147,7 @@ pub fn execute_sql_with_role(
     execute_sql_full(db, sql, Vec::new(), Some(role), ctx)
 }
 
-/// 带**参数**执行（`docs/参数化查询设计.md`）：`params` 是已类型化的字面量，
+/// 带**参数**执行（`参数化查询设计稿`）：`params` 是已类型化的字面量，
 /// 绑定在解析期完成（值→AST 字面量节点，**从不进入 SQL 文本**）。
 pub fn execute_sql_params_ctx(
     db: &Qsdb,
@@ -586,7 +586,7 @@ fn execute_stmt(
             while let Some(b) = exec.next() {
                 batches.push(b?);
             }
-            // **零行结果也给一个空批 + 完整 schema**（`对接契约.md` §二 的
+            // **零行结果也给一个空批 + 完整 schema**（`对接契约` §二 的
             // schema 协商承诺，`LIMIT 0` 是它的标准姿势——BI 工具/DBeaver
             // 探测元数据就这么写）。
             //
@@ -1020,7 +1020,7 @@ struct InsertSink<'a> {
     total: u64,
     /// 分段计时（`QSDB_INSERT_PROF=1` 时打印）：对齐 / 落段 / 批数。
     /// 动机：`INSERT … SELECT` 曾比 `db.append` 慢 6 倍而同为"扫 + 写"，
-    /// 没有分段数字只能猜（见 `docs/真机基准对账.md`）。
+    /// 没有分段数字只能猜（见 `基准对账笔记`）。
     prof_align_ns: u128,
     prof_append_ns: u128,
     prof_batches: u64,

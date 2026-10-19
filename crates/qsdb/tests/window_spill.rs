@@ -8,7 +8,7 @@
 //! 明确边界（**不覆盖**）：无 `PARTITION BY` 的查询（`OVER (ORDER BY ...)`）
 //! ——整个输入就是一个分区，无键可分区，保持现状报错（见
 //! `unpartitioned_window_still_errors_clearly`）。设计口径见
-//! `docs/内存预算与溢出设计.md` §四 4.2。
+//! `内存预算与溢出设计稿` §四 4.2。
 
 use std::sync::Arc;
 

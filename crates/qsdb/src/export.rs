@@ -1,6 +1,6 @@
 //! **湖导出**（F9 / A3）：`COPY (SELECT …) TO '<目录>' (FORMAT PARQUET, PARTITION_BY (…))`。
 //!
-//! 设计见 `docs/提交事件订阅与湖导出设计.md` §2.2。产出的布局与 qsdb-sync 的
+//! 设计见 `提交事件订阅设计稿` §2.2。产出的布局与 qsdb-sync 的
 //! `sink-parquet`、以及 Spark/Hive 生态一致：
 //!
 //! ```text
@@ -23,7 +23,7 @@
 //!
 //! 轮次式：读满 `ROUND_ROWS` 行 → 切成若干 `CHUNK_ROWS` 的块 → **`par_iter`
 //! 并行编码**。内存上界 ≈ 一轮的缓冲（不是整个结果集），并行度 ≈ 块数。
-//! 这是 `真机基准对账.md` 里 `export_parquet` 的正解（3.58s → **0.766s**，
+//! 这是 `基准对账笔记` 里 `export_parquet` 的正解（3.58s → **0.766s**，
 //! vs DuckDB 0.862s）：根因不是调参，是**没有导出原语**时调用方各自拿到的
 //! arrow-rs 单线程水平。
 //!
@@ -67,7 +67,7 @@ const COMMON_METADATA: &str = "_common_metadata";
 /// 导出格式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportFormat {
-    /// parquet + hive 目录布局（`docs/提交事件订阅与湖导出设计.md` §2.2）。
+    /// parquet + hive 目录布局（`提交事件订阅设计稿` §2.2）。
     Parquet,
     /// CSV（`header` 控制表头）。**单文件**。
     ///

@@ -55,7 +55,7 @@ QSDB 是一个**单机、嵌入式优先、列式、Arrow-native、Parquet-backe
 
 红线是里程碑验收标准，不是愿望。不达标时优先缩范围/调架构，而不是放水指标。
 
-### 2.1 对比口径（2026-10-12 定案，血泪教训）
+### 2.1 对比口径（2026-10-10 定案，血泪教训）
 
 早期 bench 用 `duckdb_vs`（QSDB 侧 4GB **解码后**缓存 + best-of-3、同进程交替）
 得出"四项反超 DuckDB"，第三方 POC 用真实业务形态复测后不成立。两条口径问题：
@@ -363,7 +363,7 @@ trait PhysExpr: Send + Sync {
 
 | 级别 | 里程碑 | 语法范围 |
 |------|--------|---------|
-| SQL-0 | M2 | `CREATE/DROP TABLE`、`DESCRIBE`、`SHOW TABLES/PARTITIONS`、`SELECT … FROM … WHERE … LIMIT`（投影/过滤/字面量/比较/逻辑）、`INSERT INTO … VALUES`（小批量）；2026-10-13 起 `INSERT INTO … SELECT …`（源可为任意 SELECT） |
+| SQL-0 | M2 | `CREATE/DROP TABLE`、`DESCRIBE`、`SHOW TABLES/PARTITIONS`、`SELECT … FROM … WHERE … LIMIT`（投影/过滤/字面量/比较/逻辑）、`INSERT INTO … VALUES`（小批量）；2026-10-11 起 `INSERT INTO … SELECT …`（源可为任意 SELECT） |
 | SQL-1 | M2 末–M3 | `GROUP BY` + count/sum/avg/min/max、`ORDER BY`、`DISTINCT`、隐式/显式 cast、标量函数 v1 集 |
 | SQL-2 | M4 | `INNER/LEFT JOIN`（等值 hash join）、`IN`/`EXISTS`（相关子查询受限形态）、`HAVING` |
 | SQL-3 | M5+ | 嵌套子查询、CTE、窗口函数、UDF/UDAF 注册、完整优化器规则集 |
@@ -696,7 +696,7 @@ M6-4 staging 写 → M6-5 HDFS → M6-6 可选租约；每阶段独立 gate。
   崩溃重开补传 exactly-once、dedup 防重复计入、staged overwrite 替换、
   配置校验）/180 默认 / clippy 双模式 0 / 默认二进制 24.38MB。
 
-### 性能专项第三批：全局聚合快路径 + UDAF 并行（2026-10-12）✅
+### 性能专项第三批：全局聚合快路径 + UDAF 并行（2026-10-10）✅
 - **全局聚合零迭代快路径**（`GroupTable::try_global_fast`，group 为空时）：
   `count(*)` = `num_rows` **O(1)**、`count(col)` = `num_rows − null_count`
   **O(1)**、整型 sum = 类型化 `values()` 切片直加 i128（null_count=0 免
@@ -716,7 +716,7 @@ M6-4 staging 写 → M6-5 HDFS → M6-6 可选租约；每阶段独立 gate。
   **vs 内置 22.78x → 7.67x**（剩余为整组物化契约固有：concat+take）。
 - 191 测试绿 × 2 批；clippy 0。
 
-### EXISTS / IN 子查询 — semi/anti-join（2026-10-12）✅
+### EXISTS / IN 子查询 — semi/anti-join（2026-10-10）✅
 - **SQL 面**：WHERE 顶层 AND 合取项级提取——`g IN (SELECT 单列)`、
   关联 `EXISTS (… WHERE 内列 = 外列 [AND 本地谓词])`、`NOT IN`/`NOT EXISTS`
   （含 NOT(...) 括号形态）；合取可链式多个 semi join、可与普通谓词混合。
@@ -740,7 +740,7 @@ M6-4 staging 写 → M6-5 HDFS → M6-6 可选租约；每阶段独立 gate。
   反超——本形态差距在扫描底座（2 列窄形态缓存聚合 0.04x），非 semi 本身。
 - 191 默认 / 204 s3 / 208 hdfs / 207 s3+hdfs 全绿；clippy 0；24.64MB。
 
-### 导入能力两条查询面原语：INSERT … SELECT + read_csv（2026-10-13）✅
+### 导入能力两条查询面原语：INSERT … SELECT + read_csv（2026-10-11）✅
 - **`INSERT INTO t [(cols)] SELECT …`**：源从"仅字面量列表"扩到**整条 SELECT**
   （含 CTE / 子查询 / 集合操作 / 窗口——不是简化版 SELECT，走
   `translate_select_full_with_ctes` + `exec_builder::build` 同一条链路）。

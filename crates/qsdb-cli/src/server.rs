@@ -1318,7 +1318,7 @@ fn new_token() -> String {
 
 /// 抽取器拒绝 → 契约错误体（`{error, code}`）。
 ///
-/// axum 内建抽取器失败时回的是**纯文本**，违反 `docs/对接契约.md` §3.2 的
+/// axum 内建抽取器失败时回的是**纯文本**，违反 `对接契约` §3.2 的
 /// "错误体恒为 `{error, code}`"承诺——驱动拿不到机器码，只能按文案猜。
 /// 现在一律 `400 INVALID_ARGUMENT`（422/415 一并归一到 400）：契约要求
 /// **一个码恒定一个状态码**，抽取器拒绝不该另开状态码分支。
@@ -1816,7 +1816,7 @@ async fn set_session_database(
     .into_response()
 }
 
-// ===================== 文件管理面（二十批，docs/文件管理面设计.md） =====================
+// ===================== 文件管理面（二十批，文件管理面设计稿） =====================
 
 #[derive(serde::Deserialize)]
 struct FileParams {
@@ -2491,7 +2491,7 @@ async fn metrics(State(s): State<Arc<AppState>>) -> Response {
 ///
 /// 消费方是 qsdb-sync：他们今天靠**轮询** `partition_stats` 发现增量，接上这里
 /// 就能换成 push（RPO 秒级 → 毫秒级）。设计见
-/// `docs/提交事件订阅与湖导出设计.md` §1.3。
+/// `提交事件订阅设计稿` §1.3。
 ///
 /// **长轮询**（不是 SSE 流）：有事件**立刻**回，没有就挂到 `wait` 再回空批次。
 /// 交付同样的延迟，但不用处理流式解析 / keep-alive / 半开连接；将来要加流式是
@@ -2547,7 +2547,7 @@ struct QueryBody {
     /// ?? 会话默认库 ?? "default"。授权按它判，单段表名落在这里。
     #[serde(default)]
     database: Option<String>,
-    /// 参数化查询（`docs/参数化查询设计.md`）：**位置数组**，`$n` 取第 n 个。
+    /// 参数化查询（`参数化查询设计稿`）：**位置数组**，`$n` 取第 n 个。
     /// 元素可以是裸 JSON 值（推类型）或 `{"type": …, "value": …}`（显式）。
     /// 缺省 = 没有参数（行为与从前一字不差）。
     #[serde(default)]
@@ -3424,7 +3424,7 @@ async fn get_config(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Respo
 struct ConfigUpdate {
     // snake_case 为规范名（与 `--config` 文件同形）；**camelCase 别名是必需的**：
     // `GET /api/v1/config` 回的就是 camelCase，不别名则"读-改-写"式整轮 PUT 被
-    // **静默忽略**（实测 2026-10-12：PUT {"queryTimeoutMs":12345} → HTTP 200 +
+    // **静默忽略**（实测 2026-10-10：PUT {"queryTimeoutMs":12345} → HTTP 200 +
     // applied:true 而值纹丝不动）。契约文档与 GET 的键形态均以 camelCase 为准。
     #[serde(default, alias = "queryTimeoutMs")]
     query_timeout_ms: Option<u64>,
@@ -3733,7 +3733,7 @@ fn schema_fields(schema: &arrow::datatypes::SchemaRef) -> Vec<serde_json::Value>
 /// `first` = 是否整个结果的第一个批（决定要不要前导逗号——批间那道缝是
 /// 流式拼接最容易错的地方，单测锁定）。
 ///
-/// 每行每列按 **Arrow 列类型**分派输出（J1+J2，2026-10-12）。
+/// 每行每列按 **Arrow 列类型**分派输出（J1+J2，2026-10-10）。
 ///
 /// 原实现忽略列类型，统一走「display 串 → parse::<i64> → parse::<f64> →
 /// true/false」的数字启发，造成两类正确性问题：

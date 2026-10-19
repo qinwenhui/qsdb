@@ -1702,7 +1702,7 @@ fn distinct_row_upper_bound(db: &Qsdb, plan: &LogicalPlan) -> Option<u64> {
     db.scan_metadata_count(&def.name, None).ok()?
 }
 
-/// v2 去重相 1 的**分片输入**（`docs/去重分区路v2设计.md` §2.2）。
+/// v2 去重相 1 的**分片输入**（`去重分区路 v2 设计稿` §2.2）。
 ///
 /// 沿 `Project*`/`Filter*` 剥到底（两者逐行保序 ⇒ 对行不相交分片可分配送）
 /// 到逻辑 `Scan`：取行不相交分片后，**每片在 `ShardScope` 下重建完整输入
@@ -1782,7 +1782,7 @@ struct FusedShape {
     probe_plan: LogicalPlan,
 }
 
-/// 维表链聚合融合的**形状判定**（`docs/join发射与维表链聚合融合设计.md` §二刀 C）。
+/// 维表链聚合融合的**形状判定**（`join 发射设计稿` §二刀 C）。
 ///
 /// 门（全部满足，任何一条不满足 = `None` 走现有路径，零改动——这是性能计划
 /// 选择，不是语义回退）：
@@ -2032,7 +2032,7 @@ fn build_aggregate(
 ) -> Result<Box<dyn ExecNode>> {
     // 聚合参数上的 `DISTINCT` 必须已在**绑定期**被 `rewrite_distinct_aggs` 消费掉。
     // 执行层不认识这个语义：放过去 = 把 `count(DISTINCT x)` 当成 `count(x)` 跑出
-    // 一个**静默的错误数字**（2026-10-13 之前的真实老行为）。宁可炸。
+    // 一个**静默的错误数字**（2026-10-11 之前的真实老行为）。宁可炸。
     if let Some(a) = aggs.iter().find(|a| a.distinct) {
         return Err(crate::error::QsdbError::unsupported(format!(
             "aggregate `{}` still carries DISTINCT at execution time — the binder rewrite \
@@ -2081,7 +2081,7 @@ fn build_aggregate(
             //    —— `.14` 真表 5 轮中位：`tpoint`(INT32) 49→**97**ms、
             //    `pdate`(DATE32，15 组) 44→**92**ms、`month`(DATE32，3 组) 43→**92**ms
             //    ⇒ 分区**一律亏 ~2×**。基准表上单线程也一路赢到 **250 万组**
-            //    （`docs/去重计数性能设计.md` §4.1）。
+            //    （`去重计数性能设计稿` §4.1）。
             //    原因就是分区路径的**相 1 是顺序的、且它自己就是一次完整的逐行编码+哈希**
             //    （≈ 单线程路径的全部成本），相 2 只是再做一遍 ⇒ 只有"相 2 的插入成本"
             //    远大于"相 1 的一次顺序遍"时才划算，而**定长键的插入本来就便宜**。
@@ -2108,7 +2108,7 @@ fn build_aggregate(
                     let nparts = distinct_parts();
                     let reserve = rows.saturating_mul(DISTINCT_SHUFFLE_BYTES_PER_ROW);
                     if let Ok(res) = ctx.try_reserve(reserve) {
-                        // ★ **单 Utf8 键 → v2 排序去重**（`docs/去重分区路v2设计.md`）。
+                        // ★ **单 Utf8 键 → v2 排序去重**（`去重分区路 v2 设计稿`）。
                         //
                         // .14 相拆账（2026-10-17）：v1 分区路相 1（顺序）228ms +
                         // 相 2（并行）420ms，相 2 是 250 万次随机哈希表插入的

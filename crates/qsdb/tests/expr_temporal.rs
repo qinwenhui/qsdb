@@ -382,8 +382,8 @@ fn j10_time_literal_projection() {
     assert!(q(&db, "SELECT TIME '08:30:00'") == vec!["08:30:00"]);
     assert!(q(&db, "SELECT TIME '08:30:00' AS t") == vec!["08:30:00"]);
     // 三种 temporal 字面量各保持原类型
-    assert!(q(&db, "SELECT DATE '2026-10-12'") == vec!["2026-10-12"]);
-    assert!(q(&db, "SELECT TIMESTAMP '2026-10-12 08:30:00'") == vec!["2026-10-12T08:30:00"]);
+    assert!(q(&db, "SELECT DATE '2026-10-10'") == vec!["2026-10-10"]);
+    assert!(q(&db, "SELECT TIMESTAMP '2026-10-10 08:30:00'") == vec!["2026-10-10T08:30:00"]);
 }
 
 #[test]

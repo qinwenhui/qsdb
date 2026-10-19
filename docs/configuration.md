@@ -14,7 +14,7 @@
 | `read_only` | bool / false | **只读模式**：拒绝一切写路径（append/overwrite/DDL/compact/gc/refresh-index）。HTTP 面 → 503 **`READ_ONLY`**（**永不重试**：只读库对读完全可用，换实例才对；与并发闸的 503 是两个码）。standby/只读副本标准姿势——只读句柄永不做写者，杜绝误连双主。CLI：`--read-only`。 |
 | `durability` | Durability / ProcessCrash | 耐久性档位（M6 后追加）：`ProcessCrash`（默认，页缓存即持久——kill -9 安全，掉电可能丢最近段）/ `PowerLoss`（segment/元数据/staging 文件 rename 前 fsync + POSIX 目录 sync，掉电安全）。**损耗实测：写吞吐约 -25%**（本机 NVMe，31MB/段每段 fsync ≈190ms；首轮脏页积压时更多）——按性能优先定案默认关；带电容/掉电保护的企业级 SSD 上 fsync 代价远低；WriteBuffer 攒大段可摊薄每字节 fsync 次数。CLI：`--durability process-crash\|power-loss`。 |
 | `trash_grace_ms` | u64 / 10 分钟 | `_trash` 静默期：被换出的旧数据文件至少保留这么久才可被 `gc()` 清理。调小可加速空间回收，但会牺牲正在进行的旧扫描（跨进程长查询）。 |
-| `scan_cache_bytes` | usize / **256MB** | 热数据缓存预算（segment 级**解码后** LRU）。**0 = 关闭**。预算应能装下热工作集且不超过机器可用内存（预算过大会触发换页反噬——实测 4GB 预算在被其他进程占内存的机器上反而变慢）。**默认取保守值守「极致低占用」定位**；宽投影要快的部署显式调大（CLI `--cache-mb`）。**权衡实测（2026-10-12，10M×4 列）**：单条累积上界是 `budget/8`（8 分片防爆内存系数），而单个分片片段约 32~64MB——**256MB（上界 32MB）恰好卡在片段大小边缘**：16 分片只进 11 个，付了缓存成本却几乎不命中（**0.182s，比关缓存 0.136s 还慢**）；**1GB（上界 128MB）** 全命中 → **0.011s（约 16x）**，代价是查询期 RSS 到 **1.2GB**。**根治方向是缓存粒度**（按批/RG 分块，使小预算也能部分命中），不是放大预算。**注意**：这是**缓存记账上限**，不是进程内存硬上限（在途 `Arc` 不计入，见内存模型一节）。 |
+| `scan_cache_bytes` | usize / **256MB** | 热数据缓存预算（segment 级**解码后** LRU）。**0 = 关闭**。预算应能装下热工作集且不超过机器可用内存（预算过大会触发换页反噬——实测 4GB 预算在被其他进程占内存的机器上反而变慢）。**默认取保守值守「极致低占用」定位**；宽投影要快的部署显式调大（CLI `--cache-mb`）。**权衡实测（2026-10-10，10M×4 列）**：单条累积上界是 `budget/8`（8 分片防爆内存系数），而单个分片片段约 32~64MB——**256MB（上界 32MB）恰好卡在片段大小边缘**：16 分片只进 11 个，付了缓存成本却几乎不命中（**0.182s，比关缓存 0.136s 还慢**）；**1GB（上界 128MB）** 全命中 → **0.011s（约 16x）**，代价是查询期 RSS 到 **1.2GB**。**根治方向是缓存粒度**（按批/RG 分块，使小预算也能部分命中），不是放大预算。**注意**：这是**缓存记账上限**，不是进程内存硬上限（在途 `Arc` 不计入，见内存模型一节）。 |
 | `query_timeout_ms` | Option\<u64\> / None | 默认查询超时（毫秒）。**这是运行期同名配置的初值**——open 后可经 [`Qsdb::runtime()`] 热更，见下节。 |
 | `query_memory_limit_bytes` | Option\<u64\> / None | 默认单查询内存上限（字节）；**None/0 = 不限**（库默认不限——嵌入方自控内存策略）。同为运行期配置的初值。**`qsdb server` 兜底 4GB**（`--query-memory-limit-mb`）：server 是唯一会叠加多查询的部署面，不给默认即「N 个查询各自无界」。只约束**物化算子**记账（join build / sort spill / window / udaf），流式扫描/聚合不记账——见内存模型一节。 |
 | `memory_budget_bytes` | Option\<u64\> / None | **全局内存预算**（字节）：本句柄内**所有**查询共享的执行内存 + 解码缓存总上界；**None/0 = 不限**（库默认不限，嵌入方自控）。与上一行的分工：那个是「单查询配额」（400 `QUERY_MEMORY_LIMIT`），这个是「整个句柄的天花板」（超了是 503 `MEMORY_PRESSURE`，可退避重试）。压力下**先挤兑缓存**再拒查询。**只约束记账到的内存**（物化算子 + 解码缓存；流式在途批的残留上界见设计文档 §七）。`qsdb server` 兜底 4GB（`--memory-budget-mb`）。 |
@@ -23,7 +23,7 @@
 | `staging_dir` | Option\<PathBuf\> / None | 远端写 staging 目录（M6-4）：Some = 启用——远端写先落本地盘（**写盘即 ACK**，写延迟与网络解耦），`flush_staged()` 批量 PUT + OCC 提交。需 S3 后端。**可见性语义**：未 flush 的数据对查询不可见（manifest 唯一真值），可见性延迟 = 上传周期；读己之写先 flush。崩溃恢复：残留对下次 flush 幂等补传（segment PUT 幂等 + manifest file_name 去重）。 |
 | `file_cache_bytes` | u64 / 0 | 远端外表（`read_parquet('s3://…')`）段文件本地磁盘缓存预算，布局 `{root}/_filecache/{url_hash}/{etag}/…`（ETag 键控，对象覆盖自动失效；预算内按 mtime LRU 驱逐）。**0 = 关闭（默认）**。仅整读（无 row group 裁剪命中）的对象入缓存；选择性查询走 range GET 不占预算。需编译 feature `s3`。 |
 
-**服务器 CLI 等价参数**（`qsdb server`）：`--cache-mb`（即 `scan_cache_bytes/1MB`）、`--query-memory-limit-mb`（单查询内存闸，默认 4096=4GB）、`--max-concurrent-queries`（并发闸，**默认 0=不限**；多客户端部署的推荐值见 `docs/多库访问控制与会话设计.md` §七）、`--file-cache-mb`（即 `file_cache_bytes/1MB`）、`--storage-type local|s3` + `--storage-endpoint/--storage-region/--storage-bucket/--storage-prefix`（即 `storage`；s3 需编译 feature）、`--staging-dir <目录>`（即 `staging_dir`，启用 M6-4 staging 写）+ `--staging-upload-secs`（后台上传周期，默认 5s；server 定时 flush_staged，启动即跑一轮=崩溃补传）。
+**服务器 CLI 等价参数**（`qsdb server`）：`--cache-mb`（即 `scan_cache_bytes/1MB`）、`--query-memory-limit-mb`（单查询内存闸，默认 4096=4GB）、`--max-concurrent-queries`（并发闸，**默认 0=不限**；多客户端部署的推荐值见 `多库与会话设计稿` §七）、`--file-cache-mb`（即 `file_cache_bytes/1MB`）、`--storage-type local|s3` + `--storage-endpoint/--storage-region/--storage-bucket/--storage-prefix`（即 `storage`；s3 需编译 feature）、`--staging-dir <目录>`（即 `staging_dir`，启用 M6-4 staging 写）+ `--staging-upload-secs`（后台上传周期，默认 5s；server 定时 flush_staged，启动即跑一轮=崩溃补传）。
 
 **feature `hdfs`（默认关闭，M6-5）**：`cargo build -p qsdb-cli --features hdfs`。hdfs-native（纯 Rust HDFS RPC，无 JVM/libhdfs）+ object_store 适配层（与 feature `s3` 同版 object_store 0.14，单一版本）。S3/HDFS 共享 `remote` 机件（Store::Remote + OCC + staging + 引用 GC）；HDFS 的条件写由锁对象模拟（create-no-clobber 锁 + 锁下 ETag 双检 + 覆写；残留锁 60s 过期窃取）。真实集群验证：Hadoop 3.1.3 e2e 全过。
 
@@ -151,7 +151,7 @@ drift 时显式报错转人工 ALTER（最小权限原则）。此矩阵不改�
 
 ## 六、内存模型（一个账本，三类租户）
 
-设计见 [`内存预算与溢出设计.md`](内存预算与溢出设计.md)；**P0（账本合一）已落地 2026-10-13**。
+设计见 [`内存预算与溢出设计稿`](内存预算与溢出设计稿)；**P0（账本合一）已落地 2026-10-13**。
 
 **一个账本**：`MemoryPool`（每个 `Qsdb` 句柄一份，`Arc` 共享）持有
 `budget` 与两个计数（`exec` 执行侧 / `cache` 缓存侧）。**准入只有一个入口**
@@ -160,7 +160,7 @@ drift 时显式报错转人工 ALTER（最小权限原则）。此矩阵不改�
 
 | 租户 | 谁 | 记账 | 压力下的行为 |
 |---|---|---|---|
-| **执行内存** | 显式物化算子：HashJoin build / CrossJoin / Sort / Window / HashAgg / Distinct / SetOp / JoinCount / semi-anti 存在集 / CTE 物化。**其中 Sort / HashAgg / Distinct / HashJoin(INNER·LEFT) 已能落盘**（内存要不到额度就溢出完成，见 [`内存预算与溢出设计.md`](内存预算与溢出设计.md) §四） | 按**分配点的实际保留量**增量预留（聚合按组表**每分片**实记——分片放大是真占用） | 有溢出能力的（**Sort / HashAgg / Distinct / HashJoin 的 INNER·LEFT**）→ 落盘完成；尚未有溢出的（Window / SetOp / semi-anti 存在集 / CTE 物化 / CrossJoin）→ `MEMORY_PRESSURE`（503 **可退避重试**） |
+| **执行内存** | 显式物化算子：HashJoin build / CrossJoin / Sort / Window / HashAgg / Distinct / SetOp / JoinCount / semi-anti 存在集 / CTE 物化。**其中 Sort / HashAgg / Distinct / HashJoin(INNER·LEFT) 已能落盘**（内存要不到额度就溢出完成，见 [`内存预算与溢出设计稿`](内存预算与溢出设计稿) §四） | 按**分配点的实际保留量**增量预留（聚合按组表**每分片**实记——分片放大是真占用） | 有溢出能力的（**Sort / HashAgg / Distinct / HashJoin 的 INNER·LEFT**）→ 落盘完成；尚未有溢出的（Window / SetOp / semi-anti 存在集 / CTE 物化 / CrossJoin）→ `MEMORY_PRESSURE`（503 **可退避重试**） |
 | **解码缓存** | `SegmentCache`（实例级共享 LRU） | 由缓存自己同步 `used` | **先被挤兑**（纯缓存，丢了大不了重算；只挤到够用，不一挤到底） |
 | **写缓冲** | `WriteBuffer` | **不纳入预算**（自带上界 64 批 / 128MB） | 攒批阈值触发 flush |
 
@@ -185,7 +185,7 @@ drift 时显式报错转人工 ALTER（最小权限原则）。此矩阵不改�
 > `/metrics` 的 `qsdb_memory_used_bytes{pool=exec|cache}` 与
 > `qsdb_queries_rejected_total{reason=concurrency|memory}`。
 
-### 三条容易踩的认知（2026-10-12 实测）
+### 三条容易踩的认知（2026-10-10 实测）
 
 1. **`scan_cache_bytes` 不是进程内存上限**。它是**缓存索引的记账上限**：已被 LRU 驱逐但仍在途被查询使用的批由 `Arc` 持有、不计入 `used`，故实际 RSS 可超预算（实测预算 1GB、峰值 1563MB）。
 2. **驱动峰值的是池 ②，不是池 ①**。实测 `mem_vs`：filter 后 352MB → aggregate 后 1035MB（缓存接近填满）→ group by 后 1235MB → 峰值 1563MB。超出预算的部分全在物化算子的执行内存里。
@@ -205,7 +205,7 @@ GET  /api/v1/tables / tables/{t}/schema / tables/{t}/partitions
 GET  /api/v1/error-codes            # 错误码目录（静态、免鉴权）
 ```
 
-**`PUT /api/v1/config` 的键形态**（2026-10-12 实测校正）：**camelCase 与
+**`PUT /api/v1/config` 的键形态**（2026-10-10 实测校正）：**camelCase 与
 snake_case 都接受**——`queryTimeoutMs` / `queryMemoryLimitBytes`（与 GET 回显
 同形，故「读-改-写」整轮可行）或 `query_timeout_ms` / `query_memory_limit_bytes`
 （与 `--config` 文件同形）。两个键名同时出现 → **422**（重复字段，不猜）。

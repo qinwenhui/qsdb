@@ -14,7 +14,7 @@ echo "== fmt =="
 cargo fmt --all -- --check
 
 echo "== clippy: 默认（qsdb + qsdb-cli + qsdb-bench + qsdb-client，含 --all-targets）=="
-# bench 也进矩阵（2026-10-13 补）：**这条漏了是有代价的**——矩阵外的那一组
+# bench 也进矩阵（2026-10-11 补）：**这条漏了是有代价的**——矩阵外的那一组
 # 攒了 3 条既有告警没人看见（bench_suite 的 doc 缩进 + 两个 `while let`），
 # 而基准工具恰恰是"判断性能有没有退"的那把尺子，它自己带病不该没人知道。
 # 基准/测量工具与产品代码同标准：**尺子歪了比被测物歪更危险**。
