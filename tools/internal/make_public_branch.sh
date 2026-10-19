@@ -38,7 +38,7 @@ mkdir -p "$STAGE/crates" "$STAGE/docs" "$STAGE/.github/workflows"
 # 内核四件套（全部公开）
 cp -r crates/qsdb crates/qsdb-cli crates/qsdb-bench crates/qsdb-client "$STAGE/crates/"
 # 顶层文件
-cp README.md LICENSE Cargo.toml Cargo.lock .gitignore .gitattributes \
+cp README.md README.zh-CN.md LICENSE Cargo.toml Cargo.lock .gitignore .gitattributes \
    SECURITY.md CONTRIBUTING.md CHANGELOG.md THIRD_PARTY_NOTICES.md "$STAGE/"
 cp .github/workflows/*.yml "$STAGE/.github/workflows/"
 

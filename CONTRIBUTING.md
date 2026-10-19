@@ -40,6 +40,3 @@ Use conventional prefixes (`feat:`, `fix:`, `docs:`, `perf:`, `test:`,
 `refactor:`) with a short imperative summary. Write the body in whichever
 language you are comfortable with.
 
-**Do not include AI-generated attribution trailers** (e.g. `Co-Authored-By`
-lines naming an AI tool) — contributions are recorded under their human
-authors only.

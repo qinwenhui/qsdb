@@ -1,24 +1,33 @@
 # QSDB
 
-**A standalone, single-node, embeddable columnar analytical database.
-Arrow-native. Parquet-backed. Zero external services.**
+**A high-performance columnar analytics database. One binary. Arrow-native.
+Parquet-backed. Zero external services.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 [![CI](https://github.com/qinwenhui/qsdb/actions/workflows/ci.yml/badge.svg)](https://github.com/qinwenhui/qsdb/actions/workflows/ci.yml)
 
-QSDB does three things — **read/write speed, resource footprint, and concurrency** —
-and deliberately nothing else. No cluster, no external metastore, no JVM:
-one static binary, usable as an embeddable Rust library or deployed as an HTTP server.
+Website: **[qsdb.qinwh.cn](http://qsdb.qinwh.cn)**
+
+[English](README.md) | 简体中文
+
+QSDB is an analytical database built for large datasets — multi-gigabyte
+tables, partitioned parquet lakes, aggregates over hundreds of millions of
+rows. It does three things — **read/write speed, resource footprint, and
+concurrency** — and deliberately nothing else. No cluster coordination, no
+external metastore, no JVM: the whole system is one static binary that runs
+as a regular network service (HTTP API, JDBC/ODBC drivers) and can also be
+embedded in-process as a Rust library — **same engine, same on-disk format;
+a delivery mode, not a different product**.
 
 ---
 
 ## Highlights
 
+- **Vectorized execution engine, written from scratch** — hash join (zero-copy string keys), window functions over DECIMAL, sort/aggregate spill, and a dense direct-index path for high-cardinality `count(DISTINCT)`. Benchmarked against DuckDB on every release; methodology and per-case numbers are public.
+- **Parquet storage with deep pruning** — column statistics, partition- and row-group-level pruning baked into the scan path; scan throughput measured in hundreds of MB/s per core.
 - **Columnar, immutable files** — append + partition-level atomic overwrite; no row-level UPDATE/DELETE (analytics don't need it, and immutability is what makes the rest cheap).
-- **Arrow end-to-end** — `RecordBatch` with zero-copy handoff in embedded mode; Arrow IPC on the wire when you want it.
-- **Parquet storage** — column statistics, partition- and row-group-level pruning baked into the scan path.
-- **Vectorized execution engine, written from scratch** — hash join (zero-copy string keys), window functions over DECIMAL, sort/aggregate spill, and a dense direct-index path for high-cardinality `count(DISTINCT)`.
+- **Arrow end-to-end** — `RecordBatch` with zero-copy handoff in-process; Arrow IPC on the wire when you want it.
 - **A wide SQL surface** — Spark-dialect friendly: `stack` / `PIVOT`, CTEs (including dead-CTE elimination), `least`/`greatest`, non-ANSI double-quoted strings, multi-value `IN` pushdown, and parameterized queries (`$1` / `?` — values never enter the SQL text).
 - **A real server, not a toy** — streaming results with constant memory, cooperative cancellation (sub-100ms end-to-end), sessions, multi-database mounts, per-database grants, hot-reconfigurable guards (result rows/bytes, timeouts, memory), and a machine-readable error-code catalog your clients can fetch at runtime.
 - **Metadata with zero moving parts** — local files + in-memory cache + partition-level file locks. No HMS, no MySQL, no ZooKeeper.
@@ -99,8 +108,10 @@ db.overwrite_partition("events", &[(...)], &batches)?; // atomic swap
 for batch in db.scan(Default::default())? { /* RecordBatch stream */ }
 ```
 
-Embedding is the right call when the database lives and dies with your process.
-Multi-process sharing, fault isolation, or remote access → use the server.
+Embedding gives you in-process Arrow handoff with no serialization at all —
+the standard path for tools, edge deployments, and test harnesses. It is the
+same engine in-process, not a stripped-down mode: when the database should
+outlive your process, or multiple clients need it, run the server.
 
 ## Performance
 
@@ -169,7 +180,16 @@ update `docs/error-codes.md` (it is enforced against the runtime catalog).
 
 ## Ecosystem
 
-- [`qsdb-studio`](https://github.com/qinwenhui/qsdb-studio) — official desktop workbench (Tauri + Vue 3, built on `qsdb-client`).
+All ecosystem projects live under [qinwenhui](https://github.com/qinwenhui).
+
+| Project | What it is |
+|---|---|
+| [qsdb-studio](https://github.com/qinwenhui/qsdb-studio) | Official desktop workbench — query, browse, administer (Tauri + Vue 3, built on `qsdb-client`) |
+| [qsdb-jdbc](https://github.com/qinwenhui/qsdb-jdbc) | JDBC driver — BI tools and JVM applications |
+| [qsdb-odbc](https://github.com/qinwenhui/qsdb-odbc) | ODBC driver — Excel / Tableau / Power BI |
+| [qsdb-sync](https://github.com/qinwenhui/qsdb-sync) | Bulk data mover — QSDB ↔ data lakes, S3/HDFS, parquet directories |
+
+**Website**: [qsdb.qinwh.cn](http://qsdb.qinwh.cn)
 
 ## License
 
