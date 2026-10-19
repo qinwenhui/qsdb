@@ -11,8 +11,9 @@ fn _uniq_seq() -> u64 {
 #[test]
 fn 常量十进制算术必须保持_const_否则外层列乘它越界() {
     let root = std::env::temp_dir().join("qsdb_repro_t19").join(format!(
-        "{}",
-        format!("{:x}_{}", std::process::id(), _uniq_seq())
+        "{:x}_{}",
+        std::process::id(),
+        _uniq_seq()
     ));
     std::fs::create_dir_all(&root).unwrap();
     let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
@@ -54,8 +55,9 @@ fn 常量十进制算术必须保持_const_否则外层列乘它越界() {
 #[test]
 fn date_format_坏串给_null_不报错() {
     let root = std::env::temp_dir().join("qsdb_repro_df").join(format!(
-        "{}",
-        format!("{:x}_{}", std::process::id(), _uniq_seq())
+        "{:x}_{}",
+        std::process::id(),
+        _uniq_seq()
     ));
     std::fs::create_dir_all(&root).unwrap();
     let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();

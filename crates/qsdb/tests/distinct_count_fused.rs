@@ -41,11 +41,7 @@ fn _uniq_seq() -> u64 {
 fn tmp(tag: &str) -> std::path::PathBuf {
     std::env::temp_dir()
         .join("qsdb_distinct_fused")
-        .join(format!(
-            "{tag}_{}_{}",
-            std::process::id(),
-            format!("{:x}_{}", std::process::id(), _uniq_seq())
-        ))
+        .join(format!("{tag}_{:x}_{}", std::process::id(), _uniq_seq()))
 }
 
 /// `budget = None` → 不限内存（融合节点不会溢出）；`Some(b)` → 逼它走溢出重分区。

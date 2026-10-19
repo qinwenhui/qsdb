@@ -18,8 +18,9 @@ fn _uniq_seq() -> u64 {
 
 fn setup(tag: &str) -> (Qsdb, std::path::PathBuf) {
     let root = std::env::temp_dir().join("qsdb_m5_udaf").join(format!(
-        "{tag}_{}",
-        format!("{:x}_{}", std::process::id(), _uniq_seq())
+        "{tag}_{:x}_{}",
+        std::process::id(),
+        _uniq_seq()
     ));
     let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
     db.sql("CREATE TABLE s (grp STRING, v BIGINT) PARTITIONED BY (grp)")

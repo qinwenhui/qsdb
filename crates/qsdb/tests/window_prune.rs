@@ -37,9 +37,9 @@ fn _uniq_seq() -> u64 {
 
 fn tmp(tag: &str) -> std::path::PathBuf {
     std::env::temp_dir().join("qsdb_window_prune").join(format!(
-        "{tag}_{}_{}",
+        "{tag}_{:x}_{}",
         std::process::id(),
-        format!("{:x}_{}", std::process::id(), _uniq_seq())
+        _uniq_seq()
     ))
 }
 

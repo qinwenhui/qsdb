@@ -23,9 +23,9 @@ fn _uniq_seq() -> u64 {
 
 fn setup(tag: &str) -> (Qsdb, std::path::PathBuf) {
     let root = std::env::temp_dir().join("qsdb_aggfilter").join(format!(
-        "{tag}_{}_{}",
+        "{tag}_{:x}_{}",
         std::process::id(),
-        format!("{:x}_{}", std::process::id(), _uniq_seq())
+        _uniq_seq()
     ));
     std::fs::create_dir_all(&root).unwrap();
     let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
@@ -249,9 +249,9 @@ fn 三条捷径都不许绕过() {
 #[test]
 fn 溢出路径逐值相同() {
     let root = std::env::temp_dir().join("qsdb_aggfilter").join(format!(
-        "spill_{}_{}",
+        "spill_{:x}_{}",
         std::process::id(),
-        format!("{:x}_{}", std::process::id(), _uniq_seq())
+        _uniq_seq()
     ));
     std::fs::create_dir_all(&root).unwrap();
     let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();

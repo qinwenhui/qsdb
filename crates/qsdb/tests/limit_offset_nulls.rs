@@ -22,11 +22,7 @@ fn _uniq_seq() -> u64 {
 fn setup(tag: &str) -> (Qsdb, std::path::PathBuf) {
     let root = std::env::temp_dir()
         .join("qsdb_limit_nulls_test")
-        .join(format!(
-            "{tag}_{}_{}",
-            std::process::id(),
-            format!("{:x}_{}", std::process::id(), _uniq_seq())
-        ));
+        .join(format!("{tag}_{:x}_{}", std::process::id(), _uniq_seq()));
     let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
     // b 含 NULL；(a,b) 无重复便于断言
     db.sql("CREATE TABLE t (a BIGINT, b BIGINT)").unwrap();

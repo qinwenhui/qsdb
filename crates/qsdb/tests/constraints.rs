@@ -16,8 +16,9 @@ fn _uniq_seq() -> u64 {
 
 fn setup() -> (Qsdb, std::path::PathBuf) {
     let root = std::env::temp_dir().join("qsdb_m5_cons").join(format!(
-        "{}",
-        format!("{:x}_{}", std::process::id(), _uniq_seq())
+        "{:x}_{}",
+        std::process::id(),
+        _uniq_seq()
     ));
     let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
     (db, root)

@@ -24,9 +24,9 @@ fn _uniq_seq() -> u64 {
 
 fn setup(tag: &str) -> (Qsdb, std::path::PathBuf) {
     let root = std::env::temp_dir().join("qsdb_topn_test").join(format!(
-        "{tag}_{}_{}",
+        "{tag}_{:x}_{}",
         std::process::id(),
-        format!("{:x}_{}", std::process::id(), _uniq_seq())
+        _uniq_seq()
     ));
     let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
     (db, root)
@@ -157,9 +157,9 @@ fn limit_boundaries() {
 #[test]
 fn topn_under_tiny_quota_still_correct() {
     let root = std::env::temp_dir().join("qsdb_topn_test").join(format!(
-        "quota_{}_{}",
+        "quota_{:x}_{}",
         std::process::id(),
-        format!("{:x}_{}", std::process::id(), _uniq_seq())
+        _uniq_seq()
     ));
     let db = Qsdb::open(
         &root,

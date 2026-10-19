@@ -16,9 +16,9 @@ fn _uniq_seq() -> u64 {
 
 fn tmp(tag: &str) -> std::path::PathBuf {
     let p = std::env::temp_dir().join("qsdb_trash").join(format!(
-        "{tag}_{}_{}",
+        "{tag}_{:x}_{}",
         std::process::id(),
-        format!("{:x}_{}", std::process::id(), _uniq_seq())
+        _uniq_seq()
     ));
     std::fs::create_dir_all(&p).unwrap();
     p

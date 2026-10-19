@@ -22,9 +22,9 @@ fn _uniq_seq() -> u64 {
 
 fn db_at(tag: &str) -> (Qsdb, std::path::PathBuf) {
     let root = std::env::temp_dir().join("qsdb_dump").join(format!(
-        "{tag}_{}_{}",
+        "{tag}_{:x}_{}",
         std::process::id(),
-        format!("{:x}_{}", std::process::id(), _uniq_seq())
+        _uniq_seq()
     ));
     std::fs::create_dir_all(&root).unwrap();
     (Qsdb::open(&root, QsdbOptions::default()).unwrap(), root)

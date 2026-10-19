@@ -27,9 +27,9 @@ fn _uniq_seq() -> u64 {
 
 fn setup(tag: &str, opts: QsdbOptions) -> (Qsdb, std::path::PathBuf) {
     let root = std::env::temp_dir().join("qsdb_hook").join(format!(
-        "{tag}_{}_{}",
+        "{tag}_{:x}_{}",
         std::process::id(),
-        format!("{:x}_{}", std::process::id(), _uniq_seq())
+        _uniq_seq()
     ));
     std::fs::create_dir_all(&root).unwrap();
     let db = Qsdb::open(&root, opts).unwrap();

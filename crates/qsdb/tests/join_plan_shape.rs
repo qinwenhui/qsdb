@@ -77,9 +77,9 @@ fn nodes(p: &LogicalPlan) -> (usize, usize) {
 
 fn seeded(tag: &str) -> (qsdb::Qsdb, std::path::PathBuf) {
     let root = std::env::temp_dir().join("qsdb_join_shape").join(format!(
-        "{tag}_{}_{}",
+        "{tag}_{:x}_{}",
         std::process::id(),
-        format!("{:x}_{}", std::process::id(), _uniq_seq())
+        _uniq_seq()
     ));
     let db = qsdb::Qsdb::open(&root, qsdb::QsdbOptions::default()).unwrap();
     db.sql("CREATE TABLE t (g BIGINT, v BIGINT)").unwrap();

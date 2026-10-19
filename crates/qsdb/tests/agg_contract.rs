@@ -28,11 +28,7 @@ fn _uniq_seq() -> u64 {
 fn tmp(tag: &str) -> std::path::PathBuf {
     let root = std::env::temp_dir()
         .join("qsdb_agg_contract_test")
-        .join(format!(
-            "{tag}_{}_{}",
-            std::process::id(),
-            format!("{:x}_{}", std::process::id(), _uniq_seq())
-        ));
+        .join(format!("{tag}_{:x}_{}", std::process::id(), _uniq_seq()));
     let _ = std::fs::remove_dir_all(&root);
     root
 }

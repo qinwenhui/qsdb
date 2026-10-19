@@ -21,9 +21,9 @@ fn _uniq_seq() -> u64 {
 
 fn tmp_root(tag: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join("qsdb_cte_alias").join(format!(
-        "{tag}_{}_{}",
+        "{tag}_{:x}_{}",
         std::process::id(),
-        format!("{:x}_{}", std::process::id(), _uniq_seq())
+        _uniq_seq()
     ));
     std::fs::create_dir_all(&d).unwrap();
     d
