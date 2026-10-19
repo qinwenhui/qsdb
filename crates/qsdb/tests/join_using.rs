@@ -15,14 +15,19 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use qsdb::{Qsdb, QsdbOptions};
 
+/// 测试目录唯一序号：pid 挡跨进程碰撞，序号挡同进程内并发（Windows 时钟
+/// 粒度 ~100ns，纳秒后缀在同 tick 内会重复——CI 上真炸过，见 constraints）。
+fn _uniq_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 fn tmp_root(tag: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join("qsdb_join_using").join(format!(
         "{tag}_{}_{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        format!("{:x}_{}", std::process::id(), _uniq_seq())
     ));
     std::fs::create_dir_all(&d).unwrap();
     d

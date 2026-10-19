@@ -20,6 +20,14 @@
 use qsdb::sql::translate::{self, LogicalPlan};
 
 /// 绑一条 SELECT，拿回未执行的逻辑计划。
+/// 测试目录唯一序号：pid 挡跨进程碰撞，序号挡同进程内并发（Windows 时钟
+/// 粒度 ~100ns，纳秒后缀在同 tick 内会重复——CI 上真炸过，见 constraints）。
+fn _uniq_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 fn plan_of(db: &qsdb::Qsdb, sql: &str) -> LogicalPlan {
     let mut stmts = translate::parse_statements(sql).expect("parse");
     assert_eq!(stmts.len(), 1, "shape 测试一次一条");
@@ -71,10 +79,7 @@ fn seeded(tag: &str) -> (qsdb::Qsdb, std::path::PathBuf) {
     let root = std::env::temp_dir().join("qsdb_join_shape").join(format!(
         "{tag}_{}_{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        format!("{:x}_{}", std::process::id(), _uniq_seq())
     ));
     let db = qsdb::Qsdb::open(&root, qsdb::QsdbOptions::default()).unwrap();
     db.sql("CREATE TABLE t (g BIGINT, v BIGINT)").unwrap();

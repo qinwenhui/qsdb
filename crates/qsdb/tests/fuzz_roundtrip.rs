@@ -30,6 +30,14 @@ impl Lcg {
     }
 }
 
+/// 测试目录唯一序号：pid 挡跨进程碰撞，序号挡同进程内并发（Windows 时钟
+/// 粒度 ~100ns，纳秒后缀在同 tick 内会重复——CI 上真炸过，见 constraints）。
+fn _uniq_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 fn col(name: &str, ty: LogicalType) -> ColumnDef {
     ColumnDef {
         name: name.into(),
@@ -101,13 +109,10 @@ fn tmp_root(tag: &str) -> std::path::PathBuf {
 }
 
 fn uuid_v7_hex() -> String {
-    // 避免引入 uuid 到测试 dev-deps 之外的路径——直接用 qsdb 内部暴露的能力
-    // （uuid 在 qsdb 依赖里，这里退而求其次用纳秒时间戳）
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{nanos:x}")
+    // 避免引入 uuid 到测试 dev-deps 之外的路径——退而求其次用
+    // 「pid + 线程内序号」拼唯一十六进制 id（纳秒后缀在 Windows 同 tick
+    // 内会重复，CI 上真炸过）。
+    format!("{:x}_{}", std::process::id(), _uniq_seq())
 }
 
 fn count_rows(db: &Qsdb, table: &str) -> usize {

@@ -28,6 +28,14 @@ static ERRORS: AtomicU64 = AtomicU64::new(0);
 
 /// 当前进程 RSS / 峰值 RSS（MB）。Windows 走 Win32，Linux 走 /proc/self/status
 /// （`VmRSS` / `VmHWM`，kB 取整 ⇒ 亚 MB 粒度丢失，对 soak 的 MB 级曲线无碍）。
+/// 测试目录唯一序号：pid 挡跨进程碰撞，序号挡同进程内并发（Windows 时钟
+/// 粒度 ~100ns，纳秒后缀在同 tick 内会重复——CI 上真炸过，见 constraints）。
+fn _uniq_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 fn mem_mb() -> (f64, f64) {
     #[cfg(windows)]
     {
@@ -121,11 +129,8 @@ fn main() {
         .unwrap_or(0); // 0 = 不设上限（短跑）
     let cap_rows: u64 = cap_millions * 1_000_000;
     let root = std::env::temp_dir().join(format!(
-        "qsdb_soak_{:x}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        "qsdb_soak_{}",
+        format!("{:x}_{}", std::process::id(), _uniq_seq())
     ));
     std::fs::create_dir_all(&root).unwrap();
     println!(

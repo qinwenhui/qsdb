@@ -1,13 +1,18 @@
 use qsdb::{Qsdb, QsdbOptions};
 
+/// 测试目录唯一序号：pid 挡跨进程碰撞，序号挡同进程内并发（Windows 时钟
+/// 粒度 ~100ns，纳秒后缀在同 tick 内会重复——CI 上真炸过，见 constraints）。
+fn _uniq_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 #[test]
 fn 常量十进制算术必须保持_const_否则外层列乘它越界() {
     let root = std::env::temp_dir().join("qsdb_repro_t19").join(format!(
         "{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        format!("{:x}_{}", std::process::id(), _uniq_seq())
     ));
     std::fs::create_dir_all(&root).unwrap();
     let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
@@ -50,10 +55,7 @@ fn 常量十进制算术必须保持_const_否则外层列乘它越界() {
 fn date_format_坏串给_null_不报错() {
     let root = std::env::temp_dir().join("qsdb_repro_df").join(format!(
         "{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        format!("{:x}_{}", std::process::id(), _uniq_seq())
     ));
     std::fs::create_dir_all(&root).unwrap();
     let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();

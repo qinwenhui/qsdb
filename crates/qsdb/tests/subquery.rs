@@ -2,13 +2,18 @@
 
 use qsdb::{Qsdb, QsdbOptions};
 
+/// 测试目录唯一序号：pid 挡跨进程碰撞，序号挡同进程内并发（Windows 时钟
+/// 粒度 ~100ns，纳秒后缀在同 tick 内会重复——CI 上真炸过，见 constraints）。
+fn _uniq_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 fn setup(tag: &str) -> (Qsdb, std::path::PathBuf) {
     let root = std::env::temp_dir().join("qsdb_m5_subq").join(format!(
         "{tag}_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        format!("{:x}_{}", std::process::id(), _uniq_seq())
     ));
     let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
     db.sql("CREATE TABLE sales (dt DATE, tenant STRING, amt BIGINT) PARTITIONED BY (dt)")
@@ -202,10 +207,7 @@ fn predicate_column_not_in_projection() {
 fn setup_semi(tag: &str) -> (Qsdb, std::path::PathBuf) {
     let root = std::env::temp_dir().join("qsdb_semi_join").join(format!(
         "{tag}_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        format!("{:x}_{}", std::process::id(), _uniq_seq())
     ));
     let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
     db.sql("CREATE TABLE t (dt DATE, g BIGINT, v BIGINT) PARTITIONED BY (dt)")
