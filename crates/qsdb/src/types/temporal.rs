@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn parse_date_ok() {
         assert_eq!(parse_date("1970-01-01").unwrap(), 0);
-        assert_eq!(parse_date("2026-10-04").unwrap(), 20_735);
+        assert_eq!(parse_date("2026-10-04").unwrap(), 20_730);
         assert_eq!(parse_date("0001-01-01").unwrap(), MIN_DATE_DAYS);
         assert_eq!(parse_date("9999-12-31").unwrap(), MAX_DATE_DAYS);
         assert_eq!(
@@ -349,10 +349,10 @@ mod tests {
     #[test]
     fn format_date_roundtrip() {
         assert_eq!(format_date(0), "1970-01-01");
-        assert_eq!(format_date(20_735), "2026-10-04");
+        assert_eq!(format_date(20_730), "2026-10-04");
         assert_eq!(format_date(MIN_DATE_DAYS), "0001-01-01");
         assert_eq!(format_date(MAX_DATE_DAYS), "9999-12-31");
-        for days in [MIN_DATE_DAYS, -1, 0, 1, 10_957, 20_735, MAX_DATE_DAYS] {
+        for days in [MIN_DATE_DAYS, -1, 0, 1, 10_957, 20_730, MAX_DATE_DAYS] {
             assert_eq!(parse_date(&format_date(days)).unwrap(), days);
         }
     }
@@ -426,11 +426,11 @@ mod tests {
         assert_eq!(parse_timestamp_ns("1970-01-01").unwrap(), 0);
         assert_eq!(
             parse_timestamp_ns("2026-10-04 14:30:00").unwrap(),
-            20_735 * NANOS_PER_DAY + 14 * NANOS_PER_HOUR + 30 * NANOS_PER_MIN
+            20_730 * NANOS_PER_DAY + 14 * NANOS_PER_HOUR + 30 * NANOS_PER_MIN
         );
         assert_eq!(
             parse_timestamp_ns("2026-10-04T14:30:00.123Z").unwrap(),
-            20_735 * NANOS_PER_DAY + 14 * NANOS_PER_HOUR + 30 * NANOS_PER_MIN + 123_000_000
+            20_730 * NANOS_PER_DAY + 14 * NANOS_PER_HOUR + 30 * NANOS_PER_MIN + 123_000_000
         );
         // i64 纳秒可表示上界附近
         assert!(parse_timestamp_ns("2262-04-11T23:47:16.854775807").is_ok());
@@ -454,14 +454,14 @@ mod tests {
         assert_eq!(format_timestamp_ns(0), "1970-01-01 00:00:00");
         assert_eq!(format_timestamp_ns(-1), "1969-12-31 23:59:59.999999999");
         assert_eq!(
-            format_timestamp_ns(20_735 * NANOS_PER_DAY + 14 * NANOS_PER_HOUR + 123_456_789),
+            format_timestamp_ns(20_730 * NANOS_PER_DAY + 14 * NANOS_PER_HOUR + 123_456_789),
             "2026-10-04 14:00:00.123456789"
         );
         assert_eq!(
-            format_timestamp_ns(20_735 * NANOS_PER_DAY + 500_000_000),
+            format_timestamp_ns(20_730 * NANOS_PER_DAY + 500_000_000),
             "2026-10-04 00:00:00.500"
         );
-        let ns = 20_735 * NANOS_PER_DAY + 14 * NANOS_PER_HOUR + 30 * NANOS_PER_MIN + 7;
+        let ns = 20_730 * NANOS_PER_DAY + 14 * NANOS_PER_HOUR + 30 * NANOS_PER_MIN + 7;
         let s = format_timestamp_ns(ns);
         assert_eq!(parse_timestamp_ns(&s).unwrap(), ns);
     }

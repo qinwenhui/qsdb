@@ -494,7 +494,7 @@ mod tests {
     #[test]
     fn dir_roundtrip() {
         let keys = vec!["dt".to_string(), "region".to_string()];
-        let vals = vec![Literal::Date(20735), Literal::Utf8("cn=east".into())];
+        let vals = vec![Literal::Date(20730), Literal::Utf8("cn=east".into())];
         let dir = partition_dir(&keys, &vals).unwrap();
         assert_eq!(dir, PathBuf::from("dt=2026-10-04/region=cn%3Deast"));
         let parsed = parse_partition_dir(&dir, 2).unwrap();
@@ -567,7 +567,7 @@ mod tests {
 
     #[test]
     fn parse_partition_value_types() {
-        let d = Literal::Date(20735);
+        let d = Literal::Date(20730);
         assert_eq!(
             parse_partition_value("2026-10-04", &LogicalType::Date).unwrap(),
             d

@@ -521,13 +521,13 @@ mod tests {
 
     #[test]
     fn cast_temporal_paths() {
-        let date = Literal::Date(20_735); // 2026-10-04
+        let date = Literal::Date(20_730); // 2026-10-04
         let ts = cast_literal(&date, &lt("TIMESTAMP")).unwrap();
-        assert_eq!(ts, Literal::Timestamp(20_735 * NANOS_PER_DAY));
+        assert_eq!(ts, Literal::Timestamp(20_730 * NANOS_PER_DAY));
         // 反向截断
         assert_eq!(
             cast_literal(
-                &Literal::Timestamp(20_735 * NANOS_PER_DAY + 123),
+                &Literal::Timestamp(20_730 * NANOS_PER_DAY + 123),
                 &lt("DATE")
             )
             .unwrap(),

@@ -197,7 +197,7 @@ mod tests {
             Literal::Binary(vec![0xAB, 0x00, 0xCD]).to_sql_string(),
             "X'AB00CD'"
         );
-        assert_eq!(Literal::Date(20_735).to_sql_string(), "2026-10-04");
+        assert_eq!(Literal::Date(20_730).to_sql_string(), "2026-10-04");
         assert_eq!(
             Literal::Time(45 * 1_000_000_000).to_sql_string(),
             "00:00:45"
