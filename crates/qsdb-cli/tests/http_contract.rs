@@ -1064,6 +1064,12 @@ fn j11_adoption_echo_and_request_strictness() {
         Some("drv-abc-1"),
         "响应头应回显 id"
     );
+    let elapsed = r
+        .header("x-qsdb-elapsed-ms")
+        .expect("query 响应应带服务端执行耗时头")
+        .parse::<f64>()
+        .expect("执行耗时头应是浮点毫秒");
+    assert!(elapsed >= 0.0, "执行耗时不能为负: {elapsed}");
     assert_eq!(
         r.json()["queryId"],
         "drv-abc-1",

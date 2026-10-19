@@ -1391,3 +1391,26 @@ fn files_浏览详情与回收站往返() {
     let listing = c.files_list(dir).expect("after trash");
     assert!(!listing.entries.iter().any(|e| e.name.contains("orphan")));
 }
+
+/// 十九批Ⅷ：`server_elapsed_ms()`——查询与流式都暴露；值来自
+/// `X-QSDB-Elapsed-Ms` 头（不含序列化/网络/客户端解码，Studio 的
+/// "查询 X · 传输 Y" 拆分就靠它）。旧内核无头 → None 的回退分支由
+/// Studio 侧处理，这里钉住"新内核必有值"。
+#[test]
+fn server_elapsed_ms_查询与流式都暴露() {
+    let s = Server::start();
+    let c = s.client();
+    c.execute("CREATE TABLE et (a BIGINT)").unwrap();
+    c.execute("INSERT INTO et VALUES (1),(2)").unwrap();
+
+    let rs = c.query("SELECT count(*) FROM et").unwrap();
+    let ms = rs.server_elapsed_ms().expect("query 响应该带执行耗时");
+    assert!(ms >= 0.0, "执行耗时不该是负数: {ms}");
+
+    let mut st = c
+        .query_stream("SELECT a FROM et", &QueryOptions::default())
+        .unwrap();
+    let sms = st.server_elapsed_ms().expect("流式响应该带执行耗时");
+    assert!(sms >= 0.0, "{sms}");
+    while st.next_chunk().unwrap().is_some() {}
+}

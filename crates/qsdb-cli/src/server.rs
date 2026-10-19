@@ -2930,6 +2930,13 @@ async fn query(
         resp.headers_mut()
             .insert(axum::http::HeaderName::from_static("x-qsdb-query-id"), v);
     }
+    // 十九批Ⅷ：服务端执行耗时（毫秒，浮点）。**不含**结果序列化/网络传输/
+    // 客户端解码——驱动可用它与自己的总往返相减，得到传输/解码耗时。
+    // JSON 通道 body 里本来就有 elapsedMs；这个头让 bulk/rows/IPC/CSV 也能拿到。
+    if let Ok(v) = axum::http::HeaderValue::from_str(&format!("{:.3}", elapsed as f64 / 1e6)) {
+        resp.headers_mut()
+            .insert(axum::http::HeaderName::from_static("x-qsdb-elapsed-ms"), v);
+    }
     resp
 }
 

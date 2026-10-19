@@ -493,12 +493,22 @@ impl ResultData {
 #[derive(Debug)]
 pub struct ResultSet {
     query_id: Option<String>,
+    /// 服务端执行耗时（ms，**不含序列化/网络/客户端解码**）。
+    server_elapsed_ms: Option<f64>,
     data: ResultData,
 }
 
 impl ResultSet {
-    pub(crate) fn new(data: ResultData, query_id: Option<String>) -> Self {
-        Self { query_id, data }
+    pub(crate) fn new(
+        data: ResultData,
+        query_id: Option<String>,
+        server_elapsed_ms: Option<f64>,
+    ) -> Self {
+        Self {
+            query_id,
+            server_elapsed_ms,
+            data,
+        }
     }
 
     /// 服务端**实际使用**的 query id。
@@ -507,6 +517,15 @@ impl ResultSet {
     /// 自己生成的（见 [`QueryOptions::query_id`]）。
     pub fn query_id(&self) -> Option<&str> {
         self.query_id.as_deref()
+    }
+
+    /// 服务端执行耗时（ms）。
+    ///
+    /// 来自响应头 `x-qsdb-elapsed-ms`（JSON 通道旧服务端没有头时回退到 body
+    /// 的 `elapsedMs`）。**不含**结果序列化、网络传输与客户端解码；调用方可用
+    /// 自己的总往返相减得到传输/解码耗时。旧服务端/流式前无此头时为 `None`。
+    pub fn server_elapsed_ms(&self) -> Option<f64> {
+        self.server_elapsed_ms
     }
 
     /// 载荷（想自己 match 时用）。
@@ -835,7 +854,11 @@ impl Client {
         )?;
         // 非 JSON 通道的 queryId 只在响应头里（J4/J11），先取出来再交出去
         let qid = resp.head.header("x-qsdb-query-id").map(str::to_string);
-        dispatch(resp.head, resp.body, qid.as_deref())
+        let server_elapsed_ms = resp
+            .head
+            .header("x-qsdb-elapsed-ms")
+            .and_then(|s| s.parse::<f64>().ok());
+        dispatch(resp.head, resp.body, qid.as_deref(), server_elapsed_ms)
     }
 
     /// **流式**读取一行一条的结果（内存恒定：只保留一块）。
@@ -878,7 +901,10 @@ impl Client {
                 Err(_) => Error::Decode(format!("期望 rows 通道，服务端 Content-Type 是 {ct:?}")),
             });
         }
-        RowStream::new(body)
+        let server_elapsed_ms = head
+            .header("x-qsdb-elapsed-ms")
+            .and_then(|s| s.parse::<f64>().ok());
+        RowStream::new(body, server_elapsed_ms)
     }
 
     /// 跑一条**无结果集**的语句（DDL/DML），拿结构化回执。
@@ -1310,7 +1336,12 @@ impl Client {
 }
 
 /// 按 `Content-Type` 分派响应（**不按请求的 format**，见 [`ResultSet`]）。
-fn dispatch(head: http::Head, body: Vec<u8>, query_id_hdr: Option<&str>) -> Result<ResultSet> {
+fn dispatch(
+    head: http::Head,
+    body: Vec<u8>,
+    query_id_hdr: Option<&str>,
+    server_elapsed_ms: Option<f64>,
+) -> Result<ResultSet> {
     let status = head.status;
     if !(200..300).contains(&status) {
         return Err(json::api_error(status, &body));
@@ -1324,18 +1355,22 @@ fn dispatch(head: http::Head, body: Vec<u8>, query_id_hdr: Option<&str>) -> Resu
         let j = JsonResult::parse(&body)?;
         // JSON 通道的 id 在体里；体里没有才看响应头（两者都回时以体为准）
         let id = qid(j.query_id.clone());
-        return Ok(ResultSet::new(ResultData::Json(j), id));
+        // 旧服务端没有统一耗时头：JSON body 里的 elapsedMs 也是服务端执行耗时。
+        let elapsed = server_elapsed_ms.or(j.elapsed_ms);
+        return Ok(ResultSet::new(ResultData::Json(j), id, elapsed));
     }
     if ct.contains("vnd.qsdb.bulk") {
         return Ok(ResultSet::new(
             ResultData::Bulk(BulkTable::decode(body)?),
             qid(None),
+            server_elapsed_ms,
         ));
     }
     if ct.contains("vnd.qsdb.rows") {
         return Ok(ResultSet::new(
             ResultData::Rows(rows::decode_all(&body)?),
             qid(None),
+            server_elapsed_ms,
         ));
     }
     if ct.contains("arrow.stream") {
@@ -1344,6 +1379,7 @@ fn dispatch(head: http::Head, body: Vec<u8>, query_id_hdr: Option<&str>) -> Resu
             return Ok(ResultSet::new(
                 ResultData::Ipc(ipc::decode_all(&body)?),
                 qid(None),
+                server_elapsed_ms,
             ));
         }
         #[cfg(not(feature = "ipc"))]

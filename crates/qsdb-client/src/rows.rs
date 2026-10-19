@@ -373,19 +373,22 @@ pub struct RowStream {
     rd: Reader<crate::http::Body>,
     schema: Arc<Vec<ColumnDesc>>,
     done: bool,
+    /// 服务端执行耗时（ms；来自响应头，不含传输/客户端解码）。
+    server_elapsed_ms: Option<f64>,
     /// 已读块数 / 行数（诊断用）。
     chunks: u64,
     rows: u64,
 }
 
 impl RowStream {
-    pub(crate) fn new(body: crate::http::Body) -> Result<Self> {
+    pub(crate) fn new(body: crate::http::Body, server_elapsed_ms: Option<f64>) -> Result<Self> {
         let mut rd = Reader::new(body);
         let schema = read_header(&mut rd)?;
         Ok(Self {
             rd,
             schema,
             done: false,
+            server_elapsed_ms,
             chunks: 0,
             rows: 0,
         })
@@ -394,6 +397,11 @@ impl RowStream {
     /// 列描述（**流一开始就有**，不必等第一块）。
     pub fn schema(&self) -> &[ColumnDesc] {
         &self.schema
+    }
+
+    /// 服务端执行耗时（ms）。旧服务端无统一耗时头时返回 `None`。
+    pub fn server_elapsed_ms(&self) -> Option<f64> {
+        self.server_elapsed_ms
     }
 
     /// 读下一块；`None` = 结果流结束。
