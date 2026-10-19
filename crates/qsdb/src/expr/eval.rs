@@ -498,7 +498,7 @@ fn decimal_arith(op: ArithOp, l: &EvalVal, r: &EvalVal, ty: &LogicalType) -> Res
         // 与下面 `Mul` 的**溢出**报错口径不同，是**刻意**的：
         // - 溢出是"这个值装不下"，报错能逼出模型/精度问题（本仓一贯口径）；
         // - 除零是**数据相关**的运行期状况（某一行分母恰好是 0），
-        //   报错会让整批结算因为一个坏行全挂，而 Spark 的答案本来就是 NULL。
+        //   报错会让整批任务因为一个坏行全挂，而 Spark 的答案本来就是 NULL。
         if b_is_zero(rd, i) && matches!(op, ArithOp::Div | ArithOp::Mod) {
             out.push(None);
             continue;

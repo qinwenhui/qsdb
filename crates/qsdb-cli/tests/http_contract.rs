@@ -2019,7 +2019,7 @@ fn grants_whitelist_per_request_effect_and_write_gate() {
         String::from_utf8_lossy(&r.body)
     );
 
-    // ⑦ 白名单制用户对未授库的语义：只授 settle → 登录成功但 default 无权
+    // ⑦ 白名单制用户对未授库的语义：只授 app → 登录成功但 default 无权
     let out = Command::new(env!("CARGO_BIN_EXE_qsdb"))
         .args(["admin", "--path"])
         .arg(&srv.root)
@@ -2029,7 +2029,7 @@ fn grants_whitelist_per_request_effect_and_write_gate() {
             "--password",
             "pw123",
             "--grant",
-            "settle=reader",
+            "app=reader",
         ])
         .output()
         .expect("run admin user add");
@@ -2043,7 +2043,7 @@ fn grants_whitelist_per_request_effect_and_write_gate() {
     );
     assert_eq!(
         r.json()["grants"],
-        serde_json::json!({ "settle": "reader" })
+        serde_json::json!({ "app": "reader" })
     );
     assert!(r.json()["role"].is_null(), "对 default 无权 → role 回 null");
     let ftok = r.json()["token"].as_str().unwrap().to_string();
@@ -2067,35 +2067,35 @@ fn multi_mount_routing_isolation_and_rejects() {
     // 第二个挂载目录（Server::start 只建 root；Drop 只清 root）
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let settle_dir =
-        std::env::temp_dir().join(format!("qsdb_mm_settle_{}_{}", std::process::id(), uniq));
-    let _ = std::fs::remove_dir_all(&settle_dir);
-    std::fs::create_dir_all(&settle_dir).unwrap();
+    let app_dir =
+        std::env::temp_dir().join(format!("qsdb_mm_app_{}_{}", std::process::id(), uniq));
+    let _ = std::fs::remove_dir_all(&app_dir);
+    std::fs::create_dir_all(&app_dir).unwrap();
 
-    let settle_s = settle_dir.to_string_lossy().replace('\\', "/");
-    let srv = Server::start(&["--mount", &format!("settle={settle_s}")]);
+    let app_s = app_dir.to_string_lossy().replace('\\', "/");
+    let srv = Server::start(&["--mount", &format!("app={app_s}")]);
     let p = srv.port;
     let q = |sql: &str| query(p, sql, None);
 
     // ① 同名表各建各的，互不串（验收核心）
     assert_eq!(q("CREATE TABLE t (a BIGINT)").status, 200);
-    assert_eq!(q("CREATE TABLE settle.t (a BIGINT)").status, 200);
+    assert_eq!(q("CREATE TABLE app.t (a BIGINT)").status, 200);
     assert_eq!(q("INSERT INTO t VALUES (1),(2)").status, 200);
-    assert_eq!(q("INSERT INTO settle.t VALUES (10),(20),(30)").status, 200);
+    assert_eq!(q("INSERT INTO app.t VALUES (10),(20),(30)").status, 200);
     let r = q("SELECT count(*) FROM t");
     assert_eq!(r.json()["rows"][0][0], 2, "default.t");
-    let r = q("SELECT count(*) FROM settle.t");
-    assert_eq!(r.json()["rows"][0][0], 3, "settle.t——同名表不串");
+    let r = q("SELECT count(*) FROM app.t");
+    assert_eq!(r.json()["rows"][0][0], 3, "app.t——同名表不串");
     // 参数化 + 限定名
     let r = query_params(
         p,
-        "SELECT count(*) FROM settle.t WHERE a = $1",
+        "SELECT count(*) FROM app.t WHERE a = $1",
         serde_json::json!([20]),
     );
     assert_eq!(r.json()["rows"][0][0], 1);
 
     // ② 跨库显式拒（501 UNSUPPORTED，不是静默连错库）
-    let r = q("SELECT count(*) FROM t JOIN settle.t ON true");
+    let r = q("SELECT count(*) FROM t JOIN app.t ON true");
     assert_eq!(r.status, 501, "{}", String::from_utf8_lossy(&r.body));
     assert_eq!(r.code(), "UNSUPPORTED");
     // 未挂载的库名 → 404
@@ -2105,7 +2105,7 @@ fn multi_mount_routing_isolation_and_rejects() {
 
     // ③ REST database 字段（优先级最高）
     let body =
-        serde_json::json!({"sql": "SELECT count(*) FROM t", "database": "settle"}).to_string();
+        serde_json::json!({"sql": "SELECT count(*) FROM t", "database": "app"}).to_string();
     let r = http(
         p,
         "POST",
@@ -2113,7 +2113,7 @@ fn multi_mount_routing_isolation_and_rejects() {
         &[("Content-Type", "application/json")],
         body.as_bytes(),
     );
-    assert_eq!(r.json()["rows"][0][0], 3, "database=settle 定向");
+    assert_eq!(r.json()["rows"][0][0], 3, "database=app 定向");
     // 未挂载的 database → 404
     let body = serde_json::json!({"sql": "SELECT 1", "database": "nope"}).to_string();
     let r = http(
@@ -2125,36 +2125,37 @@ fn multi_mount_routing_isolation_and_rejects() {
     );
     assert_eq!(r.status, 404);
 
-    // ④ 写入路由：?table=settle.t
+    // ④ 写入路由：?table=app.t
     let r = http(
         p,
         "POST",
-        "/api/v1/write?table=settle.t&mode=append&format=csv",
+        "/api/v1/write?table=app.t&mode=append&format=csv",
         &[("Content-Type", "text/csv")],
         b"a
 40
 ",
     );
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-    let r = q("SELECT count(*) FROM settle.t");
+    let r = q("SELECT count(*) FROM app.t");
     assert_eq!(r.json()["rows"][0][0], 4);
 
     // ⑤ 元数据端点带限定名
     let r = http(p, "GET", "/api/v1/tables", &[], &[]);
     let txt = String::from_utf8_lossy(&r.body).to_string();
     assert!(
-        txt.contains("default.t") && txt.contains("settle.t"),
+        txt.contains("default.t") && txt.contains("app.t"),
         "多挂载 /tables 应给限定名: {txt}"
     );
-    let r = http(p, "GET", "/api/v1/tables/settle.t/schema", &[], &[]);
+    let r = http(p, "GET", "/api/v1/tables/app.t/schema", &[], &[]);
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-    assert_eq!(r.json()["table"], "settle.t");
+    assert_eq!(r.json()["table"], "app.t");
     let r = http(p, "GET", "/api/v1/databases", &[], &[]);
     let v = r.json();
     let dbs = v["databases"].as_array().unwrap();
     assert_eq!(dbs.len(), 2);
-    assert_eq!(dbs[0]["name"], "default");
-    assert_eq!(dbs[0]["readOnly"], false);
+    // 位置无关（列表按名字典序，"app" 会排在 "default" 前面——别依赖顺序）
+    let dflt = dbs.iter().find(|d| d["name"] == "default").unwrap();
+    assert_eq!(dflt["readOnly"], false);
 
     // ⑥ USE 流程（要登录会话；开放模式登录 = anonymous 会话）
     let r = login(p, "x", "y");
@@ -2168,11 +2169,11 @@ fn multi_mount_routing_isolation_and_rejects() {
     let bearer = format!("Bearer {tok}");
     let auth = [("Authorization", bearer.as_str())];
     let qa = |sql: &str| query_auth(p, sql, None, &auth);
-    let r = qa("USE settle");
+    let r = qa("USE app");
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-    assert_eq!(r.json()["defaultDb"], "settle");
+    assert_eq!(r.json()["defaultDb"], "app");
     let r = qa("SELECT count(*) FROM t");
-    assert_eq!(r.json()["rows"][0][0], 4, "USE 后单段名落 settle");
+    assert_eq!(r.json()["rows"][0][0], 4, "USE 后单段名落 app");
     let r = qa("USE nope");
     assert_eq!(r.status, 404);
     // SHOW DATABASES
@@ -2180,7 +2181,7 @@ fn multi_mount_routing_isolation_and_rejects() {
     assert_eq!(r.status, 200);
     assert_eq!(r.json()["rowCount"], 2);
 
-    let _ = std::fs::remove_dir_all(&settle_dir);
+    let _ = std::fs::remove_dir_all(&app_dir);
 }
 
 /// `PUT /api/v1/sessions/current/database`：设会话默认库（`USE` 的 REST 落点）。
@@ -2236,7 +2237,7 @@ fn session_default_db_endpoint() {
         "PUT",
         "/api/v1/sessions/current/database",
         &[("Content-Type", "application/json"), carol[0]],
-        br#"{"database":"settle"}"#,
+        br#"{"database":"app"}"#,
     );
     assert_eq!(r.status, 404);
     assert_eq!(r.code(), "NOT_FOUND");
@@ -2537,39 +2538,39 @@ fn copy_and_files_are_mount_aware() {
     // 第二个挂载目录（同 multi_mount 测试的模式）
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let settle_dir =
+    let app_dir =
         std::env::temp_dir().join(format!("qsdb_cm_files_{}_{}", std::process::id(), uniq));
-    let _ = std::fs::remove_dir_all(&settle_dir);
-    std::fs::create_dir_all(&settle_dir).unwrap();
-    let settle_s = settle_dir
+    let _ = std::fs::remove_dir_all(&app_dir);
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let app_s = app_dir
         .to_string_lossy()
         .replace(std::path::MAIN_SEPARATOR, "/");
-    let srv = Server::start(&["--mount", &format!("settle={settle_s}")]);
+    let srv = Server::start(&["--mount", &format!("app={app_s}")]);
     let p = srv.port;
     let q = |sql: &str| query(p, sql, None);
 
-    // settle 库建表 + 写数据
-    assert_eq!(q("CREATE TABLE settle.st (a BIGINT, s STRING)").status, 200);
+    // app 库建表 + 写数据
+    assert_eq!(q("CREATE TABLE app.st (a BIGINT, s STRING)").status, 200);
     assert_eq!(
-        q("INSERT INTO settle.st VALUES (1,'x'),(2,'y'),(3,'z')").status,
+        q("INSERT INTO app.st VALUES (1,'x'),(2,'y'),(3,'z')").status,
         200
     );
 
-    // COPY：内层限定名路由到 settle + **相对目标按库根解析**（此前按进程 CWD）
-    let r = q("COPY (SELECT * FROM settle.st) TO 'exp_mount' (FORMAT CSV, HEADER true)");
+    // COPY：内层限定名路由到 app + **相对目标按库根解析**（此前按进程 CWD）
+    let r = q("COPY (SELECT * FROM app.st) TO 'exp_mount' (FORMAT CSV, HEADER true)");
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     assert_eq!(r.json()["command"], "COPY");
 
-    // `/files`：`<库名>/相对路径` 前缀 → settle 库根——下载到刚导出的文件，
-    // 内容与 settle 库根下的本地文件逐字节一致
-    let exported = settle_dir.join("exp_mount");
+    // `/files`：`<库名>/相对路径` 前缀 → app 库根——下载到刚导出的文件，
+    // 内容与 app 库根下的本地文件逐字节一致
+    let exported = app_dir.join("exp_mount");
     assert!(
         exported.is_file(),
-        "相对目标应落在 settle 库根: {}",
-        settle_dir.display()
+        "相对目标应落在 app 库根: {}",
+        app_dir.display()
     );
     let local = std::fs::read(&exported).unwrap();
-    let r = http(p, "GET", "/api/v1/files?path=settle/exp_mount", &[], &[]);
+    let r = http(p, "GET", "/api/v1/files?path=app/exp_mount", &[], &[]);
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     assert_eq!(r.body, local, "下载逐字节一致");
     // 同一文件在 default 库根不存在 → 404（挂载前缀真的路由了）

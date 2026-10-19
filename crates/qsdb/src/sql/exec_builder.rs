@@ -763,7 +763,7 @@ fn rewrite_expr(e: &PhysExpr, mapping: &[Option<usize>], all: &[String]) -> Phys
 /// 而 `def.columns` / `mapping` 用的都是**裸名**。不剥就永远判"不是表列"，于是
 /// `unwrap_or(idx)` **把旧索引原样留下**，静默指到隔壁列。
 ///
-/// 实测（2026-10-16，两张同构真表 —— 电力日清的"日前 vs 实际"）：
+/// 实测（2026-10-16，两张同构真表 —— 同一模板建的对照表）：
 /// `SELECT a.k, b.v FROM a JOIN b ON a.k=b.k` **静默回 0 行**、
 /// `SELECT a.k, b.k FROM …` 直接 `index out of bounds: len 1 index 1`（panic）。
 ///

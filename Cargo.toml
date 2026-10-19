@@ -6,7 +6,7 @@ members = ["crates/qsdb", "crates/qsdb-cli", "crates/qsdb-bench", "crates/qsdb-c
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-license = "Apache-2.0"
+license = "MIT"
 repository = "https://github.com/qinwenhui/qsdb"
 
 [workspace.dependencies]

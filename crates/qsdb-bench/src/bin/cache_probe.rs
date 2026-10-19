@@ -46,7 +46,7 @@ fn main() {
     let dir = a
         .get(1)
         .cloned()
-        .unwrap_or_else(|| "/home/qctc/qsdb-suite".into());
+        .unwrap_or_else(|| "/home/bench/qsdb-suite".into());
     let cache_mb: usize = a.get(2).and_then(|v| v.parse().ok()).unwrap_or(256);
     let sql = a
         .get(3)

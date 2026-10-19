@@ -1,0 +1,204 @@
+WITH t1 AS (
+SELECT PHID,pdate,plant_id,plant_name,unit_id,unit_name,power_company_id,power_company_name,power_type,power_type_name,settle_type,settle_type_name,trade_types,trade_types_name,yx_plant_id,yx_plant_name,yx_unit_id,yx_unit_name,approve_cost,electricity_consume_rate,gas_first_price,gas_second_price,limit_hour,not_gas_price,sulfur_price,saltpetre_price,dust_price,ultra_low_emission_price,not_gas_total_price,unit_capacity,max_output_power,month_hour,price_adjust_standard,standard_coefficient,first_subsidy_standard,second_subsidy_standard,update_time,update_by,update_name,app_type,app_type_name,base_type,base_type_name,month,power_group_name,max_capacity,min_capacity,coil_price,voltage_level_code,voltage_level_name,license_capacity,plant_group_id,plant_group_name,winter_max_capacity,summer_max_capacity,max_power_generation,min_power_generation,rated_pump_power,mechanism_power_ratio,power_price_class,power_supply_bureau,power_supply_name,bas_power_ratio,is_ahead_clear,is_ahead_clear_name FROM  t_cal_day_unit WHERE (APP_TYPE != '301') AND (PDATE IN ( '2026-04-01' )) AND (SETTLE_TYPE = '1')
+),
+t2 AS (
+SELECT pdate,tpoint,unitid,unitname,sbr,sbsj,dh,spower,epower,cost,costjm,type,planid FROM js_data.t_jygl_da_arc_unitnlbase WHERE (PDATE IN ( '2026-04-01' ))
+),
+t3 AS (
+SELECT PHID,pdate,month,settle_month,is_refund,is_refund_name,plant_id,plant_name,unit_id,unit_name,power_company_id,power_company_name,power_type,power_type_name,settle_type,settle_type_name,trade_types,trade_types_name,compensate_type,compensate_type_name,data_type,data_name,tpoint,value,version,update_time,update_by,update_name FROM  t_cal_day_compensate_unit WHERE (PDATE IN ( '2026-04-01' )) AND (SETTLE_MONTH = '2026-04-01') AND (SETTLE_TYPE = '1')
+),
+t4 AS (
+SELECT PHID,pdate,plant_id,plant_name,unit_id,unit_name,power_company_id,power_company_name,power_type,power_type_name,settle_type,settle_type_name,trade_types,trade_types_name,yx_plant_id,yx_plant_name,yx_unit_id,yx_unit_name,approve_cost,electricity_consume_rate,gas_first_price,gas_second_price,limit_hour,not_gas_price,sulfur_price,saltpetre_price,dust_price,ultra_low_emission_price,not_gas_total_price,unit_capacity,max_output_power,month_hour,price_adjust_standard,standard_coefficient,first_subsidy_standard,second_subsidy_standard,update_time,update_by,update_name,app_type,app_type_name,base_type,base_type_name,month,power_group_name,max_capacity,min_capacity,coil_price,voltage_level_code,voltage_level_name,license_capacity,plant_group_id,plant_group_name,winter_max_capacity,summer_max_capacity,max_power_generation,min_power_generation,rated_pump_power,mechanism_power_ratio,power_price_class,power_supply_bureau,power_supply_name,bas_power_ratio,is_ahead_clear,is_ahead_clear_name FROM  t_cal_day_unit WHERE (APP_TYPE != '301') AND (PDATE IN ( '2026-04-01' )) AND (SETTLE_TYPE = '1')
+),
+t5 AS (
+SELECT PHID,pdate,month,plant_id,plant_name,unit_id,unit_name,power_company_id,power_company_name,power_type,power_type_name,settle_type,settle_type_name,trade_types,trade_types_name,yx_plant_id,yx_plant_name,yx_unit_id,yx_unit_name,unit_capacity,tpoint,energy,version,update_time,update_by,update_name,app_type,app_type_name,base_type,base_type_name,electricity_consume_rate FROM  t_cal_day_energy_unit WHERE (APP_TYPE != '301') AND (PDATE IN ( '2026-04-01' )) AND (SETTLE_TYPE = '1')
+),
+t6 AS (
+SELECT PHID,pdate,month,version_id,status,status_name,update_time,update_by,update_name,compute_done_time,create_time,create_by,create_name,settle_period,settle_period_name,market_type,market_type_name,is_refund,is_solid FROM  t_cal_day_calculate_version WHERE (PDATE IN ( '2026-04-01' )) AND (VERSION_ID IN ( '78_20260401_1' ))
+),
+t7 AS (
+SELECT PDATE,TPOINT,UNITID,max(DH) AS max_DH,min(SPOWER) AS min_SPOWER,max(EPOWER) AS max_EPOWER FROM t2 GROUP BY PDATE,TPOINT,UNITID 
+),
+t8 AS (
+SELECT * FROM t3 WHERE DATA_TYPE='3'
+),
+t9 AS (
+SELECT * FROM t3 WHERE DATA_TYPE='2'
+),
+t10 AS (
+SELECT * FROM t3 WHERE DATA_TYPE='1'
+),
+t11 AS (
+SELECT t5.PHID, t5.PDATE, t5.MONTH, t5.PLANT_ID, t5.PLANT_NAME, t5.UNIT_ID, t5.UNIT_NAME, t5.POWER_COMPANY_ID, t5.POWER_COMPANY_NAME, t5.POWER_TYPE, t5.POWER_TYPE_NAME, t5.SETTLE_TYPE, t5.SETTLE_TYPE_NAME, t5.TRADE_TYPES, t5.TRADE_TYPES_NAME, t5.YX_PLANT_ID, t5.YX_PLANT_NAME, t5.YX_UNIT_ID, t5.YX_UNIT_NAME, t5.UNIT_CAPACITY, t5.TPOINT, t5.ENERGY, t5.VERSION, t5.UPDATE_TIME, t5.UPDATE_BY, t5.UPDATE_NAME, t5.APP_TYPE, t5.APP_TYPE_NAME, t5.BASE_TYPE, t5.BASE_TYPE_NAME, t4.ELECTRICITY_CONSUME_RATE FROM t5 INNER JOIN t4 ON t5.PDATE = t4.PDATE AND t5.UNIT_ID = t4.UNIT_ID
+),
+t12 AS (
+SELECT t7.PDATE, t7.TPOINT, t7.UNITID, t7.MAX_DH, t7.MAX_EPOWER, t2.COST FROM t7 INNER JOIN t2 ON t7.PDATE = t2.PDATE AND t7.TPOINT = t2.TPOINT AND t7.UNITID = t2.UNITID AND t7.MAX_DH = t2.DH
+),
+t13 AS (
+SELECT
+  `PHID`,
+  `pdate`,
+  `month`,
+  `settle_month`,
+  `is_refund`,
+  `is_refund_name`,
+  `plant_id`,
+  `plant_name`,
+  `unit_id`,
+  `unit_name`,
+  `power_company_id`,
+  `power_company_name`,
+  `power_type`,
+  `power_type_name`,
+  `settle_type`,
+  `settle_type_name`,
+  `trade_types`,
+  `trade_types_name`,
+  `compensate_type`,
+  `compensate_type_name`,
+  `data_type`,
+  `data_name`,
+  `tpoint`,
+  `value` AS `minfee`,
+  `version`,
+  `update_time`,
+  `update_by`,
+  `update_name`
+FROM t8
+),
+t14 AS (
+SELECT
+  `PHID`,
+  `pdate`,
+  `month`,
+  `settle_month`,
+  `is_refund`,
+  `is_refund_name`,
+  `plant_id`,
+  `plant_name`,
+  `unit_id`,
+  `unit_name`,
+  `power_company_id`,
+  `power_company_name`,
+  `power_type`,
+  `power_type_name`,
+  `settle_type`,
+  `settle_type_name`,
+  `trade_types`,
+  `trade_types_name`,
+  `compensate_type`,
+  `compensate_type_name`,
+  `data_type`,
+  `data_name`,
+  `tpoint`,
+  `value` AS `lable`,
+  `version`,
+  `update_time`,
+  `update_by`,
+  `update_name`
+FROM t9
+),
+t15 AS (
+SELECT
+  `PHID`,
+  `pdate`,
+  `month`,
+  `settle_month`,
+  `is_refund`,
+  `is_refund_name`,
+  `plant_id`,
+  `plant_name`,
+  `unit_id`,
+  `unit_name`,
+  `power_company_id`,
+  `power_company_name`,
+  `power_type`,
+  `power_type_name`,
+  `settle_type`,
+  `settle_type_name`,
+  `trade_types`,
+  `trade_types_name`,
+  `compensate_type`,
+  `compensate_type_name`,
+  `data_type`,
+  `data_name`,
+  `tpoint`,
+  `value` AS `mincl`,
+  `version`,
+  `update_time`,
+  `update_by`,
+  `update_name`
+FROM t10
+),
+t16 AS (
+SELECT t15.PDATE, t15.MONTH, t15.PLANT_ID, t15.PLANT_NAME, t15.UNIT_ID, t15.UNIT_NAME, t15.POWER_COMPANY_ID, t15.POWER_COMPANY_NAME, t15.POWER_TYPE, t15.POWER_TYPE_NAME, t15.SETTLE_TYPE, t15.SETTLE_TYPE_NAME, t15.TRADE_TYPES, t15.TRADE_TYPES_NAME, t15.TPOINT, t15.MINCL, t11.ENERGY, t11.ELECTRICITY_CONSUME_RATE FROM t15 INNER JOIN t11 ON t15.PDATE = t11.PDATE AND t15.UNIT_ID = t11.UNIT_ID AND t15.TPOINT = t11.TPOINT
+),
+t17 AS (
+SELECT t16.MONTH, t16.PDATE, t16.TPOINT, t16.ENERGY, t16.PLANT_ID, t16.PLANT_NAME, t16.UNIT_ID, t16.UNIT_NAME, t16.POWER_COMPANY_ID, t16.POWER_COMPANY_NAME, t16.POWER_TYPE, t16.POWER_TYPE_NAME, t16.SETTLE_TYPE, t16.SETTLE_TYPE_NAME, t16.TRADE_TYPES, t16.TRADE_TYPES_NAME, t16.ELECTRICITY_CONSUME_RATE, t16.MINCL, t14.LABLE FROM t16 INNER JOIN t14 ON t16.PDATE = t14.PDATE AND t16.TPOINT = t14.TPOINT AND t16.PLANT_ID = t14.PLANT_ID AND t16.UNIT_ID = t14.UNIT_ID
+),
+t18 AS (
+SELECT t17.MONTH, t17.PDATE, t17.TPOINT, t17.ENERGY, t17.PLANT_ID, t17.PLANT_NAME, t17.UNIT_ID, t17.UNIT_NAME, t17.POWER_COMPANY_ID, t17.POWER_COMPANY_NAME, t17.POWER_TYPE, t17.POWER_TYPE_NAME, t17.SETTLE_TYPE, t17.SETTLE_TYPE_NAME, t17.TRADE_TYPES, t17.TRADE_TYPES_NAME, t17.ELECTRICITY_CONSUME_RATE, t17.MINCL, t17.LABLE, t13.MINFEE FROM t17 INNER JOIN t13 ON t17.PDATE = t13.PDATE AND t17.TPOINT = t13.TPOINT AND t17.PLANT_ID = t13.PLANT_ID AND t17.UNIT_ID = t13.UNIT_ID
+),
+t19 AS (
+SELECT
+*
+,CAST(COALESCE(`ENERGY`,0.0)/(1-COALESCE(`ELECTRICITY_CONSUME_RATE`,0.0)) as DECIMAL(38,8)) AS `fact_energy`
+FROM t18
+),
+t20 AS (
+SELECT t19.MONTH, t19.PDATE, t19.TPOINT, t19.PLANT_ID, t19.UNIT_ID, t19.ELECTRICITY_CONSUME_RATE, t19.MINCL, t19.LABLE, t19.MINFEE, t19.FACT_ENERGY, t7.MAX_DH, t7.MIN_SPOWER, t7.MAX_EPOWER FROM t19 LEFT JOIN t7 ON t19.PDATE = t7.PDATE AND t19.TPOINT = t7.TPOINT AND t19.UNIT_ID = t7.UNITID
+),
+t21 AS (
+SELECT t20.FACT_ENERGY, t2.PDATE, t2.TPOINT, t2.UNITID, t2.DH, t2.SPOWER, t2.EPOWER, t2.COST FROM t20 INNER JOIN t2 ON t20.PDATE = t2.PDATE AND t20.TPOINT = t2.TPOINT AND t20.UNIT_ID = t2.UNITID
+),
+t22 AS (
+SELECT t20.PDATE, t20.TPOINT, t20.UNIT_ID, t20.FACT_ENERGY, t12.MAX_EPOWER, t12.COST FROM t20 INNER JOIN t12 ON t20.PDATE = t12.PDATE AND t20.TPOINT = t12.TPOINT AND t20.UNIT_ID = t12.UNITID
+),
+t23 AS (
+SELECT
+*
+,CAST(CASE when (COALESCE(`LABLE`,0.0) is null ) THEN CAST(COALESCE(`MINFEE`,0.0) AS DECIMAL(38, 8)) when (COALESCE(`LABLE`,0.0) <> 1 ) THEN CAST(COALESCE(`MINFEE`,0.0) AS DECIMAL(38, 8)) ELSE CAST(0 AS DECIMAL(38, 8)) END as DECIMAL(38,8)) AS `min_output_fee`,
+CAST(CASE when (COALESCE(`FACT_ENERGY`,0.0) >= COALESCE(`MIN_SPOWER`,0.0) ) THEN CAST(CAST(CASE when (COALESCE(`LABLE`,0.0) is null ) THEN CAST(COALESCE(`MINFEE`,0.0) AS DECIMAL(38, 8)) when (COALESCE(`LABLE`,0.0) <> 1 ) THEN CAST(COALESCE(`MINFEE`,0.0) AS DECIMAL(38, 8)) ELSE CAST(0 AS DECIMAL(38, 8)) END as DECIMAL(38,8)) AS DECIMAL(38, 8)) ELSE CAST(CAST(CASE when (COALESCE(`LABLE`,0.0) is null ) THEN CAST(COALESCE(`MINFEE`,0.0) AS DECIMAL(38, 8)) when (COALESCE(`LABLE`,0.0) <> 1 ) THEN CAST(COALESCE(`MINFEE`,0.0) AS DECIMAL(38, 8)) ELSE CAST(0 AS DECIMAL(38, 8)) END as DECIMAL(38,8))*(COALESCE(`FACT_ENERGY`,0.0)/COALESCE(`MIN_SPOWER`,0.0)) AS DECIMAL(38, 8)) END as DECIMAL(38,8)) AS `before_fee`
+FROM t20
+),
+t24 AS (
+SELECT
+*
+,CAST(CASE when (COALESCE(`FACT_ENERGY`,0.0) >= COALESCE(`EPOWER`,0.0) ) THEN CAST((COALESCE(`EPOWER`,0.0)-COALESCE(`SPOWER`,0.0))*COALESCE(`COST`,0.0) AS DECIMAL(38, 8)) when (COALESCE(`FACT_ENERGY`,0.0) > COALESCE(`SPOWER`,0.0) ) and(COALESCE(`FACT_ENERGY`,0.0) < COALESCE(`EPOWER`,0.0) ) THEN CAST((COALESCE(`FACT_ENERGY`,0.0)-COALESCE(`SPOWER`,0.0))*COALESCE(`COST`,0.0) AS DECIMAL(38, 8)) ELSE CAST(0 AS DECIMAL(38, 8)) END as DECIMAL(38,8)) AS `middle_fee`
+FROM t21
+),
+t25 AS (
+SELECT
+*
+,CAST(CASE when (COALESCE(`FACT_ENERGY`,0.0) > COALESCE(`MAX_EPOWER`,0.0) ) THEN CAST((COALESCE(`FACT_ENERGY`,0.0)-COALESCE(`MAX_EPOWER`,0.0))*COALESCE(`COST`,0.0) AS DECIMAL(38, 8)) ELSE CAST(0 AS DECIMAL(38, 8)) END as DECIMAL(38,8)) AS `after_fee`
+FROM t22
+),
+t26 AS (
+SELECT t1.PDATE, t1.PLANT_ID, t1.PLANT_NAME, t1.UNIT_ID, t1.UNIT_NAME, t1.POWER_COMPANY_ID, t1.POWER_COMPANY_NAME, t1.POWER_TYPE, t1.POWER_TYPE_NAME, t1.SETTLE_TYPE, t1.SETTLE_TYPE_NAME, t1.TRADE_TYPES, t1.TRADE_TYPES_NAME, t1.ELECTRICITY_CONSUME_RATE, t1.APP_TYPE, t1.APP_TYPE_NAME, t1.BASE_TYPE, t1.BASE_TYPE_NAME, t1.MONTH, t23.TPOINT, t23.BEFORE_FEE FROM t1 INNER JOIN t23 ON t1.PDATE = t23.PDATE AND t1.UNIT_ID = t23.UNIT_ID
+),
+t27 AS (
+SELECT PDATE,TPOINT,UNITID,sum(MIDDLE_FEE) AS middle_FEE FROM t24 GROUP BY PDATE,TPOINT,UNITID 
+),
+t28 AS (
+SELECT t26.PDATE, t26.PLANT_ID, t26.PLANT_NAME, t26.UNIT_ID, t26.UNIT_NAME, t26.POWER_COMPANY_ID, t26.POWER_COMPANY_NAME, t26.POWER_TYPE, t26.POWER_TYPE_NAME, t26.SETTLE_TYPE, t26.SETTLE_TYPE_NAME, t26.TRADE_TYPES, t26.TRADE_TYPES_NAME, t26.ELECTRICITY_CONSUME_RATE, t26.APP_TYPE, t26.APP_TYPE_NAME, t26.BASE_TYPE, t26.BASE_TYPE_NAME, t26.MONTH, t26.TPOINT, t26.BEFORE_FEE, t25.AFTER_FEE FROM t26 LEFT JOIN t25 ON t26.PDATE = t25.PDATE AND t26.UNIT_ID = t25.UNIT_ID AND t26.TPOINT = t25.TPOINT
+),
+t29 AS (
+SELECT t28.PDATE, t28.PLANT_ID, t28.PLANT_NAME, t28.UNIT_ID, t28.UNIT_NAME, t28.POWER_COMPANY_ID, t28.POWER_COMPANY_NAME, t28.POWER_TYPE, t28.POWER_TYPE_NAME, t28.SETTLE_TYPE, t28.SETTLE_TYPE_NAME, t28.TRADE_TYPES, t28.TRADE_TYPES_NAME, t28.ELECTRICITY_CONSUME_RATE, t28.APP_TYPE, t28.APP_TYPE_NAME, t28.BASE_TYPE, t28.BASE_TYPE_NAME, t28.MONTH, t28.TPOINT, t28.BEFORE_FEE, t28.AFTER_FEE, t27.MIDDLE_FEE FROM t28 LEFT JOIN t27 ON t28.PDATE = t27.PDATE AND t28.UNIT_ID = t27.UNITID AND t28.TPOINT = t27.TPOINT
+),
+t30 AS (
+SELECT t29.PDATE, t29.PLANT_ID, t29.PLANT_NAME, t29.UNIT_ID, t29.UNIT_NAME, t29.POWER_COMPANY_ID, t29.POWER_COMPANY_NAME, t29.POWER_TYPE, t29.POWER_TYPE_NAME, t29.SETTLE_TYPE, t29.SETTLE_TYPE_NAME, t29.TRADE_TYPES, t29.TRADE_TYPES_NAME, t29.ELECTRICITY_CONSUME_RATE, t29.APP_TYPE, t29.APP_TYPE_NAME, t29.BASE_TYPE, t29.BASE_TYPE_NAME, t29.MONTH, t29.TPOINT, t29.BEFORE_FEE, t29.AFTER_FEE, t29.MIDDLE_FEE, t6.VERSION_ID FROM t29 INNER JOIN t6 ON t29.PDATE = t6.PDATE
+),
+t31 AS (
+SELECT
+*
+,CAST('报价费用' as STRING) AS `settle_item_name`,
+CAST(CAST(COALESCE(`BEFORE_FEE`,0.0)+COALESCE(`AFTER_FEE`,0.0)+COALESCE(`MIDDLE_FEE`,0.0) as DECIMAL(38,8))*(1-COALESCE(`ELECTRICITY_CONSUME_RATE`,0.0)) as DECIMAL(38,8)) AS `price_fee`,
+CAST(COALESCE(`BEFORE_FEE`,0.0)+COALESCE(`AFTER_FEE`,0.0)+COALESCE(`MIDDLE_FEE`,0.0) as DECIMAL(38,8)) AS `price_fee_1`,
+CAST('06_5_3' as STRING) AS `settle_item`,
+CAST(CAST('admin6' AS STRING) as STRING) AS `update_by`,
+CAST(uuid() as STRING) AS `phid`
+FROM t30
+),
+t32 AS (
+SELECT t31.PDATE,t31.PLANT_ID,t31.PLANT_NAME,t31.UNIT_ID,t31.UNIT_NAME,t31.POWER_COMPANY_ID,t31.POWER_COMPANY_NAME,t31.POWER_TYPE,t31.POWER_TYPE_NAME,t31.SETTLE_TYPE,t31.SETTLE_TYPE_NAME,t31.TRADE_TYPES,t31.TRADE_TYPES_NAME,t31.APP_TYPE,t31.APP_TYPE_NAME,t31.BASE_TYPE,t31.BASE_TYPE_NAME,t31.MONTH,t31.TPOINT,t31.PHID,t31.UPDATE_BY,t31.SETTLE_ITEM_NAME,t31.SETTLE_ITEM,t31.VERSION_ID,t31.PRICE_FEE FROM t31
+) SELECT * FROM t32;

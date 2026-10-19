@@ -192,7 +192,7 @@ enum Cmd {
         /// `--mount 名=路径,budget-mb=2048,read-only`。
         ///
         /// `default` 库固定来自 `--path`（`--mount default=…` 显式拒绝）。
-        /// 名字进 SQL 限定符（`settle.t`）、`USE`、`SHOW DATABASES` 与
+        /// 名字进 SQL 限定符（`app.t`）、`USE`、`SHOW DATABASES` 与
         /// grants 键——必须是小写 `[a-z_][a-z0-9_]*`。各挂载独立预算/缓存/
         /// 写缓冲（并发闸是实例级的——过载保护管整个进程）。
         #[arg(long = "mount")]

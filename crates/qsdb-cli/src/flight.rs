@@ -63,7 +63,7 @@ impl QsdbFlightService {
         meta: &MetadataMap,
         sql: &str,
     ) -> Result<(String, qsdb::sql::SqlResult), Status> {
-        // 十八批Ⅵ：与 HTTP 面同一路由——限定名（`settle.t`）解析到对应挂载，
+        // 十八批Ⅵ：与 HTTP 面同一路由——限定名（`app.t`）解析到对应挂载，
         // 剥限定后落目标句柄；此前 Flight 恒跑 default 库（多库下限定名必炸）
         let (sql_exec_routed, target_db) =
             match crate::server::route_sql(&self.state, sql, None, "default") {

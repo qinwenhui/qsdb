@@ -1722,7 +1722,7 @@ fn number_literal(s: &str) -> Result<Literal> {
         // ⚠️ **小数位按用户写的算，不剪末尾的 0**：`4.0` 是 `DECIMAL(2,1)` 而不是
         // `(1,0)`。这不是美观问题 —— **它决定算术结果的类型**：真 Spark 实测
         // `d/4.0`（d 是 DECIMAL(18,4)）⇒ `decimal(22,7)`，而剪掉末尾 0 之后我们给
-        // `(20,6)`，**除法的 scale 少一位 = 结算金额的精度少一位**。
+        // `(20,6)`，**除法的 scale 少一位 = 金额的精度少一位**。
         // （整数部分的**前导** 0 仍然剪：它不进精度，`0.5` ⇒ `(1,1)` ✓ Spark 同。）
         let int_digits = int_part.trim_start_matches(['-', '+', '0']);
         let scale = frac_part.len() as i8;
@@ -2772,7 +2772,7 @@ fn ident_tokens(s: &str) -> std::collections::HashSet<String> {
 ///
 /// 绑定是**全量**的：`bind_with_ctes` 会对每个 CTE 都跑一遍 `translate_select_inner`，
 /// 而 `filter_reachable_ctes` 只在事后把不可达的从**物化列表**里删掉 —— 死 CTE 该报的错
-/// 那时早报完了。这在"机器生成的臃肿 SQL"上很致命：日清分那 154 个 SQL 块里
+/// 那时早报完了。这在"机器生成的臃肿 SQL"上很致命：真实语料那 154 个 SQL 块里
 /// **2890 个 CTE 有 562 个是死的**（最臃肿的一块 46 个定义里 38 个是死的 ——
 /// 同一个任务的别的输出的分支被复制进了每一块），而死 CTE 里藏着 **46 处
 /// `PIVOT`/`stack`**，全是**我们还没实现**的东西。
@@ -2855,7 +2855,7 @@ fn live_cte_names(main: &str, ctes: &[sqlparser::ast::Cte]) -> std::collections:
 /// WITH 子句绑定（普通 SELECT 与集合操作两路共用）：
 /// CTE 内联展开为子计划，祖先可见（后定义可引用先定义，链式）。
 ///
-/// ⚠️ **死 CTE 不绑定**（判定见 [`live_cte_names`]）—— 这是能让日清分那批
+/// ⚠️ **死 CTE 不绑定**（判定见 [`live_cte_names`]）—— 这是能让真实语料那批
 /// "臃肿 SQL"跑起来的关键：死代码里那些 `PIVOT`/`stack` 不该拦路。
 fn bind_with_ctes(
     with: Option<&sqlparser::ast::With>,
@@ -3463,7 +3463,7 @@ fn proj_item_expr(it: &sqlparser::ast::SelectItem) -> Option<&sqlparser::ast::Ex
 ///
 /// **成本**（不藏着）：兄弟投影项被复制 n 份。但 `FROM` 是 **CTE 引用**时几乎免费 ——
 /// CTE 由 `CteDef` 物化一次，引用点只是 `LogicalPlan::Values { cte_id }` 读同一份批数据
-/// （见 `resolve_table_source` / `exec_builder` 的 `add_cte_batches`）。日清分那 28 个块
+/// （见 `resolve_table_source` / `exec_builder` 的 `add_cte_batches`）。真实语料那 28 个块
 /// 的 `stack` **全部**挂在 CTE 上。`FROM` 是实表/派生表时才会真的算 n 遍。
 ///
 /// 边界一律**显式拒**（见 `docs/列转行与行转列设计.md`）：无两列别名、`stack` 被别的
@@ -4101,7 +4101,7 @@ fn translate_select_inner(
     // 处理（`JOIN` 链本来就是左深树，`FROM a, b JOIN c ON …` 折成
     // `a × b ⋈ c` 仍然正确）。
     //
-    // 日清分那批 SQL 里 `FROM t6, t1` 这种写法有 8 个块在用。
+    // 真实语料那批 SQL 里 `FROM t6, t1` 这种写法有 8 个块在用。
     let mut from_items: Vec<sqlparser::ast::TableWithJoins> = select.from.clone();
     if from_items.len() > 1 {
         let mut first = from_items.remove(0);
@@ -5316,7 +5316,7 @@ fn as_equi_key(
             _ => None,
         }
     };
-    // ⚠️ **键两侧必须先做类型归一**：`t5 INNER JOIN t8 ON t5.SETTLE_TYPE = t8.JS_OBJECT`
+    // ⚠️ **键两侧必须先做类型归一**：`t5 INNER JOIN t8 ON t5.type_code = t8.object_id`
     //    （数值列 = 字符串列，语料 L7-02_01）—— 此前各绑各的、类型原样进哈希，
     //    编码不同 ⇒ **0 匹配、无报错**（Spark 8136 行，我们 0 行；静默错值）。
     //    走与比较路径**同一套**提升（temporal/字符串字面量/字符串表达式），
@@ -5902,9 +5902,9 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
         E::Identifier(id) => {
             // ★ **双引号 = 字符串字面量**（Spark 非 ANSI 语义，也就是默认语义）。
             //
-            // 日清分那批 SQL 写的是 `CAST("变动成本补偿" AS STRING)`、`CAST("80" AS STRING)`
+            // 真实语料那批 SQL 写的是 `CAST("备注" AS STRING)`、`CAST("80" AS STRING)`
             // —— 而 sqlparser 的 GenericDialect 把 `"…"` 当**带引号标识符**，于是我们去找
-            // 一个叫「变动成本补偿」的**列**，报 `column '变动成本补偿' not found`。
+            // 一个叫「备注」的**列**，报 `column '备注' not found`。
             //
             // Spark 的既定规则是：**双引号是字符串、反引号才是标识符**
             // （`spark.sql.ansi.enabled=false` 下的默认行为，语料正是跑在这上面）。
@@ -6003,7 +6003,7 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
         // 见 `PhysExpr::Fold`），共用一条绑定路，只有选择器与参数个数规则不同。
         //
         // - `NVL(a, b)` 是 **Spark SQL 的内置函数**（= 两参的 coalesce，
-        //   实测真 Spark 3.5.2：`SELECT nvl(0.2, 1)` ⇒ `0.2`）。日清那批结算 SQL 在用。
+        //   实测真 Spark 3.5.2：`SELECT nvl(0.2, 1)` ⇒ `0.2`）。真实语料在用。
         // - `LEAST` / `GREATEST` 实测真 Spark 3.5.2（2026-10-16）：
         //   `least(1,null,3)` ⇒ `1`、`greatest(1,null,3)` ⇒ `3`（**忽略 NULL**）、
         //   `least(null,null)` ⇒ `NULL`；类型取公共超类型
@@ -6898,7 +6898,7 @@ fn bind_binary_arith(op: ArithOp, l: PhysExpr, r: PhysExpr) -> Result<PhysExpr> 
 ///   列里可能装着该类型能表示的最大值，**不能按"当前值"缩**（那会让类型依赖数据）。
 ///
 /// ⚠️ 定得**过大**的代价不是"位数难看"：精度虚高会提前撞上 38 的封顶，
-/// 把 scale 截掉 ⇒ **真丢小数**。结算场景下这是金额错。
+/// 把 scale 截掉 ⇒ **真丢小数**。金额场景下这是错值。
 /// 操作数在 decimal 算术里转成的类型：**保住它自己的整数位** + 指定的结果 scale。
 ///
 /// 为什么不能直接转成"结果类型"：结果类型的整数位对 `%` 是取 **min** 的
@@ -7049,7 +7049,7 @@ fn promote_temporal_lit(lb: PhysExpr, rb: PhysExpr) -> Result<(PhysExpr, PhysExp
 /// | `CAST(1.5 AS DECIMAL(10,2)) = '1.50'` | `true` |
 /// | `1 = 'z'` | **`NULL`** —— **不是报错**（`ansi.enabled=false` 下的语义） |
 ///
-/// ★ 日清分那批 SQL 里这是**最大的一类拦路虎**：`SETTLE_TYPE = '2'`
+/// ★ 真实语料那批 SQL 里这是**最大的一类拦路虎**：`type_code = '2'`
 /// （`TINYINT` 列 vs 字符串字面量）**一个形状就卡住 77 个块**。
 ///
 /// 转不动的（`'z'` vs 数值）**整条比较给 NULL**，与 Spark 一致 ——
@@ -7088,7 +7088,7 @@ fn promote_string_lit(lb: PhysExpr, rb: PhysExpr) -> (PhysExpr, PhysExpr) {
         // —— 字符串**表达式**侧（列/CAST 结果，L8-02_02 的
         //     `CAST(VALUE AS STRING) = 1`）：运行期 cast。**两侧一起转 double** ——
         //     Spark 对 string-vs-double 就是这么做的；string-vs-int 它走精确
-        //     bigint，这里 double 在 |v| < 2^53 时与其逐值一致（结算数值都在
+        //     bigint，这里 double 在 |v| < 2^53 时与其逐值一致（语料数值都在
         //     此范围内），换来 cast 内核统一走 arrow，不另造"字符串经 decimal
         //     再截断"的一套。转不动的值（'abc'）在 cast 处**显式报错**，不猜。
         (a, b) if a.data_type().is_string() && numeric(&b.data_type()) => (

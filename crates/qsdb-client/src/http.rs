@@ -34,8 +34,9 @@
 
 use crate::error::{Error, Result};
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::Mutex;
+use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const READ_CHUNK: usize = 64 * 1024;
@@ -68,6 +69,96 @@ impl Head {
             None => true, // HTTP/1.1 默认 keep-alive
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 普通（非流式）查询的并发中止
+// ---------------------------------------------------------------------------
+
+/// 普通请求的并发中止句柄。
+///
+/// 普通查询的响应是**一次同步读完**的，调用方在传输段无法自行检查停止标记；
+/// 要停住只能从另一个线程关掉底层 socket。句柄在请求拿到连接后绑定一个
+/// `TcpStream::try_clone()`；[`AbortHandle::abort`] 对克隆句柄
+/// `shutdown(Both)`，原连接上的阻塞 `read` 立即返回错误。
+///
+/// 停止仍是两段式：执行段用 [`crate::Client::cancel`]（服务端注销后回 404
+/// 是预期）；传输段用本句柄。句柄也可以提前 abort——请求还没拿到连接时，
+/// 它会在下一次发送前直接以 IO 错误返回，不会把查询发出去。
+#[derive(Debug, Clone, Default)]
+pub struct AbortHandle {
+    inner: Arc<AbortInner>,
+}
+
+#[derive(Debug, Default)]
+struct AbortInner {
+    socket: Mutex<Option<TcpStream>>,
+    aborted: AtomicBool,
+}
+
+impl AbortHandle {
+    /// 新建一个未中止的句柄。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 线程安全、幂等。返回是否由本次调用首次置位。
+    pub fn abort(&self) -> bool {
+        let first = !self.inner.aborted.swap(true, Ordering::SeqCst);
+        if let Some(s) = self
+            .inner
+            .socket
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = s.shutdown(Shutdown::Both);
+        }
+        first
+    }
+
+    /// 是否已中止。
+    pub fn is_aborted(&self) -> bool {
+        self.inner.aborted.load(Ordering::SeqCst)
+    }
+
+    /// 请求拿到连接后绑定 socket 克隆；abort 与 attach 的竞态在这里兜住。
+    fn attach(&self, conn: &BufConn) -> io::Result<()> {
+        if self.is_aborted() {
+            return Err(aborted_error());
+        }
+        let clone = conn.s.try_clone()?;
+        {
+            let mut slot = self.inner.socket.lock().unwrap_or_else(|e| e.into_inner());
+            *slot = Some(clone);
+        }
+        if self.is_aborted() {
+            if let Some(s) = self
+                .inner
+                .socket
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                let _ = s.shutdown(Shutdown::Both);
+            }
+            return Err(aborted_error());
+        }
+        Ok(())
+    }
+
+    /// 响应读完（或失败）后释放克隆句柄。
+    fn detach(&self) {
+        self.inner
+            .socket
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
+}
+
+fn aborted_error() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "query aborted by caller")
 }
 
 // ---------------------------------------------------------------------------
@@ -588,6 +679,27 @@ impl Http {
         self.exchange("POST", path, Some(content_type), body, extra)
     }
 
+    /// `POST` + 额外请求头 + **可并发中止**（普通非流式查询）。
+    pub fn post_with_abort(
+        &self,
+        path: &str,
+        content_type: &str,
+        extra: &[(&str, &str)],
+        body: &[u8],
+        abort: &AbortHandle,
+    ) -> Result<Response> {
+        let auth_snap = self.auth_snapshot();
+        self.exchange_auth_inner(
+            "POST",
+            path,
+            Some(content_type),
+            extra,
+            body,
+            auth_snap.as_deref(),
+            Some(abort),
+        )
+    }
+
     /// `POST` + **流式**响应体：请求带 `Connection: close`，返回的 [`Body`] 独占连接。
     pub fn post_stream(
         &self,
@@ -689,11 +801,30 @@ impl Http {
         body: &[u8],
         auth: Option<&str>,
     ) -> Result<Response> {
+        self.exchange_auth_inner(method, path, content_type, extra, body, auth, None)
+    }
+
+    /// 显式凭证 + 可选并发中止句柄的实际请求循环。
+    #[allow(clippy::too_many_arguments)]
+    fn exchange_auth_inner(
+        &self,
+        method: &str,
+        path: &str,
+        content_type: Option<&str>,
+        extra: &[(&str, &str)],
+        body: &[u8],
+        auth: Option<&str>,
+        abort: Option<&AbortHandle>,
+    ) -> Result<Response> {
         let mut slot = self.lock();
         let mut first = true;
         // `GET` 无副作用 ⇒ 允许"写出去了但没收到响应"时重发（见模块头第 2 条）
         let idempotent = method == "GET";
         loop {
+            // 排队等连接池时用户可能已经点了停止；别再把请求发出去。
+            if abort.is_some_and(AbortHandle::is_aborted) {
+                return Err(Error::Io(aborted_error()));
+            }
             let stale = match slot.as_mut() {
                 Some(c) => !c.alive(),
                 None => true,
@@ -702,6 +833,11 @@ impl Http {
                 let c = BufConn::connect(&self.host, self.port, self.connect_timeout)?;
                 c.set_io_timeout(self.io_timeout)?;
                 *slot = Some(c);
+            }
+            if let Some(a) = abort {
+                if let Some(c) = slot.as_ref() {
+                    a.attach(c).map_err(Error::Io)?;
+                }
             }
             let attempt = {
                 let c = slot.as_mut().expect("刚连上");
@@ -715,12 +851,24 @@ impl Http {
                     let conn = slot.take().expect("刚连上");
                     let mut b = Body::new(conn, framing);
                     let r = b.read_all();
-                    if reusable {
+                    let ok = r.is_ok();
+                    if let Some(a) = abort {
+                        a.detach();
+                    }
+                    // 中止或读失败时不要池化一条可能已关闭/半死的连接。
+                    if reusable && ok {
                         *slot = Some(b.conn);
                     }
                     return Ok(Response { head, body: r? });
                 }
                 Err(e) => {
+                    if let Some(a) = abort {
+                        a.detach();
+                        if a.is_aborted() {
+                            *slot = None;
+                            return Err(Error::Io(aborted_error()));
+                        }
+                    }
                     let (sent, got) = match slot.as_ref() {
                         Some(c) => (c.sent, c.got_response),
                         None => (0, false),

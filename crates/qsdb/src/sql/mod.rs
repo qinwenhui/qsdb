@@ -323,7 +323,7 @@ fn execute_stmt(
             let schema = Arc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new("user", arrow::datatypes::DataType::Utf8, true),
                 arrow::datatypes::Field::new("role", arrow::datatypes::DataType::Utf8, true),
-                // M-C 第三列（只增）：grants 摘要，如 `settle=reader,*=-`；
+                // M-C 第三列（只增）：grants 摘要，如 `app=reader,*=-`；
                 // 旧格式用户为空串
                 arrow::datatypes::Field::new("grants", arrow::datatypes::DataType::Utf8, true),
             ]));

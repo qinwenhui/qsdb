@@ -2,7 +2,7 @@
 
 > 版本：v0.1（2026-10-09）
 > 状态：设计定稿，开发起点
-> 上游参考：`参考项目设计开发文档.md`（MiniDB，以下简称「参考文档」）。参考文档的第三/四/五章细节（类型规范、统计结构等）本文按需引用，不全文复抄。
+> 上游参考：早期原型（MiniDB）的设计笔记（内部资料，未随本仓发布）。其第三/四/五章细节（类型规范、统计结构等）本文按需引用，不全文复抄。
 
 ---
 
@@ -818,7 +818,7 @@ M6-4 staging 写 → M6-5 HDFS → M6-6 可选租约；每阶段独立 gate。
   四种 feature 组合编译/测试/clippy 全绿——抽象贴合原则的枚举派发红利。
 - `StorageConfig::Hdfs { url, prefix }` + CLI `--storage-type hdfs
   --storage-hdfs-url`；身份走 `HADOOP_USER_NAME`。
-- **真实集群 e2e**（192.168.1.12:9000，Hadoop 3.1.3，hdfs 用户）：
+- **真实集群 e2e**（hdfs://namenode:9000，Hadoop 3.1.3，hdfs 用户）：
   CAS 原语（冲突拒写/锁释放）/管理表全生命周期（含 overwrite/TRUNCATE/
   引用 GC/drop）/staging 写——**3/3 全过**；无集群环境（CI）自动跳过。
 - 验收：180 默认 / 193 s3 / 197 hdfs（含 3 真实集群）/ 196 s3+hdfs

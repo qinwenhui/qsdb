@@ -235,7 +235,7 @@ fn 窗口之上有_limit() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// `DECIMAL` 列上对撞 —— 真表（电力日清）的核心列全是 `DECIMAL(30,8)`。
+/// `DECIMAL` 列上对撞 —— 真实业务表的核心列全是 `DECIMAL(30,8)`。
 ///
 /// 错位取到**另一列 DECIMAL** 时值仍然"像个正常的数"，肉眼看不出来 ⇒ 这条不是多余的。
 #[test]

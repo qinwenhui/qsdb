@@ -1,6 +1,8 @@
 [package]
 name = "qsdb-client"
-description = "QSDB 薄客户端：手写 HTTP/1.1，零网络依赖，批式优先"
+description = "Thin Rust client for QSDB: hand-rolled HTTP/1.1, zero network dependencies, columnar-batch first"
+keywords = ["database", "http-client", "analytics", "arrow", "olap"]
+categories = ["database", "network-programming"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

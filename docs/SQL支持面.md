@@ -171,7 +171,7 @@
 | `DELETE FROM t [WHERE …]` | ⚠️ | **只支持分区键谓词**（分区粒度）：`DELETE FROM t WHERE dt = '…'` ✅；`WHERE <非分区列>` → `unsupported: DELETE WHERE references non-partition column …`。**非分区表上带任何 `WHERE` 一律拒**（没有分区列可裁剪）。整表清空（无 `WHERE`）✅。<br>⚠️ F29①（2026-10-15，qsdb-sync 实测）：此前本表写的是无条件 ✅，**方括号没限定**，读起来像"任意 WHERE 都行" —— 对 BI 的"删这一行"尤其误导。**行级 DELETE 未实现**（是独立特性） |
 | `UPDATE` | ✋ | |
 | `TRUNCATE TABLE` | ✅ | |
-| `CREATE TABLE`（含 `PARTITIONED BY`、`NOT NULL`、`CHECK`、`COMMENT`） | ✅ | **分区表至少要有一个非分区列**（否则数据文件零列，见 `docs/进度与待办.md` §三之四） |
+| `CREATE TABLE`（含 `PARTITIONED BY`、`NOT NULL`、`CHECK`、`COMMENT`） | ✅ | **分区表至少要有一个非分区列**（否则数据文件零列） |
 | 列 `DEFAULT` 值 | ✋ | 静默忽略会写入 NULL 而非默认值 |
 | `CREATE TABLE … AS SELECT`（CTAS） | ✅ | 2026-10-15 实现（生态功能批次 4）。**列名与类型由 SELECT 的输出推导**（`SELECT *` / 表达式 / JOIN 都行）；也支持写显式列清单（`CREATE TABLE t (g BIGINT, n BIGINT) AS SELECT …`，列数须与查询一致）。支持 `PARTITIONED BY`。源可以是 CTE / 派生表 / JOIN。<br>⚠️ **表达式列名会被拒**：`SELECT g, count(*)` 推导出 `count(*)`，那不是合法表列名（限 `[A-Za-z_][A-Za-z0-9_]*`）⇒ 报错并指路（`… AS n` 别名，或写显式列清单）。**本仓不替用户改名** —— PG 会改成 `count`，那是另一种静默（表里出现你没写过的列名）。<br>⚠️ JOIN 的**限定名会剥掉表限定**（`a.g` ⇒ `g`，与 PG 一致）；剥完重名（`SELECT a.g, b.g`）会报出来。<br>⚠️ **失败会回滚**（把刚建的表删掉）—— PG 的 CTAS 是全有全无。但**表已存在**时是 `AlreadyExists`，**不会**动旧表。<br>⚠️ `WITH … CREATE TABLE …`（CTE 在前）sqlparser 不认，写成 `CREATE TABLE … AS WITH … SELECT …`。<br>值级验收 `tests/create_table_as.rs` |
 | `CREATE OR REPLACE TABLE … AS SELECT` | ✋ | 与不带 `AS SELECT` 的形态一样拒（判断在 CTAS 分支**之前**）。先 `DROP TABLE` 再 `CREATE`；只想换数据用 `INSERT OVERWRITE` |

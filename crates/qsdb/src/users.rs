@@ -94,7 +94,7 @@ impl UserDef {
     }
 
     /// grants 摘要（REST 回显 / 展示）：`{"*":"reader"}`、
-    /// `{"default":"writer","settle":null}`。值统一小写角色名 / null。
+    /// `{"default":"writer","app":null}`。值统一小写角色名 / null。
     pub fn grants_json(&self) -> serde_json::Value {
         match &self.grants {
             None => match self.role {
@@ -593,7 +593,7 @@ mod tests {
             grants: None,
         };
         assert_eq!(legacy.role_for("default"), Some(Role::Reader));
-        assert_eq!(legacy.role_for("settle"), Some(Role::Reader));
+        assert_eq!(legacy.role_for("app"), Some(Role::Reader));
         // 旧格式但 role 字段缺失（不该出现，防御性）：一律无权
         let empty = UserDef {
             role: None,
@@ -602,15 +602,15 @@ mod tests {
         };
         assert_eq!(empty.role_for("default"), None);
 
-        // 白名单制：只授 settle，其它库（含未挂载名）一律无权
+        // 白名单制：只授 app，其它库（含未挂载名）一律无权
         let wl = UserDef {
             name: "wl".into(),
             role: None,
             salt: String::new(),
             hash: String::new(),
-            grants: Some(BTreeMap::from([("settle".to_string(), Some(Role::Writer))])),
+            grants: Some(BTreeMap::from([("app".to_string(), Some(Role::Writer))])),
         };
-        assert_eq!(wl.role_for("settle"), Some(Role::Writer));
+        assert_eq!(wl.role_for("app"), Some(Role::Writer));
         assert_eq!(wl.role_for("default"), None);
         assert_eq!(wl.role_for("*"), None, "缺 '*' 键 = 通配也无权");
 
@@ -621,12 +621,12 @@ mod tests {
             salt: String::new(),
             hash: String::new(),
             grants: Some(BTreeMap::from([
-                ("settle".to_string(), Some(Role::Reader)),
+                ("app".to_string(), Some(Role::Reader)),
                 ("sales".to_string(), None),
                 ("*".to_string(), Some(Role::Writer)),
             ])),
         };
-        assert_eq!(mixed.role_for("settle"), Some(Role::Reader), "精确项优先");
+        assert_eq!(mixed.role_for("app"), Some(Role::Reader), "精确项优先");
         assert_eq!(mixed.role_for("sales"), None, "显式 null = 拒绝");
         assert_eq!(mixed.role_for("other"), Some(Role::Writer), "通配兜底");
         // 全拒：{"*": null}
@@ -645,36 +645,36 @@ mod tests {
         let store = Store::local(&dir);
         std::fs::create_dir_all(dir.join("_catalog")).unwrap();
 
-        // add_with_grants：白名单制（只有 settle）
+        // add_with_grants：白名单制（只有 app）
         let mut g = BTreeMap::new();
-        g.insert("settle".to_string(), Some(Role::Writer));
+        g.insert("app".to_string(), Some(Role::Writer));
         UserStore::add_with_grants(&store, "op", "pw123", g).unwrap();
         let def = UserStore::verify_def(&store, "op", "pw123").unwrap();
-        assert_eq!(def.role_for("settle"), Some(Role::Writer));
+        assert_eq!(def.role_for("app"), Some(Role::Writer));
         assert_eq!(def.role_for("default"), None, "白名单制：未列出 = 无权");
         assert!(
             UserStore::add_with_grants(&store, "x2", "pw123", BTreeMap::new()).is_err(),
             "空 grants 显式拒绝"
         );
 
-        // set_grants：整体替换（PUT 语义）——settle 收权、通配给 reader
+        // set_grants：整体替换（PUT 语义）——app 收权、通配给 reader
         let mut g2 = BTreeMap::new();
         g2.insert("*".to_string(), Some(Role::Reader));
         UserStore::set_grants(&store, "op", g2.clone()).unwrap();
         let def = UserStore::verify_def(&store, "op", "pw123").unwrap();
-        assert_eq!(def.role_for("settle"), Some(Role::Reader), "通配生效");
+        assert_eq!(def.role_for("app"), Some(Role::Reader), "通配生效");
         assert_eq!(def.role_for("default"), Some(Role::Reader));
         assert!(UserStore::set_grants(&store, "ghost", g2).is_err());
 
         // set_role：写 "*" 槽位（writer），库级精确项保留
         let mut g3 = BTreeMap::new();
-        g3.insert("settle".to_string(), Some(Role::Reader));
+        g3.insert("app".to_string(), Some(Role::Reader));
         g3.insert("*".to_string(), None);
         UserStore::add_with_grants(&store, "mix", "pw123", g3).unwrap();
         UserStore::set_role(&store, "mix", Role::Writer).unwrap();
         let def = UserStore::verify_def(&store, "mix", "pw123").unwrap();
         assert_eq!(
-            def.role_for("settle"),
+            def.role_for("app"),
             Some(Role::Reader),
             "精确项不被 set_role 覆盖"
         );
@@ -699,7 +699,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("_catalog")).unwrap();
         UserStore::add(&store, "legacy", "pw123", Role::Admin).unwrap();
         let g = BTreeMap::from([
-            ("settle".to_string(), Some(Role::Reader)),
+            ("app".to_string(), Some(Role::Reader)),
             ("*".to_string(), None),
         ]);
         UserStore::add_with_grants(&store, "op", "pw456", g).unwrap();
@@ -715,7 +715,7 @@ mod tests {
         let n = UserStore::import_json(&store2, &json, true).unwrap();
         assert_eq!(n, 2);
         let op = UserStore::verify_def(&store2, "op", "pw456").unwrap();
-        assert_eq!(op.role_for("settle"), Some(Role::Reader));
+        assert_eq!(op.role_for("app"), Some(Role::Reader));
         assert_eq!(op.role_for("default"), None, "白名单制跨库保真");
         assert_eq!(
             UserStore::verify(&store2, "legacy", "pw123"),

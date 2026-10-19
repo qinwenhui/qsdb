@@ -7,7 +7,7 @@
 //! 是**表定义原样**（列声明着 `NOT NULL`）⇒ 组装批时 `RecordBatch::try_new` 当场拒：
 //!
 //! ```text
-//! Column 'PHID' is declared as non-nullable but contains null values
+//! Column 'uid' is declared as non-nullable but contains null values
 //! ```
 //!
 //! ## 为什么整套测试都没抓到
@@ -37,9 +37,9 @@ fn setup(tag: &str) -> (Qsdb, std::path::PathBuf) {
     std::fs::create_dir_all(&root).unwrap();
     let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
     // 列**全是 NOT NULL**（照抄 MySQL 迁来的真表）
-    db.sql("CREATE TABLE a (PHID VARCHAR NOT NULL, k VARCHAR NOT NULL, v BIGINT NOT NULL)")
+    db.sql("CREATE TABLE a (uid VARCHAR NOT NULL, k VARCHAR NOT NULL, v BIGINT NOT NULL)")
         .unwrap();
-    db.sql("CREATE TABLE b (PHID VARCHAR NOT NULL, k VARCHAR NOT NULL, v BIGINT NOT NULL)")
+    db.sql("CREATE TABLE b (uid VARCHAR NOT NULL, k VARCHAR NOT NULL, v BIGINT NOT NULL)")
         .unwrap();
     db.sql("INSERT INTO a VALUES ('p1','k1',1),('p2','k2',2)")
         .unwrap();

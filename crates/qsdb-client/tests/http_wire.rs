@@ -15,7 +15,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use qsdb_client::{Auth, Client, Error};
+use qsdb_client::{AbortHandle, Auth, Client, Error, QueryOptions};
 
 // ---------------------------------------------------------------------------
 // 假服务端
@@ -217,6 +217,31 @@ const OK1: &str = r#"{"status":"ok","version":"1"}"#;
 // ---------------------------------------------------------------------------
 
 #[test]
+fn 非流式响应传输中可被并发中止() {
+    // 响应头声称 1,000,000 字节，但只先给 64 字节：客户端会阻塞在 body 读取。
+    let head =
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000000\r\n\r\n";
+    let f = fake(vec![Step::raw(&format!("{head}{}", "x".repeat(64)))]);
+    let c = client(&f);
+    let abort = AbortHandle::new();
+    let handle = abort.clone();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(handle.abort(), "第一次 abort 应当置位");
+    });
+
+    let err = c
+        .query_with_abort("SELECT 1", &QueryOptions::default(), &abort)
+        .expect_err("传输段应被中止");
+    t.join().unwrap();
+    assert!(abort.is_aborted());
+    assert!(
+        matches!(err, Error::Io(_)),
+        "中止传输应返回 IO 错误（socket shutdown），实际 {err:?}"
+    );
+}
+
+#[test]
 fn chunked_响应体被完整解码() {
     let f = fake(vec![Step::raw(&chunked(
         r#"{"status":"ok","version":"9.9"}"#,
@@ -403,10 +428,18 @@ fn url_解析严格() {
     );
     let e = Client::connect("https://example.com:443", Auth::None).unwrap_err();
     assert!(format!("{e}").contains("TLS"), "{e}");
+    let e = Client::connect("qsdbs://example.com:443", Auth::None).unwrap_err();
+    assert!(format!("{e}").contains("TLS"), "{e}");
     assert!(Client::connect("127.0.0.1:9430", Auth::None).is_err());
+    assert!(Client::connect("qsdb://127.0.0.1", Auth::None).is_err());
     assert!(Client::connect("http://:9430", Auth::None).is_err());
     assert!(Client::connect("http://127.0.0.1:99999", Auth::None).is_err());
     assert!(Client::connect("http://127.0.0.1:9430", Auth::None).is_ok());
+    assert!(Client::connect("qsdb://127.0.0.1:9430", Auth::None).is_ok());
+    assert!(Client::connect("qsdb://:9430", Auth::None).is_err());
+    let e = Client::connect("qsdb://127.0.0.1:9430/settle", Auth::None).unwrap_err();
+    assert!(format!("{e}").contains("不接受路径"), "{e}");
+    assert!(Client::connect("qsdb://127.0.0.1:9430/", Auth::None).is_ok());
 }
 
 #[test]

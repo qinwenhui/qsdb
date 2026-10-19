@@ -24,7 +24,7 @@
 //! use qsdb_client::{Auth, Client};
 //!
 //! # fn main() -> Result<(), qsdb_client::Error> {
-//! let c = Client::connect("http://192.168.1.14:9430", Auth::Basic {
+//! let c = Client::connect("http://127.0.0.1:9430", Auth::Basic {
 //!     user: "admin".into(),
 //!     password: "…".into(),
 //! })?;
@@ -122,6 +122,7 @@ use std::time::Duration;
 
 pub use crate::bulk::{BulkTable, Column, ColumnIter, ColumnView, Row, Rows};
 pub use crate::error::{Error, Result};
+pub use crate::http::AbortHandle;
 pub use crate::json::{
     AdminSession, CommitEvent, ConfigPatch, ConfigPutAck, DbInfo, DirSummary, FileColumnStat,
     FileDetail, FileEntry, FileListing, FileMount, FileSegment, JsonResult, ManifestDetail,
@@ -627,9 +628,10 @@ impl std::fmt::Debug for Client {
 impl Client {
     /// 连一个 QSDB server。
     ///
-    /// `url` 形如 `http://host:9430`（**端口必填**——不猜默认端口）。
-    /// 本方法**不建连**（惰性）：连接在第一次请求时建立，所以它不会因为
-    /// "服务端慢启动"而失败。
+    /// `url` 形如 `qsdb://host:9430`（兼容 `http://host:9430`；**端口必填**，
+    /// 不猜默认端口）。`qsdb://` 只是连接串的逻辑别名——底层仍是明文
+    /// HTTP/1.1，不代表 TLS。本方法**不建连**（惰性）：连接在第一次请求时
+    /// 建立，所以它不会因为"服务端慢启动"而失败。
     pub fn connect(url: &str, auth: Auth) -> Result<Client> {
         Client::with_options(url, auth, ConnectOptions::default())
     }
@@ -843,15 +845,61 @@ impl Client {
         self.read_with_relogin(|c| c.query_once(sql, opts))
     }
 
+    /// 跑一条 SQL + **可并发中止的传输段**（普通 bulk/rows 查询）。
+    ///
+    /// 与 [`Client::query_stream`] 的两段停止语义一致：
+    /// 1. 执行段：仍用 [`Client::cancel`]（配合 `QueryOptions::query_id`）；
+    /// 2. 传输段：服务端执行完并注销（cancel 404）后，另一个线程调用
+    ///    [`AbortHandle::abort`] 关闭底层连接；正在读响应的本调用立即以
+    ///    `Error::Io` 返回（`ErrorKind::Interrupted`），服务端下一块写失败后收尾。
+    ///
+    /// 句柄可以在请求排队等连接时就 abort：请求会在发送前直接返回，不会把
+    /// 查询发给服务端。普通 `query_with` 没有这个能力。
+    pub fn query_with_abort(
+        &self,
+        sql: &str,
+        opts: &QueryOptions,
+        abort: &AbortHandle,
+    ) -> Result<ResultSet> {
+        self.read_with_relogin(|c| c.query_once_abort(sql, opts, abort))
+    }
+
     fn query_once(&self, sql: &str, opts: &QueryOptions) -> Result<ResultSet> {
+        self.query_once_inner(sql, opts, None)
+    }
+
+    fn query_once_abort(
+        &self,
+        sql: &str,
+        opts: &QueryOptions,
+        abort: &AbortHandle,
+    ) -> Result<ResultSet> {
+        self.query_once_inner(sql, opts, Some(abort))
+    }
+
+    fn query_once_inner(
+        &self,
+        sql: &str,
+        opts: &QueryOptions,
+        abort: Option<&AbortHandle>,
+    ) -> Result<ResultSet> {
         let extra = extra_headers(opts);
         let body = body_of(sql, opts.format.as_str(), opts);
-        let resp = self.http.post_with(
-            "/api/v1/query",
-            "application/json",
-            &extra_ref(&extra),
-            body.as_bytes(),
-        )?;
+        let resp = match abort {
+            Some(a) => self.http.post_with_abort(
+                "/api/v1/query",
+                "application/json",
+                &extra_ref(&extra),
+                body.as_bytes(),
+                a,
+            )?,
+            None => self.http.post_with(
+                "/api/v1/query",
+                "application/json",
+                &extra_ref(&extra),
+                body.as_bytes(),
+            )?,
+        };
         // 非 JSON 通道的 queryId 只在响应头里（J4/J11），先取出来再交出去
         let qid = resp.head.header("x-qsdb-query-id").map(str::to_string);
         let server_elapsed_ms = resp
@@ -1447,20 +1495,32 @@ fn extra_ref<'a>(v: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)
 }
 
 fn parse_url(url: &str) -> Result<(String, u16)> {
-    let rest = if let Some(r) = url.strip_prefix("http://") {
+    // `qsdb://host:port` 是客户端连接串的**逻辑别名**：线上仍是明文
+    // HTTP/1.1（本客户端不做 TLS）。`http://` 保留兼容；两者行为完全一致。
+    let rest = if let Some(r) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("qsdb://"))
+    {
         r
-    } else if url.starts_with("https://") {
+    } else if url.starts_with("https://") || url.starts_with("qsdbs://") {
         return Err(Error::Usage(format!(
-            "{url}: 本客户端不做 TLS。内网直连请用 http://；要加密请在库前面挂 TLS 终止代理\
+            "{url}: 本客户端不做 TLS。内网直连请用 qsdb://（或 http://）；要加密请在库前面挂 TLS 终止代理\
              （见 docs/客户端与嵌入方指南.md §四）"
         )));
     } else {
-        return Err(Error::Usage(format!("{url}: 只认 `http://host:port` 形式")));
+        return Err(Error::Usage(format!(
+            "{url}: 只认 `qsdb://host:port`（兼容 `http://host:port`）形式"
+        )));
     };
-    let hostport = rest.split('/').next().unwrap_or("");
+    let (hostport, path) = rest.split_once('/').unwrap_or((rest, ""));
+    if !path.is_empty() {
+        return Err(Error::Usage(format!(
+            "{url}: 连接串只接受 host:port，不接受路径/查询参数；默认库请在连接档案里配置"
+        )));
+    }
     let (host, port) = hostport.rsplit_once(':').ok_or_else(|| {
         Error::Usage(format!(
-            "{url}: 缺端口。写成 http://host:9430 —— 不猜默认端口，猜错会连到别的服务上"
+            "{url}: 缺端口。写成 qsdb://host:9430 —— 不猜默认端口，猜错会连到别的服务上"
         ))
     })?;
     if host.is_empty() {

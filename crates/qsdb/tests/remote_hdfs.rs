@@ -9,7 +9,7 @@
 //!
 //! 运行（用户身份走 HADOOP_USER_NAME；路径用 /tmp 下独立前缀）：
 //! ```text
-//! QSDB_HDFS_URL=hdfs://192.168.1.12:9000 HADOOP_USER_NAME=hadoop \
+//! QSDB_HDFS_URL=hdfs://namenode:9000 HADOOP_USER_NAME=hadoop \
 //!   cargo test -p qsdb --features hdfs --test remote_hdfs -- --nocapture
 //! ```
 #![cfg(feature = "hdfs")]

@@ -909,7 +909,7 @@ fn ensure_mounted(state: &AppState, db: &str) -> std::result::Result<(), Box<Res
 
 /// 身份抽取（不判授权）：谁 + 会话。M-B 起 `/query`、`/write` 走这里——
 /// 它们的目标库要等解析完 SQL / 表名才知道，授权判定必须**延后到目标库确定**：
-/// 先按会话默认库判会把"只授了 settle、查询里写 settle.t"的用户误杀成 403。
+/// 先按会话默认库判会把"只授了 app、查询里写 app.t"的用户误杀成 403。
 /// 401/吊销判定与 [`authenticate`] 完全同源（Revoked → 401 `SESSION_REVOKED`）。
 struct Identity {
     user: String,
@@ -1096,7 +1096,7 @@ pub(crate) fn route_sql(
 ) -> std::result::Result<(String, String), Box<Response>> {
     let t = sql.trim_start();
     // `COPY (SELECT …) TO …` 的**文本级路由**（十八批Ⅵ）：sqlparser 0.63 解析
-    // 不了整条 COPY，M-B 起原样透传——多库下内层的 `settle.t` 无人路由，在
+    // 不了整条 COPY，M-B 起原样透传——多库下内层的 `app.t` 无人路由，在
     // default 句柄上必炸。摘出内层 SELECT 走同一套归属判定/剥限定，再拼回。
     if t.len() >= 4
         && t.as_bytes()[..4].eq_ignore_ascii_case(b"COPY")
@@ -1210,9 +1210,9 @@ fn route_query_text(
     }
     // 目标库判定（设计稿 §二 + §4.2）：
     // - **单段名锚定**在 显式库 ?? 会话默认库——绝不浮动到限定库里去
-    //   （否则 `t JOIN settle.t` 会静默连到 settle 的同名表，错数据级别的事故）；
+    //   （否则 `t JOIN app.t` 会静默连到 app 的同名表，错数据级别的事故）；
     // - 带限定名的语句（且无单段名）落那个唯一的限定库——授权也按它判，
-    //   白名单用户写 `settle.t` 即可直达，不必先 USE。
+    //   白名单用户写 `app.t` 即可直达，不必先 USE。
     let (target, touched) = match explicit_db {
         Some(exp) => {
             ensure_mounted(state, exp)?;
@@ -2354,7 +2354,7 @@ async fn export_users(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Res
 
 /// `PUT /api/v1/users/{name}/grants` —— **库级授权热改**（M-C；admin 专属）。
 ///
-/// body `{"grants": {"settle": "reader", "sales": null, "*": "writer"}}`：
+/// body `{"grants": {"app": "reader", "sales": null, "*": "writer"}}`：
 /// 键 = 库名或 `"*"`，值 = 角色名（大小写不敏感）或 `null`（**显式无权**）。
 /// **PUT = 全量替换**；想全拒给 `{"*": null}`，空表 400。
 /// 判定侧**每请求现查**（角色不缓存进会话）——本调用返回即生效，被改用户
@@ -2639,8 +2639,8 @@ async fn query(
     };
 
     // ---- 限定名路由：先定目标库，**再**按目标库判权（设计稿 §二 + §4.2）。
-    // 权限判定若抢在路由前（按会话默认库），会把"只授了 settle、查询里写
-    // settle.t"的用户误杀成 403——顺序就是语义。
+    // 权限判定若抢在路由前（按会话默认库），会把"只授了 app、查询里写
+    // app.t"的用户误杀成 403——顺序就是语义。
     let explicit_db = routed_pre.1.or(body.database.clone());
     let (sql_routed, target_db) =
         match route_sql(&s, &routed_pre.0, explicit_db.as_deref(), &session_default) {
@@ -4156,7 +4156,7 @@ mod tests {
         let db1 = Arc::new(Qsdb::open(&d1, qsdb::QsdbOptions::default()).expect("open a"));
         let db2 = Arc::new(Qsdb::open(&d2, qsdb::QsdbOptions::default()).expect("open b"));
         let state = Arc::new(AppState::with_mounts(
-            vec![("default".to_string(), db1), ("settle".to_string(), db2)],
+            vec![("default".to_string(), db1), ("app".to_string(), db2)],
             None,
             crate::commit_log::CommitLog::new(),
             0,
@@ -4172,32 +4172,32 @@ mod tests {
         let (state, d1, d2) = two_mount_state();
 
         // 限定名 → 剥掉并路由
-        let (sql, db) = route_sql(&state, "SELECT * FROM settle.t", None, "default").unwrap();
-        assert_eq!(db, "settle");
-        assert!(!sql.contains("settle"), "{sql}");
+        let (sql, db) = route_sql(&state, "SELECT * FROM app.t", None, "default").unwrap();
+        assert_eq!(db, "app");
+        assert!(!sql.contains("app"), "{sql}");
         // 单段名锚定会话默认库（**不浮动**到限定库——那是错数据级事故）
         let (_, db) = route_sql(&state, "SELECT * FROM t", None, "default").unwrap();
         assert_eq!(db, "default");
         // 显式库最高
-        let (_, db) = route_sql(&state, "SELECT * FROM t", Some("settle"), "default").unwrap();
-        assert_eq!(db, "settle");
+        let (_, db) = route_sql(&state, "SELECT * FROM t", Some("app"), "default").unwrap();
+        assert_eq!(db, "app");
         // 无限定名 + 无显式 → 会话默认库
         let (_, db) = route_sql(&state, "SELECT 1", None, "default").unwrap();
         assert_eq!(db, "default");
 
-        // 跨库：单段名锚 default + 限定 settle → 显式拒（501 UNSUPPORTED）
+        // 跨库：单段名锚 default + 限定 app → 显式拒（501 UNSUPPORTED）
         let e = route_sql(
             &state,
-            "SELECT count(*) FROM t JOIN settle.t ON true",
+            "SELECT count(*) FROM t JOIN app.t ON true",
             None,
             "default",
         )
         .unwrap_err();
         assert_eq!(e.status().as_u16(), 501, "{e:?}");
-        // 同库双限定是合法的（都落 settle），不拒
+        // 同库双限定是合法的（都落 app），不拒
         let (_, db) =
-            route_sql(&state, "SELECT * FROM settle.a, settle.b", None, "default").unwrap();
-        assert_eq!(db, "settle");
+            route_sql(&state, "SELECT * FROM app.a, app.b", None, "default").unwrap();
+        assert_eq!(db, "app");
 
         // 未挂载 → 404
         let e = route_sql(&state, "SELECT * FROM nope.t", None, "default").unwrap_err();
@@ -4206,13 +4206,13 @@ mod tests {
         // COPY 文本级路由（十八批Ⅵ）：内层限定名被识别与剥除，外壳原样保留
         let (sql, db) = route_sql(
             &state,
-            "COPY (SELECT a FROM settle.t WHERE a > 0) TO 'out' (FORMAT PARQUET)",
+            "COPY (SELECT a FROM app.t WHERE a > 0) TO 'out' (FORMAT PARQUET)",
             None,
             "default",
         )
         .unwrap();
-        assert_eq!(db, "settle", "内层限定名应路由到 settle");
-        assert!(!sql.contains("settle"), "{sql}");
+        assert_eq!(db, "app", "内层限定名应路由到 app");
+        assert!(!sql.contains("app"), "{sql}");
         assert!(sql.starts_with("COPY ("), "外壳保留: {sql}");
         assert!(sql.contains("TO 'out'"), "尾段保留: {sql}");
         // 内层单段名锚定仍在（不浮动到限定库）
@@ -4227,37 +4227,37 @@ mod tests {
         // 多行 SQL（括号配对要跨行）+ 子查询嵌套括号
         let (sql, db) = route_sql(
             &state,
-            "COPY (\n  SELECT a FROM settle.t\n  WHERE a IN (SELECT x FROM settle.u)\n) TO 'out' (FORMAT PARQUET)",
+            "COPY (\n  SELECT a FROM app.t\n  WHERE a IN (SELECT x FROM app.u)\n) TO 'out' (FORMAT PARQUET)",
             None,
             "default",
         )
         .unwrap();
-        assert_eq!(db, "settle", "{sql}");
-        assert!(!sql.contains("settle"), "嵌套子查询里的限定名也要剥: {sql}");
+        assert_eq!(db, "app", "{sql}");
+        assert!(!sql.contains("app"), "嵌套子查询里的限定名也要剥: {sql}");
 
         // DDL 目标（visitor 盲区，补刀覆盖）
-        let (sql, db) = route_sql(&state, "DROP TABLE settle.x", None, "default").unwrap();
-        assert_eq!(db, "settle");
-        assert!(!sql.contains("settle"), "{sql}");
+        let (sql, db) = route_sql(&state, "DROP TABLE app.x", None, "default").unwrap();
+        assert_eq!(db, "app");
+        assert!(!sql.contains("app"), "{sql}");
         let (sql, db) =
-            route_sql(&state, "CREATE TABLE settle.x (a BIGINT)", None, "default").unwrap();
-        assert_eq!(db, "settle");
-        assert!(!sql.contains("settle"), "{sql}");
+            route_sql(&state, "CREATE TABLE app.x (a BIGINT)", None, "default").unwrap();
+        assert_eq!(db, "app");
+        assert!(!sql.contains("app"), "{sql}");
         // INSERT 目标
         let (sql, db) =
-            route_sql(&state, "INSERT INTO settle.t VALUES (1)", None, "default").unwrap();
-        assert_eq!(db, "settle");
-        assert!(!sql.contains("settle"), "{sql}");
+            route_sql(&state, "INSERT INTO app.t VALUES (1)", None, "default").unwrap();
+        assert_eq!(db, "app");
+        assert!(!sql.contains("app"), "{sql}");
         // 子查询里的限定名
         let (sql, db) = route_sql(
             &state,
-            "SELECT count(*) FROM (SELECT a FROM settle.t WHERE a > 0) x",
+            "SELECT count(*) FROM (SELECT a FROM app.t WHERE a > 0) x",
             None,
             "default",
         )
         .unwrap();
-        assert_eq!(db, "settle");
-        assert!(!sql.contains("settle"), "{sql}");
+        assert_eq!(db, "app");
+        assert!(!sql.contains("app"), "{sql}");
 
         let _ = std::fs::remove_dir_all(&d1);
         let _ = std::fs::remove_dir_all(&d2);
@@ -4266,8 +4266,8 @@ mod tests {
     /// USE / 元数据语句识别。
     #[test]
     fn use_and_metadata_statement_parsing() {
-        assert_eq!(parse_use_statement("USE settle"), Some("settle".into()));
-        assert_eq!(parse_use_statement("  use SETTLE ;"), Some("settle".into()));
+        assert_eq!(parse_use_statement("USE app"), Some("app".into()));
+        assert_eq!(parse_use_statement("  use APP ;"), Some("app".into()));
         assert_eq!(parse_use_statement("SELECT 1"), None);
         assert_eq!(parse_use_statement("USE 9bad"), None);
         assert_eq!(parse_use_statement("USE"), None);
@@ -4280,17 +4280,17 @@ mod tests {
         assert!(!is_show_databases("SHOW TABLES"));
 
         let (state, d1, d2) = two_mount_state();
-        // SHOW PARTITIONS settle.t → 剥 + 路由
-        let (sql, db) = route_metadata_statement(&state, "SHOW PARTITIONS settle.t")
+        // SHOW PARTITIONS app.t → 剥 + 路由
+        let (sql, db) = route_metadata_statement(&state, "SHOW PARTITIONS app.t")
             .expect("metadata")
             .unwrap();
-        assert_eq!(db, "settle");
+        assert_eq!(db, "app");
         assert_eq!(sql, "SHOW PARTITIONS t");
         // DESCRIBE 同理
-        let (_, db) = route_metadata_statement(&state, "DESCRIBE settle.t")
+        let (_, db) = route_metadata_statement(&state, "DESCRIBE app.t")
             .expect("metadata")
             .unwrap();
-        assert_eq!(db, "settle");
+        assert_eq!(db, "app");
         // 单段名 → 不拦（交 route_sql 落会话默认库）
         assert!(route_metadata_statement(&state, "DESCRIBE t").is_none());
         // 未挂载 → 404

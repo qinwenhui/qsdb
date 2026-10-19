@@ -64,7 +64,7 @@ struct StringIndex {
 1. **闸门全绿**（join_surface / join_projection / join_spill / sql_e2e …）。
 2. bench `complex_three_way` / `complex_join_group` 前后对照（同数据 5M，
    3 轮中位；DuckDB 同轮）。
-3. **日清语料零回归**：154 块行数一格不变（join 改动动的是执行路径，
+3. **真实语料零回归**：154 块行数一格不变（join 改动动的是执行路径，
    行数/值必须逐块一致）。
 4. **诊断开关**：`QSDB_JOIN_PROF=1` 打印各 join 选择的键索引形态
    （I64/Str/Bytes），**可断言**（对照"静默不触发"）。

@@ -19,7 +19,7 @@
 | `query_memory_limit_bytes` | Option\<u64\> / None | 默认单查询内存上限（字节）；**None/0 = 不限**（库默认不限——嵌入方自控内存策略）。同为运行期配置的初值。**`qsdb server` 兜底 4GB**（`--query-memory-limit-mb`）：server 是唯一会叠加多查询的部署面，不给默认即「N 个查询各自无界」。只约束**物化算子**记账（join build / sort spill / window / udaf），流式扫描/聚合不记账——见内存模型一节。 |
 | `memory_budget_bytes` | Option\<u64\> / None | **全局内存预算**（字节）：本句柄内**所有**查询共享的执行内存 + 解码缓存总上界；**None/0 = 不限**（库默认不限，嵌入方自控）。与上一行的分工：那个是「单查询配额」（400 `QUERY_MEMORY_LIMIT`），这个是「整个句柄的天花板」（超了是 503 `MEMORY_PRESSURE`，可退避重试）。压力下**先挤兑缓存**再拒查询。**只约束记账到的内存**（物化算子 + 解码缓存；流式在途批的残留上界见设计文档 §七）。`qsdb server` 兜底 4GB（`--memory-budget-mb`）。 |
 | `spill_dir` | Option\<PathBuf\> / None | **溢出目录根**（排序/聚合/join 落盘用）；None = 系统临时目录。溢出量可以很大（5M 行排序就是几十上百 MB）——**生产建议与数据同盘**（`qsdb server` 默认 `<库根>/_spill`）。每次查询在其下开 `qsdb_spill_<uuid>/`，查询结束即删；`open` 时清理**超过静默期未动过**的残留子目录（崩溃遗留）。只读句柄不写库根（回落系统 temp）。CLI：`--spill-dir`。 |
-| `storage`（HDFS 形态） | `StorageConfig::Hdfs { url, prefix }` | HDFS 管理表（M6-5，feature `hdfs`）：`url` 如 `hdfs://192.168.1.12:9000`；CAS 由锁对象模拟（`hdfs_backend`）；身份走 `HADOOP_USER_NAME` 环境变量。CLI：`--storage-type hdfs --storage-hdfs-url hdfs://host:9000`。 |
+| `storage`（HDFS 形态） | `StorageConfig::Hdfs { url, prefix }` | HDFS 管理表（M6-5，feature `hdfs`）：`url` 如 `hdfs://namenode:9000`；CAS 由锁对象模拟（`hdfs_backend`）；身份走 `HADOOP_USER_NAME` 环境变量。CLI：`--storage-type hdfs --storage-hdfs-url hdfs://host:9000`。 |
 | `staging_dir` | Option\<PathBuf\> / None | 远端写 staging 目录（M6-4）：Some = 启用——远端写先落本地盘（**写盘即 ACK**，写延迟与网络解耦），`flush_staged()` 批量 PUT + OCC 提交。需 S3 后端。**可见性语义**：未 flush 的数据对查询不可见（manifest 唯一真值），可见性延迟 = 上传周期；读己之写先 flush。崩溃恢复：残留对下次 flush 幂等补传（segment PUT 幂等 + manifest file_name 去重）。 |
 | `file_cache_bytes` | u64 / 0 | 远端外表（`read_parquet('s3://…')`）段文件本地磁盘缓存预算，布局 `{root}/_filecache/{url_hash}/{etag}/…`（ETag 键控，对象覆盖自动失效；预算内按 mtime LRU 驱逐）。**0 = 关闭（默认）**。仅整读（无 row group 裁剪命中）的对象入缓存；选择性查询走 range GET 不占预算。需编译 feature `s3`。 |
 
@@ -73,7 +73,7 @@
 | **结果护栏·行数** | `--max-result-rows` / **0（关）** | ✅（`PUT /api/v1/config`，键 `maxResultRows`） | 单次查询结果行数超限 → 400 `RESULT_TOO_LARGE`，**绝不返回部分数据**。检查点在执行后、序列化前（不省计算，纯传输护栏；json/ipc/bulk/rows/csv 全格式一致）。默认关 ⇒ 升级零行为变更 |
 | **结果护栏·体量** | `--max-result-mb` / **0（关）** | ✅（同上，键 `maxResultBytes`） | 结果体量上限，按 **Arrow 数组内存估算**——JSON 序列化后实际体积可达估算的 1.5~3×（转义/数字展开），要精确护栏用行数档。热更值单位是**字节**（CLI 是 MB） |
 | 会话空闲回收 | `--session-idle-timeout-mins` / **0（关）** | ❌ | 超时会话按"踢人"路径清理（取消在跑查询 + 吊销 token，之后 401 `SESSION_REVOKED`）。默认关的理由：踢错活跃会话的代价大于泄漏代价（会话对象 ~百字节级，泄漏是审计噪音不是内存问题） |
-| **多库挂载** | `--mount 名=路径`（可重复；带选项 `名=路径,budget-mb=2048,read-only`） | ❌ | **`default` 库固定来自 `--path`**（`--mount default=…` 显式拒绝）。名字（小写 `[a-z_][a-z0-9_]*`）进 SQL 限定符（`settle.t`）、`USE`、`SHOW DATABASES` 与 grants 键。**各挂载独立**内存预算/解码缓存/写缓冲（缓存 `--cache-mb` 每挂载一份）；**并发闸是实例级的**（过载保护管整个进程）。跨库 JOIN/事务显式拒（501）。`--mount` 同路径双挂载拒绝 |
+| **多库挂载** | `--mount 名=路径`（可重复；带选项 `名=路径,budget-mb=2048,read-only`） | ❌ | **`default` 库固定来自 `--path`**（`--mount default=…` 显式拒绝）。名字（小写 `[a-z_][a-z0-9_]*`）进 SQL 限定符（`app.t`）、`USE`、`SHOW DATABASES` 与 grants 键。**各挂载独立**内存预算/解码缓存/写缓冲（缓存 `--cache-mb` 每挂载一份）；**并发闸是实例级的**（过载保护管整个进程）。跨库 JOIN/事务显式拒（501）。`--mount` 同路径双挂载拒绝 |
 | 写缓冲阈值 | WriteBufferOptions（代码默认 64 批/128MB） | ❌ | 攒批自动 flush |
 | compaction 触发 | CompactOptions（代码默认 ≥4 段且均值 <64MB） | ❌ | 见 `qsdb admin compact` |
 | Flight 监听口 | `--flight-bind` / 关 | ❌ | Arrow Flight 数据面（h2c，独立于 HTTP）；需 `--features flight` 编译（默认关闭守二进制红线）。鉴权复用 `--token`（Bearer metadata）。do_get ticket=SQL；do_put 首帧 descriptor cmd=`table:<名>` |
@@ -92,8 +92,8 @@
 **库级 grants（M-C，白名单制）**：
 ```jsonc
 // _catalog/users.json 的用户条目（grants 字段存在时即取代 role 成为判定唯一依据）
-{ "name": "op_settle", "salt": "…", "hash": "…",
-  "grants": { "settle": "Reader", "sales": null, "*": "Writer" } }
+{ "name": "op_app", "salt": "…", "hash": "…",
+  "grants": { "app": "Reader", "sales": null, "*": "Writer" } }
 ```
 - 键 = 库名或 `"*"`（通配）；值 `null` = **显式无权**；**键缺失 = 无权**（白名单制）
 - 库级精确项优先于 `"*"`；无 `grants` 字段的旧条目 = `role` 管所有库（**逐位兼容**）
@@ -126,10 +126,10 @@
 
 **用户存储**：`_catalog/users.json`（进程外可直接读不可改——密码哈希 + catalog 锁内原子写）。
 
-**SQL 管理**（Admin 专属）：`CREATE USER name WITH PASSWORD 'pw' [ROLE r]`、`DROP USER name [IF EXISTS]`、`ALTER USER name SET PASSWORD 'pw' / SET ROLE r`（= 写 `"*"` 槽位，库级精确项保留）、`SHOW USERS`（M-C 起第三列 `grants` 摘要，如 `settle=reader,*=-`）。默认角色 = writer。
+**SQL 管理**（Admin 专属）：`CREATE USER name WITH PASSWORD 'pw' [ROLE r]`、`DROP USER name [IF EXISTS]`、`ALTER USER name SET PASSWORD 'pw' / SET ROLE r`（= 写 `"*"` 槽位，库级精确项保留）、`SHOW USERS`（M-C 起第三列 `grants` 摘要，如 `app=reader,*=-`）。默认角色 = writer。
 
 **grants 管理**（M-C，不做 SQL DDL）：
-- `PUT /api/v1/users/{name}/grants`（admin 热改）：body `{"grants": {"settle": "reader", "*": null}}`，**PUT = 全量替换**；角色名大小写不敏感，`null` = 显式无权；想全拒给 `{"*": null}`（空表 400）
+- `PUT /api/v1/users/{name}/grants`（admin 热改）：body `{"grants": {"app": "reader", "*": null}}`，**PUT = 全量替换**；角色名大小写不敏感，`null` = 显式无权；想全拒给 `{"*": null}`（空表 400）
 - `qsdb admin user-add <名> [--password <密码>] [角色] [--grant 库=角色 …]`（可重复；`db=` = 显式无权；给了 `--grant` 不给角色 = 白名单制）
 - `user export/import` 原样（**grants 随 JSON 走**，failover 无缝延伸）
 - 登录响应回显 `grants` 摘要 + 默认库的当前角色（`null` = 无权）——客户端自查，不用撞 403 试探
@@ -344,10 +344,10 @@ qsdb server --path /data/qsdb   --addr 0.0.0.0:9430   --memory-budget-mb 4096   
 ### B.2 多库多租户形（M-B/M-C）
 
 ```bash
-qsdb server --path /data/qsdb-default   --mount settle=/data/qsdb-settle,budget-mb=2048   --mount sales=/data/qsdb-sales,read-only   --token <运维密钥>
+qsdb server --path /data/qsdb-default   --mount app=/data/qsdb-app,budget-mb=2048   --mount sales=/data/qsdb-sales,read-only   --token <运维密钥>
 # 库级授权：管理面走 PUT /api/v1/users/{name}/grants（热改即生效）或
-#   qsdb admin user-add op_settle --grant settle=writer
-# 客户端：SQL 限定名 settle.t 直达（授权同判）；或登录后 USE settle
+#   qsdb admin user-add op_app --grant app=writer
+# 客户端：SQL 限定名 app.t 直达（授权同判）；或登录后 USE app
 ```
 
 内存规划：**每挂载独立预算**（默认 4096MB/挂载，`budget-mb=` 覆写）——

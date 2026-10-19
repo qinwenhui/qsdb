@@ -1,79 +1,176 @@
 # QSDB
 
-**A standalone, single-node, embeddable columnar analytical database. Arrow-native. Parquet-backed. Zero external services.**
+**A standalone, single-node, embeddable columnar analytical database.
+Arrow-native. Parquet-backed. Zero external services.**
 
-通用嵌入式分析数据库：作为 Rust 库嵌入任意应用/引擎，或编译为单二进制直接部署。不绑定任何上游，接口全部基于开放标准（Arrow / Parquet / HTTP / SQL）。三件事做到极致——**读写速度、资源占用、并发能力**。
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
+[![CI](https://github.com/qinwenhui/qsdb/actions/workflows/ci.yml/badge.svg)](https://github.com/qinwenhui/qsdb/actions/workflows/ci.yml)
 
-- 列式、不可变文件：append + 分区级原子 overwrite，无行级 UPDATE/DELETE
-- Arrow `RecordBatch` 全链路零拷贝，嵌入式 API 是一等公民
-- Parquet 存储 + 列统计 + 分区/行组两级裁剪
-- 元数据 = 本地文件 + 内存缓存 + 分区级文件锁，**不依赖任何外部服务**（无 HMS/MySQL/ZooKeeper）
-- 自研向量化执行引擎（依赖刻意保持最小：arrow-rs + parquet-rs + sqlparser-rs）
+QSDB does three things — **read/write speed, resource footprint, and concurrency** —
+and deliberately nothing else. No cluster, no external metastore, no JVM:
+one static binary, usable as an embeddable Rust library or deployed as an HTTP server.
 
-## 嵌入式使用（规划 API，随里程碑逐步可用）
+---
 
-```rust
-use qsdb::{Qsdb, QsdbOptions, ScanRequest};
+## Highlights
 
-let db = Qsdb::open("/data/qsdb", QsdbOptions::default())?;
+- **Columnar, immutable files** — append + partition-level atomic overwrite; no row-level UPDATE/DELETE (analytics don't need it, and immutability is what makes the rest cheap).
+- **Arrow end-to-end** — `RecordBatch` with zero-copy handoff in embedded mode; Arrow IPC on the wire when you want it.
+- **Parquet storage** — column statistics, partition- and row-group-level pruning baked into the scan path.
+- **Vectorized execution engine, written from scratch** — hash join (zero-copy string keys), window functions over DECIMAL, sort/aggregate spill, and a dense direct-index path for high-cardinality `count(DISTINCT)`.
+- **A wide SQL surface** — Spark-dialect friendly: `stack` / `PIVOT`, CTEs (including dead-CTE elimination), `least`/`greatest`, non-ANSI double-quoted strings, multi-value `IN` pushdown, and parameterized queries (`$1` / `?` — values never enter the SQL text).
+- **A real server, not a toy** — streaming results with constant memory, cooperative cancellation (sub-100ms end-to-end), sessions, multi-database mounts, per-database grants, hot-reconfigurable guards (result rows/bytes, timeouts, memory), and a machine-readable error-code catalog your clients can fetch at runtime.
+- **Metadata with zero moving parts** — local files + in-memory cache + partition-level file locks. No HMS, no MySQL, no ZooKeeper.
+- **Minimal dependencies by design** — arrow-rs, parquet-rs, sqlparser-rs, tokio/axum. That's most of the list.
 
-// 批量写：自动分区路由、攒批、统计收集
-db.append("events", &[batch])?;
-
-// 分区整体原子替换（计算引擎幂等回写）
-db.overwrite_partition("events", &[("dt", lit_date(20664))], &batches)?;
-
-// 扫描：列裁剪 + 分区裁剪 + row group 裁剪
-for batch in db.scan(ScanRequest { table: "events", ..Default::default() })? {
-    // RecordBatch 流式消费
-}
-```
-
-## 单机服务
+## Quick start
 
 ```bash
-qsdb server --path /data/qsdb --addr 0.0.0.0:9430   # HTTP API (M3)
-qsdb shell  --path /data/qsdb                        # 本地 REPL (M2)
-qsdb query  --path /data/qsdb "SELECT ..."           # 一次性查询 (M2)
+# build
+cargo build --release -p qsdb-cli
+
+# run a server (HTTP API on :9430)
+./target/release/qsdb server --path /data/qsdb --addr 0.0.0.0:9430
+
+# or talk to a database directly
+./target/release/qsdb shell  --path /data/qsdb
+./target/release/qsdb query  --path /data/qsdb "SELECT count(*) FROM t"
 ```
 
-## 性能红线（验收口径）
+```sql
+CREATE TABLE events (uid VARCHAR, amount DECIMAL(38,8), ts TIMESTAMP)
+  PARTITIONED BY (dt DATE);
 
-| 指标 | 目标 |
-|------|------|
-| 元数据加载（万级分区，热缓存） | < 50ms |
-| 扫描吞吐（热缓存、数值列） | 单核 ≥ 300 MB/s |
-| 聚合（1 亿行 3 列 group by） | < 2s 单线程 / < 500ms 8 线程 |
-| 嵌入态空闲内存 | < 16MB RSS |
-| 服务态空闲内存 | < 48MB RSS |
-| 二进制体积（release） | ≤ 20MB |
+INSERT INTO events VALUES (...);
 
-## 路线图
+SELECT uid, sum(amount) AS total
+FROM events
+WHERE dt = '2026-10-01'
+GROUP BY uid ORDER BY total DESC LIMIT 100;
+```
 
-| 里程碑 | 内容 | 状态 |
-|--------|------|------|
-| M0 | 骨架 + 类型系统（Decimal 精度矩阵 / cast / compare） | ✅ |
-| M1 | 读写闭环：表格式 + 提交协议 + 三级裁剪扫描 + 嵌入式 API | ✅ |
-| M2 | 向量化执行 + SQL-0/1 + CLI | ✅（聚合红线部分达成，M4 复测） |
-| M3 | HTTP 服务 + compaction + WriteBuffer 攒批 | ✅ |
-| M4 | Join + spill + bloom + S3/HDFS | ⬜ |
-| M5 | 窗口/CTE/UDF + Flight + SIMD/GPU | ⬜ |
+## Rust client: `qsdb-client`
 
-M1 实测（Windows 开发机，release）：写入 1.4M rows/s、扫描 855 MB/s 单线程、万级分区元数据 18ms。
-M2 实测：1 亿行 3 列 group by 0.92s（18 线程）；SQL-0/1 全语义 e2e 106 测试。
-M3 实测：HTTP 并发写入 522MB/s（8 流回环）；二进制 15.7MB；compaction/攒批就位。
+```bash
+cargo add qsdb-client
+```
 
-## 开发
+```rust
+use qsdb_client::{Auth, Client};
+
+let c = Client::connect("http://127.0.0.1:9430", Auth::Basic {
+    user: "admin".into(),
+    password: "…".into(),
+})?;
+
+// reads: columnar batches by default, zero extra dependencies
+let rs = c.query("SELECT cat, count(*) FROM t GROUP BY cat")?;
+let t = rs.into_bulk()?;
+for row in t.rows() {
+    let (cat, n) = (row.get(0)?, row.get(1)?);
+    println!("{cat} {n}");
+}
+
+// bulk loading: never row-by-row INSERT (measured 37x slower)
+c.append("t", &[
+    ("id", vec![Some(1i64), Some(2)].into()),
+    ("cat", vec![Some("x".to_string()), None].into()),
+])?;
+
+// large results: streaming with constant memory
+let mut s = c.query_stream("SELECT * FROM big", &Default::default())?;
+while let Some(chunk) = s.next_chunk()? { /* … */ }
+```
+
+The client is hand-rolled HTTP/1.1 on top of `serde` — **zero network
+dependencies** unless you opt into Arrow IPC (`features = ["ipc"]`).
+See [`docs/客户端与嵌入方指南.md`](docs/客户端与嵌入方指南.md) for the
+embedded-vs-server decision table.
+
+## Embedded API
+
+```rust
+use qsdb::{Qsdb, QsdbOptions};
+
+let db = Qsdb::open("/data/qsdb", QsdbOptions::default())?;
+db.append("events", &[batch])?;                 // partition routing + batching
+db.overwrite_partition("events", &[(...)], &batches)?; // atomic swap
+for batch in db.scan(Default::default())? { /* RecordBatch stream */ }
+```
+
+Embedding is the right call when the database lives and dies with your process.
+Multi-process sharing, fault isolation, or remote access → use the server.
+
+## Performance
+
+The benchmark suite lives in `crates/qsdb-bench` — 19 cases (load, scan,
+aggregate, join, distinct, export) each with value assertions, run against
+DuckDB as the reference engine on a dedicated machine:
+
+```bash
+cargo run -p qsdb-bench --bin bench_suite -- --dir <data-dir> --rows 5000000 --all
+```
+
+Methodology, per-case numbers, and the reasoning behind every remaining gap
+are tracked in [`docs/真机基准对账.md`](docs/真机基准对账.md). We hold
+ourselves to a simple rule there: **every number has exactly one source of
+truth, and every regression gets a root cause, not a shrug.**
+
+## Documentation
+
+| Doc | What it covers |
+|---|---|
+| [`docs/客户端与嵌入方指南.md`](docs/客户端与嵌入方指南.md) | Client vs embedded, transport, performance levers |
+| [`docs/对接契约.md`](docs/对接契约.md) | Full HTTP API contract (endpoints, headers, error bodies) |
+| [`docs/error-codes.md`](docs/error-codes.md) | Every error code: HTTP status, category, SQLSTATE, gRPC mapping |
+| [`docs/configuration.md`](docs/configuration.md) | All configuration knobs, by effect level |
+| [`docs/format-spec.md`](docs/format-spec.md) | On-disk layout & commit protocol |
+| [`docs/bulk-format.md`](docs/bulk-format.md) / [`docs/rows-format.md`](docs/rows-format.md) | Binary batch formats (write path, streaming reads) |
+| [`docs/多库访问控制与会话设计.md`](docs/多库访问控制与会话设计.md) | Sessions, mounts, per-database grants |
+| [`docs/文件管理面设计.md`](docs/文件管理面设计.md) | Browse/inspect/trash storage files safely |
+
+More design notes live in `docs/` — each document is the design of record for
+the batch that shipped it.
+
+## Repository layout
+
+```
+crates/
+  qsdb         # the kernel: storage, execution, SQL → plan → vectorized exec
+  qsdb-cli     # the binary: server (HTTP), shell, query, admin commands
+  qsdb-client  # thin Rust client (published to crates.io)
+  qsdb-bench   # benchmark suite + probe binaries
+```
+
+## Development
 
 ```bash
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo run -p qsdb-bench -- smoke          # 基准管线自检
 ```
 
-设计文档见 [`docs/QSDB设计开发文档.md`](docs/QSDB设计开发文档.md)，磁盘格式规范见 [`docs/format-spec.md`](docs/format-spec.md)。
+CI runs fmt + clippy + tests on Linux and Windows, plus a release-binary size
+guard. Behavior changes come with regression tests; error-code changes must
+update `docs/error-codes.md` (it is enforced against the runtime catalog).
+
+## Roadmap
+
+| Area | Status |
+|---|---|
+| Type system, storage, commit protocol, pruning scans | ✅ |
+| Vectorized execution: join, window, spill, distinct | ✅ |
+| HTTP server, sessions, multi-db, per-db grants, guards | ✅ |
+| COPY-out (partitioned parquet), external tables, S3/HDFS backends | ✅ |
+| Parameterized queries, cancellation, streaming, error catalog | ✅ |
+| Flight/gRPC surface | ✅ (enhancing) |
+| Quotas, materialized views | planned |
+
+## Ecosystem
+
+- [`qsdb-studio`](https://github.com/qinwenhui/qsdb-studio) — official desktop workbench (Tauri + Vue 3, built on `qsdb-client`).
 
 ## License
 
-Apache-2.0
+[MIT](LICENSE)

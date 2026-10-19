@@ -162,7 +162,7 @@ build 侧匹配位图**。落码时先确认：**分片路径 + 非分片路径�
    - P1-2/FULL：漏掉收尾轮 → 少 **1 行**（未匹配的 build 行）⇒ 能分辨。
 3. **分片路径**：FULL/RIGHT 在**并行分片**与**串行**下结果逐行一致
    （照 `join_agg_parallel.rs` 的做法：同数据跑两遍对比）。
-4. **闸门**：`sh tools/check.sh` ALL GREEN；`.14` bench 不受影响
+4. **闸门**：`sh tools/check.sh` ALL GREEN；`基准机` bench 不受影响
    （基准全是等值 join；P0-1/P0-2 会**让它更快**，不会更慢）。
 
 ---

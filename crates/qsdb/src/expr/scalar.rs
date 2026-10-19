@@ -592,7 +592,7 @@ fn build() -> HashMap<&'static str, Arc<ScalarFnDef>> {
             eval: Arc::new(|args| {
                 let f = string_arg(args, 1, "date_format")?;
                 // 常量性判据是「**所有行同值且非 NULL**」，不能只认 `len() == 1`：
-                // 常量在批里**可能已经被广播到 n 行**（日清分那批 SQL 两个参数都是
+                // 常量在批里**可能已经被广播到 n 行**（真实语料那批 SQL 两个参数都是
                 // 常量 —— `DATE_FORMAT(CAST(CAST('2026-07-14 14:40:41' AS STRING) AS STRING),
                 // 'yyyy-MM-dd HH:mm:ss')` —— 于是 `len()` 是批长而不是 1，
                 // 只认 1 会让 **38 个块**在这条上全挂）。
@@ -673,8 +673,8 @@ fn build() -> HashMap<&'static str, Arc<ScalarFnDef>> {
 /// ## 为什么它不按普通标量函数注册
 ///
 /// 注册表的约定是「**返回 1 个元素 ⇒ 当常量广播**」（见 `expr::eval` 的
-/// `PhysExpr::Fn`）。而 `uuid()` 必须**每行不同** —— 它在这批日清结算 SQL 里是拿去
-/// 当**主键**的（`CAST(SYS_GUID() AS VARCHAR(64)) AS PHID`）：整批同一个 UUID
+/// `PhysExpr::Fn`）。而 `uuid()` 必须**每行不同** —— 它在真实语料的 SQL 里是拿去
+/// 当**主键**的（`CAST(SYS_GUID() AS VARCHAR(64)) AS uid`）：整批同一个 UUID
 /// 等于主键全撞，**数据坏了还不报错**。所以求值处对它**特判**，走这一支。
 ///
 /// ## 语义（对齐 Spark，实测 `.14` 上的 Spark 3.5.2）
@@ -861,7 +861,7 @@ fn date_format_eval(col: &ArrayRef, parts: &[FmtPart]) -> Result<ArrayRef> {
         // （实测真 Spark 3.5.2：`date_format('2026-07-14 14:40:41','yyyy-MM-dd')`
         // ⇒ `2026-07-14`，`typeof` 仍是 `string`）。
         //
-        // ★ 日清分那批 SQL 全是这个形状：`DATE_FORMAT(CAST(CAST('...' AS STRING) AS STRING),
+        // ★ 真实语料那批 SQL 全是这个形状：`DATE_FORMAT(CAST(CAST('...' AS STRING) AS STRING),
         // 'yyyy-MM-dd HH:mm:ss')` —— 一串 cast 之后参数就是**字符串**。
         // 一个形状卡住 38 个块 ⇒ 这里先转时间戳再走同一条渲染路。
         arrow::datatypes::DataType::Utf8 | arrow::datatypes::DataType::LargeUtf8 => {
@@ -869,7 +869,7 @@ fn date_format_eval(col: &ArrayRef, parts: &[FmtPart]) -> Result<ArrayRef> {
             // ⚠️ **safe = true**：转不动的行给 **NULL**，不报错 —— Spark 非 ANSI
             // 语义（`date_format('管理员','yyyy-MM-dd')` ⇒ NULL）。此前 `safe:false`
             // 整批报错：L10-01 的输入列在本切片里混着人名（'管理员'），一条坏行
-            // 挂掉整批结算 —— 与"除零 ⇒ NULL"同一口径：数据相关的运行期状况
+            // 挂掉整批任务 —— 与"除零 ⇒ NULL"同一口径：数据相关的运行期状况
             // 不该让整批挂掉。
             let casted = arrow::compute::cast_with_options(
                 col.as_ref(),

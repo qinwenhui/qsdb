@@ -3,8 +3,7 @@
 //! ## 为什么此前全套测试都没抓到
 //!
 //! `tests/join_*.rs` 里**从来没有 join 过两张同名列的表**。这个形状恰恰是真实业务里
-//! 最常见的一种：**同构的对照表**（电力日清的"日前 vs 实际"两张 `*_dgyg` 就是
-//! 11 列同名，直接照抄同一张 MySQL 模板建的）。
+//! 最常见的一种：**同构的对照表**（同一张模板建出来的两张表，11 列同名）。
 //!
 //! ## 症状（修复前）
 //!
@@ -42,10 +41,10 @@ fn setup(tag: &str) -> (Qsdb, std::path::PathBuf) {
         ));
     std::fs::create_dir_all(&root).unwrap();
     let db = Qsdb::open(&root, QsdbOptions::default()).unwrap();
-    // 两张**同名列**的表（照抄真实 dgyg 两表的形状）
-    db.sql("CREATE TABLE a (PHID VARCHAR, k VARCHAR, v BIGINT)")
+    // 两张**同名列**的表（照抄真实同构两表的形状）
+    db.sql("CREATE TABLE a (uid VARCHAR, k VARCHAR, v BIGINT)")
         .unwrap();
-    db.sql("CREATE TABLE b (PHID VARCHAR, k VARCHAR, v BIGINT)")
+    db.sql("CREATE TABLE b (uid VARCHAR, k VARCHAR, v BIGINT)")
         .unwrap();
     db.sql("INSERT INTO a VALUES ('p1','k1',1),('p2','k2',2)")
         .unwrap();
@@ -146,14 +145,14 @@ fn 计数与聚合() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// **非同名的**列取两侧也要对（`PHID` 不是 join key，走的分支不同）。
+/// **非同名的**列取两侧也要对（`uid` 不是 join key，走的分支不同）。
 #[test]
 fn 非同名列取两侧() {
     let (db, root) = setup("other");
     assert_eq!(
         rows(
             &db,
-            "SELECT a.PHID, b.PHID FROM a JOIN b ON a.k = b.k ORDER BY a.PHID"
+            "SELECT a.uid, b.uid FROM a JOIN b ON a.k = b.k ORDER BY a.uid"
         ),
         vec!["p1|q1", "p2|q2"]
     );
@@ -176,7 +175,7 @@ fn 非同名列取两侧() {
 #[test]
 fn 星号透传两份同名列() {
     let (db, root) = setup("star");
-    let out = rows(&db, "SELECT * FROM a JOIN b ON a.k = b.k ORDER BY a.PHID");
+    let out = rows(&db, "SELECT * FROM a JOIN b ON a.k = b.k ORDER BY a.uid");
     assert_eq!(out.len(), 2);
     assert_eq!(out[0], "p1|k1|1|q1|k1|10");
     assert_eq!(out[1], "p2|k2|2|q2|k2|20");

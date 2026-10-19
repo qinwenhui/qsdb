@@ -496,15 +496,15 @@ fn 引用段禁删_孤儿段进回收站() {
     assert!(r.text().contains("3"), "3 行还在");
 }
 
-/// 权限分档：settle 写者可浏览/下载 settle 文件；摸 default → 403；
+/// 权限分档：app 写者可浏览/下载 app 文件；摸 default → 403；
 /// trash 恒 admin（writer 也 403）；非 admin 列根 = 虚拟视图；无 grant → 403。
 #[test]
 fn 权限分档_读授权可浏览_删除恒admin() {
-    let s = Server::start_mounted("settle", &["--token", "t0k"]);
+    let s = Server::start_mounted("app", &["--token", "t0k"]);
     let (p, t) = (s.port, "t0k");
     seed(p, t);
 
-    // 三个用户：u1=writer@settle、u2=reader@settle、u3 无任何 grant。
+    // 三个用户：u1=writer@app、u2=reader@app、u3 无任何 grant。
     // ⚠️ CREATE USER 的 ROLE 是**旧格式全局角色**（管所有库）——必须用
     // PUT grants 转成库级模型（role 置 None）；"哪里都不给" 用 `{"*": null}`。
     for (u, pw) in [("u1", "pass1"), ("u2", "pass2"), ("u3", "pass3")] {
@@ -515,27 +515,27 @@ fn 权限分档_读授权可浏览_删除恒admin() {
         );
         assert_eq!(r.status, 200, "建 {u}: {}", r.text());
     }
-    set_grants(p, t, "u1", serde_json::json!({"settle": "writer"}));
-    set_grants(p, t, "u2", serde_json::json!({"settle": "reader"}));
+    set_grants(p, t, "u1", serde_json::json!({"app": "writer"}));
+    set_grants(p, t, "u2", serde_json::json!({"app": "reader"}));
     set_grants(p, t, "u3", serde_json::json!({"*": null}));
 
-    // settle 里的数据：DDL 恒 admin（writer 也不能 DDL）→ admin 限定名建表；
-    // u1（writer@settle）限定名 INSERT——按**目标库**判权，正是 M-B 的路由规则
-    assert_eq!(sql(p, t, "CREATE TABLE settle.st2 (a BIGINT)").status, 200);
+    // app 里的数据：DDL 恒 admin（writer 也不能 DDL）→ admin 限定名建表；
+    // u1（writer@app）限定名 INSERT——按**目标库**判权，正是 M-B 的路由规则
+    assert_eq!(sql(p, t, "CREATE TABLE app.st2 (a BIGINT)").status, 200);
     let t1 = login(p, "u1", "pass1");
     assert_eq!(
-        sql(p, &t1, "INSERT INTO settle.st2 VALUES (9),(10)").status,
+        sql(p, &t1, "INSERT INTO app.st2 VALUES (9),(10)").status,
         200,
         "{}",
-        sql(p, &t1, "INSERT INTO settle.st2 VALUES (9),(10)").text()
+        sql(p, &t1, "INSERT INTO app.st2 VALUES (9),(10)").text()
     );
 
-    // 段文件地址（settle 挂载：`settle/default/st2/<分区less>/seg_*.parquet`）
-    let r = get(p, &t1, "/api/v1/files/list?dir=settle/default/st2");
-    assert_eq!(r.status, 200, "settle 写者该能浏览自己库: {}", r.text());
+    // 段文件地址（app 挂载：`app/default/st2/<分区less>/seg_*.parquet`）
+    let r = get(p, &t1, "/api/v1/files/list?dir=app/default/st2");
+    assert_eq!(r.status, 200, "app 写者该能浏览自己库: {}", r.text());
     let seg = first_seg(&r.json());
 
-    // ① 虚拟根：u1 只看到 settle，看不到 default
+    // ① 虚拟根：u1 只看到 app，看不到 default
     let r = get(p, &t1, "/api/v1/files/list");
     assert_eq!(r.status, 200);
     let j = r.json();
@@ -545,7 +545,7 @@ fn 权限分档_读授权可浏览_删除恒admin() {
         .iter()
         .map(|e| e["name"].as_str().unwrap())
         .collect();
-    assert!(names.contains(&"settle"), "{names:?}");
+    assert!(names.contains(&"app"), "{names:?}");
     assert!(
         !names.contains(&"default"),
         "无 default grant 不该看到: {names:?}"
@@ -560,38 +560,38 @@ fn 权限分档_读授权可浏览_删除恒admin() {
     let r = get(p, &t1, "/api/v1/files?path=default/p/table.json");
     assert_eq!(r.status, 403, "download 也按读授权: {}", r.text());
 
-    // ③ settle 面读路径放行：detail / download / 段摘要
+    // ③ app 面读路径放行：detail / download / 段摘要
     let r = get(
         p,
         &t1,
-        &format!("/api/v1/files/detail?path=settle/default/st2/{seg}"),
+        &format!("/api/v1/files/detail?path=app/default/st2/{seg}"),
     );
     assert_eq!(r.status, 200, "{}", r.text());
     let j = r.json();
-    assert_eq!(j["db"], "settle");
+    assert_eq!(j["db"], "app");
     assert_eq!(j["table"], "st2");
     assert_eq!(j["segment"]["referenced"], true);
     assert_eq!(j["segment"]["rows"], 2);
     let r = get(
         p,
         &t1,
-        &format!("/api/v1/files?path=settle/default/st2/{seg}"),
+        &format!("/api/v1/files?path=app/default/st2/{seg}"),
     );
-    assert_eq!(r.status, 200, "settle 读者该能下载: {}", r.text());
+    assert_eq!(r.status, 200, "app 读者该能下载: {}", r.text());
     assert!(!r.body.is_empty());
 
-    // ④ trash 恒 admin：settle 的 writer 也 403
+    // ④ trash 恒 admin：app 的 writer 也 403
     let r = post(
         p,
         &t1,
-        &format!("/api/v1/files/trash?path=settle/default/st2/{seg}"),
+        &format!("/api/v1/files/trash?path=app/default/st2/{seg}"),
     );
     assert_eq!(r.status, 403, "{}", r.text());
     assert_eq!(r.code(), "FORBIDDEN");
 
-    // ⑤ 无 grant 用户：settle 403、根视图全空
+    // ⑤ 无 grant 用户：app 403、根视图全空
     let t3 = login(p, "u3", "pass3");
-    let r = get(p, &t3, "/api/v1/files/list?dir=settle");
+    let r = get(p, &t3, "/api/v1/files/list?dir=app");
     assert_eq!(r.status, 403);
     let r = get(p, &t3, "/api/v1/files/list");
     assert_eq!(r.status, 200);
@@ -599,9 +599,9 @@ fn 权限分档_读授权可浏览_删除恒admin() {
     assert!(j["entries"].as_array().unwrap().is_empty(), "{}", r.text());
     assert!(j["mounts"].as_array().unwrap().is_empty(), "{}", r.text());
 
-    // ⑥ reader（u2）也能浏览 settle
+    // ⑥ reader（u2）也能浏览 app
     let t2 = login(p, "u2", "pass2");
-    let r = get(p, &t2, "/api/v1/files/list?dir=settle/default/st2");
+    let r = get(p, &t2, "/api/v1/files/list?dir=app/default/st2");
     assert_eq!(r.status, 200, "reader 该能浏览: {}", r.text());
 
     // ⑦ 未认证 → 401
