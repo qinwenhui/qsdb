@@ -93,7 +93,8 @@ jobs:
           cp "target/${{ matrix.target }}/release/qsdb" "$DIR/"
           cp README.md LICENSE "$DIR/"
           tar czf "qsdb-${GITHUB_REF_NAME#v}-${{ matrix.name }}.tar.gz" "$DIR"
-          sha256sum "qsdb-${GITHUB_REF_NAME#v}-${{ matrix.name }}.tar.gz" > "qsdb-${GITHUB_REF_NAME#v}-${{ matrix.name }}.tar.gz.sha256"
+          # macOS 没有 GNU 的 sha256sum，用两端都自带的 shasum
+          shasum -a 256 "qsdb-${GITHUB_REF_NAME#v}-${{ matrix.name }}.tar.gz" > "qsdb-${GITHUB_REF_NAME#v}-${{ matrix.name }}.tar.gz.sha256"
 
       - name: Package (windows)
         if: matrix.archive == 'zip'
