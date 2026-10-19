@@ -84,6 +84,16 @@ impl Server {
                 }
             }
         };
+        // stderr 排水线程：管道 64KB 写满会把 server 阻塞在日志写入上假死
+        // （客户端表现为 ConnectionReset；2 核 CI 高并发测试必现）。
+        std::thread::spawn(move || {
+            let mut drain = [0u8; 8192];
+            while let Ok(n) = stderr.read(&mut drain) {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
         Server { child, port, root }
     }
 }

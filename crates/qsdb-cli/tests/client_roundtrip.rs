@@ -75,6 +75,18 @@ impl Server {
                 }
             }
         };
+        // 拿到端口后 stderr **必须有人持续排水**：管道容量 64KB，server 的
+        // 启动 banner + 每请求 tracing 日志没人读就会写满 ⇒ server 进程
+        // 阻塞在日志写入上整进程假死，客户端表现为 ConnectionReset。
+        // （2 核 CI 上高并发测试必现；本地核多调度散开，偶现或不现。）
+        std::thread::spawn(move || {
+            let mut drain = [0u8; 8192];
+            while let Ok(n) = stderr.read(&mut drain) {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
         // 端口开了不等于能服务（axum 起监听在 server 打印之后），探一下更稳
         let addr = format!("127.0.0.1:{port}");
         let dl = Instant::now() + Duration::from_secs(10);
@@ -689,6 +701,15 @@ fn 认证失败与成功() {
             }
         }
     };
+    // stderr 排水（同 Server::start；管道写满会让 server 假死）
+    std::thread::spawn(move || {
+        let mut drain = [0u8; 8192];
+        while let Ok(n) = stderr.read(&mut drain) {
+            if n == 0 {
+                break;
+            }
+        }
+    });
     let url = format!("http://127.0.0.1:{port}");
     // 匿名 → 401
     let anon = Client::connect(&url, Auth::None).unwrap();
@@ -1023,6 +1044,15 @@ fn 管理面一等方法_config_watch_sessions_grants() {
             }
         }
     };
+    // stderr 排水（同 Server::start；管道写满会让 server 假死）
+    std::thread::spawn(move || {
+        let mut drain = [0u8; 8192];
+        while let Ok(n) = stderr.read(&mut drain) {
+            if n == 0 {
+                break;
+            }
+        }
+    });
     let c = Client::connect(
         &format!("http://127.0.0.1:{port}"),
         Auth::Bearer("t0k".into()),
