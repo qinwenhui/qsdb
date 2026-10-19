@@ -26,28 +26,49 @@ static QUERIES: AtomicU64 = AtomicU64::new(0);
 static Q_NANOS: AtomicU64 = AtomicU64::new(0);
 static ERRORS: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(windows)]
+/// 当前进程 RSS / 峰值 RSS（MB）。Windows 走 Win32，Linux 走 /proc/self/status
+/// （`VmRSS` / `VmHWM`，kB 取整 ⇒ 亚 MB 粒度丢失，对 soak 的 MB 级曲线无碍）。
 fn mem_mb() -> (f64, f64) {
-    use windows_sys::Win32::System::ProcessStatus::{
-        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
-    };
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let mut pmc = PROCESS_MEMORY_COUNTERS::default();
-    unsafe {
-        let h = GetCurrentProcess();
-        if GetProcessMemoryInfo(
-            h,
-            &mut pmc,
-            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-        ) != 0
-        {
-            (
-                pmc.WorkingSetSize as f64 / 1048576.0,
-                pmc.PeakWorkingSetSize as f64 / 1048576.0,
-            )
-        } else {
-            (0.0, 0.0)
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut pmc = PROCESS_MEMORY_COUNTERS::default();
+        unsafe {
+            let h = GetCurrentProcess();
+            if GetProcessMemoryInfo(
+                h,
+                &mut pmc,
+                std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            ) != 0
+            {
+                (
+                    pmc.WorkingSetSize as f64 / 1048576.0,
+                    pmc.PeakWorkingSetSize as f64 / 1048576.0,
+                )
+            } else {
+                (0.0, 0.0)
+            }
         }
+    }
+    #[cfg(not(windows))]
+    {
+        let (mut cur, mut peak) = (0.0f64, 0.0f64);
+        if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+            for line in s.lines() {
+                let parse = |v: &str| -> f64 {
+                    v.split_whitespace().next().and_then(|x| x.parse().ok()).unwrap_or(0.0)
+                };
+                if let Some(v) = line.strip_prefix("VmRSS:") {
+                    cur = parse(v) / 1024.0;
+                } else if let Some(v) = line.strip_prefix("VmHWM:") {
+                    peak = parse(v) / 1024.0;
+                }
+            }
+        }
+        (cur, peak)
     }
 }
 
@@ -82,7 +103,6 @@ fn synth(rows: usize, dt: i32, seed: u64) -> RecordBatch {
     .unwrap()
 }
 
-#[cfg(windows)] // mem_mb 依赖 Win32
 fn main() {
     let mins: u64 = std::env::args()
         .nth(1)
@@ -269,9 +289,4 @@ fn main() {
     );
     let _ = cur;
     std::fs::remove_dir_all(&root).ok();
-}
-
-#[cfg(not(windows))]
-fn main() {
-    eprintln!("soak 目前仅 Windows（mem_mb 依赖 Win32）；Linux 版待 /proc/self/status 移植");
 }
