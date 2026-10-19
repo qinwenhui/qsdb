@@ -670,13 +670,13 @@ fn rewrite_plan(
                 .iter()
                 .map(|a| crate::expr::AggExpr {
                     func: a.func,
-                    arg: a.arg.as_ref().map(&re),
+                    arg: a.arg.as_ref().map(re),
                     out_name: a.out_name.clone(),
                     out_ty: a.out_ty.clone(),
                     udaf: a.udaf.clone(),
                     distinct: a.distinct,
                     // FILTER 谓词引用的是**表列**，与 arg 同一个索引空间，一起重写
-                    filter: a.filter.as_ref().map(&re),
+                    filter: a.filter.as_ref().map(re),
                 })
                 .collect(),
         },

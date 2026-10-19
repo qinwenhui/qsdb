@@ -3482,7 +3482,7 @@ fn try_rewrite_stack(q: &sqlparser::ast::Query) -> Result<Option<sqlparser::ast:
     let Some(si) = sel
         .projection
         .iter()
-        .position(|it| proj_item_expr(it).is_some_and(&mentions_stack))
+        .position(|it| proj_item_expr(it).is_some_and(mentions_stack))
     else {
         return Ok(None);
     };
