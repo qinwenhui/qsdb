@@ -10,6 +10,17 @@
 
 ## 每次发布
 
+### 0. 推送前本地全套验证（**必跑**）
+
+```bash
+bash tools/internal/prepush.sh              # fmt / clippy / 全量测试
+WITH_REMOTE=1 bash tools/internal/prepush.sh  # 加 .14 实机 Linux clippy
+```
+
+> 六轮 CI 红的教训：三次挂在"改完没跑全套验证"（两次 fmt、一次缓存假绿）。
+> **这个脚本不过，不生成、不推送。** clippy 缓存会骗人——改过代码后必须
+> 验证；要绝对干净先 `cargo clean`。
+
 ### 1. 生成公开分支（推送前现场生成，**平时不保留**）
 
 ```bash
