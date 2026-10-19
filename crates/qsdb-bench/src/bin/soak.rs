@@ -59,7 +59,10 @@ fn mem_mb() -> (f64, f64) {
         if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
             for line in s.lines() {
                 let parse = |v: &str| -> f64 {
-                    v.split_whitespace().next().and_then(|x| x.parse().ok()).unwrap_or(0.0)
+                    v.split_whitespace()
+                        .next()
+                        .and_then(|x| x.parse().ok())
+                        .unwrap_or(0.0)
                 };
                 if let Some(v) = line.strip_prefix("VmRSS:") {
                     cur = parse(v) / 1024.0;
