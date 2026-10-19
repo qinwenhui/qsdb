@@ -55,7 +55,7 @@ INSERT INTO events VALUES (...);
 
 SELECT uid, sum(amount) AS total
 FROM events
-WHERE dt = '2026-10-01'
+WHERE dt = '2026-10-03'
 GROUP BY uid ORDER BY total DESC LIMIT 100;
 ```
 

@@ -276,7 +276,7 @@ fn decimal_mod() {
     assert!(q(&db, "SELECT amount % 3 FROM t WHERE cnt = 2") == vec!["2.2500"]);
     // NULL 传播
     assert!(q(&db, "SELECT amount % 7 FROM t WHERE cnt IS NULL") == vec!["NULL"]);
-    // **除零 ⇒ NULL**（2026-10-16 行为**有变**，见下）。
+    // **除零 ⇒ NULL**（2026-10-17 行为**有变**，见下）。
     //
     // 这里原先是 `assert!(… .is_err())` —— 断言"除零必须报错"。
     // 按**真 Spark 3.5.2 实测**改成 NULL：`1/0`、小数除零、`1%0` **三格全是 NULL**，
@@ -391,7 +391,7 @@ fn scalar_over_aggregate() {
 /// **数值/小数列 与 字符串字面量** 的比较：转不动的字符串 ⇒ 整条比较是 `NULL`
 /// （Spark `ansi.enabled=false` 的语义），**不是**类型错误。
 ///
-/// 2026-10-16：语料里"空串当零"的惯用写法
+/// 2026-10-17：语料里"空串当零"的惯用写法
 /// `CASE WHEN SUM_VALUE = '' THEN 0 ELSE SUM_VALUE END`（`SUM_VALUE` 是
 /// `DECIMAL(38,8)`）**一下卡住 9 个块**，报的是
 /// `cannot compare DECIMAL(38, 8) with BOOLEAN` —— 方向完全指错。

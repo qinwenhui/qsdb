@@ -31,14 +31,14 @@
 //! （`QUERY_MEMORY_LIMIT` / `MEMORY_PRESSURE`），不硬做。
 //! 这是设计边界，见 `内存预算与溢出设计稿` §四 4.2。
 //!
-//! **DECIMAL 支持（2026-10-16）**：`sum/avg/min/max` 均可用于 `DECIMAL` 参数
+//! **DECIMAL 支持（2026-10-17）**：`sum/avg/min/max` 均可用于 `DECIMAL` 参数
 //! （金额类核心列几乎全是它）。精度口径与非窗口聚合**逐字一致**：
 //! `sum` ⇒ `min(p+10,38), s`；`avg` ⇒ `min(p+10,38), max(s,4)`（HALF_UP）；
 //! `min/max` ⇒ 参数类型。**累加用 arrow 自带的 `i256`**（零新依赖），
 //! 装不回声明精度时**显式报错，不回 NULL**。
 //!
 //! 取值口径（两条路径**同一套**）：帧内**一个非 NULL 都没有**（含空帧）⇒
-//! SUM/MIN/MAX/AVG 输出 **NULL**（此前输出 0 / NaN —— 那是错值，2026-10-15 修）；
+//! SUM/MIN/MAX/AVG 输出 **NULL**（此前输出 0 / NaN —— 那是错值，2026-10-17 修）；
 //! COUNT 输出 **0**（`count` 数的是行，空帧就是 0）。默认帧与显式帧因此
 //! **逐值一致**：`sum(x) OVER (ORDER BY i)` 与 `… ROWS BETWEEN UNBOUNDED
 //! PRECEDING AND CURRENT ROW` 在无并列时结果相同。
@@ -185,7 +185,7 @@ impl WindowFn {
             // ⚠️ **`Decimal` 必须排在 `t if t.is_numeric()` 前面**：
             //   `Decimal::is_numeric()` 为真 ⇒ 顺序反了这条臂就是**死代码**，
             //   `sum(d) OVER ()` 的输出类型会变成 **BIGINT**（值被当整数显示）。
-            //   实测（2026-10-16）：这条一直是错的，只是此前 `sum(decimal) OVER`
+            //   实测（2026-10-17）：这条一直是错的，只是此前 `sum(decimal) OVER`
             //   直接报"不支持"、**从没走到取类型那一步**，所以从没暴露。
             //   非窗口聚合那边用的是严格 `match input`（Decimal 显式一条），没这个坑。
             Self::Sum(e, _) => match e.data_type() {
@@ -1030,7 +1030,7 @@ fn framed_agg(
 }
 
 // ---------------------------------------------------------------------------
-// DECIMAL 的窗口聚合（2026-10-16）
+// DECIMAL 的窗口聚合（2026-10-17）
 //
 // 起因：`sum(d) OVER (…)` 此前报 `support: integer/float args` —— 而**金额类
 // 核心列几乎全是 `DECIMAL(30,8)`**，窗口累计是真实语料最常见的形状之一。
@@ -1064,7 +1064,7 @@ fn dec_avg(sum: i256, cnt: i64, in_scale: i8, out_scale: i8) -> Result<i128> {
     // ⚠️ **输出 scale 可能 ≠ 输入 scale**（Spark 的 `avg` 规则是 `s+4`）⇒ 输出小数位
     // 更多时把**分子**（unscaled 和）放大 `10^(s_out - s_in)`。
     //
-    // 漏掉这一步不会报错，只会**把数算小**：2026-10-16 实测 `avg(DECIMAL(30,8)) OVER ()`
+    // 漏掉这一步不会报错，只会**把数算小**：2026-10-17 实测 `avg(DECIMAL(30,8)) OVER ()`
     // 回 `0.000020833333` 而不是 `0.208333333333` —— 小了 1 万倍。
     // **同一处病在聚合那条路（`exec::agg`）也有一份，必须一起改**，
     // 否则"窗口 avg"与"聚合 avg"会给出不同的数（本文件那条逐值对撞测试会当场抓到）。

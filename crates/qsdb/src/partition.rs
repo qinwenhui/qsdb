@@ -472,7 +472,7 @@ mod tests {
     #[test]
     fn encode_decode_roundtrip() {
         for raw in [
-            "2026-10-09",
+            "2026-10-04",
             "cn=north",
             "a/b",
             "100%",
@@ -496,9 +496,9 @@ mod tests {
         let keys = vec!["dt".to_string(), "region".to_string()];
         let vals = vec![Literal::Date(20735), Literal::Utf8("cn=east".into())];
         let dir = partition_dir(&keys, &vals).unwrap();
-        assert_eq!(dir, PathBuf::from("dt=2026-10-09/region=cn%3Deast"));
+        assert_eq!(dir, PathBuf::from("dt=2026-10-04/region=cn%3Deast"));
         let parsed = parse_partition_dir(&dir, 2).unwrap();
-        assert_eq!(parsed[0], ("dt".into(), "2026-10-09".into()));
+        assert_eq!(parsed[0], ("dt".into(), "2026-10-04".into()));
         assert_eq!(parsed[1], ("region".into(), "cn=east".into()));
     }
 
@@ -569,7 +569,7 @@ mod tests {
     fn parse_partition_value_types() {
         let d = Literal::Date(20735);
         assert_eq!(
-            parse_partition_value("2026-10-09", &LogicalType::Date).unwrap(),
+            parse_partition_value("2026-10-04", &LogicalType::Date).unwrap(),
             d
         );
         assert_eq!(

@@ -43,7 +43,7 @@ cp README.md README.zh-CN.md LICENSE Cargo.toml Cargo.lock .gitignore .gitattrib
 cp .github/workflows/*.yml "$STAGE/.github/workflows/"
 
 # docs 白名单（与 tools/internal/RELEASING.md 的清单保持一致）
-# 定案（2026-10-19）：公开面只保留规范/契约 5 份，其余设计稿留在开发分支
+# 定案（2026-10-18）：公开面只保留规范/契约 5 份，其余设计稿留在开发分支
 DOCS=(
   configuration.md error-codes.md format-spec.md bulk-format.md rows-format.md
 )

@@ -26,14 +26,14 @@ use crate::write::WriteResult;
 ///
 /// **`#[non_exhaustive]` 是刻意标的**（qsdb-sync F27）——这是个**内核产出、
 /// 嵌入方只消费**的类型，J12 给 `Ok` 加两个字段就把首个嵌入方的编译打断了
-/// （穷尽匹配 → E0027）。规则（2026-10-13 与 F27 一并定）：
+/// （穷尽匹配 → E0027）。规则（2026-10-11 与 F27 一并定）：
 /// **结果/错误类类型标 `non_exhaustive`；嵌入方要构造或按字段取值的
 /// 输入/格式类型（`Literal` / `SegmentEntry` / `PartitionManifest` …）不标。**
 ///
 /// ⚠️ **枚举级标注不足以防"加字段"，必须同时标在变体上**（实测）：
 /// 枚举级只要求外部加通配臂（E0004）；外部若把变体字段列全了，加字段照样
 /// 报 E0027。变体级才会强制外部写 `..`（E0638）。**别把变体上这两行删了。**
-/// `Debug` 是**附加式**补的（2026-10-13）：先前没实现，导致调用方连
+/// `Debug` 是**附加式**补的（2026-10-11）：先前没实现，导致调用方连
 /// `{result:?}` 都用不了——内核自己的 `server.rs` / `flight.rs` 都在这里栽过
 /// （只能手写静态文案）。补上纯属易用性，不影响任何已有代码。
 #[derive(Debug)]
@@ -481,7 +481,7 @@ fn execute_stmt(
             match source {
                 translate::InsertSource::Values(rows) => {
                     // VALUES 源：列清单可只给部分列，未列出的列补 NULL
-                    // （2026-10-13 放宽：此前要求"必须覆盖全部表列"，理由是"宁可报错
+                    // （2026-10-11 放宽：此前要求"必须覆盖全部表列"，理由是"宁可报错
                     //  也不要补 NULL 写进半行"——但 INSERT … SELECT 一直允许部分列，
                     //  同一条理由并不成立；而且写端本就有 NOT NULL/CHECK 兜底
                     //  （`write::check_constraints`），缺列补 NULL 后照样会被拦下来。
@@ -610,7 +610,7 @@ fn execute_stmt(
 /// CTE 物化：按定义序执行每个 CTE 子计划 → 批缓存（cte_id → Vec<RecordBatch>）。
 /// 增量装入：链式 CTE（引用先定义者）物化时缓存已可读。
 ///
-/// 两处硬伤（2026-10-13 修）：
+/// 两处硬伤（2026-10-11 修）：
 /// ① 子计划此前用 `QueryContext::benign()` 执行——**内存闸/超时/取消
 ///    三条隔离全绕过**；现用外层真 ctx。
 /// ② 物化批此前只在"下一条 WITH 查询开始时"才被替换 → **跨查询驻留**
@@ -701,7 +701,7 @@ fn metadata_shortcut_count(
         Some(crate::expr::PhysExpr::Lit(l)) if !matches!(l, crate::Literal::Null) => {}
         Some(_) => return Ok(None),
     }
-    // ⚠️ **写了 `FILTER` 就不能走元数据短路**（2026-10-15）：这条短路直接回
+    // ⚠️ **写了 `FILTER` 就不能走元数据短路**（2026-10-17）：这条短路直接回
     // parquet footer 的行数，压根不看行 —— `count(*) FILTER (WHERE v>15)` 会被
     // 当成 `count(*)` 回**全量行数**（实测 5 而非 2），而且**一声不响**。
     // 新加任何"整表行数"式捷径时，都要问一句"这个聚合还带什么逐行条件"。
@@ -758,7 +758,7 @@ fn metadata_shortcut_count(
 /// 保留参数是为了让"要不要收紧"这件事在调用点可见。
 ///
 /// 历史上 VALUES 源传 `true`（"宁可报错也不要补 NULL 写进半行"）——与 SELECT 源
-/// 口径不一致，2026-10-13 统一放宽。
+/// 口径不一致，2026-10-11 统一放宽。
 fn insert_column_perm(
     def: &crate::catalog::TableDef,
     column_order: Option<&[String]>,

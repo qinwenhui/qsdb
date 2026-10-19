@@ -16,7 +16,7 @@ use super::translate::LogicalPlan;
 
 // 分片重写：本线程上"某个实表名 → 该分片"的一次性覆盖。
 //
-// **为什么需要**（2026-10-14：join 之后的分聚合）：并行分片只切**最底下那个 Scan**，
+// **为什么需要**（2026-10-11：join 之后的分聚合）：并行分片只切**最底下那个 Scan**，
 // 但它上面可能还有 join —— 那些层必须**每片各建一遍**（与既有 semi 分片同款权衡：
 // 墙钟不变、内存 × 分片数）。所以分片不能只喂给 `ScanExec`，得让 `build_inner`
 // **在正常建计划的过程中**把最底下那个 Scan 换成分片。
@@ -209,7 +209,7 @@ pub fn prune_decision(plan: &LogicalPlan) -> Option<(Vec<String>, Vec<String>)> 
 ///
 /// - **之上**只有 `Project`/`Limit`/`Sort(Project(…))` ⇒ 左移量由**结构**决定
 ///   （见 [`output_shift`]），不必按列名判 —— 按名判会撞车：窗口输出里的 `pdate`
-///   与表列 `pdate` 同名却活在两个空间里（2026-10-16 那次"删掉 guard"的尝试就是
+///   与表列 `pdate` 同名却活在两个空间里（2026-10-17 那次"删掉 guard"的尝试就是
 ///   死在这里：`decimal window arg downcast failed`）；
 /// - **之下**是 `Scan`/`Filter`/`Aggregate` ⇒ 三者的表达式都能精确定位；
 /// - 全计划**恰好一个** `Window`（下面的链与 [`under_window_ok`] 已排除嵌套情形）。
@@ -301,7 +301,7 @@ fn collect_plan_columns(plan: &LogicalPlan, out: &mut Vec<String>) {
                 if let Some(arg) = &a.arg {
                     collect_expr_columns(arg, out);
                 }
-                // ⚠️ **FILTER 谓词引用的列也要算**（2026-10-15）：漏了它，扫描投影
+                // ⚠️ **FILTER 谓词引用的列也要算**（2026-10-17）：漏了它，扫描投影
                 // 会把谓词要的列裁掉/换位 ⇒ 执行期按**旧索引**取列，越界 panic
                 // （实测 `Trying to access ... len is 1 but the index is 1`）。
                 if let Some(f) = &a.filter {
@@ -538,7 +538,7 @@ fn output_shift(p: &LogicalPlan, k: usize) -> usize {
 ///
 /// 这个判定替代了原先"**按列名猜**"的做法（`all.contains(name)`），后者在
 /// 「上下两层列名相同、但列空间不同」的形状上会**拿外层的位置去查表空间映射**，
-/// 静默取到隔壁那一列。实测（2026-10-14，先于本次改动就存在）：
+/// 静默取到隔壁那一列。实测（2026-10-11，先于本次改动就存在）：
 ///
 /// ```sql
 /// SELECT g, x FROM (SELECT DISTINCT g, x FROM t)   -- t(id,g,x)
@@ -586,7 +586,7 @@ fn rewrite_plan(
     //   · 是**窗口输出空间** ⇒ 分两段，见 `rewrite_above_window_expr`。
     //
     // 第三种是本文件最容易错的一处（见 `output_shift` 的表格）：它**不是**一个统一平移。
-    // 旧 `Window` 臂在这里无条件按名重写，2026-10-16 实测炸出
+    // 旧 `Window` 臂在这里无条件按名重写，2026-10-17 实测炸出
     // `decimal window arg downcast failed`。宁可少裁一列，也不能把表达式指到隔壁列上去。
     let space = direct_input(plan).map_or(0, |i| output_shift(i, k));
     let tbl = space > 0 && exprs_are_in_table_space(plan);
@@ -763,7 +763,7 @@ fn rewrite_expr(e: &PhysExpr, mapping: &[Option<usize>], all: &[String]) -> Phys
 /// 而 `def.columns` / `mapping` 用的都是**裸名**。不剥就永远判"不是表列"，于是
 /// `unwrap_or(idx)` **把旧索引原样留下**，静默指到隔壁列。
 ///
-/// 实测（2026-10-16，两张同构真表 —— 同一模板建的对照表）：
+/// 实测（2026-10-17，两张同构真表 —— 同一模板建的对照表）：
 /// `SELECT a.k, b.v FROM a JOIN b ON a.k=b.k` **静默回 0 行**、
 /// `SELECT a.k, b.k FROM …` 直接 `index out of bounds: len 1 index 1`（panic）。
 ///
@@ -1480,7 +1480,7 @@ fn try_project_join(
 /// ⇒ 外层要的位置 `p < 左宽` **原样对应**内层输出的位置 `p`。再加上外层用到的连接键
 /// 位置，就是内层要产出的集合。右键同理（全局位置减左宽转局部）。
 ///
-/// ⚠️ 实测依据（2026-10-14，.14）：join 输出宽 10 列 → 5 列，**时间减半**
+/// ⚠️ 实测依据（2026-10-11，.14）：join 输出宽 10 列 → 5 列，**时间减半**
 /// （1.33s → 0.63s，峰值 RSS 300MB → 111MB）。基准那句聚合只读 2 列。
 fn annotate_join_needs(
     plan: &LogicalPlan,
@@ -1519,7 +1519,7 @@ fn annotate_join_needs(
 /// ⚠️ `allow_scan_read` 是**必需**的闸门，不是保守选项：`build()` 的单表列裁剪会
 /// 把整棵计划的索引**重映射到裁剪后的空间**（`rewrite_plan`），而那个空间里的
 /// 位置 **不能**拿去查 `def.columns`（全表序）——查出来是**别的列**。
-/// 实测（2026-10-14）：`SELECT round(sum(score)) FROM t` 因此把 `cnt` 当成了
+/// 实测（2026-10-11）：`SELECT round(sum(score)) FROM t` 因此把 `cnt` 当成了
 /// `score`，扫描读了个空集 ⇒ 聚合回 NULL。**同一个 plan 里位置属于哪个空间，
 /// 是这个优化最容易错的地方**（这次是既有测试抓住的）。
 /// 判据：`scan_proj.is_some()` ⟺ 已被外层裁剪（位置在裁剪空间）。
@@ -2075,9 +2075,9 @@ fn build_aggregate(
             // 两条独立的依据，都实测过：
             // 1. **Int64** 单线程下已有一条专用快路（`GroupTable::int_slots`，
             //    键存在槽里 ⇒ 命中不碰 arena，实测 6–10×），而分区路径只能走
-            //    `insert_raw_key`（通用编码）⇒ 反而慢。2026-10-15 实测：没这道闸门时
+            //    `insert_raw_key`（通用编码）⇒ 反而慢。2026-10-17 实测：没这道闸门时
             //    `simple_distinct_int` 从 0.132s 退到 **0.444s**（3.4×）。
-            // 2. **整数 / 日期**这类定长键**整体**不该分区（2026-10-16 补的）
+            // 2. **整数 / 日期**这类定长键**整体**不该分区（2026-10-17 补的）
             //    —— `.14` 真表 5 轮中位：`tpoint`(INT32) 49→**97**ms、
             //    `pdate`(DATE32，15 组) 44→**92**ms、`month`(DATE32，3 组) 43→**92**ms
             //    ⇒ 分区**一律亏 ~2×**。基准表上单线程也一路赢到 **250 万组**
@@ -2155,7 +2155,7 @@ fn build_aggregate(
         && aggs.len() == 1
         && matches!(aggs[0].func, crate::expr::AggFunc::Count)
         && aggs[0].arg.is_none()
-        // ⚠️ **写了 FILTER 就不能走这条下推**（2026-10-15，与上面"有残留谓词"
+        // ⚠️ **写了 FILTER 就不能走这条下推**（2026-10-17，与上面"有残留谓词"
         // 同源）：`JoinCountExec` 只按键计数，压根没有"逐行谓词"这一步 ⇒
         // `count(*) FILTER (WHERE …)` 会被当成 `count(*)` 回**全量匹配数**。
         // 交给常规路径（结果正确、只是慢）。
@@ -2880,7 +2880,7 @@ struct ShardSource {
 /// 那是实打实的退步。故只对**小维表**分片；拿不到行数就不分（保守）。
 const JOIN_SHARD_MAX_BUILD_ROWS: u64 = 2_000_000;
 
-/// 分片数。**上限 4**，2026-10-14 在 .14 重测确认（下面有数）。
+/// 分片数。**上限 4**，2026-10-11 在 .14 重测确认（下面有数）。
 ///
 /// 旧注释给的上限 4 依据是"89 万组：4 片 0.953s / 8 片 1.407s / 16 片 2.212s"，
 /// 但那段还写着"原本**单线程串行 merge** 是高组数下的瓶颈"——**那份测量早于

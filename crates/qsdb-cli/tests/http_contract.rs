@@ -2041,10 +2041,7 @@ fn grants_whitelist_per_request_effect_and_write_gate() {
         "白名单制用户登录不该被拒: {}",
         String::from_utf8_lossy(&r.body)
     );
-    assert_eq!(
-        r.json()["grants"],
-        serde_json::json!({ "app": "reader" })
-    );
+    assert_eq!(r.json()["grants"], serde_json::json!({ "app": "reader" }));
     assert!(r.json()["role"].is_null(), "对 default 无权 → role 回 null");
     let ftok = r.json()["token"].as_str().unwrap().to_string();
     let fbearer = format!("Bearer {ftok}");
@@ -2067,8 +2064,7 @@ fn multi_mount_routing_isolation_and_rejects() {
     // 第二个挂载目录（Server::start 只建 root；Drop 只清 root）
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let app_dir =
-        std::env::temp_dir().join(format!("qsdb_mm_app_{}_{}", std::process::id(), uniq));
+    let app_dir = std::env::temp_dir().join(format!("qsdb_mm_app_{}_{}", std::process::id(), uniq));
     let _ = std::fs::remove_dir_all(&app_dir);
     std::fs::create_dir_all(&app_dir).unwrap();
 
@@ -2104,8 +2100,7 @@ fn multi_mount_routing_isolation_and_rejects() {
     assert_eq!(r.code(), "NOT_FOUND");
 
     // ③ REST database 字段（优先级最高）
-    let body =
-        serde_json::json!({"sql": "SELECT count(*) FROM t", "database": "app"}).to_string();
+    let body = serde_json::json!({"sql": "SELECT count(*) FROM t", "database": "app"}).to_string();
     let r = http(
         p,
         "POST",

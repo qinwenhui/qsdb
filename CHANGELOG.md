@@ -2,7 +2,7 @@
 
 All notable changes to QSDB are documented here.
 
-## [0.1.0] - 2026-10-19
+## [0.1.0] - 2026-10-18
 
 First public release.
 

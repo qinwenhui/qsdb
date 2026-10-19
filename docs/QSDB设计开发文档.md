@@ -1,6 +1,6 @@
 # QSDB 设计开发文档
 
-> 版本：v0.1（2026-10-09）
+> 版本：v0.1（2026-10-04）
 > 状态：设计定稿，开发起点
 > 上游参考：早期原型（MiniDB）的设计笔记（内部资料，未随本仓发布）。其第三/四/五章细节（类型规范、统计结构等）本文按需引用，不全文复抄。
 
@@ -191,7 +191,7 @@ Delta：参考文档的 `encoding_hint`、`ConstraintMgr`（唯一/范围/CHECK 
 │   └── {db}.postcard                  # db 内表名清单（默认 db = "default"）
 ├── {db}/{table}/
 │   ├── table.json                     # 表定义：schema/分区键/属性/next_gen 等
-│   ├── dt=2026-10-09/                 # 一个分区一个目录（Hive 风格）
+│   ├── dt=2026-10-04/                 # 一个分区一个目录（Hive 风格）
 │   │   ├── manifest.postcard          # ★ 分区清单 = 该分区唯一提交点
 │   │   ├── seg_0192f3a1-….parquet     # 数据文件（uuid v7 命名）
 │   │   └── .lock                      # 分区锁文件（fs2）
@@ -395,7 +395,7 @@ db.overwrite_partition("events", &[("dt", Literal::Date(20664))], &batches)?;
 let scan: ScanResult = db.scan(ScanRequest {
     table: "events",
     projection: &["tenant_id", "amount"],
-    predicate: Predicate::parse("dt = DATE '2026-10-09' AND amount > 0")?,
+    predicate: Predicate::parse("dt = DATE '2026-10-04' AND amount > 0")?,
     limit: None,
 })?;
 for batch in scan { /* RecordBatch 流式消费，零拷贝 */ }
@@ -656,7 +656,7 @@ M6-4 staging 写 → M6-5 HDFS → M6-6 可选租约；每阶段独立 gate。
   `put_if_etag`（PutMode::Create/Update，Precondition/AlreadyExists →
   冲突 false）；`occ_commit` 重放循环 ≤8 轮（每轮基于最新 cur 重建，
   天然无 ABA 丢写）；manifest 新增 `writer_epoch`（本地恒 0）。
-  ⚠️ **更正（2026-10-14）**：此处原写「`serde(default)` 即可兼容旧文件」——**那是错的**。
+  ⚠️ **更正（2026-10-11）**：此处原写「`serde(default)` 即可兼容旧文件」——**那是错的**。
   postcard 不是自描述格式，尾部加字段会让旧文件「读穿」，`serde(default)` 只在 JSON
   这类自描述格式上生效。规则是**加字段 = 同时 bump `manifest.version`**，
   且读者要保留旧版本的读路径（见 `docs/format-spec.md` §7）。

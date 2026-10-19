@@ -270,7 +270,7 @@ fn 三表链式等值_join() {
 fn cross_join() {
     let (db, root) = seeded("cross");
     // `CROSS JOIN` 是 sqlparser 的独立算子（`JoinOperator::CrossJoin`），
-    // **不经过** INNER 那条臂 —— 2026-10-15 前它被拒（而文档写着 ✅，已纠正），
+    // **不经过** INNER 那条臂 —— 2026-10-17 前它被拒（而文档写着 ✅，已纠正），
     // 现在按笛卡尔积实现，与 `ON TRUE` 那条非等值 INNER 路径同义。
     assert_eq!(count1(&db, "SELECT count(*) FROM a CROSS JOIN b"), 9, "3×3");
     assert_eq!(
@@ -415,7 +415,7 @@ fn full_outer_join_的等价拼法() {
             panic!("FULL OUTER 没有实现、又没有可用配方 —— 这是真实的表达力缺口，应当进文档/队列");
         }
     }
-    // 2026-10-15：FULL 已原生实现 ⇒ 这条配方从"替代写法"升级成**交叉校验**：
+    // 2026-10-17：FULL 已原生实现 ⇒ 这条配方从"替代写法"升级成**交叉校验**：
     // 两种写法必须给同一个数（一个走 UNION ALL 手工拼、一个走执行层收尾轮）。
     assert_eq!(
         count1(&db, "SELECT count(*) FROM a FULL OUTER JOIN b ON a.k = b.k"),
@@ -432,7 +432,7 @@ fn 行元组_in_与_any() {
     // （"修正参数"档）——驱动按码决定动作。
     //
     // 行元组这条曾经报 `invalid argument: IN subquery must select exactly one
-    // column (got 2)`：把"我们没实现"说成了"你写错了"。2026-10-15 修
+    // column (got 2)`：把"我们没实现"说成了"你写错了"。2026-10-17 修
     // （`translate.rs::is_row_value`）。
     //
     // 注意两侧都用了**真实存在**的列：第一版这里写成 b 的 `x`，报的是

@@ -30,7 +30,7 @@ def tables():
 
     ⚠️ CLI 的 `SHOW TABLES` 显示**会截断长表名**（`t_cal_day_ahead_unit_…`）——
     照着截断后的名字去 `DESCRIBE` 必然失败，于是表被**静默跳过**
-    （2026-10-16 实测：39 张被这么漏掉，还以为是"没有 pdate 列"）。
+    （2026-10-17 实测：39 张被这么漏掉，还以为是"没有 pdate 列"）。
     文件系统才是真值。
     """
     d = os.path.join(DB, "default")

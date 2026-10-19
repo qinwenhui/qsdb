@@ -4195,8 +4195,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(e.status().as_u16(), 501, "{e:?}");
         // 同库双限定是合法的（都落 app），不拒
-        let (_, db) =
-            route_sql(&state, "SELECT * FROM app.a, app.b", None, "default").unwrap();
+        let (_, db) = route_sql(&state, "SELECT * FROM app.a, app.b", None, "default").unwrap();
         assert_eq!(db, "app");
 
         // 未挂载 → 404
@@ -4244,8 +4243,7 @@ mod tests {
         assert_eq!(db, "app");
         assert!(!sql.contains("app"), "{sql}");
         // INSERT 目标
-        let (sql, db) =
-            route_sql(&state, "INSERT INTO app.t VALUES (1)", None, "default").unwrap();
+        let (sql, db) = route_sql(&state, "INSERT INTO app.t VALUES (1)", None, "default").unwrap();
         assert_eq!(db, "app");
         assert!(!sql.contains("app"), "{sql}");
         // 子查询里的限定名

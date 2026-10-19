@@ -6,7 +6,7 @@
 //! - `TIMESTAMP`：i64，自 1970-01-01T00:00:00 起的纳秒（naive，UTC 语义）
 //!
 //! 文本格式约束：
-//! - 输入：ISO 8601（`2026-10-09`、`14:30:00.123`、`2026-10-09T14:30:00.123Z`，
+//! - 输入：ISO 8601（`2026-10-04`、`14:30:00.123`、`2026-10-04T14:30:00.123Z`，
 //!   日期时间分隔符允许 `T` 或空格，尾缀 `Z` 接受并视为 naive UTC）
 //! - 输出：`YYYY-MM-DD`、`HH:MM:SS[.fff|.ffffff|.fffffffff]`、
 //!   `YYYY-MM-DD HH:MM:SS[.fff|...]`（小数部分按 3/6/9 位分组省略尾零）
@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn parse_date_ok() {
         assert_eq!(parse_date("1970-01-01").unwrap(), 0);
-        assert_eq!(parse_date("2026-10-09").unwrap(), 20_735);
+        assert_eq!(parse_date("2026-10-04").unwrap(), 20_735);
         assert_eq!(parse_date("0001-01-01").unwrap(), MIN_DATE_DAYS);
         assert_eq!(parse_date("9999-12-31").unwrap(), MAX_DATE_DAYS);
         assert_eq!(
@@ -337,7 +337,7 @@ mod tests {
             "2026-10-32",
             "2026-1-09",
             "2026/10/09",
-            "2026-10-09T00",
+            "2026-10-04T00",
             "",
             "10000-01-01",
             "0000-01-01",
@@ -349,7 +349,7 @@ mod tests {
     #[test]
     fn format_date_roundtrip() {
         assert_eq!(format_date(0), "1970-01-01");
-        assert_eq!(format_date(20_735), "2026-10-09");
+        assert_eq!(format_date(20_735), "2026-10-04");
         assert_eq!(format_date(MIN_DATE_DAYS), "0001-01-01");
         assert_eq!(format_date(MAX_DATE_DAYS), "9999-12-31");
         for days in [MIN_DATE_DAYS, -1, 0, 1, 10_957, 20_735, MAX_DATE_DAYS] {
@@ -425,11 +425,11 @@ mod tests {
         assert_eq!(parse_timestamp_ns("1970-01-01 00:00:00").unwrap(), 0);
         assert_eq!(parse_timestamp_ns("1970-01-01").unwrap(), 0);
         assert_eq!(
-            parse_timestamp_ns("2026-10-09 14:30:00").unwrap(),
+            parse_timestamp_ns("2026-10-04 14:30:00").unwrap(),
             20_735 * NANOS_PER_DAY + 14 * NANOS_PER_HOUR + 30 * NANOS_PER_MIN
         );
         assert_eq!(
-            parse_timestamp_ns("2026-10-09T14:30:00.123Z").unwrap(),
+            parse_timestamp_ns("2026-10-04T14:30:00.123Z").unwrap(),
             20_735 * NANOS_PER_DAY + 14 * NANOS_PER_HOUR + 30 * NANOS_PER_MIN + 123_000_000
         );
         // i64 纳秒可表示上界附近
@@ -440,10 +440,10 @@ mod tests {
     fn parse_timestamp_rejects() {
         for s in [
             "",
-            "2026-10-09X12:00:00",
-            "2026-10-09 25:00:00",
+            "2026-10-04X12:00:00",
+            "2026-10-04 25:00:00",
             "9999-12-31T00:00:00",
-            "2026-10-09T12:00:00.1234567890",
+            "2026-10-04T12:00:00.1234567890",
         ] {
             assert!(parse_timestamp_ns(s).is_err(), "should reject {s:?}");
         }
@@ -455,11 +455,11 @@ mod tests {
         assert_eq!(format_timestamp_ns(-1), "1969-12-31 23:59:59.999999999");
         assert_eq!(
             format_timestamp_ns(20_735 * NANOS_PER_DAY + 14 * NANOS_PER_HOUR + 123_456_789),
-            "2026-10-09 14:00:00.123456789"
+            "2026-10-04 14:00:00.123456789"
         );
         assert_eq!(
             format_timestamp_ns(20_735 * NANOS_PER_DAY + 500_000_000),
-            "2026-10-09 00:00:00.500"
+            "2026-10-04 00:00:00.500"
         );
         let ns = 20_735 * NANOS_PER_DAY + 14 * NANOS_PER_HOUR + 30 * NANOS_PER_MIN + 7;
         let s = format_timestamp_ns(ns);

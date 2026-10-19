@@ -26,7 +26,7 @@ pub const MANIFEST_FILE: &str = "manifest.postcard";
 ///   报 `Hit the end of buffer`；
 /// - 此时 `#[serde(default)]` **一点用都没有**：它只在 JSON 这类自描述格式里
 ///   生效。本文件里两处"旧 manifest 兼容：字段缺省即 0"的注释**曾经是错的**，
-///   而且错得会咬人——2026-10-14 实测：`epoch` 落盘后，20:48 生成的数据被
+///   而且错得会咬人——2026-10-11 实测：`epoch` 落盘后，20:48 生成的数据被
 ///   21:58 的内核读成 `corrupt manifest … Hit the end of buffer`，
 ///   **报错说"损坏"，真相是"版本不同"**，人会去查磁盘、查 GC，方向全错。
 ///
@@ -149,7 +149,7 @@ impl PartitionManifest {
     /// **先看版本，再解结构体**：`version` 是结构体第一个字段，postcard 顺序编码
     /// ⇒ 它恒是**前导变长整数**，可以在完整反序列化**之前**单独读出来。
     /// 这样"版本不认识"就能报成版本问题，而不是等反序列化炸成 `corrupt manifest`
-    /// （2026-10-14 实测的误导，见 [`MANIFEST_VERSION`]）。
+    /// （2026-10-11 实测的误导，见 [`MANIFEST_VERSION`]）。
     ///
     /// **v1 兼容**：v1 与 v2 的全部差别就是 v2 结尾多一个 `epoch` 变长整数。
     /// 所以 v1 文件按原样解会"读穿了"，补一个 `0x00`（变长整数 0）再解即得
@@ -339,7 +339,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// 版本不认识 ⇒ **报版本**，不许报成"损坏"（2026-10-14 实测的误导就在这里）。
+    /// 版本不认识 ⇒ **报版本**，不许报成"损坏"（2026-10-11 实测的误导就在这里）。
     #[test]
     fn unknown_version_reports_version_not_corruption() {
         let (store, dir) = tmpdir("badver");

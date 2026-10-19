@@ -416,7 +416,7 @@ enum SumCol {
 
 /// `by_hash` 的桶值：**内联一格**的小向量（零新依赖，就一个 enum）。
 ///
-/// 动机来自 `perf` 实录（2026-10-14，`count(DISTINCT gs)` 5M 行 / 2.801s）：
+/// 动机来自 `perf` 实录（2026-10-11，`count(DISTINCT gs)` 5M 行 / 2.801s）：
 /// **哈希查找 36.7% + libc 分配器 18.9%**，两者都长在这个结构上。
 /// `HashMap<u64, Vec<u32>>` 在**高基数**下每个桶只装一个 gid，却要付两次代价：
 /// ① 每组一次 `Vec` 堆分配；② 查找时多追一次指针（数据在别处，又一条 cache line）。
@@ -506,7 +506,7 @@ pub struct GroupTable {
     ///
     /// 为什么要单独存：`estimated_bytes` 原先每调一次就
     /// `by_hash.values().map(...).sum()` 遍历**全部条目**——**每批调一次**，
-    /// 于是成本是 `组数 × 批数`。实测（2026-10-14）：250 万字符串组 × 610 批
+    /// 于是成本是 `组数 × 批数`。实测（2026-10-11）：250 万字符串组 × 610 批
     /// ≈ 每次流过 **80MB**、合计 **48GB 内存流量 ≈ 5 秒**，
     /// 这正是 `SELECT DISTINCT gs`（5M 行）6.0s 里的绝大部分
     /// （对照组：同样 5M 行、500 万**整数**组的 `DISTINCT v` 只要 0.16s
@@ -601,7 +601,7 @@ impl GroupTable {
     /// 为什么要有它：`estimated_bytes` 只给一个总数，而"组表胖"有好几种完全不同的
     /// 成因（键 arena 涨 / 每组的 `Vec` 头 / 每组一个 `Literal` 堆对象 /
     /// 哈希桶失衡），总数看不出是哪一种，改起来就只能猜。
-    /// 实测（2026-10-14）`SELECT DISTINCT gs` 250 万字符串组占 4.4GB，
+    /// 实测（2026-10-11）`SELECT DISTINCT gs` 250 万字符串组占 4.4GB，
     /// 而 500 万 int64 组只占 569MB —— 差的就是这张表要指出的东西。
     pub fn profile_bytes(&self) -> Vec<(&'static str, u64)> {
         vec![
@@ -2049,7 +2049,7 @@ impl GroupTable {
         self.pending_arity.unwrap_or(0)
     }
 
-    // `group_keys()` **已删**（2026-10-14）：它把列式的 `group_lits` 转置成
+    // `group_keys()` **已删**（2026-10-11）：它把列式的 `group_lits` 转置成
     // `Vec<Vec<Literal>>`（每组一个 Vec 堆对象 + 一次 Literal 克隆），调用方再转回
     // 列式——一进一出纯白扔。唯一调用方 `DistinctExec` 改走列式的
     // [`build_output_batch_cols`]。留着它就是留着一个"顺手拿行式键"的陷阱。
@@ -2398,7 +2398,7 @@ fn finalize_col(table: &GroupTable, ai: usize, agg: &AggExpr, n: usize) -> Resul
                     // ⚠️ **溢出必须报错，不许静默变 NULL**：`i256` 能装 76 位，而输出
                     //   类型声明的是 `min(p+10, 38)` —— 装不下时 `to_i128()` 回 `None`，
                     //   直接 collect 成 `Option` 就等于把「求和超范围」说成「这组全空」。
-                    //   两个含义天差地别，而调用方无从分辨（2026-10-16 修）。
+                    //   两个含义天差地别，而调用方无从分辨（2026-10-17 修）。
                     let out: Decimal128Array = (0..n)
                         .map(|g| {
                             if cnt[g] == 0 {
@@ -2472,7 +2472,7 @@ fn finalize_col(table: &GroupTable, ai: usize, agg: &AggExpr, n: usize) -> Resul
                         // ⇒ 把**分母**放大 `10^(s_out - s_in)`，等价于把商放大同样倍数。
                         //
                         // 不这么做就是"声明 scale 8、却按 scale 4 除" ⇒ **值小 1 万倍**。
-                        // 2026-10-16 实测：`avg(DECIMAL(18,4))` 回 `0.00301750` 而不是
+                        // 2026-10-17 实测：`avg(DECIMAL(18,4))` 回 `0.00301750` 而不是
                         // `30.1750` —— **不报错、只是数小了**，最坏的一种。
                         // 旧规则 `max(s,4)` 在被测的 s=4 上恰好等于输入 scale，所以一直蒙对。
                         let in_scale = match agg.arg.as_ref().map(|a| a.data_type()) {
@@ -2510,7 +2510,7 @@ fn finalize_col(table: &GroupTable, ai: usize, agg: &AggExpr, n: usize) -> Resul
                         } else {
                             q
                         };
-                        // 同 sum：**溢出报错，不回 NULL**（2026-10-16 修）
+                        // 同 sum：**溢出报错，不回 NULL**（2026-10-17 修）
                         adj.to_i128().map(Some).ok_or_else(|| {
                             QsdbError::invalid(
                                 "avg(DECIMAL) 超出 DECIMAL 能表示的范围（38 位十进制）—— \
@@ -2546,7 +2546,7 @@ fn finalize_col(table: &GroupTable, ai: usize, agg: &AggExpr, n: usize) -> Resul
 /// **快路径 = 一次遍历的 typed builder**（常见类型）；不认识的类型退回
 /// [`literals_to_array_slow`]。
 ///
-/// 为什么要有快路径（2026-10-14 实测）：慢路径是"**每行建一个单元素 Arrow 数组
+/// 为什么要有快路径（2026-10-11 实测）：慢路径是"**每行建一个单元素 Arrow 数组
 /// 再 `interleave` 拼起来**"——n 行 = **n 个数组**，每个自带 `ArrayData` +
 /// buffers + `Arc` 链。`SELECT DISTINCT gs`（250 万字符串组）因此吃满 **4.4GB / 9s**
 /// （组表本身账上只有 449MB），对照 `count(DISTINCT gs)` 的 DuckDB 0.20s/400MB
@@ -2729,7 +2729,7 @@ pub fn build_output_batch_cols(
         .map_err(|e| QsdbError::invalid(format!("distinct out: {e}")))
 }
 
-// `build_output_batch(keys: &[Vec<Literal>], …)` **已删**（2026-10-14）：行式键的唯一
+// `build_output_batch(keys: &[Vec<Literal>], …)` **已删**（2026-10-11）：行式键的唯一
 // 来源是上面删掉的 `group_keys()`，两个一起走。列式入口见
 // [`build_output_batch_cols`]（`GROUP BY` 侧一直用的是同款列式循环 `finalize_table`）。
 

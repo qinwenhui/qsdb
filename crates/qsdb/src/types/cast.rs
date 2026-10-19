@@ -521,7 +521,7 @@ mod tests {
 
     #[test]
     fn cast_temporal_paths() {
-        let date = Literal::Date(20_735); // 2026-10-09
+        let date = Literal::Date(20_735); // 2026-10-04
         let ts = cast_literal(&date, &lt("TIMESTAMP")).unwrap();
         assert_eq!(ts, Literal::Timestamp(20_735 * NANOS_PER_DAY));
         // 反向截断
@@ -535,7 +535,7 @@ mod tests {
         );
         // 字符串解析
         assert_eq!(
-            cast_literal(&Literal::Utf8("2026-10-09".into()), &lt("DATE")).unwrap(),
+            cast_literal(&Literal::Utf8("2026-10-04".into()), &lt("DATE")).unwrap(),
             date
         );
         assert_eq!(
@@ -545,7 +545,7 @@ mod tests {
         // 输出
         assert_eq!(
             cast_literal(&date, &lt("STRING")).unwrap(),
-            Literal::Utf8("2026-10-09".into())
+            Literal::Utf8("2026-10-04".into())
         );
         // DATE 超出 ns 表示范围
         assert!(cast_literal(&Literal::Date(2_932_896), &lt("TIMESTAMP")).is_err());

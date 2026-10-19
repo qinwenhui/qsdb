@@ -47,7 +47,7 @@ def main():
                   .option("user", USER).option("password", PW)
                   .option("driver", "com.mysql.cj.jdbc.Driver")
                   # 并行拉 + 分批取：单连接一把拉 33 万行会把驱动堆吃爆
-                  # （2026-10-16 实测 `GC overhead limit exceeded`）。
+                  # （2026-10-17 实测 `GC overhead limit exceeded`）。
                   .option("numPartitions", "8")
                   .option("fetchsize", "5000")
                   .load())

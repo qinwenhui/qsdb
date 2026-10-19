@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn temporal_compare() {
-        let date = Literal::Date(20_735); // 2026-10-09
+        let date = Literal::Date(20_735); // 2026-10-04
         let ts = Literal::Timestamp(20_735 * NANOS_PER_DAY + 1);
         assert_eq!(cmp_literals(&date, &ts).unwrap(), Some(Ordering::Less));
         assert_eq!(cmp_literals(&ts, &date).unwrap(), Some(Ordering::Greater));

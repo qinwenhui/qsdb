@@ -572,11 +572,7 @@ fn 权限分档_读授权可浏览_删除恒admin() {
     assert_eq!(j["table"], "st2");
     assert_eq!(j["segment"]["referenced"], true);
     assert_eq!(j["segment"]["rows"], 2);
-    let r = get(
-        p,
-        &t1,
-        &format!("/api/v1/files?path=app/default/st2/{seg}"),
-    );
+    let r = get(p, &t1, &format!("/api/v1/files?path=app/default/st2/{seg}"));
     assert_eq!(r.status, 200, "app 读者该能下载: {}", r.text());
     assert!(!r.body.is_empty());
 

@@ -3,7 +3,7 @@
 
 为什么要绕：CLI 的输出列会**截断长名字**（加 `…`），`DESCRIBE` 也一样
 —— 长列名被截成 `deviation_income_shar…`，拼进 DDL 就是语法错
-（2026-10-16 实测：`Expected: a data type name, found: …`）。
+（2026-10-17 实测：`Expected: a data type name, found: …`）。
 `table.json` 是磁盘真值，不截断。
 """
 import json

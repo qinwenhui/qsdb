@@ -1,7 +1,7 @@
 //! `OFFSET` / `FETCH FIRST` / `NULLS FIRST|LAST` 的**语义回归**。
 //!
 //! 三者此前都是**静默丢弃**（`LIMIT 10 OFFSET 20` 少翻页、`NULLS FIRST` 恒用默认…
-//! 见 `内部 SQL 支持面清单`），后改为显式拒绝，2026-10-13 实现。
+//! 见 `内部 SQL 支持面清单`），后改为显式拒绝，2026-10-11 实现。
 //! 本文件钉住**实现是对的**——尤其：
 //! - `OFFSET` 要能**跨批**跳过（不是只在第一批里切）；
 //! - `ORDER BY … LIMIT n OFFSET m` 走 TopN 快路径时，上界必须是 `n+m` 且仍要跳 m
@@ -211,7 +211,7 @@ fn window_order_by_uses_same_nulls_rule() {
         ["10", "40", "80", "130", "130"]
     );
     // 显式 NULLS FIRST：NULL 排最前 ⇒ 首行帧内**一个非 NULL 都没有** ⇒ **NULL**
-    // （2026-10-15 修：此前给 0 —— `sum` 跳过 NULL，没有非 NULL 就是 NULL，
+    // （2026-10-17 修：此前给 0 —— `sum` 跳过 NULL，没有非 NULL 就是 NULL，
     //  0 是个会被下游当真数字的错值。PG/DuckDB 同样给 NULL。）
     assert_eq!(
         col(

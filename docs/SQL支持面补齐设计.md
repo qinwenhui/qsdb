@@ -1,10 +1,10 @@
 # SQL 支持面补齐设计 —— USING 命名空间 · CTE 列别名 · RANGE 帧（2026-10-18，设计稿）
 
-> **缘起**：F29 的"覆盖度 B-/C+"评估停在 2026-10-14；此后生态功能批次
-> #2-#4（2026-10-15）与窗口批次已经落地了一大半——**本稿先把现状用探针
+> **缘起**：F29 的"覆盖度 B-/C+"评估停在 2026-10-11；此后生态功能批次
+> #2-#4（2026-10-17）与窗口批次已经落地了一大半——**本稿先把现状用探针
 > 复核清楚，再给真实剩余缺口的范围与设计**。复核方式：22 条探针 SQL 逐条
 > 打真引擎（`work/probe_surface.sh` / `work/probe_using.sh`，2026-10-18 实测），
-> 与 `docs/SQL支持面.md`（2026-10-15 更新，含 F29 两处失实的修正注记）交叉对账。
+> 与 `docs/SQL支持面.md`（2026-10-17 更新，含 F29 两处失实的修正注记）交叉对账。
 >
 > **定位**：真实语料 154 块已全绿——本批**不为业务 SQL**，为的是
 > **BI/工具生成的 SQL**（帆软图表向导、DBeaver、JDBC 元数据驱动）——
@@ -34,7 +34,7 @@
 | # | 缺口 | 探针证据 |
 |---|---|---|
 | **S1** | **USING 命名空间不完整**：`SELECT w FROM t JOIN u USING (g)` → `not found: column 'w' (…unqualified names resolve to the left input only)`。合并列的裸名 ✅（探针第 3 条过），但**右侧非合并列的裸名不可见**；且支持面文档 §107 已记"限定名 `l.c`/`r.c` 回退裸名"的偏差（PG 是两者并存） | `work/probe_using.sh` 全系 |
-| **S2** | **CTE 列别名**：`WITH c (gg, vv) AS (SELECT g, v FROM t)` → `unsupported: CTE column alias list … refusing rather than silently ignoring`（此前别名被静默丢掉——现闸是 2026-10-15 补的，正确但没实现） | 探针 |
+| **S2** | **CTE 列别名**：`WITH c (gg, vv) AS (SELECT g, v FROM t)` → `unsupported: CTE column alias list … refusing rather than silently ignoring`（此前别名被静默丢掉——现闸是 2026-10-17 补的，正确但没实现） | 探针 |
 | **S3** | **RANGE 帧**：`sum(v) OVER (ORDER BY v RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)` → `unsupported: window frame RANGE BETWEEN … (only ROWS is implemented)`。**这正是帆软/BI 图表向导生成"运行总计"的默认形态** | 探针 |
 
 三个缺口全部是**显式拒绝**状态（话术正确、不静默）——本批是把三条闸换成真实现，

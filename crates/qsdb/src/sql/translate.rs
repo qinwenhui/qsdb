@@ -28,7 +28,7 @@ pub enum LogicalPlan {
         /// ——见 `Scan::restrict_read`。由 `exec_builder::annotate_join_needs`
         /// 在"能证明下游不读它"时设置（join 之下的聚合链）。
         ///
-        /// 收益（2026-10-14 实测）：扫描代价几乎线性于解码列宽 —— 同一张 5M 行表
+        /// 收益（2026-10-11 实测）：扫描代价几乎线性于解码列宽 —— 同一张 5M 行表
         /// 只读 2 列 0.18s、读全 7 列 0.63s，而基准那句 join 里扫描占 53%。
         read: Option<Arc<Vec<String>>>,
     },
@@ -107,7 +107,7 @@ pub enum LogicalPlan {
         /// 位置序 = 输出序（左全列 ++ 右全列），与 `HashJoinExec::schema()` 一致；
         /// 不在表里的位置**填 NULL**（列还在、schema 不变，只是没人读）。
         ///
-        /// **为什么要有它**（2026-10-14 实测）：join 输出宽 = 左全列 + 右全列，
+        /// **为什么要有它**（2026-10-11 实测）：join 输出宽 = 左全列 + 右全列，
         /// 而下游聚合往往只读其中一两列。基准那句 `t×d + GROUP BY` 产出 **1000 万行
         /// × 10 列**（含 4 个字符串列），聚合只读 2 列 —— 单线程 1.27s 里约
         /// **0.85s 白花在"物化 10 列再丢掉 8 列"**。等价的列宽实验：
@@ -158,14 +158,14 @@ pub enum UserAlterAction {
 pub type InsertRows = Vec<Vec<Literal>>;
 
 // ---------------------------------------------------------------------------
-// 绑定前的「静默丢弃」闸门（2026-10-13 系统扫描）
+// 绑定前的「静默丢弃」闸门（2026-10-11 系统扫描）
 // ---------------------------------------------------------------------------
 
 /// **凡不实现的子句，一律显式报错——绝不无声丢弃。**
 ///
 /// **为什么需要它**：绑定器是**逐字段读**的——它只读它认识的那些字段，AST 里其余
 /// 字段**默认被忽略**。于是"语法合法但没实现"的子句会安静地按"没写"执行。
-/// 2026-10-13 逐条实测（`tests/sql_silent_drop.rs` 就是这批的回归），全都不报错：
+/// 2026-10-11 逐条实测（`tests/sql_silent_drop.rs` 就是这批的回归），全都不报错：
 ///
 /// | 写了 | 实际执行成 | 后果 |
 /// |---|---|---|
@@ -379,7 +379,7 @@ fn audit_function(f: &sqlparser::ast::Function) -> Result<()> {
              (a silently-dropped clause returns wrong results without any error)"
         )))
     };
-    // `FILTER (WHERE …)` **聚合已实现**（2026-10-15，生态功能批次 3）：谓词只有
+    // `FILTER (WHERE …)` **聚合已实现**（2026-10-17，生态功能批次 3）：谓词只有
     // TRUE 才把行喂给该聚合。这里只拦**标量函数上的 FILTER**（没有意义）。
     // ⚠️ 窗口函数**不走 `try_bind_agg`**，所以窗口 + FILTER 要在
     // `parse_window_fn` 里单独拦 —— 否则它会被静默丢掉（回全量，正是本批要消灭的）。
@@ -1034,7 +1034,7 @@ fn translate_statement(
                     "CREATE OR REPLACE TABLE 未实现 —— 先 `DROP TABLE` 再 `CREATE`（要原子替换分区内容用 `INSERT OVERWRITE`）",
                 ));
             }
-            // **CTAS**（2026-10-15 实现，生态功能批次 4）。
+            // **CTAS**（2026-10-17 实现，生态功能批次 4）。
             // 此前会掉进"零列"检查、报 `table needs at least one column`（把"没实现"
             // 说成"你建表建错了"）；文档一度声称"报错文案已明确"，实测**根本没落地**
             // （与 F29② 同款）。现在按标准实现：schema 由 SELECT 的输出推导。
@@ -2544,7 +2544,7 @@ fn build_in_semi_join(
     cte_defs.extend(extra);
     let sub_cols = plan_output_columns(&sub_plan)?;
     if sub_cols.len() != 1 {
-        // 行值比较 `(a, b) IN (子查询)` 是**标准 SQL、我们没实现**（2026-10-15 的
+        // 行值比较 `(a, b) IN (子查询)` 是**标准 SQL、我们没实现**（2026-10-17 的
         // join 支持面探针抓到这条归类错）：此前一律报 400 `INVALID_ARGUMENT`
         // "IN subquery must select exactly one column" —— 那是把"没实现"说成
         // "你写错了"。**驱动按码决定动作**（400 = 修正参数 / 501 = 改写法），
@@ -4830,7 +4830,7 @@ fn translate_select_inner(
                     // **越界/非整数必须显式拒**：悄悄退回"当常量"等于**不排序**
                     //（常量排序键），用户以为排了、其实没有 —— 静默无效。
                     // 此前是靠"常量排序键会让 `RecordBatch` 列长对不齐而报错"侥幸
-                    // 拦住的，那是**借了 ProjectExec 那个 bug 的力**；2026-10-15 把
+                    // 拦住的，那是**借了 ProjectExec 那个 bug 的力**；2026-10-17 把
                     // 常量广播修好之后它就漏了（`sql_gaps::order_by_ordinal` 当场
                     // 抓到 —— 那条断言 `ORDER BY 5` 报错的用例一直是"借 bug 通过"）。
                     sqlparser::ast::Value::Number(n, _) => {
@@ -6004,7 +6004,7 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
         //
         // - `NVL(a, b)` 是 **Spark SQL 的内置函数**（= 两参的 coalesce，
         //   实测真 Spark 3.5.2：`SELECT nvl(0.2, 1)` ⇒ `0.2`）。真实语料在用。
-        // - `LEAST` / `GREATEST` 实测真 Spark 3.5.2（2026-10-16）：
+        // - `LEAST` / `GREATEST` 实测真 Spark 3.5.2（2026-10-17）：
         //   `least(1,null,3)` ⇒ `1`、`greatest(1,null,3)` ⇒ `3`（**忽略 NULL**）、
         //   `least(null,null)` ⇒ `NULL`；类型取公共超类型
         //   （`least(1,2)`⇒int、`least(1.5,2)`⇒decimal(11,1)、`least(1,2.0E0)`⇒double）。
@@ -6423,7 +6423,7 @@ pub(crate) fn bind_expr(e: &sqlparser::ast::Expr, ctx: &SchemaCtx) -> Result<Phy
             //
             // ⚠️ 求值侧早就是这样处理的（`eval.rs` 的 `PhysExpr::Cast`：全 NULL 短路，
             // 注释就写着这个理由），**只有绑定期这道闸门没跟上** —— 于是
-            // `SELECT CAST(NULL AS INT)` 一直是被拒的。2026-10-16 补上，两侧对齐。
+            // `SELECT CAST(NULL AS INT)` 一直是被拒的。2026-10-17 补上，两侧对齐。
             let is_null_lit = matches!(inner, PhysExpr::Lit(Literal::Null));
             if !is_null_lit
                 && crate::types::cast::cast_rule(&inner.data_type(), &ty)
@@ -6717,7 +6717,7 @@ fn common_supertype(a: &LogicalType, b: &LogicalType) -> LogicalType {
 
 /// 整数类型在**与 DECIMAL 统一时**占的位数（`common_supertype` 用）。
 ///
-/// 实测真 Spark 3.5.2（2026-10-16）：
+/// 实测真 Spark 3.5.2（2026-10-17）：
 /// `coalesce(cast(1 AS TINYINT), 0.0)` ⇒ `decimal(4,1)`、
 /// `coalesce(cast(1 AS INT), 0.0)` ⇒ `decimal(11,1)`、
 /// `coalesce(cast(1 AS BIGINT), 0.0)` ⇒ `decimal(21,1)`
@@ -6838,7 +6838,7 @@ fn bind_binary_arith(op: ArithOp, l: PhysExpr, r: PhysExpr) -> Result<PhysExpr> 
             // ⚠️ **两侧各自转成"保住自己的整数位 + 结果 scale"**，而**不是**转成结果类型。
             // 转成结果类型会在 `%` 上当场炸：余数比被除数小得多，Spark 的 `%` 结果
             // 整数位取 **min** ⇒ 被除数 `10.5000` 被塞进 `DECIMAL(5,4)`（上限 9.9999）
-            // **溢出 ⇒ 静默变 NULL**（2026-10-16 实测 `10.5000 % 7` 回 NULL）。
+            // **溢出 ⇒ 静默变 NULL**（2026-10-17 实测 `10.5000 % 7` 回 NULL）。
             // 每侧保住自己的整数位之后，`eval` 那边本来就会 `align_scale` 到 `rs`。
             let lc = l.cast_to(Lt::Decimal(operand_meta(*a, m.scale)?));
             let rc = r.cast_to(Lt::Decimal(operand_meta(*b, m.scale)?));
@@ -7001,7 +7001,7 @@ fn is_lit(e: &PhysExpr) -> bool {
 
 /// 比较的一侧是 NULL 字面量 ⇒ 整条比较恒 UNKNOWN（Kleene 语义）。
 ///
-/// ⚠️ **判据必须放在两个 `promote_*` 之后**（2026-10-16 修，卡住 9 个块）。
+/// ⚠️ **判据必须放在两个 `promote_*` 之后**（2026-10-17 修，卡住 9 个块）。
 ///
 /// 缘起：语料里"空串当零"的惯用写法 —— `CASE WHEN SUM_VALUE = '' THEN 0 …`，
 /// `SUM_VALUE` 是 `DECIMAL(38,8)`。`promote_string_lit` 按 Spark 语义把转不动的
@@ -7040,7 +7040,7 @@ fn promote_temporal_lit(lb: PhysExpr, rb: PhysExpr) -> Result<(PhysExpr, PhysExp
 
 /// **字符串字面量 vs 数值** 的比较：Spark 把字符串**隐式转成对方的数值类型**。
 ///
-/// 实测真 Spark 3.5.2（2026-10-16）：
+/// 实测真 Spark 3.5.2（2026-10-17）：
 ///
 /// | 表达式 | Spark |
 /// |---|---|
@@ -7281,10 +7281,10 @@ fn try_bind_agg(f: &sqlparser::ast::Function, ctx: &SchemaCtx) -> Result<Option<
     // **聚合参数上的 `DISTINCT`**：这里只打标记，真正的等价改写落在计划构造处
     // （`rewrite_distinct_aggs`：去重 + 普通聚合）。
     //
-    // 历史：2026-10-13 之前这里压根不读 `duplicate_treatment`，于是
+    // 历史：2026-10-11 之前这里压根不读 `duplicate_treatment`，于是
     // `count(DISTINCT a)` 被当成 `count(a)` 执行——回的是**错的数字**
     // （`{1,1,2}` 上回 3 而非 2），"完全合法的 SQL、悄悄给错值"这一类。
-    // 当时改成显式拒绝；2026-10-14 补上原生语义，拒绝撤掉。
+    // 当时改成显式拒绝；2026-10-11 补上原生语义，拒绝撤掉。
     //
     let distinct = has_duplicate_treatment(f);
     let func = match name.as_str() {
@@ -7569,7 +7569,7 @@ fn collect_aggs(e: &sqlparser::ast::Expr, ctx: &SchemaCtx, aggs: &mut Vec<AggExp
 /// 这个（子）表达式**就是**某个 GROUP BY 键吗？是则给出它在键里的位置。
 ///
 /// **判据必须两边都绑定成 `PhysExpr` 再比 `display()`**（同一个渲染器）。
-/// 2026-10-15 修：此前拿 AST 的 `to_string()`（`expr_display`）去比
+/// 2026-10-17 修：此前拿 AST 的 `to_string()`（`expr_display`）去比
 /// `PhysExpr::display()` —— 后者带括号（`(g + 1)` vs `g + 1`）⇒ **永远比不中**，
 /// 于是**所有表达式分组键**（`GROUP BY upper(s)` / `GROUP BY v % 2` /
 /// `GROUP BY CAST(v AS …)` / `GROUP BY CASE WHEN …` …）都掉进递归、最后报
@@ -7945,7 +7945,7 @@ pub(crate) fn split_pushdown(expr: &PhysExpr) -> (Option<Predicate>, Option<Phys
             (p, residual)
         }
         // **`Or`**：`IN (a, b, c)` 会被绑成 `x=a OR x=b OR x=c`，所以这条决定了
-        // **多值 IN 能不能下推**（2026-10-16 用户问到才发现：此前 `Or` 掉进兜底，
+        // **多值 IN 能不能下推**（2026-10-17 用户问到才发现：此前 `Or` 掉进兜底，
         // 于是多值 IN **完全不下推** —— 分区裁剪与 min/max 段裁剪都拿不到它）。
         //
         // ⚠️ 与 `And` 的规则**不同**，别看错：

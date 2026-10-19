@@ -197,7 +197,7 @@ fn cases() -> Vec<(&'static str, &'static str, &'static str)> {
             "导出",
             // **诊断用，不是对比格**：把"导出"拆成扫描与写段两半。
             // ⚠️ 这条注释原本的理由是"两侧口径不对等（DuckDB 跑内核原语、
-            // 我们跑 bench 里的单线程 writer）"。**2026-10-15 A3 之后那句不成立了**
+            // 我们跑 bench 里的单线程 writer）"。**2026-10-17 A3 之后那句不成立了**
             // —— 我们的 `export_parquet` 也走内核 `COPY … TO` 了。
             // 这条诊断格的用法随之改变：现在量的是"**同一个引擎内**，扫描占了
             // 导出耗时的多少"（下界），不再是"我们与对手的口径差"。
@@ -214,7 +214,7 @@ fn cases() -> Vec<(&'static str, &'static str, &'static str)> {
         (
             "simple_distinct",
             "简单",
-            // ✅ 2026-10-14：**两边都是原生 `count(DISTINCT gs)` 了**（本仓补上了
+            // ✅ 2026-10-11：**两边都是原生 `count(DISTINCT gs)` 了**（本仓补上了
             // 聚合参数 DISTINCT：绑定层等价改写 + `DistinctCountExec` 融合计数）。
             // 这条从"能力对照"升格成**同实现对照**。
             // 历史提醒：旧数据里那个"4× 领先"是拿我们的 `count(gs)` 比对方的
@@ -226,7 +226,7 @@ fn cases() -> Vec<(&'static str, &'static str, &'static str)> {
         (
             "simple_distinct_int",
             "简单",
-            // **为什么必须单独立一格**（2026-10-14）：`simple_distinct` 用的是
+            // **为什么必须单独立一格**（2026-10-11）：`simple_distinct` 用的是
             // **字符串**列，而字符串走不了 Int64 内联槽表 ⇒ 那条用例**看不出**
             // 整型去重的实现差异。实测代价：整型那格曾经因为 count-only 关掉
             // 内联快路径，从 0.168s 退到 0.913s（100 万组）——**5.4× 的回归，
@@ -391,7 +391,7 @@ fn peak_rss_kb() -> u64 {
 
 /// 打开库。`--budget-mb` / `--cache-mb` 可给内存预算与扫描缓存。
 ///
-/// # ★ 默认 **缓存 0**（2026-10-15 改，此前默认是 `QsdbOptions::default()` 的 256MB）
+/// # ★ 默认 **缓存 0**（2026-10-17 改，此前默认是 `QsdbOptions::default()` 的 256MB）
 ///
 /// 为什么改：本工具**每轮都重新 `open`**（`run_once` 里）⇒ 段缓存**每轮都是冷的**，
 /// 一次命中都不会有，但**每一轮都要把它灌满**。于是"峰值 RSS"那一列量到的其实是
@@ -820,7 +820,7 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
         }
         // ---- 导出 ----
         //
-        // **2026-10-15 换口径**：改成走**内核导出原语**（A3 `COPY … TO`），
+        // **2026-10-17 换口径**：改成走**内核导出原语**（A3 `COPY … TO`），
         // 与 DuckDB 那侧跑的是同一个形状（它们本来就是 `COPY … TO`）。
         // 此前这里跑的是 bench 工具里 arrow-rs 的通用单线程 writer —— 那测的是
         // "客户端写段有多慢"，不是"内核导出有多快"，两侧口径**根本不对等**
@@ -849,7 +849,7 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
             };
             (n, dt.as_millis() as u64)
         }
-        // **2026-10-15 换口径**：与 `export_parquet` 同理 —— 走**内核导出原语**
+        // **2026-10-17 换口径**：与 `export_parquet` 同理 —— 走**内核导出原语**
         // （`COPY … TO (FORMAT CSV)`），与 DuckDB 那侧同一个形状。
         // 此前跑的是 bench 工具里 arrow 的单线程 writer ⇒ 两侧口径不对等。
         "export_csv" => {
@@ -898,7 +898,7 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
         //
         // ⚠️⚠️ **断言查询一律放在计时区间之外**。校验用的都是一条**同形状的真实查询**
         // （`SELECT count(*) FROM t WHERE g < 1000` 之类），跑在 `t0` 与 `elapsed()`
-        // 之间就等于把"查询 + 校验"一起计时。2026-10-14 实测：`simple_distinct`
+        // 之间就等于把"查询 + 校验"一起计时。2026-10-11 实测：`simple_distinct`
         // 报 12.12s，而同一查询单独跑是 6.0s——**正好是两倍**，因为校验又跑了一遍
         // 完整的 `SELECT DISTINCT`。这不是小事：断言越多、越重，数字偏得越离谱，
         // 而它偏的方向**永远是把我们自己说慢**（"尺子歪了比被测物歪更危险"的同族）。
@@ -954,14 +954,14 @@ fn run_once(dir: &Path, case: &str, rows: i64, per: i64) -> (u64, u64) {
         }
         "simple_distinct" => {
             let t0 = Instant::now();
-            // 原生形态（2026-10-14 起）：绑定层改写成 `Distinct` + `count(*)`，
+            // 原生形态（2026-10-11 起）：绑定层改写成 `Distinct` + `count(*)`，
             // 执行层再由 `DistinctCountExec` 融成单遍计数。
             let n = rows_of(&db, "SELECT count(DISTINCT gs) FROM t");
             let ms = t0.elapsed().as_millis() as u64; // ← 计时到此为止（下面全是校验）
             // ⚠️ `rows_of` 对聚合**恒回 1**（结果只有一行），所以"去重结果对不对"
             // 必须另查一条标量——**而这条查询自己就是一次完整的 `SELECT DISTINCT`**，
             // 放在 `t0`/`elapsed()` 之间会把这个用例的读数**整整翻倍**
-            // （2026-10-14 实测：报 12.12s，单独跑是 6.0s）。这正是上面那段注释的由来。
+            // （2026-10-11 实测：报 12.12s，单独跑是 6.0s）。这正是上面那段注释的由来。
             // `gs = k-{i % (rows/2)}` ⇒ 恰好半数重复。**两条断言一起才有效**：
             // 去重后 = rows/2、不去重 = rows——`count(gs)` 与 `count(DISTINCT gs)`
             // **必须能分开**（这正是 2026-10-11 改数据的原因：原先 gs 全局唯一，
