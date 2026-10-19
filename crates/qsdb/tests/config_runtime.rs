@@ -63,7 +63,8 @@ fn runtime_timeout_explicit_override_wins() {
     let db = Arc::new(Qsdb::open(&root, QsdbOptions::default()).unwrap());
     db.sql("CREATE TABLE t (dt DATE, v BIGINT) PARTITIONED BY (dt)")
         .unwrap();
-    db.sql("INSERT INTO t VALUES (DATE '2026-01-01', 1)").unwrap();
+    db.sql("INSERT INTO t VALUES (DATE '2026-01-01', 1)")
+        .unwrap();
     db.runtime().set_query_timeout_ms(1);
     std::thread::sleep(Duration::from_millis(3));
     // 显式 None 覆盖运行期默认 → 不超时
